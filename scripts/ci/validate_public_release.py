@@ -184,7 +184,7 @@ def _is_allowed_directory(path: Path) -> bool:
     if parts == ("src", "omninode_rsd"):
         return True
     if parts[:3] == ("src", "omninode_rsd", ALLOWED_SOURCE_SUBSYSTEM):
-        return len(parts) == 3
+        return len(parts) == 3 or parts[3:] in {("postgres",), ("postgres", "migrations")}
     if parts[:2] == ("tests", "lifecycle"):
         return len(parts) == 2
     return False
@@ -199,10 +199,23 @@ def _is_allowed_file(path: Path) -> bool:
     if parts == VALIDATOR_PATH.parts:
         return True
     if parts[:2] == ("src", "omninode_rsd"):
-        return (len(parts) == 3 and parts[2] == "__init__.py") or (
-            len(parts) == 4
-            and parts[2] == ALLOWED_SOURCE_SUBSYSTEM
-            and path.suffix in {".py", ".yaml"}
+        return (
+            (len(parts) == 3 and parts[2] == "__init__.py")
+            or (
+                len(parts) == 4
+                and parts[2] == ALLOWED_SOURCE_SUBSYSTEM
+                and path.suffix in {".py", ".yaml"}
+            )
+            or (
+                len(parts) == 5
+                and parts[2:4] == (ALLOWED_SOURCE_SUBSYSTEM, "postgres")
+                and path.suffix == ".py"
+            )
+            or (
+                len(parts) == 6
+                and parts[2:5] == (ALLOWED_SOURCE_SUBSYSTEM, "postgres", "migrations")
+                and path.suffix in {".py", ".sql"}
+            )
         )
     if parts[:2] == ("tests", "lifecycle"):
         return len(parts) == 3 and path.suffix == ".py"

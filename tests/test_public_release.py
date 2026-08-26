@@ -154,6 +154,16 @@ def test_rejects_unallowlisted_top_level_and_source_subsystem(tmp_path: Path) ->
     assert "src/omninode_rsd/transport" in paths
 
 
+def test_allows_postgres_lifecycle_package_paths(tmp_path: Path) -> None:
+    _write(tmp_path, "src/omninode_rsd/lifecycle/postgres/__init__.py", "")
+    findings = _write(
+        tmp_path,
+        "src/omninode_rsd/lifecycle/postgres/migrations/001_lifecycle.sql",
+        "SELECT 1;\n",
+    )
+    assert findings == []
+
+
 def test_rejects_archives_environment_directories_and_multiline_port_maps(tmp_path: Path) -> None:
     (tmp_path / "release.tar.gz").write_text("placeholder", encoding="utf-8")
     (tmp_path / _marker("env")).mkdir()

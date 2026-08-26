@@ -11,6 +11,20 @@ from omninode_rsd.lifecycle.models import (
     LifecycleState,
     LifecycleTransition,
 )
+from omninode_rsd.lifecycle.postgres import (
+    AppliedLifecycleMigration,
+    DurableLifecycleEventLog,
+    LifecycleStoreConflictError,
+    LifecycleStoreCorruptionError,
+    LifecycleStoreError,
+    LifecycleStoreTransientError,
+    LifecycleStoreUnavailableError,
+    MigrationConnectionStateError,
+    PostgresConnectionFactory,
+    PostgresLifecycleEventLog,
+    PostgresLifecycleMigrationRunner,
+    PostgresMigrationConnectionFactory,
+)
 from omninode_rsd.lifecycle.reducer import reduce_lifecycle_event
 from omninode_rsd.lifecycle.replay import (
     LifecycleReplay,
@@ -28,6 +42,8 @@ from omninode_rsd.lifecycle.validation import (
 )
 
 __all__ = [
+    "AppliedLifecycleMigration",
+    "DurableLifecycleEventLog",
     "InMemoryEventLog",
     "LifecycleDescription",
     "LifecycleEvent",
@@ -42,7 +58,17 @@ __all__ = [
     "LifecycleReplayVerificationError",
     "LifecycleRunProjection",
     "LifecycleState",
+    "LifecycleStoreConflictError",
+    "LifecycleStoreCorruptionError",
+    "LifecycleStoreError",
+    "LifecycleStoreTransientError",
+    "LifecycleStoreUnavailableError",
     "LifecycleTransition",
+    "MigrationConnectionStateError",
+    "PostgresConnectionFactory",
+    "PostgresLifecycleEventLog",
+    "PostgresLifecycleMigrationRunner",
+    "PostgresMigrationConnectionFactory",
     "load_lifecycle_description",
     "parse_lifecycle_description",
     "reduce_lifecycle_event",
