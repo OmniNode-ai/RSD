@@ -1,0 +1,20 @@
+schema_version: rsd.lifecycle-description.v1
+states:
+  - INITIAL
+  - CREATED
+  - ACTIVE
+  - COMPLETED
+  - FAILED
+transitions:
+  - event_type: RUN_CREATED
+    source_state: INITIAL
+    target_state: CREATED
+  - event_type: WORK_STARTED
+    source_state: CREATED
+    target_state: ACTIVE
+  - event_type: WORK_COMPLETED
+    source_state: ACTIVE
+    target_state: COMPLETED
+  - event_type: WORK_FAILED
+    source_state: ACTIVE
+    target_state: FAILED
