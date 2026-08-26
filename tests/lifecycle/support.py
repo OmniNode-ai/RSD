@@ -5,7 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from rsd_canary.lifecycle.ingress import InMemorySequenceAllocator, LifecycleEventIngress
+from rsd_canary.lifecycle.event_log import InMemoryEventLog
+from rsd_canary.lifecycle.ingress import LifecycleEventIngress
 from rsd_canary.lifecycle.models import LifecycleEvent, LifecycleEventIntent, LifecycleEventType
 
 RUN_ID = UUID("00000000-0000-0000-0000-000000000001")
@@ -37,17 +38,17 @@ def event_stream(
         clock_value += timedelta(seconds=1)
         return value
 
-    ingress = LifecycleEventIngress(
-        InMemorySequenceAllocator(), event_id_factory=event_id, clock=clock
-    )
+    log = InMemoryEventLog()
+    builder = LifecycleEventIngress(event_id_factory=event_id, clock=clock)
     event_types = (
         LifecycleEventType.RUN_CREATED,
         LifecycleEventType.WORK_STARTED,
         last_event,
     )
     return tuple(
-        ingress.ingest(
-            LifecycleEventIntent(run_id=RUN_ID, event_type=event_type, detail=event_type.value)
+        log.ingest(
+            LifecycleEventIntent(run_id=RUN_ID, event_type=event_type, detail=event_type.value),
+            builder,
         )
         for event_type in event_types
     )
