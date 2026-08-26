@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from threading import Barrier, Lock
@@ -21,13 +22,13 @@ class _DriverRow(dict[str, object]):
 
 
 class _Result:
-    def __init__(self, rows: list[_DriverRow]) -> None:
+    def __init__(self, rows: list[Mapping[str, object] | tuple[object, ...]]) -> None:
         self._rows = rows
 
-    def fetchone(self) -> _DriverRow | None:
+    def fetchone(self) -> Mapping[str, object] | tuple[object, ...] | None:
         return self._rows[0] if self._rows else None
 
-    def fetchall(self) -> list[_DriverRow]:
+    def fetchall(self) -> list[Mapping[str, object] | tuple[object, ...]]:
         return list(self._rows)
 
 
@@ -45,8 +46,8 @@ class _Database:
         self.context_entries = 0
         self.context_exits = 0
         self.incompatible_ledger = False
-        self.catalog_relation_override: object | None = None
-        self.use_catalog_relation_override = False
+        self.catalog_probe_row_override: Mapping[str, object] | tuple[object, ...] | None = None
+        self.use_catalog_probe_row_override = False
         self._snapshot: tuple[bool, list[_DriverRow]] | None = None
 
     def begin(self) -> None:
@@ -110,12 +111,10 @@ class _Connection(AbstractContextManager["_Connection"]):
         if normalized.startswith("SELECT pg_advisory_xact_lock"):
             return _Result([])
         if normalized.startswith("SELECT to_regclass"):
-            relation_name: object | None = (
-                "rsd_canary.schema_migrations" if self._database.schema_exists else None
-            )
-            if self._database.use_catalog_relation_override:
-                relation_name = self._database.catalog_relation_override
-            return _Result([_DriverRow(relation_name=relation_name)])
+            if self._database.use_catalog_probe_row_override:
+                row = self._database.catalog_probe_row_override
+                return _Result([] if row is None else [row])
+            return _Result([_DriverRow(relation_exists=self._database.schema_exists)])
         if normalized.startswith("SELECT version, name, checksum"):
             if self._database.incompatible_ledger:
                 raise RuntimeError("schema_migrations has an incompatible shape")
@@ -199,8 +198,7 @@ class _ConcurrentBootstrapConnection(AbstractContextManager["_ConcurrentBootstra
             self._migration_lock_held = True
             return _Result([])
         if normalized.startswith("SELECT to_regclass"):
-            relation_name = "rsd_canary.schema_migrations" if self._database.schema_exists else None
-            return _Result([_DriverRow(relation_name=relation_name)])
+            return _Result([_DriverRow(relation_exists=self._database.schema_exists)])
         if normalized.startswith("SELECT version, name, checksum"):
             self._database.ledger_reads += 1
             return _Result([_Database._copy_row(row) for row in self._database.ledger])
@@ -242,7 +240,7 @@ def test_runner_locks_validates_and_records_each_pending_resource_in_one_transac
     assert statements[:3] == [
         "BEGIN;",
         "SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0));",
-        "SELECT to_regclass('rsd_canary.schema_migrations')::text AS relation_name;",
+        "SELECT to_regclass('rsd_canary.schema_migrations') IS NOT NULL AS relation_exists;",
     ]
     migration_index = statements.index(" ".join(manifest[0].content.split()))
     assert (
@@ -270,35 +268,85 @@ def test_runner_locks_validates_and_records_each_pending_resource_in_one_transac
     assert database.context_entries == database.context_exits == 2
 
 
-def test_runner_reads_the_ledger_only_after_a_present_catalog_probe() -> None:
+@pytest.mark.parametrize(
+    ("catalog_probe_row", "relation_exists"),
+    [
+        (_DriverRow(relation_exists=False), False),
+        ((False,), False),
+        (_DriverRow(relation_exists=True), True),
+        ((True,), True),
+    ],
+    ids=("mapping-absent", "tuple-absent", "mapping-present", "tuple-present"),
+)
+def test_runner_accepts_exact_catalog_probe_rows_and_reads_the_ledger_only_when_present(
+    catalog_probe_row: Mapping[str, object] | tuple[object, ...],
+    *,
+    relation_exists: bool,
+) -> None:
     database = _Database()
     migration = discover_lifecycle_migrations()[0]
-    database.schema_exists = True
-    database.ledger = [
-        _DriverRow(
-            version=migration.version,
-            name=migration.name,
-            checksum=migration.sha256,
-        )
-    ]
+    database.use_catalog_probe_row_override = True
+    database.catalog_probe_row_override = catalog_probe_row
+    if relation_exists:
+        database.schema_exists = True
+        database.ledger = [
+            _DriverRow(
+                version=migration.version,
+                name=migration.name,
+                checksum=migration.sha256,
+            )
+        ]
 
-    assert _runner(database).apply_pending() == ()
+    assert _runner(database).apply_pending() == (() if relation_exists else (migration,))
 
-    assert [query for query, _ in database.calls] == [
+    statements = [query for query, _ in database.calls]
+    assert statements[:3] == [
         "BEGIN;",
         "SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0));",
-        "SELECT to_regclass('rsd_canary.schema_migrations')::text AS relation_name;",
-        "SELECT version, name, checksum FROM rsd_canary.schema_migrations ORDER BY version ASC",
+        "SELECT to_regclass('rsd_canary.schema_migrations') IS NOT NULL AS relation_exists;",
     ]
+    ledger_read = (
+        "SELECT version, name, checksum FROM rsd_canary.schema_migrations ORDER BY version ASC"
+    )
+    if relation_exists:
+        assert statements[3] == ledger_read
+    else:
+        migration_index = statements.index(" ".join(migration.content.split()))
+        assert ledger_read not in statements[:migration_index]
     assert database.transactions == ["begin", "commit"]
 
 
-def test_runner_rejects_an_unexpected_catalog_relation_identity() -> None:
+@pytest.mark.parametrize(
+    ("catalog_probe_row", "expected_message"),
+    [
+        ((), "unexpected shape"),
+        ((False, True), "unexpected shape"),
+        ({"unexpected": False}, "unexpected shape"),
+        ({"relation_exists": False, "extra": True}, "unexpected shape"),
+        ({"relation_exists": 0}, "relation check is not valid"),
+        ({"relation_exists": "false"}, "relation check is not valid"),
+    ],
+    ids=("empty-tuple", "wide-tuple", "wrong-key", "extra-key", "integer", "string"),
+)
+def test_runner_rejects_malformed_catalog_probe_rows(
+    catalog_probe_row: Mapping[str, object] | tuple[object, ...],
+    expected_message: str,
+) -> None:
     database = _Database()
-    database.use_catalog_relation_override = True
-    database.catalog_relation_override = "rsd_canary.unexpected_relation"
+    database.use_catalog_probe_row_override = True
+    database.catalog_probe_row_override = catalog_probe_row
 
-    with pytest.raises(MigrationLedgerVerificationError, match="relation check is not valid"):
+    with pytest.raises(MigrationLedgerVerificationError, match=expected_message):
+        _runner(database).apply_pending()
+
+    assert database.transactions == ["begin", "rollback"]
+
+
+def test_runner_rejects_a_missing_catalog_probe_row() -> None:
+    database = _Database()
+    database.use_catalog_probe_row_override = True
+
+    with pytest.raises(MigrationLedgerVerificationError, match="relation check returned no row"):
         _runner(database).apply_pending()
 
     assert database.transactions == ["begin", "rollback"]
@@ -316,7 +364,7 @@ def test_runner_fails_closed_when_an_existing_ledger_has_an_incompatible_shape()
     assert statements == [
         "BEGIN;",
         "SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0));",
-        "SELECT to_regclass('rsd_canary.schema_migrations')::text AS relation_name;",
+        "SELECT to_regclass('rsd_canary.schema_migrations') IS NOT NULL AS relation_exists;",
         "SELECT version, name, checksum FROM rsd_canary.schema_migrations ORDER BY version ASC",
     ]
     assert database.transactions == ["begin", "rollback"]

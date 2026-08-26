@@ -12,9 +12,9 @@ runner starts. This suite never discovers or configures a database.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
 from typing import Protocol, cast
 
@@ -78,6 +78,20 @@ def _bootstrap_fresh_target(factory: _ConnectionFactory) -> PostgresLifecycleMig
     runner = PostgresLifecycleMigrationRunner(factory)
     assert runner.apply_pending() == discover_lifecycle_migrations()
     return runner
+
+
+def _with_rsd_canary_search_path(factory: _ConnectionFactory) -> _ConnectionFactory:
+    """Yield idle migration leases where the durable schema is search-path visible."""
+
+    @contextmanager
+    def configured_connection() -> Iterator[_Connection]:
+        with factory() as connection:
+            connection.execute("SET search_path TO rsd_canary, public;")
+            connection.commit()
+            assert connection.is_transaction_idle() is True
+            yield connection
+
+    return configured_connection
 
 
 def _scalar(
@@ -195,6 +209,15 @@ def test_runner_bootstraps_a_fresh_target_then_reruns_and_rolls_back_atomically(
             is None
         )
         connection.commit()
+
+
+def test_runner_reruns_when_the_ledger_is_visible_through_search_path(
+    request: pytest.FixtureRequest,
+) -> None:
+    factory = _with_rsd_canary_search_path(_connection_factory(request))
+    runner = _bootstrap_fresh_target(factory)
+
+    assert runner.apply_pending() == ()
 
 
 def test_append_read_tamper_trigger_and_foreign_key_constraints_are_real_postgresql_behavior(
