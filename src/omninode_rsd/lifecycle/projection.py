@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from rsd_canary.lifecycle.hashing import compute_projection_checksum
-from rsd_canary.lifecycle.models import LifecycleEvent, LifecycleRunProjection
-from rsd_canary.lifecycle.reducer import reduce_lifecycle_event
+from omninode_rsd.lifecycle.hashing import compute_projection_checksum
+from omninode_rsd.lifecycle.models import LifecycleEvent, LifecycleRunProjection
+from omninode_rsd.lifecycle.reducer import reduce_lifecycle_event
 
 
 def empty_projection(run_id: UUID) -> LifecycleRunProjection:

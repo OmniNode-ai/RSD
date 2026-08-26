@@ -8,14 +8,14 @@ from uuid import UUID
 
 import pytest
 
-from rsd_canary.lifecycle.hashing import compute_event_hash, compute_projection_checksum
-from rsd_canary.lifecycle.models import (
+from omninode_rsd.lifecycle.hashing import compute_event_hash, compute_projection_checksum
+from omninode_rsd.lifecycle.models import (
     GENESIS_HASH,
     LifecycleEvent,
     LifecycleEventType,
     LifecycleState,
 )
-from rsd_canary.lifecycle.replay import (
+from omninode_rsd.lifecycle.replay import (
     LifecycleReplay,
     LifecycleReplayArtifactError,
     LifecycleReplayInputError,

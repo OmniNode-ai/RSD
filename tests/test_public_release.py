@@ -84,7 +84,7 @@ def _address(*parts: str) -> str:
 def test_detects_prohibited_values(tmp_path: Path, content: str, rule: str) -> None:
     if callable(content):
         content = content()
-    findings = _write(tmp_path, "src/rsd_canary/lifecycle/config.py", content)
+    findings = _write(tmp_path, "src/omninode_rsd/lifecycle/config.py", content)
     assert any(item.rule == rule for item in findings)
 
 
@@ -147,11 +147,11 @@ def test_requires_exact_uppercase_root_license_filename(tmp_path: Path, filename
 def test_rejects_unallowlisted_top_level_and_source_subsystem(tmp_path: Path) -> None:
     (tmp_path / "infra").mkdir()
     (tmp_path / "infra" / "notes.txt").write_text("nothing", encoding="utf-8")
-    (tmp_path / "src" / "rsd_canary" / "transport").mkdir(parents=True)
+    (tmp_path / "src" / "omninode_rsd" / "transport").mkdir(parents=True)
     findings = scan_tree(tmp_path)
     paths = {item.path for item in findings if item.rule == "path_allowlist"}
     assert "infra" in paths
-    assert "src/rsd_canary/transport" in paths
+    assert "src/omninode_rsd/transport" in paths
 
 
 def test_rejects_archives_environment_directories_and_multiline_port_maps(tmp_path: Path) -> None:
@@ -176,6 +176,11 @@ def test_ignored_build_and_runtime_directories_are_not_scanned(tmp_path: Path) -
         target = tmp_path / directory / "leak.txt"
         target.parent.mkdir(parents=True)
         target.write_text(_address("10", ".0.0.1"), encoding="utf-8")
+    assert scan_tree(tmp_path) == []
+
+
+def test_ignores_linked_worktree_gitfile(tmp_path: Path) -> None:
+    (tmp_path / ".git").write_text("gitdir: linked-worktree", encoding="utf-8")
     assert scan_tree(tmp_path) == []
 
 

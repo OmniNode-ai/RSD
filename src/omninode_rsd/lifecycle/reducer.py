@@ -7,13 +7,13 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
-from rsd_canary.lifecycle.hashing import (
+from omninode_rsd.lifecycle.hashing import (
     advance_event_stream_hash,
     advance_transition_checksum,
     compute_event_hash,
     compute_projection_checksum,
 )
-from rsd_canary.lifecycle.models import (
+from omninode_rsd.lifecycle.models import (
     ALLOWED_LIFECYCLE_TRANSITIONS,
     GENESIS_HASH,
     LifecycleEvent,

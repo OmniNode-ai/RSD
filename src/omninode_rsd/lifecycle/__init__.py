@@ -1,8 +1,8 @@
 """Event creation, reduction, projection, and replay primitives."""
 
-from rsd_canary.lifecycle.event_log import InMemoryEventLog
-from rsd_canary.lifecycle.ingress import LifecycleEventIngress
-from rsd_canary.lifecycle.models import (
+from omninode_rsd.lifecycle.event_log import InMemoryEventLog
+from omninode_rsd.lifecycle.ingress import LifecycleEventIngress
+from omninode_rsd.lifecycle.models import (
     LifecycleDescription,
     LifecycleEvent,
     LifecycleEventIntent,
@@ -11,8 +11,8 @@ from rsd_canary.lifecycle.models import (
     LifecycleState,
     LifecycleTransition,
 )
-from rsd_canary.lifecycle.reducer import reduce_lifecycle_event
-from rsd_canary.lifecycle.replay import (
+from omninode_rsd.lifecycle.reducer import reduce_lifecycle_event
+from omninode_rsd.lifecycle.replay import (
     LifecycleReplay,
     LifecycleReplayArtifactError,
     LifecycleReplayInputError,
@@ -22,7 +22,10 @@ from rsd_canary.lifecycle.replay import (
     replay_lifecycle,
     verify_lifecycle_replay,
 )
-from rsd_canary.lifecycle.validation import load_lifecycle_description, parse_lifecycle_description
+from omninode_rsd.lifecycle.validation import (
+    load_lifecycle_description,
+    parse_lifecycle_description,
+)
 
 __all__ = [
     "InMemoryEventLog",

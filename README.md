@@ -1,10 +1,18 @@
-# rsd-canary
+# omninode-rsd
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-`rsd-canary` is a small Python library for creating, storing, and replaying
+`omninode-rsd` is a small Python library for creating, storing, and replaying
 deterministic lifecycle events. It has no network client, service endpoint, or
 deployment configuration.
+
+## Breaking package rename (pre-1.0)
+
+The distribution is now `omninode-rsd` and its Python import root is
+`omninode_rsd`. The former `rsd-canary` distribution and `rsd_canary` imports
+are removed; this release provides no compatibility package or re-export.
+Remove the former distribution from an environment before installing this one
+to avoid retaining obsolete package files.
 
 ## Development
 
@@ -31,7 +39,7 @@ The builder's event-ID and clock callbacks run inside the log's atomic critical
 section, so they must be non-blocking and must not wait on other threads or
 acquire locks in reverse order.
 
-Use `parse_lifecycle_description()` from `rsd_canary.lifecycle`
+Use `parse_lifecycle_description()` from `omninode_rsd.lifecycle`
 when a typed lifecycle-description model is needed; use
 `load_lifecycle_description()` for the compatible dictionary representation.
 

@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from rsd_canary.lifecycle.models import LifecycleEventType
-from rsd_canary.lifecycle.projection import empty_projection
-from rsd_canary.lifecycle.reducer import reduce_lifecycle_event
-from rsd_canary.lifecycle.validation import (
+from omninode_rsd.lifecycle.models import LifecycleEventType
+from omninode_rsd.lifecycle.projection import empty_projection
+from omninode_rsd.lifecycle.reducer import reduce_lifecycle_event
+from omninode_rsd.lifecycle.validation import (
     LifecycleDescriptionError,
     load_lifecycle_description,
 )
@@ -18,7 +18,7 @@ from .support import event_stream
 
 
 def test_bundled_description_matches_models() -> None:
-    path = Path(__file__).parents[2] / "src/rsd_canary/lifecycle/lifecycle_contract.yaml"
+    path = Path(__file__).parents[2] / "src/omninode_rsd/lifecycle/lifecycle_contract.yaml"
     description = load_lifecycle_description(path)
 
     assert type(description) is dict
@@ -208,7 +208,7 @@ def test_every_declared_transition_reduces() -> None:
                 (source_state.value, event.event_type.value, projection.state.value)
             )
 
-    path = Path(__file__).parents[2] / "src/rsd_canary/lifecycle/lifecycle_contract.yaml"
+    path = Path(__file__).parents[2] / "src/omninode_rsd/lifecycle/lifecycle_contract.yaml"
     description = load_lifecycle_description(path)
     expected_transitions = {
         (transition["source_state"], transition["event_type"], transition["target_state"])

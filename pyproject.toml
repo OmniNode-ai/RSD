@@ -3,7 +3,7 @@ requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "rsd-canary"
+name = "omninode-rsd"
 version = "0.1.0"
 description = "Deterministic lifecycle state-machine primitives."
 readme = "README.md"
@@ -24,7 +24,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/rsd_canary"]
+packages = ["src/omninode_rsd"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -39,4 +39,4 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["rsd_canary"]
+packages = ["omninode_rsd"]

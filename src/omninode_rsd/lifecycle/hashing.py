@@ -12,7 +12,7 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-from rsd_canary.lifecycle.models import LifecycleEvent, LifecycleRunProjection
+from omninode_rsd.lifecycle.models import LifecycleEvent, LifecycleRunProjection
 
 
 def _normalize(value: object) -> object:
