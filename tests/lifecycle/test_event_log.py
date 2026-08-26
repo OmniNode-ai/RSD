@@ -21,6 +21,14 @@ from rsd_canary.lifecycle.models import (
 from .support import event_stream
 
 
+class _EvilUUID(UUID):
+    def __eq__(self, other: object) -> bool:
+        raise RuntimeError("UUID equality must not run")
+
+    def __hash__(self) -> int:
+        raise RuntimeError("UUID hashing must not run")
+
+
 def _resign(event: LifecycleEvent) -> LifecycleEvent:
     unsigned = event.model_copy(update={"event_hash": GENESIS_HASH})
     return unsigned.model_copy(update={"event_hash": compute_event_hash(unsigned)})
@@ -122,6 +130,29 @@ def test_log_preserves_hash_check_before_sequence_check() -> None:
         log.append(invalid_event)
 
     assert log.events_for(invalid_event.run_id) == ()
+
+
+def test_log_rejects_unknown_forged_event_field_without_mutation() -> None:
+    log = InMemoryEventLog()
+    event = event_stream()[0].model_copy(update={"unexpected": "value"})
+
+    with pytest.raises(ValueError, match=r"^event is not valid$"):
+        log.append(event)
+
+    assert log.events_for(event.run_id) == ()
+
+
+@pytest.mark.filterwarnings("ignore:Pydantic serializer warnings:UserWarning")
+def test_log_rejects_evil_duplicate_event_id_before_set_membership() -> None:
+    log = InMemoryEventLog()
+    first, second, *_ = event_stream()
+    log.append(first)
+    forged_duplicate = second.model_copy(update={"event_id": _EvilUUID(str(first.event_id))})
+
+    with pytest.raises(ValueError, match=r"^event is not valid$"):
+        log.append(forged_duplicate)
+
+    assert log.events_for(first.run_id) == (first,)
 
 
 @pytest.mark.parametrize("sequence", (True, 1.0))

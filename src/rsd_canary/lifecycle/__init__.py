@@ -12,7 +12,16 @@ from rsd_canary.lifecycle.models import (
     LifecycleTransition,
 )
 from rsd_canary.lifecycle.reducer import reduce_lifecycle_event
-from rsd_canary.lifecycle.replay import replay_lifecycle
+from rsd_canary.lifecycle.replay import (
+    LifecycleReplay,
+    LifecycleReplayArtifactError,
+    LifecycleReplayInputError,
+    LifecycleReplayMismatchError,
+    LifecycleReplayRunMismatchError,
+    LifecycleReplayVerificationError,
+    replay_lifecycle,
+    verify_lifecycle_replay,
+)
 from rsd_canary.lifecycle.validation import load_lifecycle_description, parse_lifecycle_description
 
 __all__ = [
@@ -22,6 +31,12 @@ __all__ = [
     "LifecycleEventIngress",
     "LifecycleEventIntent",
     "LifecycleEventType",
+    "LifecycleReplay",
+    "LifecycleReplayArtifactError",
+    "LifecycleReplayInputError",
+    "LifecycleReplayMismatchError",
+    "LifecycleReplayRunMismatchError",
+    "LifecycleReplayVerificationError",
     "LifecycleRunProjection",
     "LifecycleState",
     "LifecycleTransition",
@@ -29,4 +44,5 @@ __all__ = [
     "parse_lifecycle_description",
     "reduce_lifecycle_event",
     "replay_lifecycle",
+    "verify_lifecycle_replay",
 ]
