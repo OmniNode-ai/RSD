@@ -8,7 +8,7 @@ from typing import cast
 import yaml
 from pydantic import ValidationError
 
-from rsd_canary.lifecycle.models import (
+from omninode_rsd.lifecycle.models import (
     ALLOWED_LIFECYCLE_TRANSITIONS,
     LifecycleDescription,
     LifecycleState,

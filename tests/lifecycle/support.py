@@ -5,9 +5,9 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from rsd_canary.lifecycle.event_log import InMemoryEventLog
-from rsd_canary.lifecycle.ingress import LifecycleEventIngress
-from rsd_canary.lifecycle.models import LifecycleEvent, LifecycleEventIntent, LifecycleEventType
+from omninode_rsd.lifecycle.event_log import InMemoryEventLog
+from omninode_rsd.lifecycle.ingress import LifecycleEventIngress
+from omninode_rsd.lifecycle.models import LifecycleEvent, LifecycleEventIntent, LifecycleEventType
 
 RUN_ID = UUID("00000000-0000-0000-0000-000000000001")
 EVENT_IDS = (

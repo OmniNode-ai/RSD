@@ -6,16 +6,16 @@ from threading import RLock
 from typing import Protocol
 from uuid import UUID
 
-from rsd_canary.lifecycle.hashing import compute_event_hash
-from rsd_canary.lifecycle.ingress import LifecycleEventIngress, validate_lifecycle_event_intent
-from rsd_canary.lifecycle.models import (
+from omninode_rsd.lifecycle.hashing import compute_event_hash
+from omninode_rsd.lifecycle.ingress import LifecycleEventIngress, validate_lifecycle_event_intent
+from omninode_rsd.lifecycle.models import (
     ALLOWED_LIFECYCLE_TRANSITIONS,
     GENESIS_HASH,
     LifecycleEvent,
     LifecycleEventIntent,
     LifecycleState,
 )
-from rsd_canary.lifecycle.reducer import LifecycleReductionError, validate_lifecycle_event
+from omninode_rsd.lifecycle.reducer import LifecycleReductionError, validate_lifecycle_event
 
 
 class LifecycleEventLog(Protocol):

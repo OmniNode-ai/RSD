@@ -9,8 +9,8 @@ from uuid import UUID
 
 import pytest
 
-from rsd_canary.lifecycle.hashing import compute_event_hash, compute_projection_checksum
-from rsd_canary.lifecycle.models import (
+from omninode_rsd.lifecycle.hashing import compute_event_hash, compute_projection_checksum
+from omninode_rsd.lifecycle.models import (
     GENESIS_HASH,
     LifecycleEvent,
     LifecycleEventIntent,
@@ -18,8 +18,8 @@ from rsd_canary.lifecycle.models import (
     LifecycleRunProjection,
     LifecycleState,
 )
-from rsd_canary.lifecycle.projection import empty_projection
-from rsd_canary.lifecycle.reducer import (
+from omninode_rsd.lifecycle.projection import empty_projection
+from omninode_rsd.lifecycle.reducer import (
     LifecycleReductionError,
     reduce_lifecycle_event,
     validate_lifecycle_event,

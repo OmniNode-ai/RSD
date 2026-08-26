@@ -8,15 +8,15 @@ from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
-from rsd_canary.lifecycle.hashing import compute_event_hash
-from rsd_canary.lifecycle.models import (
+from omninode_rsd.lifecycle.hashing import compute_event_hash
+from omninode_rsd.lifecycle.models import (
     GENESIS_HASH,
     LifecycleEvent,
     LifecycleEventIntent,
     LifecycleEventType,
     strict_model_values,
 )
-from rsd_canary.lifecycle.reducer import LifecycleReductionError, validate_lifecycle_event
+from omninode_rsd.lifecycle.reducer import LifecycleReductionError, validate_lifecycle_event
 
 _INTENT_FIELD_NAMES = frozenset(LifecycleEventIntent.model_fields)
 

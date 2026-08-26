@@ -9,8 +9,8 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from rsd_canary.lifecycle.ingress import LifecycleEventIngress
-from rsd_canary.lifecycle.models import LifecycleEvent, LifecycleEventIntent, LifecycleEventType
+from omninode_rsd.lifecycle.ingress import LifecycleEventIngress
+from omninode_rsd.lifecycle.models import LifecycleEvent, LifecycleEventIntent, LifecycleEventType
 
 
 class _IntentSubclass(LifecycleEventIntent):

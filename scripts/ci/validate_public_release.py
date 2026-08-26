@@ -181,9 +181,9 @@ def _is_allowed_directory(path: Path) -> bool:
         return len(parts) == 2
     if parts[:2] == ("scripts", "ci"):
         return len(parts) == 2
-    if parts == ("src", "rsd_canary"):
+    if parts == ("src", "omninode_rsd"):
         return True
-    if parts[:3] == ("src", "rsd_canary", ALLOWED_SOURCE_SUBSYSTEM):
+    if parts[:3] == ("src", "omninode_rsd", ALLOWED_SOURCE_SUBSYSTEM):
         return len(parts) == 3
     if parts[:2] == ("tests", "lifecycle"):
         return len(parts) == 2
@@ -198,7 +198,7 @@ def _is_allowed_file(path: Path) -> bool:
         return True
     if parts == VALIDATOR_PATH.parts:
         return True
-    if parts[:2] == ("src", "rsd_canary"):
+    if parts[:2] == ("src", "omninode_rsd"):
         return (len(parts) == 3 and parts[2] == "__init__.py") or (
             len(parts) == 4
             and parts[2] == ALLOWED_SOURCE_SUBSYSTEM
@@ -343,6 +343,11 @@ def _iter_paths(root: Path) -> tuple[list[Path], list[Finding]]:
             kept_directories.append(name)
         directories[:] = kept_directories
         for name in sorted(names):
+            # Linked Git worktrees represent their control directory as a file.
+            # Treat that metadata the same as a normal repository's ignored
+            # ``.git`` directory so validation depends only on publishable files.
+            if name == ".git":
+                continue
             relative = (current_path / name).relative_to(root)
             files.append(relative)
             if _is_archive(relative):

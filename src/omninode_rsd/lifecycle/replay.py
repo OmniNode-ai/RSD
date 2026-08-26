@@ -5,9 +5,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from rsd_canary.lifecycle.models import LifecycleEvent, LifecycleRunProjection
-from rsd_canary.lifecycle.projection import project_events
-from rsd_canary.lifecycle.reducer import (
+from omninode_rsd.lifecycle.models import LifecycleEvent, LifecycleRunProjection
+from omninode_rsd.lifecycle.projection import project_events
+from omninode_rsd.lifecycle.reducer import (
     LifecycleReductionError,
     transition_checksum,
     validate_lifecycle_event,

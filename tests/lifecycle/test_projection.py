@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from rsd_canary.lifecycle.models import LifecycleEventType, LifecycleState
-from rsd_canary.lifecycle.projection import project_events
+from omninode_rsd.lifecycle.models import LifecycleEventType, LifecycleState
+from omninode_rsd.lifecycle.projection import project_events
 
 from .support import event_stream
 

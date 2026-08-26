@@ -1,5 +1,5 @@
 """Small, deterministic lifecycle state-machine library."""
 
-from rsd_canary.lifecycle import LifecycleEvent, LifecycleEventType, LifecycleState
+from omninode_rsd.lifecycle import LifecycleEvent, LifecycleEventType, LifecycleState
 
 __all__ = ["LifecycleEvent", "LifecycleEventType", "LifecycleState"]

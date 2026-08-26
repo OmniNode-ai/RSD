@@ -8,10 +8,10 @@ from uuid import UUID
 
 import pytest
 
-from rsd_canary.lifecycle.event_log import InMemoryEventLog
-from rsd_canary.lifecycle.hashing import compute_event_hash
-from rsd_canary.lifecycle.ingress import LifecycleEventIngress
-from rsd_canary.lifecycle.models import (
+from omninode_rsd.lifecycle.event_log import InMemoryEventLog
+from omninode_rsd.lifecycle.hashing import compute_event_hash
+from omninode_rsd.lifecycle.ingress import LifecycleEventIngress
+from omninode_rsd.lifecycle.models import (
     GENESIS_HASH,
     LifecycleEvent,
     LifecycleEventIntent,
