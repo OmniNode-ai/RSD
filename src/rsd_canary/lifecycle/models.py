@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -11,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 GENESIS_HASH = "0" * 64
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+PositiveSequence = Annotated[int, Field(strict=True, ge=1)]
 
 
 class Model(BaseModel):
@@ -38,6 +41,34 @@ class LifecycleEventType(StrEnum):
     WORK_FAILED = "WORK_FAILED"
 
 
+class LifecycleTransition(Model):
+    """One permitted event-driven lifecycle transition."""
+
+    event_type: LifecycleEventType
+    source_state: LifecycleState
+    target_state: LifecycleState
+
+
+class LifecycleDescription(Model):
+    """Typed representation of the public lifecycle-description document."""
+
+    schema_version: Literal["rsd.lifecycle-description.v1"]
+    states: tuple[LifecycleState, ...]
+    transitions: tuple[LifecycleTransition, ...]
+
+
+ALLOWED_LIFECYCLE_TRANSITIONS: Mapping[
+    tuple[LifecycleState, LifecycleEventType], LifecycleState
+] = MappingProxyType(
+    {
+        (LifecycleState.INITIAL, LifecycleEventType.RUN_CREATED): LifecycleState.CREATED,
+        (LifecycleState.CREATED, LifecycleEventType.WORK_STARTED): LifecycleState.ACTIVE,
+        (LifecycleState.ACTIVE, LifecycleEventType.WORK_COMPLETED): LifecycleState.COMPLETED,
+        (LifecycleState.ACTIVE, LifecycleEventType.WORK_FAILED): LifecycleState.FAILED,
+    }
+)
+
+
 class LifecycleEventIntent(Model):
     """Caller-supplied portion of a new lifecycle event."""
 
@@ -52,12 +83,14 @@ class LifecycleEvent(Model):
     schema_version: Literal["rsd.lifecycle-event.v1"] = "rsd.lifecycle-event.v1"
     event_id: UUID
     run_id: UUID
-    sequence: Annotated[int, Field(ge=1)]
+    sequence: PositiveSequence
     occurred_at: datetime
     event_type: LifecycleEventType
     detail: Annotated[str, Field(min_length=1, max_length=1_000)]
     prior_event_hash: Sha256 = GENESIS_HASH
     event_hash: Sha256
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     @model_validator(mode="after")
     def timestamp_is_utc(self) -> LifecycleEvent:
@@ -74,7 +107,9 @@ class LifecycleRunProjection(Model):
     schema_version: Literal["rsd.lifecycle-projection.v1"] = "rsd.lifecycle-projection.v1"
     run_id: UUID
     state: LifecycleState = LifecycleState.INITIAL
-    last_sequence: int = 0
+    last_sequence: Annotated[int, Field(strict=True, ge=0)] = 0
     last_event_hash: Sha256 = GENESIS_HASH
     event_stream_hash: Sha256 = GENESIS_HASH
     projection_checksum: Sha256 = GENESIS_HASH
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)

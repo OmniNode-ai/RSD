@@ -1,4 +1,4 @@
-"""Tests for lifecycle models and event creation."""
+"""Tests for lifecycle models and stateless event construction."""
 
 from __future__ import annotations
 
@@ -8,20 +8,13 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from rsd_canary.lifecycle.ingress import InMemorySequenceAllocator, LifecycleEventIngress
-from rsd_canary.lifecycle.models import LifecycleEventIntent, LifecycleEventType
+from rsd_canary.lifecycle.ingress import LifecycleEventIngress
+from rsd_canary.lifecycle.models import LifecycleEvent, LifecycleEventIntent, LifecycleEventType
 
 
-def test_ingress_assigns_order_and_chains_hashes() -> None:
-    event_ids = iter(
-        [
-            UUID("00000000-0000-0000-0000-000000000011"),
-            UUID("00000000-0000-0000-0000-000000000012"),
-        ]
-    )
+def test_builder_uses_authoritative_sequence_and_prior_hash() -> None:
     ingress = LifecycleEventIngress(
-        InMemorySequenceAllocator(),
-        event_id_factory=lambda: next(event_ids),
+        event_id_factory=lambda: UUID("00000000-0000-0000-0000-000000000011"),
         clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
     )
     intent = LifecycleEventIntent(
@@ -30,14 +23,10 @@ def test_ingress_assigns_order_and_chains_hashes() -> None:
         detail="created",
     )
 
-    first = ingress.ingest(intent)
-    second = ingress.ingest(
-        intent.model_copy(update={"event_type": LifecycleEventType.WORK_STARTED})
-    )
+    event = ingress.build(intent, sequence=1)
 
-    assert first.sequence == 1
-    assert second.sequence == 2
-    assert second.prior_event_hash == first.event_hash
+    assert event.sequence == 1
+    assert event.prior_event_hash == "0" * 64
 
 
 def test_intent_rejects_empty_detail() -> None:
@@ -47,3 +36,33 @@ def test_intent_rejects_empty_detail() -> None:
             event_type=LifecycleEventType.RUN_CREATED,
             detail="",
         )
+
+
+@pytest.mark.parametrize("sequence", (True, 1.0))
+def test_event_rejects_non_integer_sequence(sequence: object) -> None:
+    values = {
+        "event_id": UUID("00000000-0000-0000-0000-000000000011"),
+        "run_id": UUID("00000000-0000-0000-0000-000000000001"),
+        "sequence": sequence,
+        "occurred_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "event_type": LifecycleEventType.RUN_CREATED,
+        "detail": "created",
+        "prior_event_hash": "0" * 64,
+        "event_hash": "0" * 64,
+    }
+
+    with pytest.raises(ValidationError):
+        LifecycleEvent.model_validate(values)
+
+
+@pytest.mark.parametrize("sequence", (True, 1.0, 0))
+def test_builder_rejects_invalid_authoritative_sequence(sequence: object) -> None:
+    ingress = LifecycleEventIngress()
+    intent = LifecycleEventIntent(
+        run_id=UUID("00000000-0000-0000-0000-000000000001"),
+        event_type=LifecycleEventType.RUN_CREATED,
+        detail="created",
+    )
+
+    with pytest.raises(ValueError, match="event is not valid"):
+        ingress.build(intent, sequence=sequence)  # type: ignore[arg-type]

@@ -4,14 +4,18 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from rsd_canary.lifecycle.hashing import compute_projection_checksum
 from rsd_canary.lifecycle.models import LifecycleEvent, LifecycleRunProjection
 from rsd_canary.lifecycle.reducer import reduce_lifecycle_event
 
 
 def empty_projection(run_id: UUID) -> LifecycleRunProjection:
-    """Create the initial projection for a run."""
+    """Create the checksum-valid initial projection for a run."""
 
-    return LifecycleRunProjection(run_id=run_id)
+    projection = LifecycleRunProjection(run_id=run_id)
+    return projection.model_copy(
+        update={"projection_checksum": compute_projection_checksum(projection)}
+    )
 
 
 def project_events(events: tuple[LifecycleEvent, ...]) -> LifecycleRunProjection:
