@@ -6,10 +6,8 @@ from threading import RLock
 from typing import Protocol
 from uuid import UUID
 
-from pydantic import ValidationError
-
 from rsd_canary.lifecycle.hashing import compute_event_hash
-from rsd_canary.lifecycle.ingress import LifecycleEventIngress
+from rsd_canary.lifecycle.ingress import LifecycleEventIngress, validate_lifecycle_event_intent
 from rsd_canary.lifecycle.models import (
     ALLOWED_LIFECYCLE_TRANSITIONS,
     GENESIS_HASH,
@@ -17,6 +15,7 @@ from rsd_canary.lifecycle.models import (
     LifecycleEventIntent,
     LifecycleState,
 )
+from rsd_canary.lifecycle.reducer import LifecycleReductionError, validate_lifecycle_event
 
 
 class LifecycleEventLog(Protocol):
@@ -54,7 +53,7 @@ class InMemoryEventLog:
         identifier, timestamp, and resulting event are admitted atomically.
         """
 
-        validated_intent = LifecycleEventIntent.model_validate(intent)
+        validated_intent = validate_lifecycle_event_intent(intent)
         with self._lock:
             events = self._events_by_run.get(validated_intent.run_id, [])
             current_state = self._current_state(events)
@@ -92,11 +91,8 @@ class InMemoryEventLog:
     @staticmethod
     def _validate_event(event: LifecycleEvent) -> LifecycleEvent:
         try:
-            values = {
-                field_name: getattr(event, field_name) for field_name in LifecycleEvent.model_fields
-            }
-            return LifecycleEvent.model_validate(values)
-        except (AttributeError, ValidationError) as error:
+            return validate_lifecycle_event(event)
+        except LifecycleReductionError as error:
             raise ValueError("event is not valid") from error
 
     @staticmethod

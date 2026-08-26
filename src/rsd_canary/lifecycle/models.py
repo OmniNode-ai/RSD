@@ -22,6 +22,35 @@ class Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+def strict_model_values(
+    instance: object,
+    *,
+    expected_type: type[BaseModel],
+    field_names: frozenset[str],
+) -> dict[str, object] | None:
+    """Return exact declared Pydantic 2.x fields, or ``None`` when forged.
+
+    Trust boundaries use the public ``model_fields`` declaration together with
+    ``vars(instance)``.  Pydantic 2.x stores model instance values in that
+    mapping, so checking its exact built-in-string field set detects values
+    inserted or removed through ``model_copy(update=...)`` before validation.
+    This intentionally relies on the supported Pydantic 2.x model contract.
+    """
+
+    if type(instance) is not expected_type:
+        return None
+    try:
+        values = vars(instance)
+    except TypeError:
+        return None
+    if type(values) is not dict or len(values) != len(field_names):
+        return None
+    keys = tuple(values)
+    if any(type(key) is not str for key in keys) or frozenset(keys) != field_names:
+        return None
+    return {field_name: values[field_name] for field_name in field_names}
+
+
 class LifecycleState(StrEnum):
     """Possible states for one run."""
 
