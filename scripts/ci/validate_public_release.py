@@ -356,12 +356,13 @@ def _iter_paths(root: Path) -> tuple[list[Path], list[Finding]]:
             kept_directories.append(name)
         directories[:] = kept_directories
         for name in sorted(names):
-            # Linked Git worktrees represent their control directory as a file.
-            # Treat that metadata the same as a normal repository's ignored
-            # ``.git`` directory so validation depends only on publishable files.
-            if name == ".git":
+            candidate = current_path / name
+            # Linked Git worktrees represent only the root control directory as
+            # a regular ``.git`` file. Preserve normal ignored-directory
+            # behavior, but do not exempt nested paths or symlinks.
+            if candidate == root / ".git" and candidate.is_file() and not candidate.is_symlink():
                 continue
-            relative = (current_path / name).relative_to(root)
+            relative = candidate.relative_to(root)
             files.append(relative)
             if _is_archive(relative):
                 findings.append(

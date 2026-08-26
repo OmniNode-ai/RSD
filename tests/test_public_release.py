@@ -189,9 +189,31 @@ def test_ignored_build_and_runtime_directories_are_not_scanned(tmp_path: Path) -
     assert scan_tree(tmp_path) == []
 
 
-def test_ignores_linked_worktree_gitfile(tmp_path: Path) -> None:
+def test_allows_root_linked_worktree_gitfile(tmp_path: Path) -> None:
     (tmp_path / ".git").write_text("gitdir: linked-worktree", encoding="utf-8")
     assert scan_tree(tmp_path) == []
+
+
+def test_rejects_nested_gitfile_in_an_allowlisted_tree(tmp_path: Path) -> None:
+    findings = _write(
+        tmp_path,
+        "src/omninode_rsd/lifecycle/.git",
+        "gitdir: nested-worktree",
+    )
+    assert any(
+        item.path == "src/omninode_rsd/lifecycle/.git" and item.rule == "path_allowlist"
+        for item in findings
+    )
+
+
+def test_rejects_root_gitfile_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "linked-git-control"
+    target.write_text("gitdir: nested-worktree", encoding="utf-8")
+    (tmp_path / ".git").symlink_to(target)
+
+    findings = scan_tree(tmp_path)
+
+    assert any(item.path == ".git" and item.rule == "path_allowlist" for item in findings)
 
 
 def test_validate_tree_raises_with_actionable_findings(tmp_path: Path) -> None:
