@@ -14,6 +14,57 @@ are removed; this release provides no compatibility package or re-export.
 Remove the former distribution from an environment before installing this one
 to avoid retaining obsolete package files.
 
+## PostgreSQL lifecycle schema
+
+The package includes a versioned PostgreSQL schema migration manifest for the
+durable lifecycle store. `discover_lifecycle_migrations()` only reads packaged
+resources and reports their version, name, SQL content, and SHA-256 digest. It
+never opens a database connection, reads configuration, or executes DDL.
+
+`PostgresLifecycleMigrationRunner` applies the manifest through a
+caller-supplied connection context manager. It starts the transaction, acquires
+a transaction-scoped migration advisory lock, reads the ledger, verifies its
+typed `version`, `name`, and `checksum` rows are the exact ordered manifest
+prefix, executes each pending resource, records its matching ledger row, and
+commits. Any failure rolls back the same transaction. The packaged SQL resource
+contains no transaction control, endpoint, credential, or role configuration.
+The runner never re-runs an applied migration or repairs drift in place.
+`001_create_lifecycle_store.sql` deliberately has no fail-open `IF NOT EXISTS`
+clauses: an existing or incompatible object aborts the migration for operator
+investigation.
+
+Each runner invocation requires a fresh, exclusive connection lease whose
+adapter reports an idle transaction state before the runner issues `BEGIN`.
+The factory context owns connection release or closure; the runner never closes
+or returns it directly. A commit error leaves the database outcome ambiguous,
+including when the subsequent rollback reports success. Operators must inspect
+the migration ledger against the packaged manifest before retrying; when both
+commit and rollback fail, the original commit error retains the rollback error
+as its cause and records the reconciliation requirement.
+
+The PostgreSQL adapters are trusted boundaries, not authorization systems.
+External canonical provisioning MUST assign a dedicated NOLOGIN owner to the
+`rsd_canary` schema and every lifecycle object. This literal is a persisted
+PostgreSQL schema identifier, intentionally distinct from the renamed Python
+import root. Provisioning MUST grant the runtime adapter exactly `USAGE` on the
+schema, `SELECT` and `INSERT` on `lifecycle_events`, and `SELECT`, `INSERT`, and
+`UPDATE` on `lifecycle_run_heads`; it must not grant that adapter access to
+`schema_migrations`, or `UPDATE`, `DELETE`, or `TRUNCATE` on lifecycle events.
+The reviewed migration adapter receives only the DDL and ledger read/insert
+authority required for its controlled invocation. The package does not create
+roles, set ownership, or grant privileges. The schema revokes `PUBLIC` access,
+and has no `SECURITY DEFINER` function.
+
+`PostgresLifecycleEventLog` accepts a caller-supplied callable that returns a
+connection context manager. The caller owns its database driver and connection
+configuration; the adapter has no DSN parsing, pool creation, migration
+execution, or retry loop. It recomputes and verifies canonical event hashes and
+projections on every write and read, without duplicating the Python hash logic
+in SQL. Each ingestion uses one `READ COMMITTED` transaction and locks the
+target run. That advisory lock coordinates only trusted adapter writers whose
+strict database ACLs prevent bypass writes; it is not protection against other
+independently privileged database users.
+
 ## Development
 
 Use Python 3.12 or newer and uv:
@@ -25,6 +76,11 @@ uv run mypy src/ --strict
 uv run ruff format --check src/ tests/
 uv run ruff check src/ tests/
 ```
+
+The PostgreSQL integration suite is opt-in. It runs only with
+`--postgres-integration` and an externally injected
+`postgres_lifecycle_connection_factory` fixture for a disposable isolated
+database; the package never discovers or configures that database.
 
 The bundled YAML file documents the states and transitions supported by the
 library.
