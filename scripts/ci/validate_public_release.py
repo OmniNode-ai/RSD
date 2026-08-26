@@ -20,7 +20,7 @@ from typing import Final
 from urllib.parse import urlsplit
 
 IGNORED_DIRECTORIES: Final[frozenset[str]] = frozenset(
-    {".git", ".venv", "dist", "build", ".mypy_cache", ".pytest_cache", ".ruff_cache", "__pycache__"}
+    {".venv", "dist", "build", ".mypy_cache", ".pytest_cache", ".ruff_cache", "__pycache__"}
 )
 ARCHIVE_SUFFIXES: Final[tuple[str, ...]] = (
     ".7z",
@@ -336,9 +336,28 @@ def _iter_paths(root: Path) -> tuple[list[Path], list[Finding]]:
         current_path = Path(current)
         kept_directories: list[str] = []
         for name in sorted(directories):
+            candidate = current_path / name
+            if name == ".git":
+                # A standard checkout's real root control directory is
+                # operational metadata. Nested control directories and all
+                # symlinks are publishable-path violations and are never
+                # traversed.
+                if candidate == root / ".git" and not candidate.is_symlink() and candidate.is_dir():
+                    continue
+                relative = candidate.relative_to(root)
+                findings.append(
+                    _finding(
+                        relative,
+                        1,
+                        1,
+                        "path_allowlist",
+                        "directory is not public-release allowlisted",
+                    )
+                )
+                continue
             if name in IGNORED_DIRECTORIES:
                 continue
-            relative = (current_path / name).relative_to(root)
+            relative = candidate.relative_to(root)
             if ENV_REFERENCE_RE.fullmatch(name):
                 findings.append(
                     _finding(relative, 1, 1, "environment_file", "environment file is prohibited")

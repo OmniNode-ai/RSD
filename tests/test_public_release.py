@@ -175,7 +175,6 @@ def test_rejects_archives_environment_directories_and_multiline_port_maps(tmp_pa
 
 def test_ignored_build_and_runtime_directories_are_not_scanned(tmp_path: Path) -> None:
     for directory in (
-        ".git",
         ".venv",
         "dist",
         "build",
@@ -186,6 +185,14 @@ def test_ignored_build_and_runtime_directories_are_not_scanned(tmp_path: Path) -
         target = tmp_path / directory / "leak.txt"
         target.parent.mkdir(parents=True)
         target.write_text(_address("10", ".0.0.1"), encoding="utf-8")
+    assert scan_tree(tmp_path) == []
+
+
+def test_allows_root_git_directory_as_operational_metadata(tmp_path: Path) -> None:
+    target = tmp_path / ".git" / "leak.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text(_address("10", ".0.0.1"), encoding="utf-8")
+
     assert scan_tree(tmp_path) == []
 
 
@@ -206,6 +213,18 @@ def test_rejects_nested_gitfile_in_an_allowlisted_tree(tmp_path: Path) -> None:
     )
 
 
+def test_rejects_nested_git_directory_without_scanning_its_contents(tmp_path: Path) -> None:
+    target = tmp_path / "src" / "omninode_rsd" / "lifecycle" / ".git" / "leak.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text(_address("10", ".0.0.1"), encoding="utf-8")
+
+    findings = scan_tree(tmp_path)
+
+    assert {(item.path, item.rule) for item in findings} == {
+        ("src/omninode_rsd/lifecycle/.git", "path_allowlist")
+    }
+
+
 def test_rejects_root_gitfile_symlink(tmp_path: Path) -> None:
     target = tmp_path / "linked-git-control"
     target.write_text("gitdir: nested-worktree", encoding="utf-8")
@@ -214,6 +233,17 @@ def test_rejects_root_gitfile_symlink(tmp_path: Path) -> None:
     findings = scan_tree(tmp_path)
 
     assert any(item.path == ".git" and item.rule == "path_allowlist" for item in findings)
+
+
+def test_rejects_root_git_directory_symlink_without_traversal(tmp_path: Path) -> None:
+    target = tmp_path.with_name(f"{tmp_path.name}-external-git")
+    target.mkdir()
+    (target / "leak.txt").write_text(_address("10", ".0.0.1"), encoding="utf-8")
+    (tmp_path / ".git").symlink_to(target, target_is_directory=True)
+
+    findings = scan_tree(tmp_path)
+
+    assert {(item.path, item.rule) for item in findings} == {(".git", "path_allowlist")}
 
 
 def test_validate_tree_raises_with_actionable_findings(tmp_path: Path) -> None:
