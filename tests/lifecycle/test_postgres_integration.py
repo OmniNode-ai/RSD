@@ -2,11 +2,11 @@
 
 An external test plugin or local test configuration supplies a
 ``postgres_lifecycle_connection_factory`` fixture only when
-``--postgres-integration`` is selected.  The fixture must target a disposable,
-isolated database and return a fresh transaction-capable connection context
-manager for every call. Each yielded connection must report an idle transaction
-state before the migration runner starts. This suite never discovers or
-configures a database.
+``--postgres-integration`` is selected.  The fixture must target a fresh,
+disposable isolated database for each test and return a fresh transaction-
+capable connection context manager for every call against that target. Each
+yielded connection must report an idle transaction state before the migration
+runner starts. This suite never discovers or configures a database.
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ def _connection_factory(request: pytest.FixtureRequest) -> _ConnectionFactory:
     return cast(_ConnectionFactory, fixture)
 
 
-def _apply_schema(factory: _ConnectionFactory) -> PostgresLifecycleMigrationRunner:
+def _bootstrap_fresh_target(factory: _ConnectionFactory) -> PostgresLifecycleMigrationRunner:
     runner = PostgresLifecycleMigrationRunner(factory)
     assert runner.apply_pending() == discover_lifecycle_migrations()
     return runner
@@ -93,6 +93,24 @@ def _scalar(
     assert isinstance(row, Mapping)
     assert set(row) == {"value"}
     return row["value"]
+
+
+def _assert_migration_ledger_is_absent(factory: _ConnectionFactory) -> None:
+    """Prove the runner, rather than the fixture, owns fresh-target bootstrap."""
+
+    with factory() as connection:
+        connection.execute("BEGIN;")
+        try:
+            relation_name = _scalar(
+                connection,
+                "SELECT to_regclass(%s)::text AS value",
+                ("rsd_canary.schema_migrations",),
+            )
+        except Exception:
+            connection.rollback()
+            raise
+        connection.commit()
+    assert relation_name is None
 
 
 def _builder() -> LifecycleEventIngress:
@@ -120,12 +138,13 @@ def _expect_database_error(
             pytest.fail("database operation unexpectedly succeeded")
 
 
-def test_migration_syntax_ledger_and_rollback_are_real_postgresql_behavior(
+def test_runner_bootstraps_a_fresh_target_then_reruns_and_rolls_back_atomically(
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     factory = _connection_factory(request)
-    runner = _apply_schema(factory)
+    _assert_migration_ledger_is_absent(factory)
+    runner = _bootstrap_fresh_target(factory)
     manifest = discover_lifecycle_migrations()
 
     assert runner.apply_pending() == ()
@@ -182,7 +201,7 @@ def test_append_read_tamper_trigger_and_foreign_key_constraints_are_real_postgre
     request: pytest.FixtureRequest,
 ) -> None:
     factory = _connection_factory(request)
-    _apply_schema(factory)
+    _bootstrap_fresh_target(factory)
     store = PostgresLifecycleEventLog(factory)
     event = store.ingest(
         LifecycleEventIntent(

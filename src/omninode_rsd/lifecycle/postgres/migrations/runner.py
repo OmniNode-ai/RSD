@@ -20,7 +20,10 @@ from omninode_rsd.lifecycle.postgres.migrations import (
 _BEGIN_SQL: Final[str] = "BEGIN;"
 _MIGRATION_LOCK_SQL: Final[str] = "SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0));"
 _MIGRATION_LOCK_KEY: Final[str] = "rsd_canary.lifecycle_migrations"
-_LEDGER_RELATION_SQL: Final[str] = "SELECT to_regclass(%s)::text AS relation_name;"
+_LEDGER_RELATION_SQL: Final[str] = (
+    "SELECT to_regclass('rsd_canary.schema_migrations')::text AS relation_name;"
+)
+_LEDGER_RELATION_NAME: Final[str] = "rsd_canary.schema_migrations"
 _READ_LEDGER_SQL: Final[str] = """
 SELECT version, name, checksum
 FROM rsd_canary.schema_migrations
@@ -46,8 +49,10 @@ class PostgresMigrationConnection(Protocol):
 
     The factory must yield a dedicated lease for every runner invocation.  It
     must not wrap caller-owned transactional work, and it may release or close
-    the lease only through its own context-manager exit semantics.  The runner
-    never calls a close or release method itself.
+    the lease only through its own context-manager exit semantics.  If a login
+    migrator enters a separately provisioned NOLOGIN owner role, the factory
+    must complete that caller-owned setup before yielding this idle lease. The
+    runner never calls a close or release method itself.
     """
 
     def execute(self, query: str, params: tuple[object, ...] = ()) -> PostgresMigrationResult: ...
@@ -74,10 +79,13 @@ class PostgresLifecycleMigrationRunner:
 
     This is a trusted, privileged adapter boundary.  External canonical
     provisioning owns the database and identities: it must assign a NOLOGIN
-    owner and grant this adapter only the migration operations it requires.
-    The runner never creates roles, grants privileges, reads configuration, or
-    accepts a database endpoint.  It validates the existing ledger against the
-    packaged manifest before it executes any pending SQL.
+    owner and grant this adapter only the migration operations it requires. A
+    login migrator may enter that separately provisioned owner role before its
+    factory yields an idle lease; this runner accepts no role names and does
+    not configure roles. The runner never creates roles, grants privileges,
+    reads configuration, or accepts a database endpoint. It validates an
+    existing ledger against the packaged manifest before it executes any
+    pending SQL.
     """
 
     def __init__(self, connection_factory: PostgresMigrationConnectionFactory) -> None:
@@ -142,10 +150,7 @@ class PostgresLifecycleMigrationRunner:
     def _read_applied_migrations(
         connection: PostgresMigrationConnection,
     ) -> tuple[AppliedLifecycleMigration, ...]:
-        relation_row = connection.execute(
-            _LEDGER_RELATION_SQL,
-            ("rsd_canary.schema_migrations",),
-        ).fetchone()
+        relation_row = connection.execute(_LEDGER_RELATION_SQL).fetchone()
         if relation_row is None:
             raise MigrationLedgerVerificationError(
                 "migration ledger relation check returned no row"
@@ -153,7 +158,7 @@ class PostgresLifecycleMigrationRunner:
         relation_name = _row_values(relation_row, _LEDGER_RELATION_COLUMNS)["relation_name"]
         if relation_name is None:
             return ()
-        if type(relation_name) is not str:
+        if type(relation_name) is not str or relation_name != _LEDGER_RELATION_NAME:
             raise MigrationLedgerVerificationError("migration ledger relation check is not valid")
         return tuple(
             AppliedLifecycleMigration.from_row(row)

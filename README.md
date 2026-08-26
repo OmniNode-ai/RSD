@@ -23,12 +23,15 @@ never opens a database connection, reads configuration, or executes DDL.
 
 `PostgresLifecycleMigrationRunner` applies the manifest through a
 caller-supplied connection context manager. It starts the transaction, acquires
-a transaction-scoped migration advisory lock, reads the ledger, verifies its
-typed `version`, `name`, and `checksum` rows are the exact ordered manifest
-prefix, executes each pending resource, records its matching ledger row, and
-commits. Any failure rolls back the same transaction. The packaged SQL resource
-contains no transaction control, endpoint, credential, or role configuration.
-The runner never re-runs an applied migration or repairs drift in place.
+a transaction-scoped migration advisory lock, then probes the fixed ledger
+relation. If it is absent, the applied prefix is empty and migration `001` plus
+its ledger row are created in that same transaction. If it is present, the
+runner reads the ledger, verifies its typed `version`, `name`, and `checksum`
+rows are the exact ordered manifest prefix, executes each pending resource,
+records its matching ledger row, and commits. Any failure rolls back the same
+transaction. The packaged SQL resource contains no transaction control,
+endpoint, credential, or role configuration. The runner never re-runs an
+applied migration or repairs drift in place.
 `001_create_lifecycle_store.sql` deliberately has no fail-open `IF NOT EXISTS`
 clauses: an existing or incompatible object aborts the migration for operator
 investigation.
@@ -46,9 +49,12 @@ The PostgreSQL adapters are trusted boundaries, not authorization systems.
 External canonical provisioning MUST assign a dedicated NOLOGIN owner to the
 `rsd_canary` schema and every lifecycle object. This literal is a persisted
 PostgreSQL schema identifier, intentionally distinct from the renamed Python
-import root. Provisioning MUST grant the runtime adapter exactly `USAGE` on the
-schema, `SELECT` and `INSERT` on `lifecycle_events`, and `SELECT`, `INSERT`, and
-`UPDATE` on `lifecycle_run_heads`; it must not grant that adapter access to
+import root. A login migrator may enter that separately provisioned owner role
+before its injected factory yields an idle lease; role selection is caller-owned
+and the runner has no role-name configuration surface. Provisioning MUST grant
+the runtime adapter exactly `USAGE` on the schema, `SELECT` and `INSERT` on
+`lifecycle_events`, and `SELECT`, `INSERT`, and `UPDATE` on
+`lifecycle_run_heads`; it must not grant that adapter access to
 `schema_migrations`, or `UPDATE`, `DELETE`, or `TRUNCATE` on lifecycle events.
 The reviewed migration adapter receives only the DDL and ledger read/insert
 authority required for its controlled invocation. The package does not create
@@ -79,8 +85,10 @@ uv run ruff check src/ tests/
 
 The PostgreSQL integration suite is opt-in. It runs only with
 `--postgres-integration` and an externally injected
-`postgres_lifecycle_connection_factory` fixture for a disposable isolated
-database; the package never discovers or configures that database.
+`postgres_lifecycle_connection_factory` fixture for a fresh disposable isolated
+database per test. The runner, rather than the fixture, bootstraps the fresh
+schema and migration ledger; the package never discovers or configures that
+database.
 
 The bundled YAML file documents the states and transitions supported by the
 library.
