@@ -14,6 +14,9 @@ dependencies = [
   "PyYAML>=6.0,<7",
 ]
 
+[project.scripts]
+rsd-infisical-disposable-lifecycle = "omninode_rsd.lifecycle.infisical_disposable:main"
+
 [dependency-groups]
 dev = [
   "mypy>=1.13,<2",
