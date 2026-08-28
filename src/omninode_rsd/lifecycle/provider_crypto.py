@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import binascii
 import ctypes
+import fcntl
 import hashlib
 import hmac
 import json
@@ -24,7 +25,7 @@ import re
 import stat
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -51,8 +52,10 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     DisposableTransportProfile,
     InitialProvisioningIntentV1,
     ProviderReferenceV1,
+    _strict_canonical_model,
     _UniqueLoader,
     initial_provisioning_intent_sha256,
+    strict_canonical_initial_provisioning_intent,
 )
 
 _SHA256: Final = r"^[0-9a-f]{64}$"
@@ -77,8 +80,6 @@ _FINGERPRINT_ATTESTATION_NAME: Final = "provider-fingerprint-attestation.yaml"
 _REPLAY_POLICY_NAME: Final = "replay-authority-policy.yaml"
 _SIGNER_GENESIS_NAME: Final = "signer-genesis.yaml"
 _TRANSPORT_FAILURE: Final = object()
-_SYSTEM_CLOCK_CAPABILITY: Final = object()
-_TEST_CLOCK_CAPABILITY: Final = object()
 
 
 class ProviderCryptoError(RuntimeError):
@@ -291,10 +292,15 @@ class ProviderMaterialSpecV1(_Model):
 
     @model_validator(mode="after")
     def uses_exact_purpose_contract(self) -> ProviderMaterialSpecV1:
+        if (
+            type(self.purpose) is not ProviderMaterialPurpose
+            or type(self.format) is not ProviderMaterialFormat
+        ):
+            raise ValueError("provider material specification is invalid")
         expected_format = _PURPOSE_FORMATS[self.purpose]
         expected_lengths = _FORMAT_LENGTHS[expected_format]
         if (
-            self.format is not expected_format
+            self.format.value != expected_format.value
             or (self.value_min_bytes, self.value_max_bytes) != expected_lengths
             or (
                 self.reference.provider == "macos_keychain"
@@ -548,38 +554,42 @@ def _parse_timestamp(value: str) -> datetime | None:
 
 
 def _system_utc_clock() -> datetime:
-    """Return the only production clock accepted by bootstrap mutations."""
+    """Return the process-local UTC clock used at each mutation boundary."""
 
     return datetime.now(UTC)
 
 
-def _read_clock(clock: Callable[[], datetime]) -> datetime:
-    """Read and normalize a capability-provided test clock."""
+def _canonical_initial_intent(intent: InitialProvisioningIntentV1) -> InitialProvisioningIntentV1:
+    """Reject all construction/copy type drift before a bootstrap operation."""
 
     try:
-        value = clock()
-    except Exception:
-        raise ProviderCryptoError("clock") from None
-    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
-        raise ProviderCryptoError("clock")
-    return value.astimezone(UTC)
+        return strict_canonical_initial_provisioning_intent(intent)
+    except ValueError:
+        raise ProviderCryptoError("initial_intent") from None
 
 
-def _require_mutation_clock_capability(capability: object) -> None:
-    """Keep historical clocks unavailable to installed bootstrap callers."""
+def _reject_unsupported_tls_termination(
+    intent: InitialProvisioningIntentV1,
+) -> InitialProvisioningIntentV1:
+    """Return canonical non-TLS intent, blocking every current TLS bootstrap write."""
 
-    if capability not in {_SYSTEM_CLOCK_CAPABILITY, _TEST_CLOCK_CAPABILITY}:
-        raise ProviderCryptoError("clock")
-
-
-def _reject_unsupported_tls_termination(intent: InitialProvisioningIntentV1) -> None:
-    """Block every bootstrap write for TLS until its full material amendment exists."""
-
+    canonical = _canonical_initial_intent(intent)
+    profile = canonical.plan.transport.profile
     if (
-        type(intent) is not InitialProvisioningIntentV1
-        or intent.plan.transport.profile is DisposableTransportProfile.TLS_VERIFIED
+        type(profile) is not DisposableTransportProfile
+        or profile.value == DisposableTransportProfile.TLS_VERIFIED.value
     ):
         raise ProviderCryptoError("tls_termination_amendment_required")
+    return canonical
+
+
+def _canonical_artifact(model: object, model_type: type[_Model], *, phase: str) -> _Model:
+    """Revalidate a caller model before it can select an artifact or Keychain row."""
+
+    try:
+        return _strict_canonical_model(model, model_type)
+    except ValueError:
+        raise ProviderCryptoError(phase) from None
 
 
 def _signature_message(domain: bytes, model: BaseModel) -> bytes:
@@ -726,11 +736,11 @@ def verify_signer_genesis(
 ) -> None:
     """Verify issuer approval and exact initial-intent binding for a key seed."""
 
-    if (
-        type(genesis) is not SignerGenesisV1
-        or type(initial_intent) is not InitialProvisioningIntentV1
-    ):
-        raise ProviderCryptoError("signer_genesis")
+    genesis = cast(
+        SignerGenesisV1,
+        _canonical_artifact(genesis, SignerGenesisV1, phase="signer_genesis"),
+    )
+    initial_intent = _canonical_initial_intent(initial_intent)
     _verify_initial_intent_signature(initial_intent, issuer=issuer)
     _verify_signed(genesis, domain=_SIGNER_GENESIS_DOMAIN, signer=issuer)
     if genesis.initial_intent_sha256 != initial_provisioning_intent_sha256(initial_intent):
@@ -745,8 +755,11 @@ def trusted_signer_from_genesis(
 ) -> tuple[str, bytes, str]:
     """Return a public trust anchor only after issuer and intent verification."""
 
-    if type(genesis) is not SignerGenesisV1:
-        raise ProviderCryptoError("signer_genesis")
+    genesis = cast(
+        SignerGenesisV1,
+        _canonical_artifact(genesis, SignerGenesisV1, phase="signer_genesis"),
+    )
+    initial_intent = _canonical_initial_intent(initial_intent)
     verify_signer_genesis(genesis, issuer=issuer, initial_intent=initial_intent)
     try:
         public_key = _canonical_base64(genesis.public_key_base64)
@@ -764,11 +777,12 @@ def verify_replay_authority_policy_artifact(
 ) -> None:
     """Verify a signed replay namespace cannot be caller-substituted."""
 
-    if (
-        type(artifact) is not ReplayAuthorityPolicyArtifactV1
-        or type(initial_intent) is not InitialProvisioningIntentV1
-        or type(expected_policy_sha256) is not str
-    ):
+    artifact = cast(
+        ReplayAuthorityPolicyArtifactV1,
+        _canonical_artifact(artifact, ReplayAuthorityPolicyArtifactV1, phase="replay_policy"),
+    )
+    initial_intent = _canonical_initial_intent(initial_intent)
+    if type(expected_policy_sha256) is not str:
         raise ProviderCryptoError("replay_policy")
     _verify_initial_intent_signature(initial_intent, issuer=signer)
     _verify_signed(artifact, domain=_REPLAY_POLICY_DOMAIN, signer=signer)
@@ -807,6 +821,11 @@ def _verify_material_signer(
 ) -> None:
     """Bind every material signature to one issuer-approved intent signer."""
 
+    signer_genesis = cast(
+        SignerGenesisV1,
+        _canonical_artifact(signer_genesis, SignerGenesisV1, phase="signer_genesis"),
+    )
+    initial_intent = _canonical_initial_intent(initial_intent)
     verify_signer_genesis(signer_genesis, issuer=issuer, initial_intent=initial_intent)
     valid = False
     try:
@@ -843,10 +862,17 @@ def _verify_provider_material_policy_at(
 ) -> None:
     """Verify all policy references, purposes, and retention before use."""
 
+    policy = cast(
+        ProviderMaterialPolicyV1,
+        _canonical_artifact(policy, ProviderMaterialPolicyV1, phase="material_policy"),
+    )
+    signer_genesis = cast(
+        SignerGenesisV1,
+        _canonical_artifact(signer_genesis, SignerGenesisV1, phase="signer_genesis"),
+    )
+    initial_intent = _canonical_initial_intent(initial_intent)
     if (
-        type(policy) is not ProviderMaterialPolicyV1
-        or type(initial_intent) is not InitialProvisioningIntentV1
-        or type(expected_disposal_owner) is not str
+        type(expected_disposal_owner) is not str
         or type(expected_approver_identity) is not str
         or type(now) is not datetime
         or now.tzinfo is None
@@ -919,14 +945,24 @@ def _verify_provider_fingerprint_attestation_at(
 ) -> dict[str, str]:
     """Return trusted reference-to-fingerprint bindings after strict verification."""
 
-    if (
-        type(attestation) is not ProviderFingerprintAttestationV1
-        or type(policy) is not ProviderMaterialPolicyV1
-        or type(initial_intent) is not InitialProvisioningIntentV1
-        or type(now) is not datetime
-        or now.tzinfo is None
-        or now.utcoffset() is None
-    ):
+    attestation = cast(
+        ProviderFingerprintAttestationV1,
+        _canonical_artifact(
+            attestation,
+            ProviderFingerprintAttestationV1,
+            phase="fingerprint_attestation",
+        ),
+    )
+    policy = cast(
+        ProviderMaterialPolicyV1,
+        _canonical_artifact(policy, ProviderMaterialPolicyV1, phase="material_policy"),
+    )
+    signer_genesis = cast(
+        SignerGenesisV1,
+        _canonical_artifact(signer_genesis, SignerGenesisV1, phase="signer_genesis"),
+    )
+    initial_intent = _canonical_initial_intent(initial_intent)
+    if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:
         raise ProviderCryptoError("fingerprint_attestation")
     _verify_material_signer(
         signer=signer,
@@ -1061,13 +1097,27 @@ def verify_provider_material_genesis(
     create or modify any provider item by itself.
     """
 
-    if (
-        type(genesis) is not ProviderMaterialGenesisV1
-        or type(policy) is not ProviderMaterialPolicyV1
-        or type(attestation) is not ProviderFingerprintAttestationV1
-        or type(initial_intent) is not InitialProvisioningIntentV1
-    ):
-        raise ProviderCryptoError("material_genesis")
+    genesis = cast(
+        ProviderMaterialGenesisV1,
+        _canonical_artifact(genesis, ProviderMaterialGenesisV1, phase="material_genesis"),
+    )
+    policy = cast(
+        ProviderMaterialPolicyV1,
+        _canonical_artifact(policy, ProviderMaterialPolicyV1, phase="material_policy"),
+    )
+    attestation = cast(
+        ProviderFingerprintAttestationV1,
+        _canonical_artifact(
+            attestation,
+            ProviderFingerprintAttestationV1,
+            phase="fingerprint_attestation",
+        ),
+    )
+    signer_genesis = cast(
+        SignerGenesisV1,
+        _canonical_artifact(signer_genesis, SignerGenesisV1, phase="signer_genesis"),
+    )
+    initial_intent = _canonical_initial_intent(initial_intent)
     _verify_material_signer(
         signer=signer,
         signer_genesis=signer_genesis,
@@ -1141,29 +1191,33 @@ def _is_canonical_base64url_32(raw: bytearray) -> bool:
 def _validate_value(spec: ProviderMaterialSpecV1, value: bytearray) -> None:
     """Validate format without returning or serializing the material value."""
 
-    if type(value) is not bytearray or not (
-        spec.value_min_bytes <= len(value) <= spec.value_max_bytes
+    if (
+        type(spec) is not ProviderMaterialSpecV1
+        or type(spec.format) is not ProviderMaterialFormat
+        or type(value) is not bytearray
+        or not (spec.value_min_bytes <= len(value) <= spec.value_max_bytes)
     ):
         raise ProviderCryptoError("material_format")
     raw = value
-    if spec.format in {
-        ProviderMaterialFormat.HMAC_SHA256_RAW_32_V1,
-        ProviderMaterialFormat.AES_256_GCM_RAW_32_V1,
+    format_value = spec.format.value
+    if format_value in {
+        ProviderMaterialFormat.HMAC_SHA256_RAW_32_V1.value,
+        ProviderMaterialFormat.AES_256_GCM_RAW_32_V1.value,
     }:
         return
-    if spec.format is ProviderMaterialFormat.INFISICAL_HEX_16_V1:
+    if format_value == ProviderMaterialFormat.INFISICAL_HEX_16_V1.value:
         if not _is_lower_hex_16(raw):
             raise ProviderCryptoError("material_format")
         return
-    if spec.format is ProviderMaterialFormat.INFISICAL_AUTH_SECRET_BASE64_32_V1:
+    if format_value == ProviderMaterialFormat.INFISICAL_AUTH_SECRET_BASE64_32_V1.value:
         if not _is_canonical_standard_base64_32(raw):
             raise ProviderCryptoError("material_format")
         return
-    if spec.format is ProviderMaterialFormat.VALKEY_PASSWORD_BASE64URL_32_V1:
+    if format_value == ProviderMaterialFormat.VALKEY_PASSWORD_BASE64URL_32_V1.value:
         if not _is_canonical_base64url_32(raw):
             raise ProviderCryptoError("material_format")
         return
-    if spec.format is ProviderMaterialFormat.X509_CA_PEM_V1:
+    if format_value == ProviderMaterialFormat.X509_CA_PEM_V1.value:
         try:
             # cryptography accepts immutable input here. This isolated parser
             # boundary therefore makes one unavoidable transient copy; the
@@ -1351,6 +1405,11 @@ class KeychainEd25519Signer:
         initial_intent: InitialProvisioningIntentV1,
         _store: _KeychainTransport | None = None,
     ) -> None:
+        initial_intent = _canonical_initial_intent(initial_intent)
+        genesis = cast(
+            SignerGenesisV1,
+            _canonical_artifact(genesis, SignerGenesisV1, phase="signer_genesis"),
+        )
         verify_signer_genesis(genesis, issuer=issuer, initial_intent=initial_intent)
         self._genesis = genesis
         self._store = _default_keychain_store() if _store is None else _store
@@ -1427,8 +1486,13 @@ class KeychainEd25519Signer:
         message: bytes | None = None
         for model_type, build_message in messages:
             if type(artifact) is model_type:
-                candidate_intent = getattr(artifact, "initial_intent_sha256", None)
-                candidate_key_id = getattr(artifact, "signer_key_id", None)
+                canonical_artifact = _canonical_artifact(
+                    artifact,
+                    model_type,
+                    phase="keychain_signer_scope",
+                )
+                candidate_intent = getattr(canonical_artifact, "initial_intent_sha256", None)
+                candidate_key_id = getattr(canonical_artifact, "signer_key_id", None)
                 if (
                     type(candidate_intent) is not str
                     or type(candidate_key_id) is not str
@@ -1436,7 +1500,7 @@ class KeychainEd25519Signer:
                     or candidate_key_id != self._genesis.key_id
                 ):
                     raise ProviderCryptoError("keychain_signer_scope")
-                message = build_message(artifact)
+                message = build_message(canonical_artifact)
                 break
         if message is None:
             raise ProviderCryptoError("keychain_signer_scope")
@@ -1450,6 +1514,7 @@ class KeychainEd25519Signer:
 
 
 def provision_keychain_ed25519_signer(
+    paths: ProviderMaterialArtifactPaths,
     genesis: SignerGenesisV1,
     *,
     issuer: _TrustedSigner,
@@ -1457,7 +1522,7 @@ def provision_keychain_ed25519_signer(
     seed: bytearray,
     _store: _KeychainTransport | None = None,
 ) -> KeychainEd25519Signer:
-    """Create one Keychain seed only when a signed genesis exactly binds it.
+    """Create one Keychain seed only after a signed genesis is durable.
 
     The caller must supply the seed through an in-memory trusted boundary.  This
     API accepts no path, environment-variable name, or command-line value.
@@ -1467,42 +1532,65 @@ def provision_keychain_ed25519_signer(
     if type(seed) is not bytearray:
         raise ProviderCryptoError("keychain_signer")
     try:
-        _reject_unsupported_tls_termination(initial_intent)
-        verify_signer_genesis(genesis, issuer=issuer, initial_intent=initial_intent)
-        try:
-            derived = (
-                Ed25519PrivateKey.from_private_bytes(seed)
-                .public_key()
-                .public_bytes(
-                    serialization.Encoding.Raw,
-                    serialization.PublicFormat.Raw,
-                )
+        initial_intent = _reject_unsupported_tls_termination(initial_intent)
+        with _OwnerOnlyArtifactDirectory(paths.root) as directory:
+            genesis = _persist_verified_signer_genesis_in_directory(
+                directory,
+                signer_genesis_name=paths.signer_genesis_name(),
+                genesis=genesis,
+                issuer=issuer,
+                initial_intent=initial_intent,
             )
-        except ValueError:
-            raise ProviderCryptoError("keychain_signer") from None
-        try:
-            expected_public = _canonical_base64(genesis.public_key_base64)
-        except ValueError:
-            raise ProviderCryptoError("signer_genesis") from None
-        if (
-            len(seed) != 32
-            or not hmac.compare_digest(_sha256(seed), genesis.seed_fingerprint_sha256)
-            or not hmac.compare_digest(derived, expected_public)
-        ):
-            raise ProviderCryptoError("keychain_signer")
-        store = _default_keychain_store() if _store is None else _store
-        reference = genesis.keychain_reference
-        created = _create_keychain_value(store, reference.service, reference.account, seed)
-        if type(created) is not bool:
-            raise ProviderCryptoError("keychain_signer")
-        if not created:
-            raise ProviderCryptoError("keychain_signer_replayed")
-        return KeychainEd25519Signer(
-            genesis,
-            issuer=issuer,
-            initial_intent=initial_intent,
-            _store=store,
-        )
+            # Keep the same owner-only root descriptor open through the
+            # one-way Keychain write, and re-open/reverify the durable name
+            # immediately before it.  A path replacement cannot select a
+            # different root between the durable trust-anchor check and
+            # ``SecItemAdd``.
+            genesis = _require_persisted_signer_genesis_in_directory(
+                directory,
+                signer_genesis_name=paths.signer_genesis_name(),
+                genesis=genesis,
+                issuer=issuer,
+                initial_intent=initial_intent,
+            )
+            try:
+                derived = (
+                    Ed25519PrivateKey.from_private_bytes(seed)
+                    .public_key()
+                    .public_bytes(
+                        serialization.Encoding.Raw,
+                        serialization.PublicFormat.Raw,
+                    )
+                )
+            except ValueError:
+                raise ProviderCryptoError("keychain_signer") from None
+            try:
+                expected_public = _canonical_base64(genesis.public_key_base64)
+            except ValueError:
+                raise ProviderCryptoError("signer_genesis") from None
+            if (
+                len(seed) != 32
+                or not hmac.compare_digest(_sha256(seed), genesis.seed_fingerprint_sha256)
+                or not hmac.compare_digest(derived, expected_public)
+            ):
+                raise ProviderCryptoError("keychain_signer")
+            store = _default_keychain_store() if _store is None else _store
+            reference = genesis.keychain_reference
+            with directory.pin_exact_signer_genesis(
+                paths.signer_genesis_name(),
+                _yaml_bytes(genesis),
+            ):
+                created = _create_keychain_value(store, reference.service, reference.account, seed)
+            if type(created) is not bool:
+                raise ProviderCryptoError("keychain_signer")
+            if not created:
+                raise ProviderCryptoError("keychain_signer_replayed")
+            return KeychainEd25519Signer(
+                genesis,
+                issuer=issuer,
+                initial_intent=initial_intent,
+                _store=store,
+            )
     finally:
         _zeroize(seed)
 
@@ -1516,6 +1604,7 @@ def load_keychain_ed25519_signer(
 ) -> KeychainEd25519Signer:
     """Load only an issuer-verified persistent signer genesis and Keychain seed."""
 
+    initial_intent = _canonical_initial_intent(initial_intent)
     genesis = load_verified_signer_genesis(
         paths,
         issuer=issuer,
@@ -1577,8 +1666,10 @@ class MacOSKeychainProviderProvenanceAdapter:
         *,
         _store: _KeychainTransport | None = None,
     ) -> None:
-        if type(policy) is not ProviderMaterialPolicyV1:
-            raise ProviderCryptoError("material_policy")
+        policy = cast(
+            ProviderMaterialPolicyV1,
+            _canonical_artifact(policy, ProviderMaterialPolicyV1, phase="material_policy"),
+        )
         self._specs = policy.by_reference()
         self._store = _default_keychain_store() if _store is None else _store
 
@@ -1746,6 +1837,145 @@ class _OwnerOnlyArtifactDirectory:
         finally:
             os.close(descriptor)
 
+    def fsync_existing(self, name: str) -> None:
+        """Durably pin one already-validated immutable artifact before a write."""
+
+        if name not in {
+            _MATERIAL_POLICY_NAME,
+            _MATERIAL_GENESIS_NAME,
+            _FINGERPRINT_ATTESTATION_NAME,
+            _REPLAY_POLICY_NAME,
+            _SIGNER_GENESIS_NAME,
+        }:
+            raise ProviderCryptoError("artifact_name")
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=self._descriptor(),
+            )
+        except OSError:
+            raise ProviderCryptoError("artifact_read") from None
+        try:
+            details = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_uid != os.getuid()
+                or stat.S_IMODE(details.st_mode) != 0o600
+                or details.st_nlink != 1
+                or details.st_size < 1
+                or details.st_size > _MAX_ARTIFACT_BYTES
+            ):
+                raise ProviderCryptoError("artifact_read")
+            os.fsync(descriptor)
+            os.fsync(self._descriptor())
+        except OSError:
+            raise ProviderCryptoError("artifact_write") from None
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _exact_file_details(
+        details: os.stat_result,
+    ) -> tuple[int, int, int, int, int, int, int, int]:
+        """Return the immutable identity/timestamp tuple for a pinned artifact."""
+
+        return (
+            details.st_dev,
+            details.st_ino,
+            details.st_nlink,
+            details.st_uid,
+            stat.S_IMODE(details.st_mode),
+            details.st_size,
+            details.st_mtime_ns,
+            details.st_ctime_ns,
+        )
+
+    @staticmethod
+    def _read_descriptor_exact(descriptor: int, expected: bytes) -> None:
+        """Compare an open immutable-artifact FD without reopening its name."""
+
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            remaining = len(expected)
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    raise ProviderCryptoError("signer_genesis")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if os.read(descriptor, 1) or not hmac.compare_digest(b"".join(chunks), expected):
+                raise ProviderCryptoError("signer_genesis")
+        except OSError:
+            raise ProviderCryptoError("signer_genesis") from None
+
+    @contextmanager
+    def pin_exact_signer_genesis(self, name: str, expected: bytes) -> Iterator[None]:
+        """Hold one signer artifact stable through an irreversible Keychain write.
+
+        The exclusive advisory lease coordinates same-owner RSD processes.  The
+        descriptor is re-read and its identity/timestamps are compared when the
+        lease releases, so a non-cooperating in-place replacement also turns
+        the bootstrap into a fail-closed orphan state rather than a successful
+        completed provisioning.
+        """
+
+        if name != _SIGNER_GENESIS_NAME or type(expected) is not bytes or not expected:
+            raise ProviderCryptoError("signer_genesis")
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=self._descriptor(),
+            )
+        except OSError:
+            raise ProviderCryptoError("signer_genesis") from None
+        locked = False
+        try:
+            details = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_uid != os.getuid()
+                or stat.S_IMODE(details.st_mode) != 0o600
+                or details.st_nlink != 1
+                or details.st_size != len(expected)
+            ):
+                raise ProviderCryptoError("signer_genesis")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError:
+                raise ProviderCryptoError("signer_genesis_busy") from None
+            self._read_descriptor_exact(descriptor, expected)
+            try:
+                os.fsync(descriptor)
+                os.fsync(self._descriptor())
+            except OSError:
+                raise ProviderCryptoError("signer_genesis") from None
+            original_details = self._exact_file_details(details)
+            try:
+                yield
+            finally:
+                final_details = os.fstat(descriptor)
+                if self._exact_file_details(
+                    final_details
+                ) != original_details or final_details.st_size != len(expected):
+                    raise ProviderCryptoError("signer_genesis")
+                self._read_descriptor_exact(descriptor, expected)
+                try:
+                    os.fsync(descriptor)
+                    os.fsync(self._descriptor())
+                except OSError:
+                    raise ProviderCryptoError("signer_genesis") from None
+        except OSError:
+            raise ProviderCryptoError("signer_genesis") from None
+        finally:
+            if locked:
+                with suppress(OSError):
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
     def write_once(self, name: str, value: bytes) -> None:
         if (
             name
@@ -1785,6 +2015,16 @@ class _OwnerOnlyArtifactDirectory:
         except OSError:
             raise ProviderCryptoError("artifact_write") from None
 
+    def write_once_or_require_exact(self, name: str, value: bytes) -> None:
+        """Create one durable artifact or admit only exact crash recovery bytes."""
+
+        existing = self.read_optional(name)
+        if existing is None:
+            self.write_once(name, value)
+        elif not hmac.compare_digest(existing, value):
+            raise ProviderCryptoError("artifact_replayed")
+        self.fsync_existing(name)
+
 
 def _yaml_bytes(model: BaseModel) -> bytes:
     try:
@@ -1813,7 +2053,11 @@ def persist_replay_authority_policy_artifact(
 ) -> None:
     """Explicitly persist one signed replay-policy preimage before use."""
 
-    _reject_unsupported_tls_termination(initial_intent)
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
+    artifact = cast(
+        ReplayAuthorityPolicyArtifactV1,
+        _canonical_artifact(artifact, ReplayAuthorityPolicyArtifactV1, phase="replay_policy"),
+    )
     verify_replay_authority_policy_artifact(
         artifact,
         signer=signer,
@@ -1822,6 +2066,114 @@ def persist_replay_authority_policy_artifact(
     )
     with _OwnerOnlyArtifactDirectory(paths.root) as directory:
         directory.write_once(paths.replay_policy_name(), _yaml_bytes(artifact))
+
+
+def _persist_verified_signer_genesis_in_directory(
+    directory: _OwnerOnlyArtifactDirectory,
+    *,
+    signer_genesis_name: str,
+    genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+) -> SignerGenesisV1:
+    """Durably create and reverify signer genesis through one held root FD."""
+
+    canonical_genesis = cast(
+        SignerGenesisV1,
+        _canonical_artifact(genesis, SignerGenesisV1, phase="signer_genesis"),
+    )
+    verify_signer_genesis(canonical_genesis, issuer=issuer, initial_intent=initial_intent)
+    expected = _yaml_bytes(canonical_genesis)
+    directory.write_once_or_require_exact(signer_genesis_name, expected)
+    # ``write_once`` fsyncs both the file and containing descriptor.  The
+    # reopen below is still mandatory: it proves that the durable name now
+    # resolves to the exact signed bytes bound to this input.
+    persisted_raw = directory.read(signer_genesis_name)
+    if not hmac.compare_digest(persisted_raw, expected):
+        raise ProviderCryptoError("signer_genesis")
+    persisted = cast(
+        SignerGenesisV1,
+        _load_model(persisted_raw, SignerGenesisV1, phase="signer_genesis"),
+    )
+    persisted = cast(
+        SignerGenesisV1,
+        _canonical_artifact(persisted, SignerGenesisV1, phase="signer_genesis"),
+    )
+    verify_signer_genesis(persisted, issuer=issuer, initial_intent=initial_intent)
+    if persisted != canonical_genesis:
+        raise ProviderCryptoError("signer_genesis")
+    return persisted
+
+
+def _persist_verified_signer_genesis(
+    paths: ProviderMaterialArtifactPaths,
+    genesis: SignerGenesisV1,
+    *,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+) -> SignerGenesisV1:
+    """Durably create or prove one exact signer genesis before a SecItemAdd."""
+
+    with _OwnerOnlyArtifactDirectory(paths.root) as directory:
+        return _persist_verified_signer_genesis_in_directory(
+            directory,
+            signer_genesis_name=paths.signer_genesis_name(),
+            genesis=genesis,
+            issuer=issuer,
+            initial_intent=initial_intent,
+        )
+
+
+def _require_persisted_signer_genesis_in_directory(
+    directory: _OwnerOnlyArtifactDirectory,
+    *,
+    signer_genesis_name: str,
+    genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+) -> SignerGenesisV1:
+    """Require an exact durable signer genesis through the held root FD."""
+
+    canonical_genesis = cast(
+        SignerGenesisV1,
+        _canonical_artifact(genesis, SignerGenesisV1, phase="signer_genesis"),
+    )
+    expected = _yaml_bytes(canonical_genesis)
+    persisted_raw = directory.read(signer_genesis_name)
+    if not hmac.compare_digest(persisted_raw, expected):
+        raise ProviderCryptoError("signer_genesis")
+    directory.fsync_existing(signer_genesis_name)
+    persisted = cast(
+        SignerGenesisV1,
+        _load_model(persisted_raw, SignerGenesisV1, phase="signer_genesis"),
+    )
+    persisted = cast(
+        SignerGenesisV1,
+        _canonical_artifact(persisted, SignerGenesisV1, phase="signer_genesis"),
+    )
+    verify_signer_genesis(persisted, issuer=issuer, initial_intent=initial_intent)
+    if persisted != canonical_genesis:
+        raise ProviderCryptoError("signer_genesis")
+    return persisted
+
+
+def _require_persisted_signer_genesis(
+    paths: ProviderMaterialArtifactPaths,
+    genesis: SignerGenesisV1,
+    *,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+) -> SignerGenesisV1:
+    """Require an already durable, exact signer genesis before material writes."""
+
+    with _OwnerOnlyArtifactDirectory(paths.root) as directory:
+        return _require_persisted_signer_genesis_in_directory(
+            directory,
+            signer_genesis_name=paths.signer_genesis_name(),
+            genesis=genesis,
+            issuer=issuer,
+            initial_intent=initial_intent,
+        )
 
 
 def persist_signer_genesis(
@@ -1833,10 +2185,13 @@ def persist_signer_genesis(
 ) -> None:
     """Persist one issuer-signed Keychain signer trust anchor without mutation."""
 
-    _reject_unsupported_tls_termination(initial_intent)
-    verify_signer_genesis(genesis, issuer=issuer, initial_intent=initial_intent)
-    with _OwnerOnlyArtifactDirectory(paths.root) as directory:
-        directory.write_once(paths.signer_genesis_name(), _yaml_bytes(genesis))
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
+    _persist_verified_signer_genesis(
+        paths,
+        genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+    )
 
 
 def load_verified_signer_genesis(
@@ -1847,15 +2202,19 @@ def load_verified_signer_genesis(
 ) -> SignerGenesisV1:
     """Load a persisted signer genesis through the owner-only descriptor boundary."""
 
+    initial_intent = _canonical_initial_intent(initial_intent)
     with _OwnerOnlyArtifactDirectory(paths.root) as directory:
+        raw = directory.read(paths.signer_genesis_name())
         genesis = cast(
             SignerGenesisV1,
-            _load_model(
-                directory.read(paths.signer_genesis_name()),
-                SignerGenesisV1,
-                phase="signer_genesis",
-            ),
+            _load_model(raw, SignerGenesisV1, phase="signer_genesis"),
         )
+    genesis = cast(
+        SignerGenesisV1,
+        _canonical_artifact(genesis, SignerGenesisV1, phase="signer_genesis"),
+    )
+    if not hmac.compare_digest(raw, _yaml_bytes(genesis)):
+        raise ProviderCryptoError("signer_genesis")
     verify_signer_genesis(genesis, issuer=issuer, initial_intent=initial_intent)
     return genesis
 
@@ -1872,41 +2231,19 @@ def _load_verified_signer_genesis_from_reader(
         raw = reader.read(_SIGNER_GENESIS_NAME)
     except Exception:
         raise ProviderCryptoError("signer_genesis") from None
+    initial_intent = _canonical_initial_intent(initial_intent)
     genesis = cast(
         SignerGenesisV1,
         _load_model(raw, SignerGenesisV1, phase="signer_genesis"),
     )
+    genesis = cast(
+        SignerGenesisV1,
+        _canonical_artifact(genesis, SignerGenesisV1, phase="signer_genesis"),
+    )
+    if not hmac.compare_digest(raw, _yaml_bytes(genesis)):
+        raise ProviderCryptoError("signer_genesis")
     verify_signer_genesis(genesis, issuer=issuer, initial_intent=initial_intent)
     return genesis, _sha256(raw)
-
-
-def _persist_provider_material_policy_at(
-    paths: ProviderMaterialArtifactPaths,
-    policy: ProviderMaterialPolicyV1,
-    *,
-    signer: _TrustedSigner,
-    signer_genesis: SignerGenesisV1,
-    issuer: _TrustedSigner,
-    initial_intent: InitialProvisioningIntentV1,
-    expected_disposal_owner: str,
-    expected_approver_identity: str,
-    now: datetime,
-    _capability: object,
-) -> None:
-    _require_mutation_clock_capability(_capability)
-    _reject_unsupported_tls_termination(initial_intent)
-    _verify_provider_material_policy_at(
-        policy,
-        signer=signer,
-        signer_genesis=signer_genesis,
-        issuer=issuer,
-        initial_intent=initial_intent,
-        expected_disposal_owner=expected_disposal_owner,
-        expected_approver_identity=expected_approver_identity,
-        now=now,
-    )
-    with _OwnerOnlyArtifactDirectory(paths.root) as directory:
-        directory.write_once(paths.policy_name(), _yaml_bytes(policy))
 
 
 def persist_provider_material_policy(
@@ -1922,8 +2259,18 @@ def persist_provider_material_policy(
 ) -> None:
     """Persist a signed material policy once using the trusted UTC clock."""
 
-    _persist_provider_material_policy_at(
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
+    policy = cast(
+        ProviderMaterialPolicyV1,
+        _canonical_artifact(policy, ProviderMaterialPolicyV1, phase="material_policy"),
+    )
+    signer_genesis = _require_persisted_signer_genesis(
         paths,
+        signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+    )
+    _verify_provider_material_policy_at(
         policy,
         signer=signer,
         signer_genesis=signer_genesis,
@@ -1932,40 +2279,12 @@ def persist_provider_material_policy(
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
         now=_system_utc_clock(),
-        _capability=_SYSTEM_CLOCK_CAPABILITY,
     )
+    with _OwnerOnlyArtifactDirectory(paths.root) as directory:
+        directory.write_once(paths.policy_name(), _yaml_bytes(policy))
 
 
-def _persist_provider_material_policy_for_test(
-    paths: ProviderMaterialArtifactPaths,
-    policy: ProviderMaterialPolicyV1,
-    *,
-    signer: _TrustedSigner,
-    signer_genesis: SignerGenesisV1,
-    issuer: _TrustedSigner,
-    initial_intent: InitialProvisioningIntentV1,
-    expected_disposal_owner: str,
-    expected_approver_identity: str,
-    _clock: Callable[[], datetime],
-    _capability: object,
-) -> None:
-    if _capability is not _TEST_CLOCK_CAPABILITY:
-        raise ProviderCryptoError("test_clock")
-    _persist_provider_material_policy_at(
-        paths,
-        policy,
-        signer=signer,
-        signer_genesis=signer_genesis,
-        issuer=issuer,
-        initial_intent=initial_intent,
-        expected_disposal_owner=expected_disposal_owner,
-        expected_approver_identity=expected_approver_identity,
-        now=_read_clock(_clock),
-        _capability=_TEST_CLOCK_CAPABILITY,
-    )
-
-
-def _persist_provider_material_genesis_at(
+def persist_provider_material_genesis(
     paths: ProviderMaterialArtifactPaths,
     genesis: ProviderMaterialGenesisV1,
     *,
@@ -1977,11 +2296,32 @@ def _persist_provider_material_genesis_at(
     initial_intent: InitialProvisioningIntentV1,
     expected_disposal_owner: str,
     expected_approver_identity: str,
-    now: datetime,
-    _capability: object,
 ) -> None:
-    _require_mutation_clock_capability(_capability)
-    _reject_unsupported_tls_termination(initial_intent)
+    """Persist a signed pending manifest using the trusted UTC clock."""
+
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
+    policy = cast(
+        ProviderMaterialPolicyV1,
+        _canonical_artifact(policy, ProviderMaterialPolicyV1, phase="material_policy"),
+    )
+    genesis = cast(
+        ProviderMaterialGenesisV1,
+        _canonical_artifact(genesis, ProviderMaterialGenesisV1, phase="material_genesis"),
+    )
+    attestation = cast(
+        ProviderFingerprintAttestationV1,
+        _canonical_artifact(
+            attestation,
+            ProviderFingerprintAttestationV1,
+            phase="fingerprint_attestation",
+        ),
+    )
+    signer_genesis = _require_persisted_signer_genesis(
+        paths,
+        signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+    )
     _verify_provider_material_bundle_at(
         policy,
         attestation,
@@ -1991,7 +2331,7 @@ def _persist_provider_material_genesis_at(
         initial_intent=initial_intent,
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
-        now=now,
+        now=_system_utc_clock(),
     )
     verify_provider_material_genesis(
         genesis,
@@ -2019,68 +2359,43 @@ def _persist_provider_material_genesis_at(
         directory.write_once(paths.genesis_name(), _yaml_bytes(genesis))
 
 
-def persist_provider_material_genesis(
-    paths: ProviderMaterialArtifactPaths,
-    genesis: ProviderMaterialGenesisV1,
+def _read_material_artifacts_from_directory(
+    directory: _OwnerOnlyArtifactDirectory,
     *,
-    policy: ProviderMaterialPolicyV1,
-    attestation: ProviderFingerprintAttestationV1,
-    signer: _TrustedSigner,
-    signer_genesis: SignerGenesisV1,
-    issuer: _TrustedSigner,
-    initial_intent: InitialProvisioningIntentV1,
-    expected_disposal_owner: str,
-    expected_approver_identity: str,
-) -> None:
-    """Persist a signed pending manifest using the trusted UTC clock."""
+    policy_name: str,
+    genesis_name: str,
+    attestation_name: str,
+) -> tuple[
+    ProviderMaterialPolicyV1, ProviderMaterialGenesisV1, ProviderFingerprintAttestationV1 | None
+]:
+    """Read material state only through a caller-held artifact-root descriptor."""
 
-    _persist_provider_material_genesis_at(
-        paths,
-        genesis,
-        policy=policy,
-        attestation=attestation,
-        signer=signer,
-        signer_genesis=signer_genesis,
-        issuer=issuer,
-        initial_intent=initial_intent,
-        expected_disposal_owner=expected_disposal_owner,
-        expected_approver_identity=expected_approver_identity,
-        now=_system_utc_clock(),
-        _capability=_SYSTEM_CLOCK_CAPABILITY,
+    policy = cast(
+        ProviderMaterialPolicyV1,
+        _load_model(
+            directory.read(policy_name),
+            ProviderMaterialPolicyV1,
+            phase="material_policy",
+        ),
     )
-
-
-def _persist_provider_material_genesis_for_test(
-    paths: ProviderMaterialArtifactPaths,
-    genesis: ProviderMaterialGenesisV1,
-    *,
-    policy: ProviderMaterialPolicyV1,
-    attestation: ProviderFingerprintAttestationV1,
-    signer: _TrustedSigner,
-    signer_genesis: SignerGenesisV1,
-    issuer: _TrustedSigner,
-    initial_intent: InitialProvisioningIntentV1,
-    expected_disposal_owner: str,
-    expected_approver_identity: str,
-    _clock: Callable[[], datetime],
-    _capability: object,
-) -> None:
-    if _capability is not _TEST_CLOCK_CAPABILITY:
-        raise ProviderCryptoError("test_clock")
-    _persist_provider_material_genesis_at(
-        paths,
-        genesis,
-        policy=policy,
-        attestation=attestation,
-        signer=signer,
-        signer_genesis=signer_genesis,
-        issuer=issuer,
-        initial_intent=initial_intent,
-        expected_disposal_owner=expected_disposal_owner,
-        expected_approver_identity=expected_approver_identity,
-        now=_read_clock(_clock),
-        _capability=_TEST_CLOCK_CAPABILITY,
+    genesis = cast(
+        ProviderMaterialGenesisV1,
+        _load_model(
+            directory.read(genesis_name),
+            ProviderMaterialGenesisV1,
+            phase="material_genesis",
+        ),
     )
+    raw_attestation = directory.read_optional(attestation_name)
+    if raw_attestation is None:
+        return policy, genesis, None
+    attestation = cast(
+        ProviderFingerprintAttestationV1,
+        _load_model(
+            raw_attestation, ProviderFingerprintAttestationV1, phase="fingerprint_attestation"
+        ),
+    )
+    return policy, genesis, attestation
 
 
 def _read_material_artifacts(
@@ -2089,32 +2404,12 @@ def _read_material_artifacts(
     ProviderMaterialPolicyV1, ProviderMaterialGenesisV1, ProviderFingerprintAttestationV1 | None
 ]:
     with _OwnerOnlyArtifactDirectory(paths.root) as directory:
-        policy = cast(
-            ProviderMaterialPolicyV1,
-            _load_model(
-                directory.read(paths.policy_name()),
-                ProviderMaterialPolicyV1,
-                phase="material_policy",
-            ),
+        return _read_material_artifacts_from_directory(
+            directory,
+            policy_name=paths.policy_name(),
+            genesis_name=paths.genesis_name(),
+            attestation_name=paths.attestation_name(),
         )
-        genesis = cast(
-            ProviderMaterialGenesisV1,
-            _load_model(
-                directory.read(paths.genesis_name()),
-                ProviderMaterialGenesisV1,
-                phase="material_genesis",
-            ),
-        )
-        raw_attestation = directory.read_optional(paths.attestation_name())
-        if raw_attestation is None:
-            return policy, genesis, None
-        attestation = cast(
-            ProviderFingerprintAttestationV1,
-            _load_model(
-                raw_attestation, ProviderFingerprintAttestationV1, phase="fingerprint_attestation"
-            ),
-        )
-    return policy, genesis, attestation
 
 
 def provider_material_genesis_status(
@@ -2126,16 +2421,23 @@ def provider_material_genesis_status(
 
     try:
         with _OwnerOnlyArtifactDirectory(paths.root) as directory:
+            raw_signer_genesis = directory.read_optional(paths.signer_genesis_name())
             raw_policy = directory.read_optional(paths.policy_name())
             raw_genesis = directory.read_optional(paths.genesis_name())
             raw_attestation = directory.read_optional(paths.attestation_name())
     except ProviderCryptoError:
         return ProviderMaterialGenesisStatus.INVALID
-    if raw_policy is None and raw_genesis is None and raw_attestation is None:
+    if (
+        raw_signer_genesis is None
+        and raw_policy is None
+        and raw_genesis is None
+        and raw_attestation is None
+    ):
         return ProviderMaterialGenesisStatus.ABSENT
-    if raw_policy is None or raw_genesis is None:
+    if raw_signer_genesis is None or raw_policy is None or raw_genesis is None:
         return ProviderMaterialGenesisStatus.INVALID
     try:
+        _load_model(raw_signer_genesis, SignerGenesisV1, phase="signer_genesis")
         policy = cast(
             ProviderMaterialPolicyV1,
             _load_model(raw_policy, ProviderMaterialPolicyV1, phase="material_policy"),
@@ -2181,7 +2483,7 @@ def provider_material_genesis_status(
     return ProviderMaterialGenesisStatus.PARTIAL_OR_RECONCILIATION_REQUIRED
 
 
-def _provision_keychain_materials_at(
+def _provision_keychain_materials(
     paths: ProviderMaterialArtifactPaths,
     *,
     policy: ProviderMaterialPolicyV1,
@@ -2193,8 +2495,6 @@ def _provision_keychain_materials_at(
     initial_intent: InitialProvisioningIntentV1,
     expected_disposal_owner: str,
     expected_approver_identity: str,
-    now: datetime,
-    _capability: object,
     materials: Mapping[ProviderMaterialPurpose, bytearray],
     _store: _KeychainTransport | None = None,
 ) -> None:
@@ -2208,74 +2508,144 @@ def _provision_keychain_materials_at(
 
     supplied: dict[ProviderMaterialPurpose, bytearray] = {}
     material_mapping_failed = False
-    _require_mutation_clock_capability(_capability)
     try:
         supplied = dict(materials)
     except Exception:
         material_mapping_failed = True
     try:
         if material_mapping_failed or not all(
-            type(value) is bytearray for value in supplied.values()
+            type(purpose) is ProviderMaterialPurpose and type(value) is bytearray
+            for purpose, value in supplied.items()
         ):
             raise ProviderCryptoError("material_values")
-        _reject_unsupported_tls_termination(initial_intent)
-        _verify_provider_material_bundle_at(
-            policy,
-            attestation,
-            signer=signer,
-            signer_genesis=signer_genesis,
-            issuer=issuer,
-            initial_intent=initial_intent,
-            expected_disposal_owner=expected_disposal_owner,
-            expected_approver_identity=expected_approver_identity,
-            now=now,
+        initial_intent = _reject_unsupported_tls_termination(initial_intent)
+        policy = cast(
+            ProviderMaterialPolicyV1,
+            _canonical_artifact(policy, ProviderMaterialPolicyV1, phase="material_policy"),
         )
-        verify_provider_material_genesis(
-            genesis,
-            policy=policy,
-            attestation=attestation,
-            signer=signer,
-            signer_genesis=signer_genesis,
-            issuer=issuer,
-            initial_intent=initial_intent,
+        genesis = cast(
+            ProviderMaterialGenesisV1,
+            _canonical_artifact(genesis, ProviderMaterialGenesisV1, phase="material_genesis"),
         )
-        if set(supplied) != {spec.purpose for spec in policy.materials}:
-            raise ProviderCryptoError("material_values")
-        if any(spec.reference.provider != "macos_keychain" for spec in policy.materials):
-            raise ProviderCryptoError("material_provider")
-        persisted_policy, persisted_genesis, persisted_attestation = _read_material_artifacts(paths)
-        if (
-            persisted_policy != policy
-            or persisted_genesis != genesis
-            or persisted_attestation is not None
-        ):
-            raise ProviderCryptoError("material_genesis_state")
-        store = _default_keychain_store() if _store is None else _store
-        expected_fingerprints = attestation.fingerprint_by_reference()
-        for spec in policy.materials:
-            value = supplied[spec.purpose]
-            _validate_value(spec, value)
-            fingerprint = _sha256(value)
-            expected_fingerprint = expected_fingerprints.get(spec.reference.reference_sha256)
-            if expected_fingerprint is None or not hmac.compare_digest(
-                fingerprint, expected_fingerprint
-            ):
-                raise ProviderCryptoError("material_fingerprint")
-            created = _create_keychain_value(
-                store, spec.reference.service, spec.reference.account, value
-            )
-            if type(created) is not bool:
-                raise ProviderCryptoError("material_provider")
-            if not created:
-                raise ProviderCryptoError("material_duplicate_or_partial")
-        terminal_policy, terminal_genesis, terminal_attestation = _read_material_artifacts(paths)
-        if (
-            terminal_policy != policy
-            or terminal_genesis != genesis
-            or terminal_attestation is not None
-        ):
-            raise ProviderCryptoError("material_genesis_state")
+        attestation = cast(
+            ProviderFingerprintAttestationV1,
+            _canonical_artifact(
+                attestation,
+                ProviderFingerprintAttestationV1,
+                phase="fingerprint_attestation",
+            ),
+        )
         with _OwnerOnlyArtifactDirectory(paths.root) as directory:
+            # Hold one descriptor-relative root for every revalidation and
+            # every create-only Keychain write.  A root rename/replacement
+            # cannot select a different signer genesis between checks.
+            signer_genesis = _require_persisted_signer_genesis_in_directory(
+                directory,
+                signer_genesis_name=paths.signer_genesis_name(),
+                genesis=signer_genesis,
+                issuer=issuer,
+                initial_intent=initial_intent,
+            )
+            now = _system_utc_clock()
+            _verify_provider_material_bundle_at(
+                policy,
+                attestation,
+                signer=signer,
+                signer_genesis=signer_genesis,
+                issuer=issuer,
+                initial_intent=initial_intent,
+                expected_disposal_owner=expected_disposal_owner,
+                expected_approver_identity=expected_approver_identity,
+                now=now,
+            )
+            verify_provider_material_genesis(
+                genesis,
+                policy=policy,
+                attestation=attestation,
+                signer=signer,
+                signer_genesis=signer_genesis,
+                issuer=issuer,
+                initial_intent=initial_intent,
+            )
+            if set(supplied) != {spec.purpose for spec in policy.materials}:
+                raise ProviderCryptoError("material_values")
+            if any(spec.reference.provider != "macos_keychain" for spec in policy.materials):
+                raise ProviderCryptoError("material_provider")
+            persisted_policy, persisted_genesis, persisted_attestation = (
+                _read_material_artifacts_from_directory(
+                    directory,
+                    policy_name=paths.policy_name(),
+                    genesis_name=paths.genesis_name(),
+                    attestation_name=paths.attestation_name(),
+                )
+            )
+            if (
+                persisted_policy != policy
+                or persisted_genesis != genesis
+                or persisted_attestation is not None
+            ):
+                raise ProviderCryptoError("material_genesis_state")
+            store = _default_keychain_store() if _store is None else _store
+            expected_fingerprints = attestation.fingerprint_by_reference()
+            for spec in policy.materials:
+                # Reopen and verify the durable signer immediately before each
+                # irreversible ``SecItemAdd``.  This rejects a same-owner
+                # artifact replacement rather than using stale in-memory
+                # signer authority.
+                _require_persisted_signer_genesis_in_directory(
+                    directory,
+                    signer_genesis_name=paths.signer_genesis_name(),
+                    genesis=signer_genesis,
+                    issuer=issuer,
+                    initial_intent=initial_intent,
+                )
+                current_policy, current_genesis, current_attestation = (
+                    _read_material_artifacts_from_directory(
+                        directory,
+                        policy_name=paths.policy_name(),
+                        genesis_name=paths.genesis_name(),
+                        attestation_name=paths.attestation_name(),
+                    )
+                )
+                if (
+                    current_policy != policy
+                    or current_genesis != genesis
+                    or current_attestation is not None
+                ):
+                    raise ProviderCryptoError("material_genesis_state")
+                value = supplied[spec.purpose]
+                _validate_value(spec, value)
+                fingerprint = _sha256(value)
+                expected_fingerprint = expected_fingerprints.get(spec.reference.reference_sha256)
+                if expected_fingerprint is None or not hmac.compare_digest(
+                    fingerprint, expected_fingerprint
+                ):
+                    raise ProviderCryptoError("material_fingerprint")
+                with directory.pin_exact_signer_genesis(
+                    paths.signer_genesis_name(),
+                    _yaml_bytes(signer_genesis),
+                ):
+                    created = _create_keychain_value(
+                        store, spec.reference.service, spec.reference.account, value
+                    )
+                if type(created) is not bool:
+                    raise ProviderCryptoError("material_provider")
+                if not created:
+                    raise ProviderCryptoError("material_duplicate_or_partial")
+            terminal_policy, terminal_genesis, terminal_attestation = (
+                _read_material_artifacts_from_directory(
+                    directory,
+                    policy_name=paths.policy_name(),
+                    genesis_name=paths.genesis_name(),
+                    attestation_name=paths.attestation_name(),
+                )
+            )
+            if (
+                terminal_policy != policy
+                or terminal_genesis != genesis
+                or terminal_attestation is not None
+            ):
+                raise ProviderCryptoError("material_genesis_state")
             directory.write_once(paths.attestation_name(), _yaml_bytes(attestation))
     finally:
         for value in supplied.values():
@@ -2299,7 +2669,7 @@ def provision_keychain_materials(
 ) -> None:
     """Create material rows only once using the trusted production UTC clock."""
 
-    _provision_keychain_materials_at(
+    _provision_keychain_materials(
         paths,
         policy=policy,
         genesis=genesis,
@@ -2310,45 +2680,6 @@ def provision_keychain_materials(
         initial_intent=initial_intent,
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
-        now=_system_utc_clock(),
-        _capability=_SYSTEM_CLOCK_CAPABILITY,
-        materials=materials,
-        _store=_store,
-    )
-
-
-def _provision_keychain_materials_for_test(
-    paths: ProviderMaterialArtifactPaths,
-    *,
-    policy: ProviderMaterialPolicyV1,
-    genesis: ProviderMaterialGenesisV1,
-    attestation: ProviderFingerprintAttestationV1,
-    signer: _TrustedSigner,
-    signer_genesis: SignerGenesisV1,
-    issuer: _TrustedSigner,
-    initial_intent: InitialProvisioningIntentV1,
-    expected_disposal_owner: str,
-    expected_approver_identity: str,
-    materials: Mapping[ProviderMaterialPurpose, bytearray],
-    _store: _KeychainTransport | None,
-    _clock: Callable[[], datetime],
-    _capability: object,
-) -> None:
-    if _capability is not _TEST_CLOCK_CAPABILITY:
-        raise ProviderCryptoError("test_clock")
-    _provision_keychain_materials_at(
-        paths,
-        policy=policy,
-        genesis=genesis,
-        attestation=attestation,
-        signer=signer,
-        signer_genesis=signer_genesis,
-        issuer=issuer,
-        initial_intent=initial_intent,
-        expected_disposal_owner=expected_disposal_owner,
-        expected_approver_identity=expected_approver_identity,
-        now=_read_clock(_clock),
-        _capability=_TEST_CLOCK_CAPABILITY,
         materials=materials,
         _store=_store,
     )
@@ -2405,6 +2736,13 @@ def load_verified_provider_material_bundle(
 ) -> tuple[ProviderMaterialPolicyV1, ProviderMaterialGenesisV1, ProviderFingerprintAttestationV1]:
     """Load only a cryptographically verified terminal material state."""
 
+    initial_intent = _canonical_initial_intent(initial_intent)
+    signer_genesis = _require_persisted_signer_genesis(
+        paths,
+        signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+    )
     return _load_verified_provider_material_bundle_at(
         paths,
         signer=signer,
@@ -2414,32 +2752,6 @@ def load_verified_provider_material_bundle(
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
         now=_system_utc_clock(),
-    )
-
-
-def _load_verified_provider_material_bundle_for_test(
-    paths: ProviderMaterialArtifactPaths,
-    *,
-    signer: _TrustedSigner,
-    signer_genesis: SignerGenesisV1,
-    issuer: _TrustedSigner,
-    initial_intent: InitialProvisioningIntentV1,
-    expected_disposal_owner: str,
-    expected_approver_identity: str,
-    _clock: Callable[[], datetime],
-    _capability: object,
-) -> tuple[ProviderMaterialPolicyV1, ProviderMaterialGenesisV1, ProviderFingerprintAttestationV1]:
-    if _capability is not _TEST_CLOCK_CAPABILITY:
-        raise ProviderCryptoError("test_clock")
-    return _load_verified_provider_material_bundle_at(
-        paths,
-        signer=signer,
-        signer_genesis=signer_genesis,
-        issuer=issuer,
-        initial_intent=initial_intent,
-        expected_disposal_owner=expected_disposal_owner,
-        expected_approver_identity=expected_approver_identity,
-        now=_read_clock(_clock),
     )
 
 
@@ -2469,11 +2781,38 @@ def _load_verified_provider_material_bundle_from_reader_at(
     """
 
     try:
+        raw_signer_genesis = reader.read(_SIGNER_GENESIS_NAME)
         raw_policy = reader.read(_MATERIAL_POLICY_NAME)
         raw_genesis = reader.read(_MATERIAL_GENESIS_NAME)
         raw_attestation = reader.read(_FINGERPRINT_ATTESTATION_NAME)
     except Exception:
         raise ProviderCryptoError("material_artifact") from None
+    persisted_signer_genesis = cast(
+        SignerGenesisV1,
+        _load_model(raw_signer_genesis, SignerGenesisV1, phase="signer_genesis"),
+    )
+    persisted_signer_genesis = cast(
+        SignerGenesisV1,
+        _canonical_artifact(
+            persisted_signer_genesis,
+            SignerGenesisV1,
+            phase="signer_genesis",
+        ),
+    )
+    if not hmac.compare_digest(raw_signer_genesis, _yaml_bytes(persisted_signer_genesis)):
+        raise ProviderCryptoError("signer_genesis")
+    initial_intent = _canonical_initial_intent(initial_intent)
+    verify_signer_genesis(
+        persisted_signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+    )
+    signer_genesis = cast(
+        SignerGenesisV1,
+        _canonical_artifact(signer_genesis, SignerGenesisV1, phase="signer_genesis"),
+    )
+    if persisted_signer_genesis != signer_genesis:
+        raise ProviderCryptoError("signer_genesis")
     policy = cast(
         ProviderMaterialPolicyV1,
         _load_model(raw_policy, ProviderMaterialPolicyV1, phase="material_policy"),

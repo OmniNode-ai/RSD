@@ -86,6 +86,92 @@ def canonical_sha256(model: BaseModel) -> str:
     )
 
 
+def _canonical_model_bytes(model: BaseModel) -> bytes:
+    """Render a typed model as the one JSON spelling used at security boundaries."""
+
+    try:
+        return json.dumps(
+            model.model_dump(mode="json", warnings="error"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except Exception:
+        raise ValueError("model is not canonically serializable") from None
+
+
+def _same_exact_model_shape(original: object, canonical: object) -> bool:
+    """Reject ``model_construct``/``model_copy`` values with typed-field drift.
+
+    Equality is insufficient here because ``StrEnum`` compares equal to its
+    string value.  A signed model may be revalidated from canonical JSON, but
+    accepting its pre-validation object would still let a raw string or a
+    subclass reach an enum-sensitive boundary.
+    """
+
+    if type(original) is not type(canonical):
+        return False
+    if isinstance(original, BaseModel):
+        if not isinstance(canonical, BaseModel) or type(original) is not type(canonical):
+            return False
+        return all(
+            _same_exact_model_shape(getattr(original, name), getattr(canonical, name))
+            for name in original.__class__.model_fields
+        )
+    if type(original) is tuple:
+        canonical_tuple = cast(tuple[object, ...], canonical)
+        return len(original) == len(canonical_tuple) and all(
+            _same_exact_model_shape(left, right)
+            for left, right in zip(original, canonical_tuple, strict=True)
+        )
+    if type(original) is list:
+        canonical_list = cast(list[object], canonical)
+        return len(original) == len(canonical_list) and all(
+            _same_exact_model_shape(left, right)
+            for left, right in zip(original, canonical_list, strict=True)
+        )
+    if type(original) is dict:
+        canonical_dict = cast(dict[object, object], canonical)
+        if len(original) != len(canonical_dict):
+            return False
+        return all(
+            _same_exact_model_shape(left_key, right_key)
+            and _same_exact_model_shape(original[left_key], canonical_dict[right_key])
+            for left_key, right_key in zip(original, canonical_dict, strict=True)
+        )
+    return original == canonical
+
+
+def _strict_canonical_model[StrictModel: BaseModel](
+    model: object, model_type: type[StrictModel]
+) -> StrictModel:
+    """Round-trip a model and reject every noncanonical or type-drifted input."""
+
+    if type(model) is not model_type:
+        raise ValueError("model type is invalid")
+    try:
+        original = _canonical_model_bytes(cast(BaseModel, model))
+        canonical = model_type.model_validate_json(original, strict=True)
+        rendered = _canonical_model_bytes(canonical)
+    except Exception:
+        raise ValueError("model is invalid") from None
+    if (
+        type(canonical) is not model_type
+        or original != rendered
+        or not _same_exact_model_shape(model, canonical)
+    ):
+        raise ValueError("model is not canonical")
+    return canonical
+
+
+def _is_tls_verified_profile(profile: object) -> bool:
+    """Compare the canonical profile value only after exact enum validation."""
+
+    return (
+        type(profile) is DisposableTransportProfile
+        and profile.value == DisposableTransportProfile.TLS_VERIFIED.value
+    )
+
+
 def _timestamp(value: str) -> datetime:
     if not _TIMESTAMP.fullmatch(value):
         raise ValueError("timestamp must be canonical UTC")
@@ -303,7 +389,9 @@ class TransportContractV1(_Model):
         parsed = urlsplit(self.authority)
         assert parsed.hostname is not None and parsed.port is not None
         address = ipaddress.ip_address(parsed.hostname)
-        if self.profile is DisposableTransportProfile.TLS_VERIFIED:
+        if type(self.profile) is not DisposableTransportProfile:
+            raise ValueError("transport profile must be canonical")
+        if _is_tls_verified_profile(self.profile):
             valid = (
                 parsed.scheme == "https"
                 and self.listener_binding == "tls_lan"
@@ -623,7 +711,9 @@ class ProposalV1(_Model):
         ):
             raise ValueError("proposal provider references do not bind candidate")
         anchor = self.provider_references.tls_trust_anchor
-        if self.transport.profile is DisposableTransportProfile.TLS_VERIFIED:
+        if type(self.transport.profile) is not DisposableTransportProfile:
+            raise ValueError("transport profile must be canonical")
+        if _is_tls_verified_profile(self.transport.profile):
             if (
                 anchor is None
                 or anchor.reference_sha256 != self.transport.tls_trust_anchor_reference_sha256
@@ -915,7 +1005,9 @@ class InitialProvisioningIntentV1(_Model):
         ):
             raise ValueError("initial plan provider references do not bind caches")
         anchor = self.provider_references.tls_trust_anchor
-        if self.plan.transport.profile is DisposableTransportProfile.TLS_VERIFIED:
+        if type(self.plan.transport.profile) is not DisposableTransportProfile:
+            raise ValueError("transport profile must be canonical")
+        if _is_tls_verified_profile(self.plan.transport.profile):
             if (
                 anchor is None
                 or anchor.reference_sha256 != self.plan.transport.tls_trust_anchor_reference_sha256
@@ -924,6 +1016,21 @@ class InitialProvisioningIntentV1(_Model):
         elif anchor is not None:
             raise ValueError("initial unpublished plan cannot carry TLS trust reference")
         return self
+
+
+def strict_canonical_initial_provisioning_intent(
+    intent: InitialProvisioningIntentV1,
+) -> InitialProvisioningIntentV1:
+    """Return the only typed form admissible at a Phase-B mutation boundary.
+
+    This is deliberately separate from signature verification: the caller must
+    verify the returned canonical model under its domain-specific trust anchor
+    before performing any effect.  The round-trip prevents a caller from using
+    Pydantic's construction/copy escape hatches to smuggle raw strings or
+    subclasses into enum- or type-sensitive code.
+    """
+
+    return _strict_canonical_model(intent, InitialProvisioningIntentV1)
 
 
 class ObservedServiceResourcesV1(_Model):

@@ -15,10 +15,12 @@ import traceback
 import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event, Lock
 from typing import Literal, Protocol
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -27,8 +29,9 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.x509.oid import NameOID
 
+import omninode_rsd.lifecycle.authorization as authorization_module
+import omninode_rsd.lifecycle.provider_crypto as provider_crypto_module
 from omninode_rsd.lifecycle.authorization import (
-    _TEST_CLOCK_CAPABILITY,
     ArtifactRootLease,
     AuthorizationError,
     AuthorizationPaths,
@@ -51,16 +54,12 @@ from omninode_rsd.lifecycle.authorization import (
     SQLiteInitialProvisioningJournal,
     TrustedEd25519SignerV1,
     VerifiedExecutionContext,
-    _authorize_and_execute_for_test,
-    _authorize_initial_provisioning_and_execute_for_test,
     _canonical_signed_content,
     _initial_intent_message,
     _initial_journal_genesis_reconciliation_message,
     _journal_genesis_message,
     _journal_genesis_reconciliation_message,
     _observed_candidate_attestation_message,
-    _provision_initial_journal_for_test,
-    _provision_journal_for_test,
     _signature_message,
     authorize_and_execute,
     authorize_initial_provisioning_and_execute,
@@ -118,11 +117,9 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     validate_observed_candidate_transition,
 )
 from omninode_rsd.lifecycle.provider_crypto import (
-    _TEST_CLOCK_CAPABILITY as _PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
-)
-from omninode_rsd.lifecycle.provider_crypto import (
     KeychainEd25519Signer,
     KeychainItemReferenceV1,
+    MacOSKeychainProviderProvenanceAdapter,
     ProviderCryptoError,
     ProviderFingerprintAttestationV1,
     ProviderMaterialArtifactPaths,
@@ -134,12 +131,10 @@ from omninode_rsd.lifecycle.provider_crypto import (
     ProviderMaterialSpecV1,
     ReplayAuthorityPolicyArtifactV1,
     SignerGenesisV1,
-    _load_verified_provider_material_bundle_for_test,
-    _persist_provider_material_genesis_for_test,
-    _persist_provider_material_policy_for_test,
-    _provision_keychain_materials_for_test,
     load_keychain_ed25519_signer,
+    load_verified_provider_material_bundle,
     load_verified_signer_genesis,
+    persist_provider_material_genesis,
     persist_provider_material_policy,
     persist_signer_genesis,
     provider_fingerprint_attestation_message,
@@ -147,6 +142,7 @@ from omninode_rsd.lifecycle.provider_crypto import (
     provider_material_genesis_status,
     provider_material_policy_message,
     provision_keychain_ed25519_signer,
+    provision_keychain_materials,
     replay_authority_policy_message,
     signer_genesis_message,
 )
@@ -166,6 +162,232 @@ _TEST_REPLAY_POLICY = ReplayAuthorityPolicyV1(
 )
 _TEST_REPLAY_AUTHORITIES: dict[str, _AtomicReplayAuthority] = {}
 _TEST_REPLAY_AUTHORITIES_LOCK = Lock()
+
+
+@contextmanager
+def _patched_system_clock(module: object, clock: Callable[[], datetime]):
+    """Test seam only: production entries never receive a caller clock."""
+
+    with patch.object(module, "_system_utc_clock", clock):
+        yield
+
+
+def _provision_initial_journal_for_test(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteInitialProvisioningJournal,
+    intent: InitialProvisioningIntentV1,
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
+    replay_policy_artifact: ReplayAuthorityPolicyArtifactV1,
+    _clock: Callable[[], datetime],
+) -> object:
+    with _patched_system_clock(authorization_module, _clock):
+        return provision_initial_journal(
+            paths,
+            signer=signer,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            journal=journal,
+            intent=intent,
+            replay_authority=replay_authority,
+            replay_policy=replay_policy,
+            replay_policy_artifact=replay_policy_artifact,
+        )
+
+
+def _authorize_initial_provisioning_and_execute_for_test(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    provider: object,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteInitialProvisioningJournal,
+    effect: Callable[[InitialProvisioningExecutionContext], InitialProvisioningEffectReceiptV1],
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
+    _clock: Callable[[], datetime],
+) -> object:
+    with _patched_system_clock(authorization_module, _clock):
+        return authorize_initial_provisioning_and_execute(
+            paths,
+            signer=signer,
+            provider=provider,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            journal=journal,
+            effect=effect,
+            replay_authority=replay_authority,
+            replay_policy=replay_policy,
+        )
+
+
+def _provision_journal_for_test(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteAuthorizationJournal,
+    receipt: JournalGenesisReceiptV1,
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
+    _clock: Callable[[], datetime],
+) -> object:
+    with _patched_system_clock(authorization_module, _clock):
+        return provision_journal(
+            paths,
+            signer=signer,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            journal=journal,
+            receipt=receipt,
+            replay_authority=replay_authority,
+            replay_policy=replay_policy,
+        )
+
+
+def _authorize_and_execute_for_test(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    provider: object,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteAuthorizationJournal,
+    initial_journal: SQLiteInitialProvisioningJournal,
+    effect: Callable[[VerifiedExecutionContext], EffectReceiptV1],
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
+    _clock: Callable[[], datetime],
+) -> ExecutionReceiptV1:
+    with _patched_system_clock(authorization_module, _clock):
+        return authorize_and_execute(
+            paths,
+            signer=signer,
+            provider=provider,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            journal=journal,
+            initial_journal=initial_journal,
+            effect=effect,
+            replay_authority=replay_authority,
+            replay_policy=replay_policy,
+        )
+
+
+def _persist_provider_material_policy_for_test(
+    paths: ProviderMaterialArtifactPaths,
+    policy: ProviderMaterialPolicyV1,
+    *,
+    signer: object,
+    signer_genesis: SignerGenesisV1,
+    issuer: object,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    _clock: Callable[[], datetime],
+) -> None:
+    with _patched_system_clock(provider_crypto_module, _clock):
+        persist_provider_material_policy(
+            paths,
+            policy,
+            signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            initial_intent=initial_intent,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+        )
+
+
+def _persist_provider_material_genesis_for_test(
+    paths: ProviderMaterialArtifactPaths,
+    genesis: ProviderMaterialGenesisV1,
+    *,
+    policy: ProviderMaterialPolicyV1,
+    attestation: ProviderFingerprintAttestationV1,
+    signer: object,
+    signer_genesis: SignerGenesisV1,
+    issuer: object,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    _clock: Callable[[], datetime],
+) -> None:
+    with _patched_system_clock(provider_crypto_module, _clock):
+        persist_provider_material_genesis(
+            paths,
+            genesis,
+            policy=policy,
+            attestation=attestation,
+            signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            initial_intent=initial_intent,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+        )
+
+
+def _provision_keychain_materials_for_test(
+    paths: ProviderMaterialArtifactPaths,
+    *,
+    policy: ProviderMaterialPolicyV1,
+    genesis: ProviderMaterialGenesisV1,
+    attestation: ProviderFingerprintAttestationV1,
+    signer: object,
+    signer_genesis: SignerGenesisV1,
+    issuer: object,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    materials: Mapping[ProviderMaterialPurpose, bytearray],
+    _store: object,
+    _clock: Callable[[], datetime],
+) -> None:
+    with _patched_system_clock(provider_crypto_module, _clock):
+        provision_keychain_materials(
+            paths,
+            policy=policy,
+            genesis=genesis,
+            attestation=attestation,
+            signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            initial_intent=initial_intent,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            materials=materials,
+            _store=_store,
+        )
+
+
+def _load_verified_provider_material_bundle_for_test(
+    paths: ProviderMaterialArtifactPaths,
+    *,
+    signer: object,
+    signer_genesis: SignerGenesisV1,
+    issuer: object,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    _clock: Callable[[], datetime],
+) -> tuple[ProviderMaterialPolicyV1, ProviderMaterialGenesisV1, ProviderFingerprintAttestationV1]:
+    with _patched_system_clock(provider_crypto_module, _clock):
+        return load_verified_provider_material_bundle(
+            paths,
+            signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            initial_intent=initial_intent,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+        )
 
 
 class _StringQueue(Protocol):
@@ -1643,7 +1865,6 @@ def _ensure_test_initial_stage(
                 replay_policy=_TEST_REPLAY_POLICY,
                 replay_policy_artifact=_replay_policy_artifact(intent, signer=signer),
                 _clock=lambda: _NOW,
-                _capability=_TEST_CLOCK_CAPABILITY,
             )
             _authorize_initial_provisioning_and_execute_for_test(
                 paths,
@@ -1656,7 +1877,6 @@ def _ensure_test_initial_stage(
                 replay_authority=replay_authority,
                 replay_policy=_TEST_REPLAY_POLICY,
                 _clock=lambda: _NOW,
-                _capability=_TEST_CLOCK_CAPABILITY,
             )
             # Read the committed immutable receipt rather than trusting the helper object.
             raw = (paths.root / paths.initial_receipt_name()).read_bytes()
@@ -1760,7 +1980,6 @@ def _ensure_test_journal_provisioned(
             replay_authority=authority,
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
 
 
@@ -1841,7 +2060,6 @@ def _execute_for_test(
         replay_authority=authority,
         replay_policy=_TEST_REPLAY_POLICY,
         _clock=lambda: now,
-        _capability=_TEST_CLOCK_CAPABILITY,
     )
 
 
@@ -2013,7 +2231,6 @@ def test_initial_scope_cannot_be_used_as_observed_effect_authority(tmp_path: Pat
         replay_policy=_TEST_REPLAY_POLICY,
         replay_policy_artifact=_replay_policy_artifact(intent, signer=signer),
         _clock=lambda: _NOW,
-        _capability=_TEST_CLOCK_CAPABILITY,
     )
     seen: list[InitialProvisioningExecutionContext] = []
 
@@ -2039,7 +2256,6 @@ def test_initial_scope_cannot_be_used_as_observed_effect_authority(tmp_path: Pat
             replay_authority=authority,
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
 
     assert len(seen) == 1
@@ -2082,7 +2298,6 @@ def test_initial_genesis_reconciliation_never_retries_creation(
             replay_policy=_TEST_REPLAY_POLICY,
             replay_policy_artifact=_replay_policy_artifact(intent, signer=signer),
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
     monkeypatch.setattr(journal, "_set_marker_current", original)
     assert journal.migration_status() is InitialProvisioningJournalStatus.PROVISIONING_INCOMPLETE
@@ -2122,7 +2337,6 @@ def test_initial_genesis_reconciliation_never_retries_creation(
             replay_policy=_TEST_REPLAY_POLICY,
             replay_policy_artifact=_replay_policy_artifact(intent, signer=signer),
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
 
 
@@ -2144,7 +2358,6 @@ def test_external_initial_genesis_blocks_same_operation_at_a_new_path(tmp_path: 
         replay_policy=_TEST_REPLAY_POLICY,
         replay_policy_artifact=_replay_policy_artifact(first_intent, signer=signer),
         _clock=lambda: _NOW,
-        _capability=_TEST_CLOCK_CAPABILITY,
     )
 
     second_root = tmp_path / "second-artifacts"
@@ -2164,7 +2377,6 @@ def test_external_initial_genesis_blocks_same_operation_at_a_new_path(tmp_path: 
             replay_policy=_TEST_REPLAY_POLICY,
             replay_policy_artifact=_replay_policy_artifact(second_intent, signer=signer),
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
     assert (
         second_journal.migration_status()
@@ -2182,6 +2394,16 @@ def test_public_execution_has_no_caller_controlled_clock(tmp_path: Path) -> None
     assert "now" not in inspect.signature(authorize_initial_provisioning_and_execute).parameters
     assert "now" not in inspect.signature(provision_journal).parameters
     assert "now" not in inspect.signature(provision_initial_journal).parameters
+    assert "clock" not in inspect.signature(authorize_and_execute).parameters
+    assert "clock" not in inspect.signature(authorize_initial_provisioning_and_execute).parameters
+    assert "now" not in inspect.signature(provision_keychain_ed25519_signer).parameters
+    assert "clock" not in inspect.signature(provision_keychain_ed25519_signer).parameters
+    assert "now" not in inspect.signature(provision_keychain_materials).parameters
+    assert "clock" not in inspect.signature(provision_keychain_materials).parameters
+    assert "now" not in inspect.signature(persist_provider_material_policy).parameters
+    assert "clock" not in inspect.signature(persist_provider_material_policy).parameters
+    assert not hasattr(provider_crypto_module, "_SYSTEM_CLOCK_CAPABILITY")
+    assert not hasattr(provider_crypto_module, "_TEST_CLOCK_CAPABILITY")
     assert "provider_fingerprints" not in inspect.signature(authorize_and_execute).parameters
     assert "provider_material_policy" not in inspect.signature(authorize_and_execute).parameters
     assert (
@@ -2220,21 +2442,59 @@ def test_public_execution_has_no_caller_controlled_clock(tmp_path: Path) -> None
             replay_policy=_TEST_REPLAY_POLICY,
             now=_NOW,  # type: ignore[call-arg]
         )
-    with pytest.raises(AuthorizationError, match="test_clock"):
-        _authorize_and_execute_for_test(
-            AuthorizationPaths(root),
+    assert not hasattr(authorization_module, "_authorize_and_execute_with_clock")
+    assert not hasattr(authorization_module, "_TEST_CLOCK_CAPABILITY")
+
+
+def test_public_authorization_cannot_rewind_stale_stage_time(tmp_path: Path) -> None:
+    """A historical fixture cannot reach an effect through a production API."""
+
+    root = tmp_path / "stale-authorization-artifacts"
+    signer, fingerprints, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    journal = _journal(tmp_path)
+    initial_journal = _initial_journal(tmp_path, paths)
+    authority = _test_replay_authority(journal)
+    provider = _Provider(fingerprints)
+    _ensure_test_journal_provisioned(
+        paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        replay_authority=authority,
+    )
+    _ensure_test_initial_stage(
+        paths,
+        signer=signer,
+        provider=provider,
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=initial_journal,
+        replay_authority=authority,
+    )
+    called = False
+
+    def effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
+        nonlocal called
+        called = True
+        return _effect(context)
+
+    with pytest.raises(AuthorizationError, match=r"phase_a_approval|initial_stage_freshness"):
+        authorize_and_execute(
+            paths,
             signer=signer,
-            provider=_Provider(fingerprints),
+            provider=provider,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=journal,
             initial_journal=initial_journal,
-            effect=_effect,
-            replay_authority=_test_replay_authority(journal),
+            effect=effect,
+            replay_authority=authority,
             replay_policy=_TEST_REPLAY_POLICY,
-            _clock=lambda: _NOW,
-            _capability=object(),
         )
+    assert not called
 
 
 def test_phase_b_absent_journal_never_initializes_or_provisions(tmp_path: Path) -> None:
@@ -2293,7 +2553,6 @@ def test_missing_replay_authority_fails_before_journal_provisioning(tmp_path: Pa
             replay_authority=None,  # type: ignore[arg-type]
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
     assert journal.migration_status() is JournalMigrationStatus.ABSENT
     assert not (root / AuthorizationPaths.journal_genesis_name()).exists()
@@ -2328,7 +2587,6 @@ def test_initial_replay_policy_is_durable_before_tombstone_and_allows_exact_reco
         replay_policy=_TEST_REPLAY_POLICY,
         replay_policy_artifact=policy_artifact,
         _clock=lambda: _NOW,
-        _capability=_TEST_CLOCK_CAPABILITY,
     )
     assert observed == [(True, InitialProvisioningJournalStatus.PROVISIONING_INCOMPLETE)]
 
@@ -2354,7 +2612,6 @@ def test_initial_replay_policy_is_durable_before_tombstone_and_allows_exact_reco
         replay_policy=_TEST_REPLAY_POLICY,
         replay_policy_artifact=recovery_artifact,
         _clock=lambda: _NOW,
-        _capability=_TEST_CLOCK_CAPABILITY,
     )
     assert recovery_journal.migration_status() is InitialProvisioningJournalStatus.CURRENT
 
@@ -2384,7 +2641,6 @@ def test_initial_replay_policy_substitution_blocks_before_external_claim(tmp_pat
             replay_policy=_TEST_REPLAY_POLICY,
             replay_policy_artifact=policy_artifact,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
     assert not authority.tombstones
     assert journal.migration_status() is InitialProvisioningJournalStatus.ABSENT
@@ -2415,7 +2671,6 @@ def test_external_tombstone_blocks_local_rollback_and_deleted_operation_row(
         replay_authority=authority,
         replay_policy=_TEST_REPLAY_POLICY,
         _clock=lambda: _NOW,
-        _capability=_TEST_CLOCK_CAPABILITY,
     )
     effects: list[VerifiedExecutionContext] = []
 
@@ -2499,7 +2754,6 @@ def test_external_tombstone_blocks_local_rollback_and_deleted_operation_row(
             replay_authority=authority,
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
     assert journal.migration_status() is JournalMigrationStatus.PROVISIONING_INCOMPLETE
     assert not journal._path.exists()
@@ -2551,7 +2805,6 @@ def test_genesis_blocks_pair_removal_replay_and_identity_file_removal(tmp_path: 
         replay_authority=_test_replay_authority(journal),
         replay_policy=_TEST_REPLAY_POLICY,
         _clock=lambda: _NOW,
-        _capability=_TEST_CLOCK_CAPABILITY,
     )
     effects: list[str] = []
 
@@ -2620,7 +2873,6 @@ def test_genesis_blocks_pair_removal_replay_and_identity_file_removal(tmp_path: 
             replay_authority=_test_replay_authority(journal),
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
 
 
@@ -2650,7 +2902,6 @@ def test_genesis_copy_or_removal_blocks_effect_before_claim(tmp_path: Path) -> N
             replay_authority=_test_replay_authority(journal),
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
     target_genesis = target / AuthorizationPaths.journal_genesis_name()
     target_genesis.unlink()
@@ -2716,7 +2967,6 @@ def test_genesis_rejects_second_provision_and_signed_mismatch(tmp_path: Path) ->
         replay_authority=_test_replay_authority(journal),
         replay_policy=_TEST_REPLAY_POLICY,
         _clock=lambda: _NOW,
-        _capability=_TEST_CLOCK_CAPABILITY,
     )
     with pytest.raises(AuthorizationError, match="journal_genesis_replayed"):
         _provision_journal_for_test(
@@ -2729,7 +2979,6 @@ def test_genesis_rejects_second_provision_and_signed_mismatch(tmp_path: Path) ->
             replay_authority=_test_replay_authority(journal),
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
 
     mismatch_root = tmp_path / "mismatch-artifacts"
@@ -2757,7 +3006,6 @@ def test_genesis_rejects_second_provision_and_signed_mismatch(tmp_path: Path) ->
             replay_authority=_test_replay_authority(mismatch_journal),
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
     assert mismatch_journal.migration_status() is JournalMigrationStatus.ABSENT
     assert not (mismatch_root / AuthorizationPaths.journal_genesis_name()).exists()
@@ -2780,7 +3028,6 @@ def test_genesis_rejects_second_provision_and_signed_mismatch(tmp_path: Path) ->
             replay_authority=_test_replay_authority(mismatch_journal),
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
     assert mismatch_journal.migration_status() is JournalMigrationStatus.ABSENT
 
@@ -2819,7 +3066,6 @@ def test_genesis_crash_windows_require_signed_reconciliation(
             replay_authority=_test_replay_authority(journal),
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
     monkeypatch.setattr(ArtifactRootLease, "write_once", original_write_once)
     assert journal.migration_status() is JournalMigrationStatus.PROVISIONING_INCOMPLETE
@@ -2835,7 +3081,6 @@ def test_genesis_crash_windows_require_signed_reconciliation(
             replay_authority=_test_replay_authority(journal),
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
     assert (
         reconcile_journal_genesis(
@@ -2877,7 +3122,6 @@ def test_genesis_crash_windows_require_signed_reconciliation(
             replay_authority=_test_replay_authority(completed_journal),
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
     monkeypatch.setattr(completed_journal, "_set_genesis_marker_state", original_set_state)
     assert completed_journal.migration_status() is JournalMigrationStatus.PROVISIONING_INCOMPLETE
@@ -2894,7 +3138,6 @@ def test_genesis_crash_windows_require_signed_reconciliation(
             replay_authority=_test_replay_authority(completed_journal),
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
     assert (
         reconcile_journal_genesis(
@@ -3863,7 +4106,6 @@ def test_provider_material_genesis_is_create_only_and_partial_state_blocks_retry
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
         _clock=lambda: _NOW,
-        _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
     )
     _persist_provider_material_genesis_for_test(
         artifact_paths,
@@ -3877,7 +4119,6 @@ def test_provider_material_genesis_is_create_only_and_partial_state_blocks_retry
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
         _clock=lambda: _NOW,
-        _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
     )
     store = _CreateOnlyMaterialStore()
     _provision_keychain_materials_for_test(
@@ -3894,7 +4135,6 @@ def test_provider_material_genesis_is_create_only_and_partial_state_blocks_retry
         materials=values,
         _store=store,
         _clock=lambda: _NOW,
-        _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
     )
     assert all(not any(value) for value in values.values())
     assert (
@@ -3911,7 +4151,6 @@ def test_provider_material_genesis_is_create_only_and_partial_state_blocks_retry
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             _clock=lambda: _NOW,
-            _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
         )
     )
     assert loaded_policy == policy
@@ -3934,7 +4173,6 @@ def test_provider_material_genesis_is_create_only_and_partial_state_blocks_retry
             materials=retry_values,
             _store=store,
             _clock=lambda: _NOW,
-            _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
         )
     assert all(not any(value) for value in retry_values.values())
 
@@ -3973,7 +4211,6 @@ def test_provider_material_genesis_is_create_only_and_partial_state_blocks_retry
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
         _clock=lambda: _NOW,
-        _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
     )
     _persist_provider_material_genesis_for_test(
         partial_artifact_paths,
@@ -3987,7 +4224,6 @@ def test_provider_material_genesis_is_create_only_and_partial_state_blocks_retry
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
         _clock=lambda: _NOW,
-        _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
     )
     provider_secret = "secret-bearing-provider-error"
     partial_store = _CreateOnlyMaterialStore(fail_after=1, failure_message=provider_secret)
@@ -4006,7 +4242,6 @@ def test_provider_material_genesis_is_create_only_and_partial_state_blocks_retry
             materials=partial_values,
             _store=partial_store,
             _clock=lambda: _NOW,
-            _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
         )
     assert provider_secret not in "".join(traceback.format_exception(caught.value))
     assert caught.value.__cause__ is None
@@ -4016,6 +4251,35 @@ def test_provider_material_genesis_is_create_only_and_partial_state_blocks_retry
         provider_material_genesis_status(partial_artifact_paths, _store=partial_store).value
         == "partial_or_reconciliation_required"
     )
+
+
+def test_keychain_provenance_adapter_rejects_copied_material_policy(tmp_path: Path) -> None:
+    root = tmp_path / "adapter-canonical-policy"
+    issuer, _fingerprints, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    intent = _initial_intent(
+        paths,
+        signer=issuer,
+        journal=_initial_journal(tmp_path, paths),
+        proposal=_proposal(provider="macos_keychain"),
+    )
+    values = _provider_material_values()
+    fingerprints = _material_fingerprints(intent, values)
+    policy, _attestation, _genesis = _provider_material_bundle(
+        intent,
+        signer=issuer,
+        fingerprints=fingerprints,
+    )
+    drifted_spec = policy.materials[0].model_copy(
+        update={"format": ProviderMaterialFormat.HMAC_SHA256_RAW_32_V1.value}
+    )
+    drifted_policy = policy.model_copy(update={"materials": (drifted_spec, *policy.materials[1:])})
+
+    with pytest.raises(ProviderCryptoError, match="material_policy"):
+        MacOSKeychainProviderProvenanceAdapter(
+            drifted_policy,
+            _store=_CreateOnlyMaterialStore(),
+        )
 
 
 def test_public_material_persistence_cannot_use_a_historical_clock(tmp_path: Path) -> None:
@@ -4054,6 +4318,12 @@ def test_public_material_persistence_cannot_use_a_historical_clock(tmp_path: Pat
     artifact_paths = ProviderMaterialArtifactPaths(root)
 
     assert "now" not in inspect.signature(persist_provider_material_policy).parameters
+    persist_signer_genesis(
+        artifact_paths,
+        signer_genesis,
+        issuer=issuer,
+        initial_intent=intent,
+    )
     with pytest.raises(ProviderCryptoError, match="material_policy"):
         persist_provider_material_policy(
             artifact_paths,
@@ -4121,6 +4391,7 @@ def test_signer_genesis_binds_keychain_seed_and_refuses_duplicate_creation(tmp_p
     )
     store = _CreateOnlyMaterialStore()
     signer = provision_keychain_ed25519_signer(
+        artifact_paths,
         genesis,
         issuer=issuer,
         initial_intent=intent,
@@ -4141,6 +4412,13 @@ def test_signer_genesis_binds_keychain_seed_and_refuses_duplicate_creation(tmp_p
     )
     assert not hasattr(signer, "sign")
     signer.key().verify(signer.sign_artifact(artifact), replay_authority_policy_message(artifact))
+
+    class _RawService(str):
+        pass
+
+    drifted_artifact = artifact.model_copy(update={"service": _RawService(artifact.service)})
+    with pytest.raises(ProviderCryptoError, match="keychain_signer_scope"):
+        signer.sign_artifact(drifted_artifact)
     wrong_intent_artifact = artifact.model_copy(update={"initial_intent_sha256": "f" * 64})
     with pytest.raises(ProviderCryptoError, match="keychain_signer_scope"):
         signer.sign_artifact(wrong_intent_artifact)
@@ -4173,6 +4451,7 @@ def test_signer_genesis_binds_keychain_seed_and_refuses_duplicate_creation(tmp_p
     duplicate_seed = bytearray(b"s" * 32)
     with pytest.raises(ProviderCryptoError, match="keychain_signer_replayed"):
         provision_keychain_ed25519_signer(
+            artifact_paths,
             genesis,
             issuer=issuer,
             initial_intent=intent,
@@ -4180,6 +4459,198 @@ def test_signer_genesis_binds_keychain_seed_and_refuses_duplicate_creation(tmp_p
             _store=store,
         )
     assert not any(duplicate_seed)
+
+
+def test_signer_genesis_is_pinned_before_keychain_writes_and_orphans_block(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "durable-signer-artifacts"
+    issuer, _fingerprints, issuer_key = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    intent = _initial_intent(paths, signer=issuer, journal=_initial_journal(tmp_path, paths))
+    provider_signer, genesis = _provider_signer_for_intent(intent, issuer=issuer)
+    private_key = _TEST_SIGNING_KEYS[provider_signer.public_key_fingerprint_sha256]
+    seed = bytearray(
+        private_key.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+    )
+    artifact_paths = ProviderMaterialArtifactPaths(root)
+
+    class _GenesisCheckingStore(_CreateOnlyMaterialStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.checked = False
+
+        def add_if_absent(self, service: str, account: str, value: bytearray) -> bool:
+            genesis_path = root / artifact_paths.signer_genesis_name()
+            assert genesis_path.is_file()
+            assert genesis_path.stat().st_mode & 0o777 == 0o600
+            assert (
+                load_verified_signer_genesis(
+                    artifact_paths,
+                    issuer=issuer,
+                    initial_intent=intent,
+                )
+                == genesis
+            )
+            self.checked = True
+            return super().add_if_absent(service, account, value)
+
+    store = _GenesisCheckingStore()
+    provision_keychain_ed25519_signer(
+        artifact_paths,
+        genesis,
+        issuer=issuer,
+        initial_intent=intent,
+        seed=seed,
+        _store=store,
+    )
+    assert store.checked
+    assert not any(seed)
+
+    replacement_private = Ed25519PrivateKey.generate()
+    replacement_public = replacement_private.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    replacement_seed = bytearray(
+        replacement_private.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+    )
+    unsigned_replacement = genesis.model_copy(
+        update={
+            "key_id": "replacement-provider-signer",
+            "public_key_base64": base64.b64encode(replacement_public).decode(),
+            "public_key_fingerprint_sha256": _digest(replacement_public),
+            "seed_fingerprint_sha256": _digest(replacement_seed),
+            "signature_base64": base64.b64encode(b"0" * 64).decode(),
+        }
+    )
+    replacement = unsigned_replacement.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                issuer_key.sign(signer_genesis_message(unsigned_replacement))
+            ).decode()
+        }
+    )
+    blocked_store = _CreateOnlyMaterialStore()
+    with pytest.raises(ProviderCryptoError, match="artifact_replayed"):
+        provision_keychain_ed25519_signer(
+            artifact_paths,
+            replacement,
+            issuer=issuer,
+            initial_intent=intent,
+            seed=replacement_seed,
+            _store=blocked_store,
+        )
+    assert not blocked_store.records
+    assert not any(replacement_seed)
+
+    # The signed file is held under an exclusive descriptor lease during the
+    # irreversible add.  A same-owner writer that ignores that advisory lease
+    # can still mutate the open inode, so the post-add descriptor revalidation
+    # must fail closed rather than report a successful bootstrap.
+    mutating_root = tmp_path / "mutating-signer-artifacts"
+    mutating_issuer, _mutating_fingerprints, _ = _authorize_materials(mutating_root)
+    mutating_paths = AuthorizationPaths(mutating_root)
+    mutating_intent = _initial_intent(
+        mutating_paths,
+        signer=mutating_issuer,
+        journal=_initial_journal(tmp_path, mutating_paths),
+    )
+    mutating_provider_signer, mutating_genesis = _provider_signer_for_intent(
+        mutating_intent,
+        issuer=mutating_issuer,
+    )
+    mutating_private_key = _TEST_SIGNING_KEYS[
+        mutating_provider_signer.public_key_fingerprint_sha256
+    ]
+    mutating_seed = bytearray(
+        mutating_private_key.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+    )
+    mutating_artifact_paths = ProviderMaterialArtifactPaths(mutating_root)
+
+    class _MutatingSignerStore(_CreateOnlyMaterialStore):
+        def add_if_absent(self, service: str, account: str, value: bytearray) -> bool:
+            created = super().add_if_absent(service, account, value)
+            signer_path = mutating_root / mutating_artifact_paths.signer_genesis_name()
+            with signer_path.open("r+b", buffering=0) as handle:
+                original = handle.read(1)
+                assert original
+                handle.seek(0)
+                handle.write(b"x" if original != b"x" else b"y")
+                handle.flush()
+                os.fsync(handle.fileno())
+            return created
+
+    mutating_store = _MutatingSignerStore()
+    with pytest.raises(ProviderCryptoError, match="signer_genesis"):
+        provision_keychain_ed25519_signer(
+            mutating_artifact_paths,
+            mutating_genesis,
+            issuer=mutating_issuer,
+            initial_intent=mutating_intent,
+            seed=mutating_seed,
+            _store=mutating_store,
+        )
+    # The irreversible row may already exist, but the public API has not
+    # blessed it: recovery is an orphan/fail-closed state, never success.
+    assert mutating_store.records
+    assert not any(mutating_seed)
+
+    orphan_root = tmp_path / "orphan-material-artifacts"
+    orphan_issuer, _orphan_fingerprints, _ = _authorize_materials(orphan_root)
+    orphan_paths = AuthorizationPaths(orphan_root)
+    orphan_intent = _initial_intent(
+        orphan_paths,
+        signer=orphan_issuer,
+        journal=_initial_journal(tmp_path, orphan_paths),
+        proposal=_proposal(provider="macos_keychain"),
+    )
+    values = _provider_material_values()
+    fingerprints = _material_fingerprints(orphan_intent, values)
+    policy, attestation, material_genesis = _provider_material_bundle(
+        orphan_intent,
+        signer=orphan_issuer,
+        fingerprints=fingerprints,
+    )
+    orphan_provider_signer, orphan_signer_genesis = _provider_signer_for_intent(
+        orphan_intent,
+        issuer=orphan_issuer,
+    )
+    orphan_artifact_paths = ProviderMaterialArtifactPaths(orphan_root)
+    # A manually prepared policy/manifest without a durable signer trust
+    # anchor is an orphaned crash/manual state, never a material-create path.
+    _write(orphan_root, orphan_artifact_paths.policy_name(), policy)
+    _write(orphan_root, orphan_artifact_paths.genesis_name(), material_genesis)
+    orphan_store = _CreateOnlyMaterialStore()
+    with pytest.raises(ProviderCryptoError, match="artifact_read"):
+        provision_keychain_materials(
+            orphan_artifact_paths,
+            policy=policy,
+            genesis=material_genesis,
+            attestation=attestation,
+            signer=orphan_provider_signer,
+            signer_genesis=orphan_signer_genesis,
+            issuer=orphan_issuer,
+            initial_intent=orphan_intent,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            materials=values,
+            _store=orphan_store,
+        )
+    assert not orphan_store.records
+    assert all(not any(value) for value in values.values())
 
 
 def test_phase_b_rejects_forged_provider_attestation_before_effect(tmp_path: Path) -> None:
@@ -4233,7 +4704,6 @@ def test_phase_b_rejects_forged_provider_attestation_before_effect(tmp_path: Pat
             replay_authority=authority,
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
     assert not called
     assert caught.value.__cause__ is None
@@ -4289,7 +4759,6 @@ def test_phase_b_rejects_manual_provider_without_terminal_material_artifacts(
             replay_authority=authority,
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
     assert not called
 
@@ -4319,7 +4788,85 @@ def test_tls_initial_intent_never_claims_or_reaches_an_effect(tmp_path: Path) ->
             replay_policy=_TEST_REPLAY_POLICY,
             replay_policy_artifact=_replay_policy_artifact(intent, signer=signer),
             _clock=lambda: _NOW,
-            _capability=_TEST_CLOCK_CAPABILITY,
         )
     assert not authority.tombstones
     assert journal.migration_status() is InitialProvisioningJournalStatus.ABSENT
+
+
+def test_tls_type_drift_is_blocked_before_replay_or_keychain_creation(tmp_path: Path) -> None:
+    """Raw strings and construction escapes cannot turn TLS into a non-TLS plan."""
+
+    root = tmp_path / "tls-type-drift-artifacts"
+    issuer, _fingerprints, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    typed_journal = _initial_journal(tmp_path, paths)
+    typed_intent = _initial_intent(
+        paths,
+        signer=issuer,
+        journal=typed_journal,
+        proposal=_proposal(tls=True),
+    )
+    provider_signer, signer_genesis = _provider_signer_for_intent(typed_intent, issuer=issuer)
+    provider_key = _TEST_SIGNING_KEYS[provider_signer.public_key_fingerprint_sha256]
+    provider_seed = provider_key.private_bytes(
+        serialization.Encoding.Raw,
+        serialization.PrivateFormat.Raw,
+        serialization.NoEncryption(),
+    )
+
+    class _TlsProfileSubclass(str):
+        pass
+
+    raw_transport = typed_intent.plan.transport.model_copy(update={"profile": "tls_verified_v1"})
+    subclass_transport = typed_intent.plan.transport.model_copy(
+        update={"profile": _TlsProfileSubclass("tls_verified_v1")}
+    )
+    constructed_transport_fields = typed_intent.plan.transport.model_dump(mode="python")
+    constructed_transport_fields["profile"] = "tls_verified_v1"
+    constructed_transport = TransportContractV1.model_construct(**constructed_transport_fields)
+    constructed_intent_fields = typed_intent.model_dump(mode="python")
+    constructed_intent_fields["plan"] = typed_intent.plan.model_copy(
+        update={"transport": constructed_transport}
+    )
+    drifted_intents = (
+        typed_intent.model_copy(
+            update={"plan": typed_intent.plan.model_copy(update={"transport": raw_transport})}
+        ),
+        typed_intent.model_copy(
+            update={"plan": typed_intent.plan.model_copy(update={"transport": subclass_transport})}
+        ),
+        InitialProvisioningIntentV1.model_construct(**constructed_intent_fields),
+    )
+
+    for index, drifted_intent in enumerate(drifted_intents):
+        authority = _AtomicReplayAuthority()
+        journal = SQLiteInitialProvisioningJournal(tmp_path / f"tls-drift-{index}.sqlite3")
+        with pytest.raises(AuthorizationError, match=r"initial_intent|tls_termination"):
+            provision_initial_journal(
+                paths,
+                signer=issuer,
+                expected_disposal_owner="acceptance-owner",
+                expected_approver_identity="approval-owner",
+                journal=journal,
+                intent=drifted_intent,
+                replay_authority=authority,
+                replay_policy=_TEST_REPLAY_POLICY,
+                replay_policy_artifact=_replay_policy_artifact(typed_intent, signer=issuer),
+            )
+        assert not authority.tombstones
+        assert journal.migration_status() is InitialProvisioningJournalStatus.ABSENT
+
+        seed = bytearray(provider_seed)
+        store = _CreateOnlyMaterialStore()
+        with pytest.raises(ProviderCryptoError, match=r"initial_intent|tls_termination"):
+            provision_keychain_ed25519_signer(
+                ProviderMaterialArtifactPaths(root),
+                signer_genesis,
+                issuer=issuer,
+                initial_intent=drifted_intent,
+                seed=seed,
+                _store=store,
+            )
+        assert not store.records
+        assert not any(seed)
+        assert not (root / ProviderMaterialArtifactPaths.signer_genesis_name()).exists()

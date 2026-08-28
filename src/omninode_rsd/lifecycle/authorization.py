@@ -57,9 +57,11 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     RuntimeContractV1,
     TargetAttestationV1,
     _OwnerOnlyReader,
+    _strict_canonical_model,
     _UniqueLoader,
     compile_preflight,
     initial_provisioning_intent_sha256,
+    strict_canonical_initial_provisioning_intent,
     validate_observed_candidate_transition,
 )
 from omninode_rsd.lifecycle.provider_crypto import (
@@ -122,8 +124,6 @@ _INITIAL_VERIFIED_CAPABILITY: Final = object()
 _INITIAL_INTENT_CAPABILITY: Final = object()
 _JOURNAL_PIN_CAPABILITY: Final = object()
 _INITIAL_JOURNAL_PIN_CAPABILITY: Final = object()
-_TEST_CLOCK_CAPABILITY: Final = object()
-_SYSTEM_CLOCK_CAPABILITY: Final = object()
 _SAFE_CALL_FAILURE: Final = object()
 _OPERATION_TABLE: Final = "authorization_operation_journal"
 _JOURNAL_METADATA_TABLE: Final = "authorization_journal_metadata"
@@ -982,11 +982,14 @@ def _claim_replay_tombstone(
 ) -> None:
     method = _replay_claim_method(authority)
     result = _safe_call(lambda: method(tombstone))
-    if result is ReplayAuthorityClaimResult.CREATED:
+    if (
+        type(result) is ReplayAuthorityClaimResult
+        and result.value == ReplayAuthorityClaimResult.CREATED.value
+    ):
         return
-    if result in {
-        ReplayAuthorityClaimResult.DUPLICATE_SAME,
-        ReplayAuthorityClaimResult.DUPLICATE_CONFLICT,
+    if type(result) is ReplayAuthorityClaimResult and result.value in {
+        ReplayAuthorityClaimResult.DUPLICATE_SAME.value,
+        ReplayAuthorityClaimResult.DUPLICATE_CONFLICT.value,
     }:
         raise AuthorizationError(phase)
     raise AuthorizationError("replay_authority_failure")
@@ -1164,9 +1167,10 @@ def _parse_document(raw: bytes, *, phase: str) -> dict[str, object]:
 
 def _parse_signature(raw: bytes) -> DetachedAuthorizationSignatureV1:
     try:
-        return DetachedAuthorizationSignatureV1.model_validate(
+        parsed = DetachedAuthorizationSignatureV1.model_validate(
             _parse_document(raw, phase="signature_artifact")
         )
+        return _strict_canonical_model(parsed, DetachedAuthorizationSignatureV1)
     except (AuthorizationError, ValidationError, ValueError):
         raise AuthorizationError("signature_artifact") from None
 
@@ -1220,6 +1224,12 @@ def _journal_genesis_message(receipt: JournalGenesisReceiptV1) -> bytes:
 def _verify_journal_genesis_signature(
     receipt: JournalGenesisReceiptV1, *, signer: TrustedEd25519SignerV1
 ) -> None:
+    receipt = cast(
+        JournalGenesisReceiptV1,
+        _canonical_artifact_model(
+            receipt, JournalGenesisReceiptV1, phase="journal_genesis_signature"
+        ),
+    )
     if (
         type(receipt) is not JournalGenesisReceiptV1
         or type(signer) is not TrustedEd25519SignerV1
@@ -1258,6 +1268,7 @@ def _observed_candidate_attestation_message(attestation: ObservedCandidateAttest
 def _verify_initial_intent_signature(
     intent: InitialProvisioningIntentV1, *, signer: TrustedEd25519SignerV1
 ) -> None:
+    intent = _canonical_initial_intent(intent)
     if (
         type(intent) is not InitialProvisioningIntentV1
         or type(signer) is not TrustedEd25519SignerV1
@@ -1277,6 +1288,14 @@ def _verify_observed_candidate_attestation_signature(
     *,
     signer: TrustedEd25519SignerV1,
 ) -> None:
+    attestation = cast(
+        ObservedCandidateAttestationV1,
+        _canonical_artifact_model(
+            attestation,
+            ObservedCandidateAttestationV1,
+            phase="observed_attestation_signature",
+        ),
+    )
     if (
         type(attestation) is not ObservedCandidateAttestationV1
         or type(signer) is not TrustedEd25519SignerV1
@@ -1418,7 +1437,8 @@ def _verify_artifact_snapshot(
                 parsed = model_type.model_validate(
                     _parse_document(artifact, phase="evidence_model")
                 )
-            except (AuthorizationError, ValidationError):
+                parsed = _strict_canonical_model(parsed, model_type)
+            except (AuthorizationError, ValidationError, ValueError):
                 raise AuthorizationError("evidence_model") from None
             evidence_models[name] = parsed
             _verify_embedded_marker(signature=signature, model=parsed, signer=signer)
@@ -1429,7 +1449,9 @@ def _verify_artifact_snapshot(
         final_contract = RuntimeContractV1.model_validate(
             _parse_document(snapshot["runtime-contract.yaml"], phase="contract")
         )
-    except (AuthorizationError, ValidationError):
+        proposal = _strict_canonical_model(proposal, ProposalV1)
+        final_contract = _strict_canonical_model(final_contract, RuntimeContractV1)
+    except (AuthorizationError, ValidationError, ValueError):
         raise AuthorizationError("proposal_contract") from None
     if datetime.fromisoformat(proposal.retention_expires_at.removesuffix("Z") + "+00:00") <= now:
         raise AuthorizationError("retention")
@@ -1467,6 +1489,7 @@ def _verify_journal_genesis_artifact(
         receipt = JournalGenesisReceiptV1.model_validate(
             _parse_document(raw, phase="journal_genesis_artifact")
         )
+        receipt = _strict_canonical_model(receipt, JournalGenesisReceiptV1)
     except (AuthorizationError, ValidationError, ValueError):
         raise AuthorizationError("journal_genesis_artifact") from None
     _verify_journal_genesis_binding(
@@ -1580,6 +1603,7 @@ def _read_initial_stage_artifacts(
         intent = InitialProvisioningIntentV1.model_validate(
             _parse_document(raw[paths.initial_intent_name()], phase="initial_intent_artifact")
         )
+        intent = _canonical_initial_intent(intent)
         receipt = InitialProvisioningEffectReceiptV1.model_validate(
             _parse_document(raw[paths.initial_receipt_name()], phase="initial_receipt_artifact")
         )
@@ -1588,6 +1612,8 @@ def _read_initial_stage_artifacts(
                 raw[paths.observed_attestation_name()], phase="observed_attestation_artifact"
             )
         )
+        receipt = _strict_canonical_model(receipt, InitialProvisioningEffectReceiptV1)
+        attestation = _strict_canonical_model(attestation, ObservedCandidateAttestationV1)
     except (AuthorizationError, DisposablePreflightError, ValidationError, ValueError):
         raise AuthorizationError("initial_stage_artifact") from None
     _verify_initial_intent_signature(intent, signer=signer)
@@ -1634,6 +1660,7 @@ def _read_verified_initial_intent(
         intent = InitialProvisioningIntentV1.model_validate(
             _parse_document(raw, phase="initial_intent_artifact")
         )
+        intent = _canonical_initial_intent(intent)
     except (AuthorizationError, DisposablePreflightError, ValidationError, ValueError):
         raise AuthorizationError("initial_intent_artifact") from None
     _verify_initial_intent_signature(intent, signer=signer)
@@ -1677,6 +1704,7 @@ def _read_replay_policy_artifact(
         artifact = ReplayAuthorityPolicyArtifactV1.model_validate(
             _parse_document(raw, phase="replay_policy_artifact")
         )
+        artifact = _strict_canonical_model(artifact, ReplayAuthorityPolicyArtifactV1)
         verify_replay_authority_policy_artifact(
             artifact,
             signer=signer,
@@ -3496,6 +3524,14 @@ class SQLiteAuthorizationJournal:
     ) -> JournalMigrationStatus:
         """Resolve a pending genesis only with typed signed operator evidence."""
 
+        receipt = cast(
+            JournalGenesisReconciliationReceiptV1,
+            _canonical_artifact_model(
+                receipt,
+                JournalGenesisReconciliationReceiptV1,
+                phase="journal_genesis_reconciliation",
+            ),
+        )
         _verify_journal_genesis_reconciliation_receipt(receipt, signer=signer)
         with self._identity_lease() as lease:
             lease.assert_stable()
@@ -3856,7 +3892,7 @@ class SQLiteAuthorizationJournal:
                 (
                     AuthorizationOperationState.FAILED_RECOVERY_REQUIRED.value,
                     "explicit_recovery",
-                    datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                    _system_utc_clock().isoformat(timespec="seconds").replace("+00:00", "Z"),
                     operation_id,
                     AuthorizationOperationState.CLAIMED.value,
                     AuthorizationOperationState.IN_PROGRESS.value,
@@ -3886,6 +3922,14 @@ class SQLiteAuthorizationJournal:
         and perform no automatic retry.
         """
 
+        receipt = cast(
+            ReconciliationReceiptV1,
+            _canonical_artifact_model(
+                receipt,
+                ReconciliationReceiptV1,
+                phase="reconciliation_signature",
+            ),
+        )
         _verify_reconciliation_receipt(receipt, signer=signer)
 
         def reconcile(connection: sqlite3.Connection) -> str:
@@ -3914,7 +3958,7 @@ class SQLiteAuthorizationJournal:
                     AuthorizationOperationState.COMMITTED.value,
                     receipt.effect_receipt_sha256,
                     "reconciled",
-                    datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                    _system_utc_clock().isoformat(timespec="seconds").replace("+00:00", "Z"),
                     receipt.operation_id,
                     receipt.idempotency_key,
                     AuthorizationOperationState.IN_PROGRESS.value,
@@ -4452,7 +4496,11 @@ class SQLiteInitialProvisioningJournal:
         intent = verified.intent
         with self._identity_lease() as lease:
             lease.assert_stable()
-            if self.migration_status() is not InitialProvisioningJournalStatus.ABSENT:
+            status = self.migration_status()
+            if (
+                type(status) is not InitialProvisioningJournalStatus
+                or status.value != InitialProvisioningJournalStatus.ABSENT.value
+            ):
                 raise AuthorizationError("initial_journal_replayed")
             marker = _InitialJournalMarkerV1(
                 schema_version="rsd.initial-provisioning-journal-marker.v1",
@@ -4557,8 +4605,14 @@ class SQLiteInitialProvisioningJournal:
         can only be explicitly abandoned, preserving the external tombstone.
         """
 
-        if type(receipt) is not InitialJournalGenesisReconciliationReceiptV1:
-            raise AuthorizationError("initial_journal_reconciliation")
+        receipt = cast(
+            InitialJournalGenesisReconciliationReceiptV1,
+            _canonical_artifact_model(
+                receipt,
+                InitialJournalGenesisReconciliationReceiptV1,
+                phase="initial_journal_reconciliation",
+            ),
+        )
         with self._identity_lease() as lease:
             lease.assert_stable()
             marker = self._read_marker()
@@ -4855,7 +4909,7 @@ class SQLiteInitialProvisioningJournal:
                 (
                     InitialProvisioningOperationState.FAILED_RECOVERY_REQUIRED.value,
                     "explicit_recovery",
-                    datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                    _system_utc_clock().isoformat(timespec="seconds").replace("+00:00", "Z"),
                     provisioning_operation_id,
                     InitialProvisioningOperationState.CLAIMED.value,
                     InitialProvisioningOperationState.IN_PROGRESS.value,
@@ -4872,9 +4926,10 @@ class SQLiteInitialProvisioningJournal:
 
 
 def _validate_effect_receipt(context: VerifiedExecutionContext, value: object) -> EffectReceiptV1:
-    if type(value) is not EffectReceiptV1:
-        raise AuthorizationError("effect_receipt")
-    receipt = value
+    receipt = cast(
+        EffectReceiptV1,
+        _canonical_artifact_model(value, EffectReceiptV1, phase="effect_receipt"),
+    )
     if (
         receipt.operation_kind != context.operation_kind
         or receipt.operation_id != context.operation_id
@@ -4889,9 +4944,14 @@ def _validate_initial_effect_receipt(
 ) -> InitialProvisioningEffectReceiptV1:
     """Reject every effect output outside the one empty-resource scope."""
 
-    if type(value) is not InitialProvisioningEffectReceiptV1:
-        raise AuthorizationError("initial_effect_receipt")
-    receipt = value
+    receipt = cast(
+        InitialProvisioningEffectReceiptV1,
+        _canonical_artifact_model(
+            value,
+            InitialProvisioningEffectReceiptV1,
+            phase="initial_effect_receipt",
+        ),
+    )
     if (
         receipt.operation_kind != context.operation_kind
         or receipt.operation_scope != context.operation_scope
@@ -4932,6 +4992,14 @@ def _verify_journal_genesis_reconciliation_receipt(
     *,
     signer: TrustedEd25519SignerV1,
 ) -> None:
+    receipt = cast(
+        JournalGenesisReconciliationReceiptV1,
+        _canonical_artifact_model(
+            receipt,
+            JournalGenesisReconciliationReceiptV1,
+            phase="journal_genesis_reconciliation_signature",
+        ),
+    )
     if (
         type(receipt) is not JournalGenesisReconciliationReceiptV1
         or type(signer) is not TrustedEd25519SignerV1
@@ -4959,6 +5027,14 @@ def _verify_initial_journal_genesis_reconciliation_receipt(
     *,
     signer: TrustedEd25519SignerV1,
 ) -> None:
+    receipt = cast(
+        InitialJournalGenesisReconciliationReceiptV1,
+        _canonical_artifact_model(
+            receipt,
+            InitialJournalGenesisReconciliationReceiptV1,
+            phase="initial_journal_reconciliation_signature",
+        ),
+    )
     if (
         type(receipt) is not InitialJournalGenesisReconciliationReceiptV1
         or type(signer) is not TrustedEd25519SignerV1
@@ -4975,6 +5051,14 @@ def _verify_initial_journal_genesis_reconciliation_receipt(
 def _verify_reconciliation_receipt(
     receipt: ReconciliationReceiptV1, *, signer: TrustedEd25519SignerV1
 ) -> None:
+    receipt = cast(
+        ReconciliationReceiptV1,
+        _canonical_artifact_model(
+            receipt,
+            ReconciliationReceiptV1,
+            phase="reconciliation_signature",
+        ),
+    )
     if (
         type(receipt) is not ReconciliationReceiptV1
         or type(signer) is not TrustedEd25519SignerV1
@@ -4989,15 +5073,28 @@ def _verify_reconciliation_receipt(
         raise AuthorizationError("reconciliation_signature")
 
 
-def _read_clock(clock: Callable[[], datetime]) -> datetime:
-    observed = _safe_call(clock)
-    if type(observed) is not datetime or observed.tzinfo is None or observed.utcoffset() is None:
-        raise AuthorizationError("clock")
-    return observed.astimezone(UTC)
-
-
 def _system_utc_clock() -> datetime:
     return datetime.now(UTC)
+
+
+def _canonical_initial_intent(intent: InitialProvisioningIntentV1) -> InitialProvisioningIntentV1:
+    """Reject Pydantic construction/copy drift before an authorization decision."""
+
+    try:
+        return strict_canonical_initial_provisioning_intent(intent)
+    except ValueError:
+        raise AuthorizationError("initial_intent_artifact") from None
+
+
+def _canonical_artifact_model(
+    model: object, model_type: type[BaseModel], *, phase: str
+) -> BaseModel:
+    """Revalidate caller-supplied signed models before a journal or effect path."""
+
+    try:
+        return _strict_canonical_model(model, model_type)
+    except ValueError:
+        raise AuthorizationError(phase) from None
 
 
 def _acquire_provider_lease(
@@ -5071,15 +5168,19 @@ def _check_observed_stage_stability(
 
     journal._assert_pinned_execution_identity(journal_pin)
     journal.assert_intent(intent)
+    state = journal.operation_state(intent.intent.provisioning_operation_id)
     if (
-        journal.operation_state(intent.intent.provisioning_operation_id)
-        is not InitialProvisioningOperationState.PROVISIONED_EMPTY
+        type(state) is not InitialProvisioningOperationState
+        or state.value != InitialProvisioningOperationState.PROVISIONED_EMPTY.value
     ):
         raise AuthorizationError("initial_operation_state")
 
 
 def _require_current_initial_journal(status: InitialProvisioningJournalStatus) -> None:
-    if status is InitialProvisioningJournalStatus.CURRENT:
+    if (
+        type(status) is InitialProvisioningJournalStatus
+        and status.value == InitialProvisioningJournalStatus.CURRENT.value
+    ):
         return
     phases = {
         InitialProvisioningJournalStatus.ABSENT: "initial_journal_absent",
@@ -5118,19 +5219,24 @@ def _verify_initial_intent_binding(
 def _require_tls_termination_profile(profile: object) -> None:
     """Keep TLS profiles outside every current create and effect boundary."""
 
-    if profile is DisposableTransportProfile.TLS_VERIFIED:
+    if (
+        type(profile) is not DisposableTransportProfile
+        or profile.value == DisposableTransportProfile.TLS_VERIFIED.value
+    ):
         raise AuthorizationError("tls_termination_amendment_required")
 
 
-def _require_tls_termination_amendment(intent: InitialProvisioningIntentV1) -> None:
-    """Reject malformed and TLS initial intents at the effect boundary."""
+def _require_tls_termination_amendment(
+    intent: InitialProvisioningIntentV1,
+) -> InitialProvisioningIntentV1:
+    """Return canonical non-TLS intent at an effect boundary."""
 
-    if type(intent) is not InitialProvisioningIntentV1:
-        raise AuthorizationError("tls_termination_amendment_required")
-    _require_tls_termination_profile(intent.plan.transport.profile)
+    canonical = _canonical_initial_intent(intent)
+    _require_tls_termination_profile(canonical.plan.transport.profile)
+    return canonical
 
 
-def _provision_initial_journal_with_clock(
+def _provision_initial_journal(
     paths: AuthorizationPaths,
     *,
     signer: TrustedEd25519SignerV1,
@@ -5141,13 +5247,9 @@ def _provision_initial_journal_with_clock(
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
     replay_policy_artifact: ReplayAuthorityPolicyArtifactV1,
-    clock: Callable[[], datetime],
-    _capability: object,
 ) -> InitialJournalProvisioningReceiptV1:
     """Explicit create-once initial journal provisioning from a signed intent."""
 
-    if _capability not in {_TEST_CLOCK_CAPABILITY, _SYSTEM_CLOCK_CAPABILITY}:
-        raise AuthorizationError("test_clock")
     if (
         type(paths) is not AuthorizationPaths
         or type(signer) is not TrustedEd25519SignerV1
@@ -5157,8 +5259,25 @@ def _provision_initial_journal_with_clock(
         or type(replay_policy_artifact) is not ReplayAuthorityPolicyArtifactV1
     ):
         raise AuthorizationError("initial_journal_genesis")
+    intent = _require_tls_termination_amendment(intent)
+    replay_policy = cast(
+        ReplayAuthorityPolicyV1,
+        _canonical_artifact_model(
+            replay_policy,
+            ReplayAuthorityPolicyV1,
+            phase="replay_authority_policy",
+        ),
+    )
+    replay_policy_artifact = cast(
+        ReplayAuthorityPolicyArtifactV1,
+        _canonical_artifact_model(
+            replay_policy_artifact,
+            ReplayAuthorityPolicyArtifactV1,
+            phase="replay_policy_artifact",
+        ),
+    )
     _replay_claim_method(replay_authority)
-    now = _read_clock(clock)
+    now = _system_utc_clock()
     _verify_initial_intent_signature(intent, signer=signer)
     replay_policy_verified = _safe_call(
         lambda: verify_replay_authority_policy_artifact(
@@ -5191,10 +5310,13 @@ def _provision_initial_journal_with_clock(
         capability=_INITIAL_INTENT_CAPABILITY,
     )
     _verify_initial_intent_binding(verified, journal=journal, replay_policy=replay_policy)
-    _require_tls_termination_amendment(intent)
     with ArtifactRootLease(paths.root) as artifact_lease:
         artifact_lease.assert_stable()
-        if journal.migration_status() is not InitialProvisioningJournalStatus.ABSENT:
+        journal_status = journal.migration_status()
+        if (
+            type(journal_status) is not InitialProvisioningJournalStatus
+            or journal_status.value != InitialProvisioningJournalStatus.ABSENT.value
+        ):
             raise AuthorizationError("initial_journal_replayed")
         artifact_lease.assert_absent(paths.initial_intent_name(), phase="initial_journal_replayed")
         artifact_lease.assert_absent(paths.initial_receipt_name(), phase="initial_journal_replayed")
@@ -5264,7 +5386,7 @@ def provision_initial_journal(
 ) -> InitialJournalProvisioningReceiptV1:
     """Provision the separate pre-creation journal exactly once."""
 
-    return _provision_initial_journal_with_clock(
+    return _provision_initial_journal(
         paths,
         signer=signer,
         expected_disposal_owner=expected_disposal_owner,
@@ -5274,41 +5396,6 @@ def provision_initial_journal(
         replay_authority=replay_authority,
         replay_policy=replay_policy,
         replay_policy_artifact=replay_policy_artifact,
-        clock=_system_utc_clock,
-        _capability=_SYSTEM_CLOCK_CAPABILITY,
-    )
-
-
-def _provision_initial_journal_for_test(
-    paths: AuthorizationPaths,
-    *,
-    signer: TrustedEd25519SignerV1,
-    expected_disposal_owner: str,
-    expected_approver_identity: str,
-    journal: SQLiteInitialProvisioningJournal,
-    intent: InitialProvisioningIntentV1,
-    replay_authority: ProtocolReplayAuthority,
-    replay_policy: ReplayAuthorityPolicyV1,
-    replay_policy_artifact: ReplayAuthorityPolicyArtifactV1,
-    _clock: Callable[[], datetime],
-    _capability: object,
-) -> InitialJournalProvisioningReceiptV1:
-    """Module-restricted test clock seam for initial journal provisioning."""
-
-    if _capability is not _TEST_CLOCK_CAPABILITY:
-        raise AuthorizationError("test_clock")
-    return _provision_initial_journal_with_clock(
-        paths,
-        signer=signer,
-        expected_disposal_owner=expected_disposal_owner,
-        expected_approver_identity=expected_approver_identity,
-        journal=journal,
-        intent=intent,
-        replay_authority=replay_authority,
-        replay_policy=replay_policy,
-        replay_policy_artifact=replay_policy_artifact,
-        clock=_clock,
-        _capability=_TEST_CLOCK_CAPABILITY,
     )
 
 
@@ -5319,7 +5406,7 @@ def _mark_initial_effect_ambiguous(
         raise AuthorizationError("initial_effect_failed_recovery_required")
 
 
-def _authorize_initial_provisioning_and_execute_with_clock(
+def _run_initial_authorization(
     paths: AuthorizationPaths,
     *,
     signer: TrustedEd25519SignerV1,
@@ -5330,7 +5417,6 @@ def _authorize_initial_provisioning_and_execute_with_clock(
     effect: Callable[[InitialProvisioningExecutionContext], InitialProvisioningEffectReceiptV1],
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
-    clock: Callable[[], datetime],
 ) -> InitialProvisioningExecutionReceiptV1:
     """Authorize only the typed isolated-empty pre-observation effect scope."""
 
@@ -5342,6 +5428,14 @@ def _authorize_initial_provisioning_and_execute_with_clock(
         or not callable(effect)
     ):
         raise AuthorizationError("initial_journal_effect")
+    replay_policy = cast(
+        ReplayAuthorityPolicyV1,
+        _canonical_artifact_model(
+            replay_policy,
+            ReplayAuthorityPolicyV1,
+            phase="replay_authority_policy",
+        ),
+    )
     _replay_claim_method(replay_authority)
     with ArtifactRootLease(paths.root) as artifact_lease:
         artifact_lease.assert_stable()
@@ -5351,13 +5445,17 @@ def _authorize_initial_provisioning_and_execute_with_clock(
             signer=signer,
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
-            now=_read_clock(clock),
+            now=_system_utc_clock(),
             reader=artifact_lease.reader(),
         )
         _verify_initial_intent_binding(
             verified_intent, journal=journal, replay_policy=replay_policy
         )
-        _require_tls_termination_amendment(verified_intent.intent)
+        verified_intent = _VerifiedInitialIntent(
+            intent=_require_tls_termination_amendment(verified_intent.intent),
+            intent_sha256=verified_intent.intent_sha256,
+            capability=_INITIAL_INTENT_CAPABILITY,
+        )
         replay_artifact, replay_raw = _read_replay_policy_artifact(
             paths,
             signer=signer,
@@ -5370,7 +5468,7 @@ def _authorize_initial_provisioning_and_execute_with_clock(
             initial_intent=verified_intent.intent,
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
-            now=_read_clock(clock),
+            now=_system_utc_clock(),
             reader=artifact_lease.reader(),
         )
         journal.assert_intent(verified_intent)
@@ -5396,7 +5494,7 @@ def _authorize_initial_provisioning_and_execute_with_clock(
                 signer=signer,
                 expected_disposal_owner=expected_disposal_owner,
                 expected_approver_identity=expected_approver_identity,
-                now=_read_clock(clock),
+                now=_system_utc_clock(),
                 reader=artifact_lease.reader(),
             )
             if repeated_intent != verified_intent or repeated_raw != initial_raw:
@@ -5415,7 +5513,7 @@ def _authorize_initial_provisioning_and_execute_with_clock(
                 initial_intent=repeated_intent.intent,
                 expected_disposal_owner=expected_disposal_owner,
                 expected_approver_identity=expected_approver_identity,
-                now=_read_clock(clock),
+                now=_system_utc_clock(),
                 reader=artifact_lease.reader(),
             )
             if (
@@ -5441,7 +5539,7 @@ def _authorize_initial_provisioning_and_execute_with_clock(
                 initial_intent=verified_intent.intent,
                 expected_disposal_owner=expected_disposal_owner,
                 expected_approver_identity=expected_approver_identity,
-                now=_read_clock(clock),
+                now=_system_utc_clock(),
                 reader=artifact_lease.reader(),
             )
             if (
@@ -5449,7 +5547,7 @@ def _authorize_initial_provisioning_and_execute_with_clock(
                 or terminal_material_snapshot != material_snapshot
             ):
                 raise AuthorizationError("initial_artifact_race")
-            authorized_at = _read_clock(clock).isoformat(timespec="seconds").replace("+00:00", "Z")
+            authorized_at = _system_utc_clock().isoformat(timespec="seconds").replace("+00:00", "Z")
             context = InitialProvisioningExecutionContext(
                 operation_kind=_INITIAL_OPERATION_KIND,
                 operation_scope="create_isolated_empty_resources_v1",
@@ -5503,7 +5601,7 @@ def _authorize_initial_provisioning_and_execute_with_clock(
                         initial_intent=verified_intent.intent,
                         expected_disposal_owner=expected_disposal_owner,
                         expected_approver_identity=expected_approver_identity,
-                        now=_read_clock(clock),
+                        now=_system_utc_clock(),
                         reader=artifact_lease.reader(),
                     )
                 )
@@ -5591,7 +5689,7 @@ def authorize_initial_provisioning_and_execute(
 ) -> InitialProvisioningExecutionReceiptV1:
     """Use the trusted system clock for the sole initial creation boundary."""
 
-    return _authorize_initial_provisioning_and_execute_with_clock(
+    return _run_initial_authorization(
         paths,
         signer=signer,
         provider=provider,
@@ -5601,43 +5699,10 @@ def authorize_initial_provisioning_and_execute(
         effect=effect,
         replay_authority=replay_authority,
         replay_policy=replay_policy,
-        clock=_system_utc_clock,
     )
 
 
-def _authorize_initial_provisioning_and_execute_for_test(
-    paths: AuthorizationPaths,
-    *,
-    signer: TrustedEd25519SignerV1,
-    provider: ProviderProvenanceAdapter,
-    expected_disposal_owner: str,
-    expected_approver_identity: str,
-    journal: SQLiteInitialProvisioningJournal,
-    effect: Callable[[InitialProvisioningExecutionContext], InitialProvisioningEffectReceiptV1],
-    replay_authority: ProtocolReplayAuthority,
-    replay_policy: ReplayAuthorityPolicyV1,
-    _clock: Callable[[], datetime],
-    _capability: object,
-) -> InitialProvisioningExecutionReceiptV1:
-    """Module-restricted clock seam for adversarial initial-stage tests."""
-
-    if _capability is not _TEST_CLOCK_CAPABILITY:
-        raise AuthorizationError("test_clock")
-    return _authorize_initial_provisioning_and_execute_with_clock(
-        paths,
-        signer=signer,
-        provider=provider,
-        expected_disposal_owner=expected_disposal_owner,
-        expected_approver_identity=expected_approver_identity,
-        journal=journal,
-        effect=effect,
-        replay_authority=replay_authority,
-        replay_policy=replay_policy,
-        clock=_clock,
-    )
-
-
-def _provision_journal_with_clock(
+def _provision_journal(
     paths: AuthorizationPaths,
     *,
     signer: TrustedEd25519SignerV1,
@@ -5647,13 +5712,9 @@ def _provision_journal_with_clock(
     receipt: JournalGenesisReceiptV1,
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
-    clock: Callable[[], datetime],
-    _capability: object,
 ) -> JournalProvisioningReceiptV1:
     """Explicit one-time journal genesis; never called by authorization/effect paths."""
 
-    if _capability is not _TEST_CLOCK_CAPABILITY and _capability is not _SYSTEM_CLOCK_CAPABILITY:
-        raise AuthorizationError("test_clock")
     if (
         type(paths) is not AuthorizationPaths
         or type(signer) is not TrustedEd25519SignerV1
@@ -5662,8 +5723,20 @@ def _provision_journal_with_clock(
         or type(replay_policy) is not ReplayAuthorityPolicyV1
     ):
         raise AuthorizationError("journal_genesis")
+    receipt = cast(
+        JournalGenesisReceiptV1,
+        _canonical_artifact_model(receipt, JournalGenesisReceiptV1, phase="journal_genesis"),
+    )
+    replay_policy = cast(
+        ReplayAuthorityPolicyV1,
+        _canonical_artifact_model(
+            replay_policy,
+            ReplayAuthorityPolicyV1,
+            phase="replay_authority_policy",
+        ),
+    )
     _replay_claim_method(replay_authority)
-    now = _read_clock(clock)
+    now = _system_utc_clock()
     with ArtifactRootLease(paths.root) as artifact_lease:
         artifacts, _ = _verify_artifact_snapshot(
             paths,
@@ -5691,9 +5764,15 @@ def _provision_journal_with_clock(
             capability=_GENESIS_CAPABILITY,
         )
         status = journal.migration_status()
-        if status is JournalMigrationStatus.PROVISIONING_INCOMPLETE:
+        if (
+            type(status) is JournalMigrationStatus
+            and status.value == JournalMigrationStatus.PROVISIONING_INCOMPLETE.value
+        ):
             raise AuthorizationError("provisioning_incomplete")
-        if status is not JournalMigrationStatus.ABSENT:
+        if (
+            type(status) is not JournalMigrationStatus
+            or status.value != JournalMigrationStatus.ABSENT.value
+        ):
             raise AuthorizationError("journal_genesis_replayed")
         artifact_lease.assert_absent(paths.journal_genesis_name(), phase="journal_genesis_replayed")
         journal._begin_verified_genesis(verified)
@@ -5730,7 +5809,7 @@ def provision_journal(
 ) -> JournalProvisioningReceiptV1:
     """Provision exactly one signed journal identity for the supplied artifacts."""
 
-    return _provision_journal_with_clock(
+    return _provision_journal(
         paths,
         signer=signer,
         expected_disposal_owner=expected_disposal_owner,
@@ -5739,39 +5818,6 @@ def provision_journal(
         receipt=receipt,
         replay_authority=replay_authority,
         replay_policy=replay_policy,
-        clock=_system_utc_clock,
-        _capability=_SYSTEM_CLOCK_CAPABILITY,
-    )
-
-
-def _provision_journal_for_test(
-    paths: AuthorizationPaths,
-    *,
-    signer: TrustedEd25519SignerV1,
-    expected_disposal_owner: str,
-    expected_approver_identity: str,
-    journal: SQLiteAuthorizationJournal,
-    receipt: JournalGenesisReceiptV1,
-    replay_authority: ProtocolReplayAuthority,
-    replay_policy: ReplayAuthorityPolicyV1,
-    _clock: Callable[[], datetime],
-    _capability: object,
-) -> JournalProvisioningReceiptV1:
-    """Test-only clock seam, unavailable from the public provisioning entry point."""
-
-    if _capability is not _TEST_CLOCK_CAPABILITY:
-        raise AuthorizationError("test_clock")
-    return _provision_journal_with_clock(
-        paths,
-        signer=signer,
-        expected_disposal_owner=expected_disposal_owner,
-        expected_approver_identity=expected_approver_identity,
-        journal=journal,
-        receipt=receipt,
-        replay_authority=replay_authority,
-        replay_policy=replay_policy,
-        clock=_clock,
-        _capability=_TEST_CLOCK_CAPABILITY,
     )
 
 
@@ -5789,6 +5835,14 @@ def reconcile_journal_genesis(
         or type(signer) is not TrustedEd25519SignerV1
     ):
         raise AuthorizationError("journal_genesis_reconciliation")
+    receipt = cast(
+        JournalGenesisReconciliationReceiptV1,
+        _canonical_artifact_model(
+            receipt,
+            JournalGenesisReconciliationReceiptV1,
+            phase="journal_genesis_reconciliation",
+        ),
+    )
     return journal.reconcile_genesis(receipt, signer=signer)
 
 
@@ -5806,12 +5860,23 @@ def reconcile_initial_journal_genesis(
         or type(signer) is not TrustedEd25519SignerV1
     ):
         raise AuthorizationError("initial_journal_reconciliation")
+    receipt = cast(
+        InitialJournalGenesisReconciliationReceiptV1,
+        _canonical_artifact_model(
+            receipt,
+            InitialJournalGenesisReconciliationReceiptV1,
+            phase="initial_journal_reconciliation",
+        ),
+    )
     _verify_initial_journal_genesis_reconciliation_receipt(receipt, signer=signer)
     return journal.reconcile_genesis(receipt)
 
 
 def _require_current_journal(status: JournalMigrationStatus) -> None:
-    if status is JournalMigrationStatus.CURRENT:
+    if (
+        type(status) is JournalMigrationStatus
+        and status.value == JournalMigrationStatus.CURRENT.value
+    ):
         return
     phases = {
         JournalMigrationStatus.ABSENT: "journal_absent",
@@ -5827,7 +5892,7 @@ def _require_current_journal(status: JournalMigrationStatus) -> None:
     raise AuthorizationError(phases[status])
 
 
-def _authorize_and_execute_with_clock(
+def _run_observed_authorization(
     paths: AuthorizationPaths,
     *,
     signer: TrustedEd25519SignerV1,
@@ -5839,14 +5904,8 @@ def _authorize_and_execute_with_clock(
     effect: Callable[[VerifiedExecutionContext], EffectReceiptV1],
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
-    clock: Callable[[], datetime],
 ) -> ExecutionReceiptV1:
-    """Internal implementation with a capability-hidden test clock.
-
-    The public entry point always supplies the system UTC clock.  A failed
-    callback and any process interruption after ``_begin_effect`` leave an
-    ambiguous operation that cannot be retried automatically.
-    """
+    """Authorize an observed effect using the internal UTC clock at each check."""
 
     if (
         type(paths) is not AuthorizationPaths
@@ -5857,6 +5916,14 @@ def _authorize_and_execute_with_clock(
         or not callable(effect)
     ):
         raise AuthorizationError("journal_effect")
+    replay_policy = cast(
+        ReplayAuthorityPolicyV1,
+        _canonical_artifact_model(
+            replay_policy,
+            ReplayAuthorityPolicyV1,
+            phase="replay_authority_policy",
+        ),
+    )
     _replay_claim_method(replay_authority)
     with ArtifactRootLease(paths.root) as artifact_lease:
         artifact_lease.assert_stable()
@@ -5870,7 +5937,7 @@ def _authorize_and_execute_with_clock(
             expected_approver_identity=expected_approver_identity,
             journal=journal,
             replay_policy=replay_policy,
-            now=_read_clock(clock),
+            now=_system_utc_clock(),
             reader=artifact_lease.reader(),
         )
         initial_stage, initial_stage_snapshot = _read_initial_stage_artifacts(
@@ -5878,7 +5945,7 @@ def _authorize_and_execute_with_clock(
             signer=signer,
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
-            now=_read_clock(clock),
+            now=_system_utc_clock(),
             reader=artifact_lease.reader(),
         )
         verified_initial_intent = _VerifiedInitialIntent(
@@ -5889,7 +5956,11 @@ def _authorize_and_execute_with_clock(
         _verify_initial_intent_binding(
             verified_initial_intent, journal=initial_journal, replay_policy=replay_policy
         )
-        _require_tls_termination_amendment(verified_initial_intent.intent)
+        verified_initial_intent = _VerifiedInitialIntent(
+            intent=_require_tls_termination_amendment(verified_initial_intent.intent),
+            intent_sha256=verified_initial_intent.intent_sha256,
+            capability=_INITIAL_INTENT_CAPABILITY,
+        )
         replay_artifact, replay_raw = _read_replay_policy_artifact(
             paths,
             signer=signer,
@@ -5902,13 +5973,16 @@ def _authorize_and_execute_with_clock(
             initial_intent=initial_stage.intent,
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
-            now=_read_clock(clock),
+            now=_system_utc_clock(),
             reader=artifact_lease.reader(),
         )
         initial_journal.assert_intent(verified_initial_intent)
+        initial_state = initial_journal.operation_state(
+            initial_stage.intent.provisioning_operation_id
+        )
         if (
-            initial_journal.operation_state(initial_stage.intent.provisioning_operation_id)
-            is not InitialProvisioningOperationState.PROVISIONED_EMPTY
+            type(initial_state) is not InitialProvisioningOperationState
+            or initial_state.value != InitialProvisioningOperationState.PROVISIONED_EMPTY.value
         ):
             raise AuthorizationError("initial_operation_state")
         initial_journal_pin = initial_journal._pin_execution_identity()
@@ -5953,7 +6027,7 @@ def _authorize_and_execute_with_clock(
                     expected_approver_identity=expected_approver_identity,
                     journal=journal,
                     replay_policy=replay_policy,
-                    now=_read_clock(clock),
+                    now=_system_utc_clock(),
                     reader=artifact_lease.reader(),
                 )
             )
@@ -5962,7 +6036,7 @@ def _authorize_and_execute_with_clock(
                 signer=signer,
                 expected_disposal_owner=expected_disposal_owner,
                 expected_approver_identity=expected_approver_identity,
-                now=_read_clock(clock),
+                now=_system_utc_clock(),
                 reader=artifact_lease.reader(),
             )
             repeated_replay_artifact, repeated_replay_raw = _read_replay_policy_artifact(
@@ -5977,7 +6051,7 @@ def _authorize_and_execute_with_clock(
                 initial_intent=repeated_stage.intent,
                 expected_disposal_owner=expected_disposal_owner,
                 expected_approver_identity=expected_approver_identity,
-                now=_read_clock(clock),
+                now=_system_utc_clock(),
                 reader=artifact_lease.reader(),
             )
             try:
@@ -6021,7 +6095,7 @@ def _authorize_and_execute_with_clock(
                 or expectations != final_expectations
             ):
                 raise AuthorizationError("provider_race")
-            authorization_clock = _read_clock(clock)
+            authorization_clock = _system_utc_clock()
             terminal_artifacts, terminal_genesis, terminal_snapshot = (
                 _verify_authorization_artifact_snapshot(
                     paths,
@@ -6153,7 +6227,7 @@ def _authorize_and_execute_with_clock(
                         initial_intent=verified_initial_intent.intent,
                         expected_disposal_owner=expected_disposal_owner,
                         expected_approver_identity=expected_approver_identity,
-                        now=_read_clock(clock),
+                        now=_system_utc_clock(),
                         reader=artifact_lease.reader(),
                     )
                 )
@@ -6204,40 +6278,6 @@ def _authorize_and_execute_with_clock(
         return execution_receipt
 
 
-def _authorize_and_execute_for_test(
-    paths: AuthorizationPaths,
-    *,
-    signer: TrustedEd25519SignerV1,
-    provider: ProviderProvenanceAdapter,
-    expected_disposal_owner: str,
-    expected_approver_identity: str,
-    journal: SQLiteAuthorizationJournal,
-    initial_journal: SQLiteInitialProvisioningJournal,
-    effect: Callable[[VerifiedExecutionContext], EffectReceiptV1],
-    replay_authority: ProtocolReplayAuthority,
-    replay_policy: ReplayAuthorityPolicyV1,
-    _clock: Callable[[], datetime],
-    _capability: object,
-) -> ExecutionReceiptV1:
-    """Test-only clock seam, inaccessible from the exported entry point."""
-
-    if _capability is not _TEST_CLOCK_CAPABILITY:
-        raise AuthorizationError("test_clock")
-    return _authorize_and_execute_with_clock(
-        paths,
-        signer=signer,
-        provider=provider,
-        expected_disposal_owner=expected_disposal_owner,
-        expected_approver_identity=expected_approver_identity,
-        journal=journal,
-        initial_journal=initial_journal,
-        effect=effect,
-        replay_authority=replay_authority,
-        replay_policy=replay_policy,
-        clock=_clock,
-    )
-
-
 def authorize_and_execute(
     paths: AuthorizationPaths,
     *,
@@ -6253,7 +6293,7 @@ def authorize_and_execute(
 ) -> ExecutionReceiptV1:
     """Verify, lease, execute once, and commit using the trusted UTC clock."""
 
-    return _authorize_and_execute_with_clock(
+    return _run_observed_authorization(
         paths,
         signer=signer,
         provider=provider,
@@ -6264,7 +6304,6 @@ def authorize_and_execute(
         effect=effect,
         replay_authority=replay_authority,
         replay_policy=replay_policy,
-        clock=_system_utc_clock,
     )
 
 

@@ -158,8 +158,11 @@ typed `ReplayAuthorityPolicyV1`, and one effect callback. It requires actual
 detached-signature sidecars for the proposal, final contract, and evidence
 artifacts; Phase-A signature markers alone never authorize.
 
-The verifier uses its trusted UTC clock rather than a caller-provided time. It
-reads bounded owner-only artifact files through one open root-directory
+The verifier uses its trusted UTC clock rather than a caller-provided time. At
+every bootstrap, journal, and effect boundary it round-trips signed models into
+their exact canonical typed forms, so raw strings, enum subclasses, and
+`model_copy()`/`model_construct()` type drift cannot bypass transport policy.
+It reads bounded owner-only artifact files through one open root-directory
 descriptor, runs Phase-A before and after provider inspection, and rejects
 changed content, sidecars, unsafe file metadata, stale evidence, expired
 retention, signer mismatch, provider mismatch, and replayed journal claims.
@@ -254,6 +257,13 @@ The material policy also carries the signer Keychain reference and seed
 fingerprint. That signer item, every material purpose/reference, and every
 material fingerprint must be pairwise distinct, so an Ed25519 seed cannot be
 reused as HMAC, AEAD, or application material.
+
+Before any Keychain `SecItemAdd`, the signed `SignerGenesisV1` trust anchor is
+created or proven byte-identical, fsynced with its owner-only directory,
+descriptor-reopened, and signature/binding verified. Material provisioning
+holds that descriptor-relative root through its create-only writes and
+rechecks the signer genesis before each write; an absent, substituted, or
+orphaned signer state fails closed.
 
 The public material policy has fixed purpose-to-format bindings: commitment
 HMAC and backup AES-256-GCM keys are each 32 raw bytes; the normal Infisical
