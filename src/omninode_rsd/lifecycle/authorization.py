@@ -5236,6 +5236,27 @@ def _require_tls_termination_amendment(
     return canonical
 
 
+def _require_signed_non_tls_initial_intent(
+    intent: InitialProvisioningIntentV1,
+    *,
+    signer: TrustedEd25519SignerV1,
+) -> InitialProvisioningIntentV1:
+    """Validate a supplied stage intent before a mutating boundary opens files.
+
+    The public journal/effect APIs intentionally require the signed initial
+    intent again even though a matching immutable copy is later read under the
+    artifact lease.  This gives unsupported TLS a true zero-side-effect path:
+    no root lock, journal file, replay claim, provider lease, or callback can
+    be reached before the canonical type, signature, and transport profile are
+    rejected.
+    """
+
+    canonical = _canonical_initial_intent(intent)
+    _verify_initial_intent_signature(canonical, signer=signer)
+    _require_tls_termination_profile(canonical.plan.transport.profile)
+    return canonical
+
+
 def _provision_initial_journal(
     paths: AuthorizationPaths,
     *,
@@ -5259,7 +5280,7 @@ def _provision_initial_journal(
         or type(replay_policy_artifact) is not ReplayAuthorityPolicyArtifactV1
     ):
         raise AuthorizationError("initial_journal_genesis")
-    intent = _require_tls_termination_amendment(intent)
+    intent = _require_signed_non_tls_initial_intent(intent, signer=signer)
     replay_policy = cast(
         ReplayAuthorityPolicyV1,
         _canonical_artifact_model(
@@ -5278,7 +5299,6 @@ def _provision_initial_journal(
     )
     _replay_claim_method(replay_authority)
     now = _system_utc_clock()
-    _verify_initial_intent_signature(intent, signer=signer)
     replay_policy_verified = _safe_call(
         lambda: verify_replay_authority_policy_artifact(
             replay_policy_artifact,
@@ -5410,6 +5430,7 @@ def _run_initial_authorization(
     paths: AuthorizationPaths,
     *,
     signer: TrustedEd25519SignerV1,
+    initial_intent: InitialProvisioningIntentV1,
     provider: ProviderProvenanceAdapter,
     expected_disposal_owner: str,
     expected_approver_identity: str,
@@ -5423,11 +5444,13 @@ def _run_initial_authorization(
     if (
         type(paths) is not AuthorizationPaths
         or type(signer) is not TrustedEd25519SignerV1
+        or type(initial_intent) is not InitialProvisioningIntentV1
         or type(journal) is not SQLiteInitialProvisioningJournal
         or type(replay_policy) is not ReplayAuthorityPolicyV1
         or not callable(effect)
     ):
         raise AuthorizationError("initial_journal_effect")
+    initial_intent = _require_signed_non_tls_initial_intent(initial_intent, signer=signer)
     replay_policy = cast(
         ReplayAuthorityPolicyV1,
         _canonical_artifact_model(
@@ -5451,6 +5474,8 @@ def _run_initial_authorization(
         _verify_initial_intent_binding(
             verified_intent, journal=journal, replay_policy=replay_policy
         )
+        if verified_intent.intent != initial_intent:
+            raise AuthorizationError("initial_intent_binding")
         verified_intent = _VerifiedInitialIntent(
             intent=_require_tls_termination_amendment(verified_intent.intent),
             intent_sha256=verified_intent.intent_sha256,
@@ -5679,6 +5704,7 @@ def authorize_initial_provisioning_and_execute(
     paths: AuthorizationPaths,
     *,
     signer: TrustedEd25519SignerV1,
+    initial_intent: InitialProvisioningIntentV1,
     provider: ProviderProvenanceAdapter,
     expected_disposal_owner: str,
     expected_approver_identity: str,
@@ -5692,6 +5718,7 @@ def authorize_initial_provisioning_and_execute(
     return _run_initial_authorization(
         paths,
         signer=signer,
+        initial_intent=initial_intent,
         provider=provider,
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
@@ -5709,6 +5736,8 @@ def _provision_journal(
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
+    initial_journal: SQLiteInitialProvisioningJournal,
+    initial_intent: InitialProvisioningIntentV1,
     receipt: JournalGenesisReceiptV1,
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
@@ -5719,10 +5748,13 @@ def _provision_journal(
         type(paths) is not AuthorizationPaths
         or type(signer) is not TrustedEd25519SignerV1
         or type(journal) is not SQLiteAuthorizationJournal
+        or type(initial_journal) is not SQLiteInitialProvisioningJournal
+        or type(initial_intent) is not InitialProvisioningIntentV1
         or type(receipt) is not JournalGenesisReceiptV1
         or type(replay_policy) is not ReplayAuthorityPolicyV1
     ):
         raise AuthorizationError("journal_genesis")
+    initial_intent = _require_signed_non_tls_initial_intent(initial_intent, signer=signer)
     receipt = cast(
         JournalGenesisReceiptV1,
         _canonical_artifact_model(receipt, JournalGenesisReceiptV1, phase="journal_genesis"),
@@ -5747,6 +5779,64 @@ def _provision_journal(
             reader=artifact_lease.reader(),
         )
         _require_tls_termination_profile(artifacts.proposal.transport.profile)
+        initial_stage, _ = _read_initial_stage_artifacts(
+            paths,
+            signer=signer,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            now=now,
+            reader=artifact_lease.reader(),
+        )
+        if initial_stage.intent != initial_intent:
+            raise AuthorizationError("initial_intent_binding")
+        verified_initial_intent = _VerifiedInitialIntent(
+            intent=_require_tls_termination_amendment(initial_stage.intent),
+            intent_sha256=initial_provisioning_intent_sha256(initial_stage.intent),
+            capability=_INITIAL_INTENT_CAPABILITY,
+        )
+        _require_current_initial_journal(initial_journal.migration_status())
+        _verify_initial_intent_binding(
+            verified_initial_intent,
+            journal=initial_journal,
+            replay_policy=replay_policy,
+        )
+        initial_journal.assert_intent(verified_initial_intent)
+        initial_state = initial_journal.operation_state(
+            initial_stage.intent.provisioning_operation_id
+        )
+        if (
+            type(initial_state) is not InitialProvisioningOperationState
+            or initial_state.value != InitialProvisioningOperationState.PROVISIONED_EMPTY.value
+        ):
+            raise AuthorizationError("initial_operation_state")
+        initial_journal_pin = initial_journal._pin_execution_identity()
+        try:
+            validate_observed_candidate_transition(
+                initial_stage.intent,
+                initial_stage.receipt,
+                initial_stage.attestation,
+                artifacts.proposal,
+                artifacts.final_contract,
+            )
+        except ValueError:
+            raise AuthorizationError("initial_stage_transition") from None
+        _check_observed_stage_stability(
+            initial_journal,
+            initial_journal_pin,
+            verified_initial_intent,
+        )
+        # Observed genesis shares the initial stage's durable, signed replay
+        # namespace.  It is never permitted to claim an external tombstone
+        # from a transient caller policy object or before that predecessor has
+        # committed its isolated-empty creation receipt.
+        replay_artifact, replay_raw = _read_replay_policy_artifact(
+            paths,
+            signer=signer,
+            initial_intent=verified_initial_intent.intent,
+            replay_policy=replay_policy,
+            reader=artifact_lease.reader(),
+        )
+        artifact_lease.assert_stable()
         _verify_journal_genesis_binding(
             receipt,
             artifacts=artifacts,
@@ -5776,12 +5866,41 @@ def _provision_journal(
             raise AuthorizationError("journal_genesis_replayed")
         artifact_lease.assert_absent(paths.journal_genesis_name(), phase="journal_genesis_replayed")
         journal._begin_verified_genesis(verified)
+        replay_before_claim, replay_before_claim_raw = _read_replay_policy_artifact(
+            paths,
+            signer=signer,
+            initial_intent=verified_initial_intent.intent,
+            replay_policy=replay_policy,
+            reader=artifact_lease.reader(),
+        )
+        if replay_before_claim != replay_artifact or replay_before_claim_raw != replay_raw:
+            raise AuthorizationError("replay_policy_artifact")
+        artifact_lease.assert_stable()
+        _check_observed_stage_stability(
+            initial_journal,
+            initial_journal_pin,
+            verified_initial_intent,
+        )
         _claim_replay_tombstone(
             replay_authority,
             _genesis_tombstone(replay_policy, verified),
             phase="journal_genesis_replayed",
         )
+        replay_after_claim, replay_after_claim_raw = _read_replay_policy_artifact(
+            paths,
+            signer=signer,
+            initial_intent=verified_initial_intent.intent,
+            replay_policy=replay_policy,
+            reader=artifact_lease.reader(),
+        )
+        if replay_after_claim != replay_artifact or replay_after_claim_raw != replay_raw:
+            raise AuthorizationError("replay_policy_artifact")
         artifact_lease.assert_stable()
+        _check_observed_stage_stability(
+            initial_journal,
+            initial_journal_pin,
+            verified_initial_intent,
+        )
         artifact_lease.write_once(
             paths.journal_genesis_name(), raw, phase="journal_genesis_replayed"
         )
@@ -5803,6 +5922,8 @@ def provision_journal(
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
+    initial_journal: SQLiteInitialProvisioningJournal,
+    initial_intent: InitialProvisioningIntentV1,
     receipt: JournalGenesisReceiptV1,
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
@@ -5815,6 +5936,8 @@ def provision_journal(
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
         journal=journal,
+        initial_journal=initial_journal,
+        initial_intent=initial_intent,
         receipt=receipt,
         replay_authority=replay_authority,
         replay_policy=replay_policy,
@@ -5896,6 +6019,7 @@ def _run_observed_authorization(
     paths: AuthorizationPaths,
     *,
     signer: TrustedEd25519SignerV1,
+    initial_intent: InitialProvisioningIntentV1,
     provider: ProviderProvenanceAdapter,
     expected_disposal_owner: str,
     expected_approver_identity: str,
@@ -5910,12 +6034,14 @@ def _run_observed_authorization(
     if (
         type(paths) is not AuthorizationPaths
         or type(signer) is not TrustedEd25519SignerV1
+        or type(initial_intent) is not InitialProvisioningIntentV1
         or type(journal) is not SQLiteAuthorizationJournal
         or type(initial_journal) is not SQLiteInitialProvisioningJournal
         or type(replay_policy) is not ReplayAuthorityPolicyV1
         or not callable(effect)
     ):
         raise AuthorizationError("journal_effect")
+    initial_intent = _require_signed_non_tls_initial_intent(initial_intent, signer=signer)
     replay_policy = cast(
         ReplayAuthorityPolicyV1,
         _canonical_artifact_model(
@@ -5956,6 +6082,8 @@ def _run_observed_authorization(
         _verify_initial_intent_binding(
             verified_initial_intent, journal=initial_journal, replay_policy=replay_policy
         )
+        if verified_initial_intent.intent != initial_intent:
+            raise AuthorizationError("initial_intent_binding")
         verified_initial_intent = _VerifiedInitialIntent(
             intent=_require_tls_termination_amendment(verified_initial_intent.intent),
             intent_sha256=verified_initial_intent.intent_sha256,
@@ -6282,6 +6410,7 @@ def authorize_and_execute(
     paths: AuthorizationPaths,
     *,
     signer: TrustedEd25519SignerV1,
+    initial_intent: InitialProvisioningIntentV1,
     provider: ProviderProvenanceAdapter,
     expected_disposal_owner: str,
     expected_approver_identity: str,
@@ -6296,6 +6425,7 @@ def authorize_and_execute(
     return _run_observed_authorization(
         paths,
         signer=signer,
+        initial_intent=initial_intent,
         provider=provider,
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,

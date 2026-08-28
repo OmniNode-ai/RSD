@@ -740,7 +740,7 @@ def verify_signer_genesis(
         SignerGenesisV1,
         _canonical_artifact(genesis, SignerGenesisV1, phase="signer_genesis"),
     )
-    initial_intent = _canonical_initial_intent(initial_intent)
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
     _verify_initial_intent_signature(initial_intent, issuer=issuer)
     _verify_signed(genesis, domain=_SIGNER_GENESIS_DOMAIN, signer=issuer)
     if genesis.initial_intent_sha256 != initial_provisioning_intent_sha256(initial_intent):
@@ -759,7 +759,7 @@ def trusted_signer_from_genesis(
         SignerGenesisV1,
         _canonical_artifact(genesis, SignerGenesisV1, phase="signer_genesis"),
     )
-    initial_intent = _canonical_initial_intent(initial_intent)
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
     verify_signer_genesis(genesis, issuer=issuer, initial_intent=initial_intent)
     try:
         public_key = _canonical_base64(genesis.public_key_base64)
@@ -781,7 +781,7 @@ def verify_replay_authority_policy_artifact(
         ReplayAuthorityPolicyArtifactV1,
         _canonical_artifact(artifact, ReplayAuthorityPolicyArtifactV1, phase="replay_policy"),
     )
-    initial_intent = _canonical_initial_intent(initial_intent)
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
     if type(expected_policy_sha256) is not str:
         raise ProviderCryptoError("replay_policy")
     _verify_initial_intent_signature(initial_intent, issuer=signer)
@@ -825,7 +825,7 @@ def _verify_material_signer(
         SignerGenesisV1,
         _canonical_artifact(signer_genesis, SignerGenesisV1, phase="signer_genesis"),
     )
-    initial_intent = _canonical_initial_intent(initial_intent)
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
     verify_signer_genesis(signer_genesis, issuer=issuer, initial_intent=initial_intent)
     valid = False
     try:
@@ -870,7 +870,7 @@ def _verify_provider_material_policy_at(
         SignerGenesisV1,
         _canonical_artifact(signer_genesis, SignerGenesisV1, phase="signer_genesis"),
     )
-    initial_intent = _canonical_initial_intent(initial_intent)
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
     if (
         type(expected_disposal_owner) is not str
         or type(expected_approver_identity) is not str
@@ -961,7 +961,7 @@ def _verify_provider_fingerprint_attestation_at(
         SignerGenesisV1,
         _canonical_artifact(signer_genesis, SignerGenesisV1, phase="signer_genesis"),
     )
-    initial_intent = _canonical_initial_intent(initial_intent)
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
     if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:
         raise ProviderCryptoError("fingerprint_attestation")
     _verify_material_signer(
@@ -1117,7 +1117,7 @@ def verify_provider_material_genesis(
         SignerGenesisV1,
         _canonical_artifact(signer_genesis, SignerGenesisV1, phase="signer_genesis"),
     )
-    initial_intent = _canonical_initial_intent(initial_intent)
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
     _verify_material_signer(
         signer=signer,
         signer_genesis=signer_genesis,
@@ -1405,7 +1405,7 @@ class KeychainEd25519Signer:
         initial_intent: InitialProvisioningIntentV1,
         _store: _KeychainTransport | None = None,
     ) -> None:
-        initial_intent = _canonical_initial_intent(initial_intent)
+        initial_intent = _reject_unsupported_tls_termination(initial_intent)
         genesis = cast(
             SignerGenesisV1,
             _canonical_artifact(genesis, SignerGenesisV1, phase="signer_genesis"),
@@ -1604,7 +1604,7 @@ def load_keychain_ed25519_signer(
 ) -> KeychainEd25519Signer:
     """Load only an issuer-verified persistent signer genesis and Keychain seed."""
 
-    initial_intent = _canonical_initial_intent(initial_intent)
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
     genesis = load_verified_signer_genesis(
         paths,
         issuer=issuer,
@@ -2134,6 +2134,10 @@ def _require_persisted_signer_genesis_in_directory(
 ) -> SignerGenesisV1:
     """Require an exact durable signer genesis through the held root FD."""
 
+    # This helper is also reached by material readiness paths.  Reject an
+    # unsupported TLS intent before the descriptor performs even a read so a
+    # pre-populated artifact directory cannot make TLS look ready.
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
     canonical_genesis = cast(
         SignerGenesisV1,
         _canonical_artifact(genesis, SignerGenesisV1, phase="signer_genesis"),
@@ -2202,7 +2206,7 @@ def load_verified_signer_genesis(
 ) -> SignerGenesisV1:
     """Load a persisted signer genesis through the owner-only descriptor boundary."""
 
-    initial_intent = _canonical_initial_intent(initial_intent)
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
     with _OwnerOnlyArtifactDirectory(paths.root) as directory:
         raw = directory.read(paths.signer_genesis_name())
         genesis = cast(
@@ -2227,11 +2231,11 @@ def _load_verified_signer_genesis_from_reader(
 ) -> tuple[SignerGenesisV1, str]:
     """Load the trust anchor from an authorization-pinned root descriptor."""
 
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
     try:
         raw = reader.read(_SIGNER_GENESIS_NAME)
     except Exception:
         raise ProviderCryptoError("signer_genesis") from None
-    initial_intent = _canonical_initial_intent(initial_intent)
     genesis = cast(
         SignerGenesisV1,
         _load_model(raw, SignerGenesisV1, phase="signer_genesis"),
@@ -2698,6 +2702,7 @@ def _load_verified_provider_material_bundle_at(
 ) -> tuple[ProviderMaterialPolicyV1, ProviderMaterialGenesisV1, ProviderFingerprintAttestationV1]:
     """Load and verify only completed material artifacts through one root fd."""
 
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
     policy, genesis, attestation = _read_material_artifacts(paths)
     if attestation is None:
         raise ProviderCryptoError("material_genesis_pending")
@@ -2736,7 +2741,7 @@ def load_verified_provider_material_bundle(
 ) -> tuple[ProviderMaterialPolicyV1, ProviderMaterialGenesisV1, ProviderFingerprintAttestationV1]:
     """Load only a cryptographically verified terminal material state."""
 
-    initial_intent = _canonical_initial_intent(initial_intent)
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
     signer_genesis = _require_persisted_signer_genesis(
         paths,
         signer_genesis,
@@ -2780,6 +2785,7 @@ def _load_verified_provider_material_bundle_from_reader_at(
     effect path.
     """
 
+    initial_intent = _reject_unsupported_tls_termination(initial_intent)
     try:
         raw_signer_genesis = reader.read(_SIGNER_GENESIS_NAME)
         raw_policy = reader.read(_MATERIAL_POLICY_NAME)
@@ -2801,7 +2807,6 @@ def _load_verified_provider_material_bundle_from_reader_at(
     )
     if not hmac.compare_digest(raw_signer_genesis, _yaml_bytes(persisted_signer_genesis)):
         raise ProviderCryptoError("signer_genesis")
-    initial_intent = _canonical_initial_intent(initial_intent)
     verify_signer_genesis(
         persisted_signer_genesis,
         issuer=issuer,

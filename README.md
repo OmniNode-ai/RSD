@@ -148,6 +148,9 @@ server certificate and server signing-key custody, every Phase-B journal and eff
 boundary rejects that profile with
 `tls_termination_amendment_required` before a provider lease, local create,
 external tombstone, or callback can run.
+The same strict canonical-and-signed transport check is performed before any
+provider-crypto readiness or Keychain signer load, so a manually pre-populated
+TLS-profile provider state is not reported as usable.
 
 `omninode_rsd.lifecycle.authorize_and_execute()` is the observed-lifecycle
 mutation-admission boundary for a disposable acceptance workflow. It accepts
@@ -183,6 +186,11 @@ complete the initial stage above and invoke `provision_journal()` once with a
 trusted Ed25519-signed `JournalGenesisReceiptV1`. That receipt commits to the
 operation/proposal/final hashes, expected owner and approver, canonical journal path, fresh journal ID,
 and journal schema digest, including the exact replay-policy digest.
+Observed journal genesis also requires the caller's exact signed initial intent
+and a committed `provisioned_empty` predecessor in the initial journal. Before
+it can claim its external tombstone, it descriptor-reopens and verifies the
+immutable initial replay-policy artifact; a transient caller policy, a missing
+preimage, or an observed-genesis-before-initial attempt fails closed.
 Provisioning writes an owner-only pending marker before it claims a
 create-once external genesis tombstone and creates the database. The
 authorization path claims a second, operation tombstone before its local

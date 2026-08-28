@@ -203,6 +203,7 @@ def _authorize_initial_provisioning_and_execute_for_test(
     paths: AuthorizationPaths,
     *,
     signer: TrustedEd25519SignerV1,
+    initial_intent: InitialProvisioningIntentV1 | None = None,
     provider: object,
     expected_disposal_owner: str,
     expected_approver_identity: str,
@@ -212,10 +213,13 @@ def _authorize_initial_provisioning_and_execute_for_test(
     replay_policy: ReplayAuthorityPolicyV1,
     _clock: Callable[[], datetime],
 ) -> object:
+    if initial_intent is None:
+        initial_intent = _initial_intent(paths, signer=signer, journal=journal)
     with _patched_system_clock(authorization_module, _clock):
         return authorize_initial_provisioning_and_execute(
             paths,
             signer=signer,
+            initial_intent=initial_intent,
             provider=provider,
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
@@ -233,11 +237,17 @@ def _provision_journal_for_test(
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
+    initial_journal: SQLiteInitialProvisioningJournal | None = None,
+    initial_intent: InitialProvisioningIntentV1 | None = None,
     receipt: JournalGenesisReceiptV1,
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
     _clock: Callable[[], datetime],
 ) -> object:
+    if initial_journal is None:
+        initial_journal = _initial_journal(paths.root.parent, paths)
+    if initial_intent is None:
+        initial_intent = _initial_intent(paths, signer=signer, journal=initial_journal)
     with _patched_system_clock(authorization_module, _clock):
         return provision_journal(
             paths,
@@ -245,6 +255,8 @@ def _provision_journal_for_test(
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
             journal=journal,
+            initial_journal=initial_journal,
+            initial_intent=initial_intent,
             receipt=receipt,
             replay_authority=replay_authority,
             replay_policy=replay_policy,
@@ -255,6 +267,7 @@ def _authorize_and_execute_for_test(
     paths: AuthorizationPaths,
     *,
     signer: TrustedEd25519SignerV1,
+    initial_intent: InitialProvisioningIntentV1 | None = None,
     provider: object,
     expected_disposal_owner: str,
     expected_approver_identity: str,
@@ -265,10 +278,13 @@ def _authorize_and_execute_for_test(
     replay_policy: ReplayAuthorityPolicyV1,
     _clock: Callable[[], datetime],
 ) -> ExecutionReceiptV1:
+    if initial_intent is None:
+        initial_intent = _initial_intent(paths, signer=signer, journal=initial_journal)
     with _patched_system_clock(authorization_module, _clock):
         return authorize_and_execute(
             paths,
             signer=signer,
+            initial_intent=initial_intent,
             provider=provider,
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
@@ -1844,7 +1860,7 @@ def _ensure_test_initial_stage(
     expected_approver_identity: str,
     journal: SQLiteInitialProvisioningJournal,
     replay_authority: ProtocolReplayAuthority,
-) -> None:
+) -> InitialProvisioningIntentV1:
     with _TEST_PROVISION_LOCK:
         if journal.migration_status() is InitialProvisioningJournalStatus.ABSENT:
             intent = _initial_intent(paths, signer=signer, journal=journal)
@@ -1869,6 +1885,7 @@ def _ensure_test_initial_stage(
             _authorize_initial_provisioning_and_execute_for_test(
                 paths,
                 signer=signer,
+                initial_intent=intent,
                 provider=provider,
                 expected_disposal_owner=expected_disposal_owner,
                 expected_approver_identity=expected_approver_identity,
@@ -1886,6 +1903,8 @@ def _ensure_test_initial_stage(
                 paths.observed_attestation_name(),
                 _observed_attestation(intent, stored, signer=signer),
             )
+        raw = (paths.root / paths.initial_intent_name()).read_bytes()
+        return InitialProvisioningIntentV1.model_validate(yaml.safe_load(raw))
 
 
 def _root_lock_path(root: Path) -> Path:
@@ -1955,11 +1974,17 @@ def _ensure_test_journal_provisioned(
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
+    initial_journal: SQLiteInitialProvisioningJournal | None = None,
+    initial_intent: InitialProvisioningIntentV1 | None = None,
     replay_authority: ProtocolReplayAuthority | None = None,
 ) -> None:
     """Use the explicit public provisioning boundary; authorization never does this."""
 
     authority = _test_replay_authority(journal) if replay_authority is None else replay_authority
+    if initial_journal is None:
+        initial_journal = _initial_journal(paths.root.parent, paths)
+    if initial_intent is None:
+        initial_intent = _initial_intent(paths, signer=signer, journal=initial_journal)
     with _TEST_PROVISION_LOCK:
         if journal.migration_status() is not JournalMigrationStatus.ABSENT:
             return
@@ -1976,6 +2001,8 @@ def _ensure_test_journal_provisioned(
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
             journal=journal,
+            initial_journal=initial_journal,
+            initial_intent=initial_intent,
             receipt=receipt,
             replay_authority=authority,
             replay_policy=_TEST_REPLAY_POLICY,
@@ -2028,17 +2055,30 @@ def _execute_for_test(
 ) -> ExecutionReceiptV1:
     authority = _test_replay_authority(journal) if replay_authority is None else replay_authority
     initial_journal = _initial_journal(paths.root.parent, paths)
+    initial_intent = _initial_intent(paths, signer=signer, journal=initial_journal)
     if provision:
+        initial_intent = _ensure_test_initial_stage(
+            paths,
+            signer=signer,
+            provider=provider,
+            provider_fingerprints=provider_fingerprints,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            journal=initial_journal,
+            replay_authority=authority,
+        )
         _ensure_test_journal_provisioned(
             paths,
             signer=signer,
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
             journal=journal,
+            initial_journal=initial_journal,
+            initial_intent=initial_intent,
             replay_authority=authority,
         )
-    if journal.migration_status() is JournalMigrationStatus.CURRENT:
-        _ensure_test_initial_stage(
+    elif journal.migration_status() is JournalMigrationStatus.CURRENT:
+        initial_intent = _ensure_test_initial_stage(
             paths,
             signer=signer,
             provider=provider,
@@ -2051,6 +2091,7 @@ def _execute_for_test(
     return _authorize_and_execute_for_test(
         paths,
         signer=signer,
+        initial_intent=initial_intent,
         provider=provider,
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
@@ -2456,15 +2497,7 @@ def test_public_authorization_cannot_rewind_stale_stage_time(tmp_path: Path) -> 
     initial_journal = _initial_journal(tmp_path, paths)
     authority = _test_replay_authority(journal)
     provider = _Provider(fingerprints)
-    _ensure_test_journal_provisioned(
-        paths,
-        signer=signer,
-        expected_disposal_owner="acceptance-owner",
-        expected_approver_identity="approval-owner",
-        journal=journal,
-        replay_authority=authority,
-    )
-    _ensure_test_initial_stage(
+    initial_intent = _ensure_test_initial_stage(
         paths,
         signer=signer,
         provider=provider,
@@ -2472,6 +2505,16 @@ def test_public_authorization_cannot_rewind_stale_stage_time(tmp_path: Path) -> 
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
         journal=initial_journal,
+        replay_authority=authority,
+    )
+    _ensure_test_journal_provisioned(
+        paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        initial_journal=initial_journal,
+        initial_intent=initial_intent,
         replay_authority=authority,
     )
     called = False
@@ -2485,6 +2528,7 @@ def test_public_authorization_cannot_rewind_stale_stage_time(tmp_path: Path) -> 
         authorize_and_execute(
             paths,
             signer=signer,
+            initial_intent=initial_intent,
             provider=provider,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
@@ -2646,6 +2690,120 @@ def test_initial_replay_policy_substitution_blocks_before_external_claim(tmp_pat
     assert journal.migration_status() is InitialProvisioningJournalStatus.ABSENT
 
 
+def test_observed_genesis_requires_completed_initial_stage_and_durable_replay_policy(
+    tmp_path: Path,
+) -> None:
+    """Observed genesis cannot get ahead of the signed initial-stage preimage."""
+
+    root = tmp_path / "ordered-observed-genesis"
+    signer, fingerprints, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    journal = _journal(tmp_path)
+    initial_journal = _initial_journal(tmp_path, paths)
+    unsigned_stage_intent = _initial_intent(paths, signer=signer, journal=initial_journal)
+    receipt = _journal_genesis_receipt(
+        paths,
+        signer=signer,
+        journal=journal,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+    )
+
+    class _PolicyVisibleAuthority(_AtomicReplayAuthority):
+        def __init__(self) -> None:
+            super().__init__()
+            self.observed_genesis_policy_visible = False
+
+        def claim_once(self, tombstone: ReplayTombstoneV1) -> ReplayAuthorityClaimResult:
+            if tombstone.kind == "observed_genesis":
+                policy_path = root / paths.replay_policy_name()
+                self.observed_genesis_policy_visible = (
+                    policy_path.read_bytes()
+                    == yaml.safe_dump(
+                        _replay_policy_artifact(unsigned_stage_intent, signer=signer).model_dump(
+                            mode="json"
+                        ),
+                        sort_keys=True,
+                    ).encode()
+                    and initial_journal.operation_state(
+                        unsigned_stage_intent.provisioning_operation_id
+                    )
+                    is InitialProvisioningOperationState.PROVISIONED_EMPTY
+                )
+            return super().claim_once(tombstone)
+
+    authority = _PolicyVisibleAuthority()
+    # A valid future observed receipt is never enough: the separate initial
+    # operation must have committed its bounded creation receipt first.
+    with pytest.raises(AuthorizationError, match="initial_stage_artifact"):
+        _provision_journal_for_test(
+            paths,
+            signer=signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            initial_journal=initial_journal,
+            initial_intent=unsigned_stage_intent,
+            receipt=receipt,
+            replay_authority=authority,
+            replay_policy=_TEST_REPLAY_POLICY,
+            _clock=lambda: _NOW,
+        )
+    assert not authority.tombstones
+    assert journal.migration_status() is JournalMigrationStatus.ABSENT
+
+    initial_intent = _ensure_test_initial_stage(
+        paths,
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=initial_journal,
+        replay_authority=authority,
+    )
+    policy_path = root / paths.replay_policy_name()
+    policy_bytes = policy_path.read_bytes()
+    policy_path.unlink()
+    claims_before_missing_preimage = tuple(authority.tombstones)
+    with pytest.raises(AuthorizationError, match="replay_policy_artifact"):
+        _provision_journal_for_test(
+            paths,
+            signer=signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            initial_journal=initial_journal,
+            initial_intent=initial_intent,
+            receipt=receipt,
+            replay_authority=authority,
+            replay_policy=_TEST_REPLAY_POLICY,
+            _clock=lambda: _NOW,
+        )
+    assert tuple(authority.tombstones) == claims_before_missing_preimage
+    assert journal.migration_status() is JournalMigrationStatus.ABSENT
+
+    # Operator restoration must be the exact signed initial preimage; observed
+    # provisioning reopens and verifies it immediately before the claim.
+    policy_path.write_bytes(policy_bytes)
+    policy_path.chmod(0o600)
+    _provision_journal_for_test(
+        paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        initial_journal=initial_journal,
+        initial_intent=initial_intent,
+        receipt=receipt,
+        replay_authority=authority,
+        replay_policy=_TEST_REPLAY_POLICY,
+        _clock=lambda: _NOW,
+    )
+    assert authority.observed_genesis_policy_visible
+    assert journal.migration_status() is JournalMigrationStatus.CURRENT
+
+
 def test_external_tombstone_blocks_local_rollback_and_deleted_operation_row(
     tmp_path: Path,
 ) -> None:
@@ -2654,6 +2812,17 @@ def test_external_tombstone_blocks_local_rollback_and_deleted_operation_row(
     paths = AuthorizationPaths(root)
     journal = _journal(tmp_path)
     authority = _test_replay_authority(journal)
+    initial_journal = _initial_journal(tmp_path, paths)
+    initial_intent = _ensure_test_initial_stage(
+        paths,
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=initial_journal,
+        replay_authority=authority,
+    )
     genesis = _journal_genesis_receipt(
         paths,
         signer=signer,
@@ -2667,6 +2836,8 @@ def test_external_tombstone_blocks_local_rollback_and_deleted_operation_row(
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
         journal=journal,
+        initial_journal=initial_journal,
+        initial_intent=initial_intent,
         receipt=genesis,
         replay_authority=authority,
         replay_policy=_TEST_REPLAY_POLICY,
@@ -2788,6 +2959,17 @@ def test_genesis_blocks_pair_removal_replay_and_identity_file_removal(tmp_path: 
     signer, fingerprints, _ = _authorize_materials(root)
     journal = _journal(tmp_path)
     paths = AuthorizationPaths(root)
+    initial_journal = _initial_journal(tmp_path, paths)
+    initial_intent = _ensure_test_initial_stage(
+        paths,
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=initial_journal,
+        replay_authority=_test_replay_authority(journal),
+    )
     genesis = _journal_genesis_receipt(
         paths,
         signer=signer,
@@ -2801,6 +2983,8 @@ def test_genesis_blocks_pair_removal_replay_and_identity_file_removal(tmp_path: 
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
         journal=journal,
+        initial_journal=initial_journal,
+        initial_intent=initial_intent,
         receipt=genesis,
         replay_authority=_test_replay_authority(journal),
         replay_policy=_TEST_REPLAY_POLICY,
@@ -2886,12 +3070,26 @@ def test_genesis_copy_or_removal_blocks_effect_before_claim(tmp_path: Path) -> N
     source_paths = AuthorizationPaths(source)
     target_paths = AuthorizationPaths(target)
     for paths, journal in ((source_paths, source_journal), (target_paths, target_journal)):
+        authority = _test_replay_authority(journal)
+        initial_journal = _initial_journal(paths.root.parent, paths)
+        initial_intent = _ensure_test_initial_stage(
+            paths,
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=initial_journal,
+            replay_authority=authority,
+        )
         _provision_journal_for_test(
             paths,
             signer=signer,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=journal,
+            initial_journal=initial_journal,
+            initial_intent=initial_intent,
             receipt=_journal_genesis_receipt(
                 paths,
                 signer=signer,
@@ -2899,7 +3097,7 @@ def test_genesis_copy_or_removal_blocks_effect_before_claim(tmp_path: Path) -> N
                 expected_disposal_owner="acceptance-owner",
                 expected_approver_identity="approval-owner",
             ),
-            replay_authority=_test_replay_authority(journal),
+            replay_authority=authority,
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
         )
@@ -2947,9 +3145,21 @@ def test_genesis_copy_or_removal_blocks_effect_before_claim(tmp_path: Path) -> N
 
 def test_genesis_rejects_second_provision_and_signed_mismatch(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
-    signer, _, _ = _authorize_materials(root)
+    signer, fingerprints, _ = _authorize_materials(root)
     paths = AuthorizationPaths(root)
     journal = _journal(tmp_path)
+    authority = _test_replay_authority(journal)
+    initial_journal = _initial_journal(tmp_path, paths)
+    initial_intent = _ensure_test_initial_stage(
+        paths,
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=initial_journal,
+        replay_authority=authority,
+    )
     receipt = _journal_genesis_receipt(
         paths,
         signer=signer,
@@ -2963,8 +3173,10 @@ def test_genesis_rejects_second_provision_and_signed_mismatch(tmp_path: Path) ->
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
         journal=journal,
+        initial_journal=initial_journal,
+        initial_intent=initial_intent,
         receipt=receipt,
-        replay_authority=_test_replay_authority(journal),
+        replay_authority=authority,
         replay_policy=_TEST_REPLAY_POLICY,
         _clock=lambda: _NOW,
     )
@@ -2975,16 +3187,30 @@ def test_genesis_rejects_second_provision_and_signed_mismatch(tmp_path: Path) ->
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=journal,
+            initial_journal=initial_journal,
+            initial_intent=initial_intent,
             receipt=receipt,
-            replay_authority=_test_replay_authority(journal),
+            replay_authority=authority,
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
         )
 
     mismatch_root = tmp_path / "mismatch-artifacts"
-    mismatch_signer, _, _ = _authorize_materials(mismatch_root)
+    mismatch_signer, mismatch_fingerprints, _ = _authorize_materials(mismatch_root)
     mismatch_paths = AuthorizationPaths(mismatch_root)
     mismatch_journal = _journal(tmp_path / "mismatch-journal")
+    mismatch_authority = _test_replay_authority(mismatch_journal)
+    mismatch_initial_journal = _initial_journal(tmp_path, mismatch_paths)
+    mismatch_initial_intent = _ensure_test_initial_stage(
+        mismatch_paths,
+        signer=mismatch_signer,
+        provider=_Provider(mismatch_fingerprints),
+        provider_fingerprints=mismatch_fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=mismatch_initial_journal,
+        replay_authority=mismatch_authority,
+    )
     valid = _journal_genesis_receipt(
         mismatch_paths,
         signer=mismatch_signer,
@@ -3002,8 +3228,10 @@ def test_genesis_rejects_second_provision_and_signed_mismatch(tmp_path: Path) ->
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=mismatch_journal,
+            initial_journal=mismatch_initial_journal,
+            initial_intent=mismatch_initial_intent,
             receipt=invalid_signature,
-            replay_authority=_test_replay_authority(mismatch_journal),
+            replay_authority=mismatch_authority,
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
         )
@@ -3024,8 +3252,10 @@ def test_genesis_rejects_second_provision_and_signed_mismatch(tmp_path: Path) ->
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=mismatch_journal,
+            initial_journal=mismatch_initial_journal,
+            initial_intent=mismatch_initial_intent,
             receipt=wrong_owner,
-            replay_authority=_test_replay_authority(mismatch_journal),
+            replay_authority=mismatch_authority,
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
         )
@@ -3036,9 +3266,21 @@ def test_genesis_crash_windows_require_signed_reconciliation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "artifacts"
-    signer, _, _ = _authorize_materials(root)
+    signer, fingerprints, _ = _authorize_materials(root)
     paths = AuthorizationPaths(root)
     journal = _journal(tmp_path)
+    authority = _test_replay_authority(journal)
+    initial_journal = _initial_journal(tmp_path, paths)
+    initial_intent = _ensure_test_initial_stage(
+        paths,
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=initial_journal,
+        replay_authority=authority,
+    )
     receipt = _journal_genesis_receipt(
         paths,
         signer=signer,
@@ -3062,14 +3304,20 @@ def test_genesis_crash_windows_require_signed_reconciliation(
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=journal,
+            initial_journal=initial_journal,
+            initial_intent=initial_intent,
             receipt=receipt,
-            replay_authority=_test_replay_authority(journal),
+            replay_authority=authority,
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
         )
     monkeypatch.setattr(ArtifactRootLease, "write_once", original_write_once)
     assert journal.migration_status() is JournalMigrationStatus.PROVISIONING_INCOMPLETE
     assert not journal._path.exists()
+    assert (root / paths.replay_policy_name()).read_bytes() == yaml.safe_dump(
+        _replay_policy_artifact(initial_intent, signer=signer).model_dump(mode="json"),
+        sort_keys=True,
+    ).encode()
     with pytest.raises(AuthorizationError, match="provisioning_incomplete"):
         _provision_journal_for_test(
             paths,
@@ -3077,8 +3325,10 @@ def test_genesis_crash_windows_require_signed_reconciliation(
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=journal,
+            initial_journal=initial_journal,
+            initial_intent=initial_intent,
             receipt=receipt,
-            replay_authority=_test_replay_authority(journal),
+            replay_authority=authority,
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
         )
@@ -3097,6 +3347,18 @@ def test_genesis_crash_windows_require_signed_reconciliation(
     completed_signer, completed_fingerprints, _ = _authorize_materials(completed_root)
     completed_paths = AuthorizationPaths(completed_root)
     completed_journal = _journal(tmp_path / "completed-journal")
+    completed_authority = _test_replay_authority(completed_journal)
+    completed_initial_journal = _initial_journal(tmp_path, completed_paths)
+    completed_initial_intent = _ensure_test_initial_stage(
+        completed_paths,
+        signer=completed_signer,
+        provider=_Provider(completed_fingerprints),
+        provider_fingerprints=completed_fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=completed_initial_journal,
+        replay_authority=completed_authority,
+    )
     completed_receipt = _journal_genesis_receipt(
         completed_paths,
         signer=completed_signer,
@@ -3118,8 +3380,10 @@ def test_genesis_crash_windows_require_signed_reconciliation(
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=completed_journal,
+            initial_journal=completed_initial_journal,
+            initial_intent=completed_initial_intent,
             receipt=completed_receipt,
-            replay_authority=_test_replay_authority(completed_journal),
+            replay_authority=completed_authority,
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
         )
@@ -3134,8 +3398,10 @@ def test_genesis_crash_windows_require_signed_reconciliation(
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=completed_journal,
+            initial_journal=completed_initial_journal,
+            initial_intent=completed_initial_intent,
             receipt=completed_receipt,
-            replay_authority=_test_replay_authority(completed_journal),
+            replay_authority=completed_authority,
             replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
         )
@@ -3261,12 +3527,28 @@ def test_phase_b_pins_journal_anchor_before_provider_and_effect(tmp_path: Path) 
     root = tmp_path / "artifacts"
     signer, fingerprints, _ = _authorize_materials(root)
     journal = _journal(tmp_path)
+    paths = AuthorizationPaths(root)
+    authority = _test_replay_authority(journal)
+    initial_journal = _initial_journal(tmp_path, paths)
+    initial_intent = _ensure_test_initial_stage(
+        paths,
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=initial_journal,
+        replay_authority=authority,
+    )
     _ensure_test_journal_provisioned(
-        AuthorizationPaths(root),
+        paths,
         signer=signer,
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
         journal=journal,
+        initial_journal=initial_journal,
+        initial_intent=initial_intent,
+        replay_authority=authority,
     )
     _ensure_test_initial_stage(
         AuthorizationPaths(root),
@@ -3445,12 +3727,28 @@ def test_replay_authority_failure_is_value_redacted_and_prevents_effect(tmp_path
     root = tmp_path / "artifacts"
     signer, fingerprints, _ = _authorize_materials(root)
     journal = _journal(tmp_path)
+    paths = AuthorizationPaths(root)
+    initial_authority = _test_replay_authority(journal)
+    initial_journal = _initial_journal(tmp_path, paths)
+    initial_intent = _ensure_test_initial_stage(
+        paths,
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=initial_journal,
+        replay_authority=initial_authority,
+    )
     _ensure_test_journal_provisioned(
-        AuthorizationPaths(root),
+        paths,
         signer=signer,
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
         journal=journal,
+        initial_journal=initial_journal,
+        initial_intent=initial_intent,
+        replay_authority=initial_authority,
     )
 
     class FailingAuthority:
@@ -3851,22 +4149,25 @@ def test_phase_b_rejects_artifact_and_provider_mutation_before_effect(tmp_path: 
     paths = AuthorizationPaths(root)
     journal = _journal(tmp_path)
     authority = _test_replay_authority(journal)
-    _ensure_test_journal_provisioned(
-        paths,
-        signer=signer,
-        expected_disposal_owner="acceptance-owner",
-        expected_approver_identity="approval-owner",
-        journal=journal,
-        replay_authority=authority,
-    )
-    _ensure_test_initial_stage(
+    initial_journal = _initial_journal(tmp_path, paths)
+    initial_intent = _ensure_test_initial_stage(
         paths,
         signer=signer,
         provider=_Provider(fingerprints),
         provider_fingerprints=fingerprints,
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
-        journal=_initial_journal(tmp_path, paths),
+        journal=initial_journal,
+        replay_authority=authority,
+    )
+    _ensure_test_journal_provisioned(
+        paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        initial_journal=initial_journal,
+        initial_intent=initial_intent,
         replay_authority=authority,
     )
     raced_sidecar = root / AuthorizationPaths.signature_name("proposal.yaml")
@@ -3898,22 +4199,25 @@ def test_phase_b_rejects_artifact_and_provider_mutation_before_effect(tmp_path: 
     provider_paths = AuthorizationPaths(provider_root)
     provider_journal = _journal(tmp_path / "provider-journal")
     provider_authority = _test_replay_authority(provider_journal)
-    _ensure_test_journal_provisioned(
-        provider_paths,
-        signer=signer,
-        expected_disposal_owner="acceptance-owner",
-        expected_approver_identity="approval-owner",
-        journal=provider_journal,
-        replay_authority=provider_authority,
-    )
-    _ensure_test_initial_stage(
+    provider_initial_journal = _initial_journal(provider_paths.root.parent, provider_paths)
+    provider_initial_intent = _ensure_test_initial_stage(
         provider_paths,
         signer=signer,
         provider=_Provider(fingerprints),
         provider_fingerprints=fingerprints,
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
-        journal=_initial_journal(provider_paths.root.parent, provider_paths),
+        journal=provider_initial_journal,
+        replay_authority=provider_authority,
+    )
+    _ensure_test_journal_provisioned(
+        provider_paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=provider_journal,
+        initial_journal=provider_initial_journal,
+        initial_intent=provider_initial_intent,
         replay_authority=provider_authority,
     )
     with pytest.raises(AuthorizationError, match="provider_provenance"):
@@ -3958,7 +4262,7 @@ def test_phase_b_rejects_disposal_owner_or_approval_mismatch(tmp_path: Path) -> 
     root = tmp_path / "artifacts"
     signer, fingerprints, _ = _authorize_materials(root)
 
-    with pytest.raises(AuthorizationError, match="owner_approval"):
+    with pytest.raises(AuthorizationError, match=r"initial_intent_freshness|owner_approval"):
         _execute_for_test(
             AuthorizationPaths(root),
             signer=signer,
@@ -4064,7 +4368,7 @@ def test_phase_b_rejects_sidecar_swap_and_noncanonical_base64_alias(tmp_path: Pa
             provider_fingerprints=fingerprints,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
-            journal=_journal(tmp_path),
+            journal=_journal(tmp_path / "alias-journal"),
             effect=_effect,
             now=_NOW,
         )
@@ -4660,15 +4964,7 @@ def test_phase_b_rejects_forged_provider_attestation_before_effect(tmp_path: Pat
     journal = _journal(tmp_path)
     authority = _test_replay_authority(journal)
     initial_journal = _initial_journal(tmp_path, paths)
-    _ensure_test_journal_provisioned(
-        paths,
-        signer=signer,
-        expected_disposal_owner="acceptance-owner",
-        expected_approver_identity="approval-owner",
-        journal=journal,
-        replay_authority=authority,
-    )
-    _ensure_test_initial_stage(
+    initial_intent = _ensure_test_initial_stage(
         paths,
         signer=signer,
         provider=_Provider(fingerprints),
@@ -4676,6 +4972,16 @@ def test_phase_b_rejects_forged_provider_attestation_before_effect(tmp_path: Pat
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
         journal=initial_journal,
+        replay_authority=authority,
+    )
+    _ensure_test_journal_provisioned(
+        paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        initial_journal=initial_journal,
+        initial_intent=initial_intent,
         replay_authority=authority,
     )
     attestation_path = root / ProviderMaterialArtifactPaths.attestation_name()
@@ -4695,6 +5001,7 @@ def test_phase_b_rejects_forged_provider_attestation_before_effect(tmp_path: Pat
         _authorize_and_execute_for_test(
             paths,
             signer=signer,
+            initial_intent=initial_intent,
             provider=_Provider(fingerprints),
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
@@ -4719,15 +5026,7 @@ def test_phase_b_rejects_manual_provider_without_terminal_material_artifacts(
     journal = _journal(tmp_path)
     authority = _test_replay_authority(journal)
     initial_journal = _initial_journal(tmp_path, paths)
-    _ensure_test_journal_provisioned(
-        paths,
-        signer=signer,
-        expected_disposal_owner="acceptance-owner",
-        expected_approver_identity="approval-owner",
-        journal=journal,
-        replay_authority=authority,
-    )
-    _ensure_test_initial_stage(
+    initial_intent = _ensure_test_initial_stage(
         paths,
         signer=signer,
         provider=_Provider(fingerprints),
@@ -4735,6 +5034,16 @@ def test_phase_b_rejects_manual_provider_without_terminal_material_artifacts(
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
         journal=initial_journal,
+        replay_authority=authority,
+    )
+    _ensure_test_journal_provisioned(
+        paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        initial_journal=initial_journal,
+        initial_intent=initial_intent,
         replay_authority=authority,
     )
     terminal_marker = root / ProviderMaterialArtifactPaths.attestation_name()
@@ -4750,6 +5059,7 @@ def test_phase_b_rejects_manual_provider_without_terminal_material_artifacts(
         _authorize_and_execute_for_test(
             paths,
             signer=signer,
+            initial_intent=initial_intent,
             provider=_Provider(fingerprints),
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
@@ -4775,6 +5085,8 @@ def test_tls_initial_intent_never_claims_or_reaches_an_effect(tmp_path: Path) ->
         proposal=_proposal(tls=True),
     )
     authority = _AtomicReplayAuthority()
+    lock_path = _root_lock_path(root)
+    assert not lock_path.exists()
 
     with pytest.raises(AuthorizationError, match="tls_termination_amendment_required"):
         _provision_initial_journal_for_test(
@@ -4791,6 +5103,167 @@ def test_tls_initial_intent_never_claims_or_reaches_an_effect(tmp_path: Path) ->
         )
     assert not authority.tombstones
     assert journal.migration_status() is InitialProvisioningJournalStatus.ABSENT
+    assert not lock_path.exists()
+
+
+def test_tls_rejection_has_zero_journal_or_effect_side_effects(tmp_path: Path) -> None:
+    """A valid TLS intent is stopped before locks, journals, adapters, or effects."""
+
+    root = tmp_path / "tls-zero-side-effects"
+    signer, _fingerprints, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    initial_journal = _initial_journal(tmp_path, paths)
+    observed_journal = _journal(tmp_path)
+    tls_intent = _initial_intent(
+        paths,
+        signer=signer,
+        journal=initial_journal,
+        proposal=_proposal(tls=True),
+    )
+    observed_receipt = _journal_genesis_receipt(
+        paths,
+        signer=signer,
+        journal=observed_journal,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+    )
+    authority = _AtomicReplayAuthority()
+
+    class _NoCallProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def acquire(self, references: tuple[ProviderReferenceV1, ...]) -> object:
+            del references
+            self.calls += 1
+            raise AssertionError("TLS must stop before provider acquisition")
+
+    provider = _NoCallProvider()
+    effects: list[object] = []
+
+    def observed_effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
+        effects.append(object())
+        return _effect(context)
+
+    def initial_effect(
+        context: InitialProvisioningExecutionContext,
+    ) -> InitialProvisioningEffectReceiptV1:
+        effects.append(object())
+        return _initial_effect(context)
+
+    lock_path = _root_lock_path(root)
+    assert not lock_path.exists()
+    with pytest.raises(AuthorizationError, match="tls_termination_amendment_required"):
+        provision_journal(
+            paths,
+            signer=signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=observed_journal,
+            initial_journal=initial_journal,
+            initial_intent=tls_intent,
+            receipt=observed_receipt,
+            replay_authority=authority,
+            replay_policy=_TEST_REPLAY_POLICY,
+        )
+    with pytest.raises(AuthorizationError, match="tls_termination_amendment_required"):
+        authorize_initial_provisioning_and_execute(
+            paths,
+            signer=signer,
+            initial_intent=tls_intent,
+            provider=provider,  # type: ignore[arg-type]
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=initial_journal,
+            effect=initial_effect,
+            replay_authority=authority,
+            replay_policy=_TEST_REPLAY_POLICY,
+        )
+    with pytest.raises(AuthorizationError, match="tls_termination_amendment_required"):
+        authorize_and_execute(
+            paths,
+            signer=signer,
+            initial_intent=tls_intent,
+            provider=provider,  # type: ignore[arg-type]
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=observed_journal,
+            initial_journal=initial_journal,
+            effect=observed_effect,
+            replay_authority=authority,
+            replay_policy=_TEST_REPLAY_POLICY,
+        )
+    assert not lock_path.exists()
+    assert not authority.tombstones
+    assert not effects
+    assert provider.calls == 0
+    assert observed_journal.migration_status() is JournalMigrationStatus.ABSENT
+    assert initial_journal.migration_status() is InitialProvisioningJournalStatus.ABSENT
+    assert not observed_journal._path.exists()
+    assert not initial_journal._path.exists()
+
+
+def test_tls_cannot_construct_or_load_keychain_signer_or_provider_readiness(tmp_path: Path) -> None:
+    """Manual/preexisting TLS state cannot surface a signer or material bundle."""
+
+    root = tmp_path / "tls-readiness"
+    issuer, _fingerprints, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    tls_intent = _initial_intent(
+        paths,
+        signer=issuer,
+        journal=_initial_journal(tmp_path, paths),
+        proposal=_proposal(tls=True),
+    )
+    provider_signer, signer_genesis = _provider_signer_for_intent(tls_intent, issuer=issuer)
+    artifact_paths = ProviderMaterialArtifactPaths(root)
+
+    class _NoReadStore(_CreateOnlyMaterialStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reads = 0
+
+        def read_if_present(self, service: str, account: str) -> bytearray | None:
+            del service, account
+            self.reads += 1
+            raise AssertionError("TLS must stop before Keychain read")
+
+    store = _NoReadStore()
+    with pytest.raises(ProviderCryptoError, match="tls_termination_amendment_required"):
+        KeychainEd25519Signer(
+            signer_genesis,
+            issuer=issuer,
+            initial_intent=tls_intent,
+            _store=store,
+        )
+    with pytest.raises(ProviderCryptoError, match="tls_termination_amendment_required"):
+        load_keychain_ed25519_signer(
+            artifact_paths,
+            issuer=issuer,
+            initial_intent=tls_intent,
+            _store=store,
+        )
+    with pytest.raises(ProviderCryptoError, match="tls_termination_amendment_required"):
+        load_verified_signer_genesis(
+            artifact_paths,
+            issuer=issuer,
+            initial_intent=tls_intent,
+        )
+    with pytest.raises(ProviderCryptoError, match="tls_termination_amendment_required"):
+        load_verified_provider_material_bundle(
+            artifact_paths,
+            signer=provider_signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            initial_intent=tls_intent,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+        )
+    assert store.reads == 0
+    assert not (root / artifact_paths.signer_genesis_name()).exists()
+    assert not (root / artifact_paths.policy_name()).exists()
+    assert not (root / artifact_paths.genesis_name()).exists()
+    assert not (root / artifact_paths.attestation_name()).exists()
 
 
 def test_tls_type_drift_is_blocked_before_replay_or_keychain_creation(tmp_path: Path) -> None:
@@ -4838,6 +5311,15 @@ def test_tls_type_drift_is_blocked_before_replay_or_keychain_creation(tmp_path: 
         InitialProvisioningIntentV1.model_construct(**constructed_intent_fields),
     )
 
+    class _NoCallProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def acquire(self, references: tuple[ProviderReferenceV1, ...]) -> object:
+            del references
+            self.calls += 1
+            raise AssertionError("TLS type drift must stop before provider acquisition")
+
     for index, drifted_intent in enumerate(drifted_intents):
         authority = _AtomicReplayAuthority()
         journal = SQLiteInitialProvisioningJournal(tmp_path / f"tls-drift-{index}.sqlite3")
@@ -4855,6 +5337,80 @@ def test_tls_type_drift_is_blocked_before_replay_or_keychain_creation(tmp_path: 
             )
         assert not authority.tombstones
         assert journal.migration_status() is InitialProvisioningJournalStatus.ABSENT
+
+        # The same malformed-but-signature-preserving forms must stop at the
+        # observed journal/effect entries too.  Neither stage gets to create a
+        # lock or journal, claim replay, acquire provenance, or call an effect.
+        observed_journal = SQLiteAuthorizationJournal(tmp_path / f"tls-observed-{index}.sqlite3")
+        observed_receipt = _journal_genesis_receipt(
+            paths,
+            signer=issuer,
+            journal=observed_journal,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+        )
+        with pytest.raises(AuthorizationError, match=r"initial_intent|tls_termination"):
+            provision_journal(
+                paths,
+                signer=issuer,
+                expected_disposal_owner="acceptance-owner",
+                expected_approver_identity="approval-owner",
+                journal=observed_journal,
+                initial_journal=journal,
+                initial_intent=drifted_intent,
+                receipt=observed_receipt,
+                replay_authority=authority,
+                replay_policy=_TEST_REPLAY_POLICY,
+            )
+        provider = _NoCallProvider()
+        called_effects: list[object] = []
+
+        def initial_effect(
+            context: InitialProvisioningExecutionContext,
+            _called_effects: list[object] = called_effects,
+        ) -> InitialProvisioningEffectReceiptV1:
+            _called_effects.append(object())
+            return _initial_effect(context)
+
+        def observed_effect(
+            context: VerifiedExecutionContext,
+            _called_effects: list[object] = called_effects,
+        ) -> EffectReceiptV1:
+            _called_effects.append(object())
+            return _effect(context)
+
+        with pytest.raises(AuthorizationError, match=r"initial_intent|tls_termination"):
+            authorize_initial_provisioning_and_execute(
+                paths,
+                signer=issuer,
+                initial_intent=drifted_intent,
+                provider=provider,  # type: ignore[arg-type]
+                expected_disposal_owner="acceptance-owner",
+                expected_approver_identity="approval-owner",
+                journal=journal,
+                effect=initial_effect,
+                replay_authority=authority,
+                replay_policy=_TEST_REPLAY_POLICY,
+            )
+        with pytest.raises(AuthorizationError, match=r"initial_intent|tls_termination"):
+            authorize_and_execute(
+                paths,
+                signer=issuer,
+                initial_intent=drifted_intent,
+                provider=provider,  # type: ignore[arg-type]
+                expected_disposal_owner="acceptance-owner",
+                expected_approver_identity="approval-owner",
+                journal=observed_journal,
+                initial_journal=journal,
+                effect=observed_effect,
+                replay_authority=authority,
+                replay_policy=_TEST_REPLAY_POLICY,
+            )
+        assert not authority.tombstones
+        assert provider.calls == 0
+        assert not called_effects
+        assert not _root_lock_path(root).exists()
+        assert observed_journal.migration_status() is JournalMigrationStatus.ABSENT
 
         seed = bytearray(provider_seed)
         store = _CreateOnlyMaterialStore()
