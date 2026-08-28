@@ -2,13 +2,17 @@
 
 from omninode_rsd.lifecycle.authorization import (
     AuthorizationError,
-    AuthorizationGrantV1,
+    AuthorizationOperationState,
     AuthorizationPaths,
+    EffectReceiptV1,
+    ExecutionReceiptV1,
     ProviderProvenance,
     ProviderProvenanceAdapter,
+    ProviderSnapshotLease,
     SQLiteAuthorizationJournal,
     TrustedEd25519SignerV1,
-    authorize_and_consume,
+    VerifiedExecutionContext,
+    authorize_and_execute,
 )
 from omninode_rsd.lifecycle.event_log import InMemoryEventLog
 from omninode_rsd.lifecycle.ingress import LifecycleEventIngress
@@ -54,9 +58,11 @@ from omninode_rsd.lifecycle.validation import (
 __all__ = [
     "AppliedLifecycleMigration",
     "AuthorizationError",
-    "AuthorizationGrantV1",
+    "AuthorizationOperationState",
     "AuthorizationPaths",
     "DurableLifecycleEventLog",
+    "EffectReceiptV1",
+    "ExecutionReceiptV1",
     "InMemoryEventLog",
     "LifecycleDescription",
     "LifecycleEvent",
@@ -84,9 +90,11 @@ __all__ = [
     "PostgresMigrationConnectionFactory",
     "ProviderProvenance",
     "ProviderProvenanceAdapter",
+    "ProviderSnapshotLease",
     "SQLiteAuthorizationJournal",
     "TrustedEd25519SignerV1",
-    "authorize_and_consume",
+    "VerifiedExecutionContext",
+    "authorize_and_execute",
     "load_lifecycle_description",
     "parse_lifecycle_description",
     "reduce_lifecycle_event",

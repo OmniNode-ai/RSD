@@ -5,23 +5,28 @@ from __future__ import annotations
 import base64
 import hashlib
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 
 import pytest
 import yaml
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from omninode_rsd.lifecycle.authorization import (
+    ArtifactRootLease,
     AuthorizationError,
-    AuthorizationGrantV1,
     AuthorizationPaths,
+    EffectReceiptV1,
+    ExecutionReceiptV1,
     ProviderProvenance,
     SQLiteAuthorizationJournal,
     TrustedEd25519SignerV1,
+    VerifiedExecutionContext,
     _canonical_signed_content,
     _signature_message,
-    authorize_and_consume,
+    authorize_and_execute,
 )
 from omninode_rsd.lifecycle.authorization import (
     main as authorization_main,
@@ -592,17 +597,35 @@ def test_cli_blocks_without_creating_artifacts(
 
 
 class _Provider:
-    def __init__(self, fingerprints: Mapping[str, str], *, mutate: Path | None = None) -> None:
+    def __init__(
+        self,
+        fingerprints: Mapping[str, str],
+        *,
+        mutate_artifact: Path | None = None,
+        mutate_provider: bool = False,
+    ) -> None:
         self._fingerprints = fingerprints
-        self._mutate = mutate
+        self._mutate_artifact = mutate_artifact
+        self._mutate_provider = mutate_provider
         self._mutated = False
+        self._references: tuple[ProviderReferenceV1, ...] = ()
+
+    def acquire(self, references: tuple[ProviderReferenceV1, ...]) -> _Provider:
+        self._references = references
+        return self
+
+    def __enter__(self) -> _Provider:
+        return self
+
+    def __exit__(self, exception_type: object, exception: object, traceback: object) -> None:
+        del exception_type, exception, traceback
 
     def inspect(self, reference: ProviderReferenceV1) -> ProviderProvenance | None:
-        if self._mutate is not None and not self._mutated:
-            self._mutate.write_text(
-                self._mutate.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+        if self._mutate_artifact is not None and not self._mutated:
+            self._mutate_artifact.write_text(
+                self._mutate_artifact.read_text(encoding="utf-8") + "\n", encoding="utf-8"
             )
-            self._mutate.chmod(0o600)
+            self._mutate_artifact.chmod(0o600)
             self._mutated = True
         return ProviderProvenance(
             provider=reference.provider,
@@ -611,6 +634,20 @@ class _Provider:
             version=reference.version,
             reference_sha256=reference.reference_sha256,
             fingerprint_sha256=self._fingerprints[reference.reference_sha256],
+        )
+
+    def recheck(self, reference: ProviderReferenceV1) -> ProviderProvenance | None:
+        fingerprint = self._fingerprints[reference.reference_sha256]
+        if self._mutate_provider and not self._mutated:
+            self._mutated = True
+            fingerprint = "0" * 64 if fingerprint != "0" * 64 else "1" * 64
+        return ProviderProvenance(
+            provider=reference.provider,
+            service=reference.service,
+            account=reference.account,
+            version=reference.version,
+            reference_sha256=reference.reference_sha256,
+            fingerprint_sha256=fingerprint,
         )
 
 
@@ -690,7 +727,7 @@ def _authorize_materials(
             "algorithm": "ed25519",
             "artifact_name": name,
             "artifact_sha256": artifact_sha256,
-            "schema_version": "rsd.authorization-signature.v2",
+            "schema_version": "rsd.authorization-signature.v3",
             "signature_base64": base64.b64encode(signature).decode(),
             "signer_key_id": signer.key_id,
             "signed_content_sha256": signed_content_sha256,
@@ -746,11 +783,21 @@ def _journal(tmp_path: Path) -> SQLiteAuthorizationJournal:
     return SQLiteAuthorizationJournal(root / "authorization.sqlite3")
 
 
-def test_phase_b_authorizes_then_consumes_before_returning_audit_grant(tmp_path: Path) -> None:
+def _effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
+    assert not hasattr(context, "root")
+    return EffectReceiptV1(
+        schema_version="rsd.lifecycle-effect-receipt.v1",
+        operation_id=context.operation_id,
+        idempotency_key=context.idempotency_key,
+        effect_receipt_sha256="f" * 64,
+    )
+
+
+def test_phase_b_executes_only_after_durable_claim(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     signer, fingerprints, _ = _authorize_materials(root)
 
-    grant = authorize_and_consume(
+    receipt = authorize_and_execute(
         AuthorizationPaths(root),
         signer=signer,
         provider=_Provider(fingerprints),
@@ -758,42 +805,185 @@ def test_phase_b_authorizes_then_consumes_before_returning_audit_grant(tmp_path:
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
         journal=_journal(tmp_path),
+        effect=_effect,
         now=_NOW,
     )
 
-    assert grant.status == "consumed"
-    assert "nonce" not in grant.model_dump()
+    assert receipt.status == "committed"
+    assert "nonce" not in receipt.model_dump()
 
 
-def test_phase_b_rejects_sidecar_race_and_provider_mismatch(tmp_path: Path) -> None:
+def test_same_operation_with_fresh_nonce_executes_effect_once(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     signer, fingerprints, _ = _authorize_materials(root)
-    raced_sidecar = root / AuthorizationPaths.signature_name("proposal.yaml")
+    journal = _journal(tmp_path)
+    effects: list[str] = []
 
-    with pytest.raises(AuthorizationError, match="artifact_race"):
-        authorize_and_consume(
+    def effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
+        effects.append(context.idempotency_key)
+        return _effect(context)
+
+    def execute() -> str:
+        try:
+            authorize_and_execute(
+                AuthorizationPaths(root),
+                signer=signer,
+                provider=_Provider(fingerprints),
+                provider_fingerprints=fingerprints,
+                expected_disposal_owner="acceptance-owner",
+                expected_approver_identity="approval-owner",
+                journal=journal,
+                effect=effect,
+                now=_NOW,
+            )
+        except AuthorizationError as error:
+            return error.phase
+        return "committed"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(lambda _: execute(), range(2)))
+
+    assert sorted(outcomes) == ["committed", "operation_replayed"]
+    assert len(effects) == 1
+
+
+def test_effect_failure_requires_recovery_and_never_replays(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints, _ = _authorize_materials(root)
+    journal = _journal(tmp_path)
+
+    def fail_effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
+        del context
+        raise RuntimeError("effect failure")
+
+    with pytest.raises(AuthorizationError, match="effect_failed_recovery_required"):
+        authorize_and_execute(
             AuthorizationPaths(root),
             signer=signer,
-            provider=_Provider(fingerprints, mutate=raced_sidecar),
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            effect=fail_effect,
+            now=_NOW,
+        )
+    assert journal.operation_state(_proposal().operation_id).value == "failed_recovery_required"
+    with pytest.raises(AuthorizationError, match="operation_replayed"):
+        authorize_and_execute(
+            AuthorizationPaths(root),
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            effect=_effect,
+            now=_NOW,
+        )
+
+
+def test_owner_lock_blocks_cooperating_artifact_writer(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints, _ = _authorize_materials(root)
+    entered_provider = Event()
+    release_provider = Event()
+    writer_acquired = Event()
+
+    class BlockingProvider(_Provider):
+        def inspect(self, reference: ProviderReferenceV1) -> ProviderProvenance | None:
+            entered_provider.set()
+            assert release_provider.wait(timeout=5)
+            return super().inspect(reference)
+
+    def execute() -> None:
+        authorize_and_execute(
+            AuthorizationPaths(root),
+            signer=signer,
+            provider=BlockingProvider(fingerprints),
             provider_fingerprints=fingerprints,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=_journal(tmp_path),
+            effect=_effect,
             now=_NOW,
         )
 
-    wrong = dict(fingerprints)
-    first = next(iter(wrong))
-    wrong[first] = "0" * 64
-    with pytest.raises(AuthorizationError, match="provider_provenance"):
-        authorize_and_consume(
+    def writer() -> None:
+        with ArtifactRootLease(root):
+            writer_acquired.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        running = executor.submit(execute)
+        assert entered_provider.wait(timeout=5)
+        blocked_writer = executor.submit(writer)
+        assert not writer_acquired.wait(timeout=0.1)
+        release_provider.set()
+        running.result(timeout=5)
+        blocked_writer.result(timeout=5)
+    assert writer_acquired.is_set()
+
+
+def test_artifact_lock_rejects_relaxed_mode_and_symlink(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    _materials(root)
+    with ArtifactRootLease(root):
+        pass
+    lock_path = root / ".rsd-authorization.lock"
+    lock_path.chmod(0o644)
+    with pytest.raises(AuthorizationError, match="artifact_lock_file"), ArtifactRootLease(root):
+        pass
+
+    symlink_root = tmp_path / "symlink-artifacts"
+    _materials(symlink_root)
+    target = tmp_path / "lock-target"
+    target.write_bytes(b"lock")
+    target.chmod(0o600)
+    (symlink_root / ".rsd-authorization.lock").symlink_to(target)
+    with (
+        pytest.raises(AuthorizationError, match="artifact_lock_file"),
+        ArtifactRootLease(symlink_root),
+    ):
+        pass
+
+
+def test_phase_b_rejects_artifact_and_provider_mutation_before_effect(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints, _ = _authorize_materials(root)
+    raced_sidecar = root / AuthorizationPaths.signature_name("proposal.yaml")
+    called = False
+
+    def effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
+        nonlocal called
+        called = True
+        return _effect(context)
+
+    with pytest.raises(AuthorizationError, match="artifact_race"):
+        authorize_and_execute(
             AuthorizationPaths(root),
             signer=signer,
-            provider=_Provider(fingerprints),
-            provider_fingerprints=wrong,
+            provider=_Provider(fingerprints, mutate_artifact=raced_sidecar),
+            provider_fingerprints=fingerprints,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=_journal(tmp_path),
+            effect=effect,
+            now=_NOW,
+        )
+    assert not called
+
+    provider_root = tmp_path / "provider-artifacts"
+    signer, fingerprints, _ = _authorize_materials(provider_root)
+    with pytest.raises(AuthorizationError, match="provider_provenance"):
+        authorize_and_execute(
+            AuthorizationPaths(provider_root),
+            signer=signer,
+            provider=_Provider(fingerprints, mutate_provider=True),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=_journal(tmp_path),
+            effect=_effect,
             now=_NOW,
         )
 
@@ -804,7 +994,7 @@ def test_phase_b_rejects_marker_only_signature_and_cli_is_read_only(tmp_path: Pa
     (root / AuthorizationPaths.signature_name("approval.yaml")).unlink()
 
     with pytest.raises(AuthorizationError, match="artifact_snapshot"):
-        authorize_and_consume(
+        authorize_and_execute(
             AuthorizationPaths(root),
             signer=signer,
             provider=_Provider(fingerprints),
@@ -812,6 +1002,7 @@ def test_phase_b_rejects_marker_only_signature_and_cli_is_read_only(tmp_path: Pa
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=_journal(tmp_path),
+            effect=_effect,
             now=_NOW,
         )
     assert authorization_main(["authorize", "--root", str(root)]) == 2
@@ -823,7 +1014,7 @@ def test_phase_b_rejects_disposal_owner_or_approval_mismatch(tmp_path: Path) -> 
     signer, fingerprints, _ = _authorize_materials(root)
 
     with pytest.raises(AuthorizationError, match="owner_approval"):
-        authorize_and_consume(
+        authorize_and_execute(
             AuthorizationPaths(root),
             signer=signer,
             provider=_Provider(fingerprints),
@@ -831,27 +1022,26 @@ def test_phase_b_rejects_disposal_owner_or_approval_mismatch(tmp_path: Path) -> 
             expected_disposal_owner="wrong-owner",
             expected_approver_identity="approval-owner",
             journal=_journal(tmp_path),
+            effect=_effect,
             now=_NOW,
         )
 
 
-def test_audit_grant_cannot_be_consumed_as_a_forged_decision(tmp_path: Path) -> None:
-    grant = AuthorizationGrantV1(
-        schema_version="rsd.lifecycle-authorization-grant.v1",
-        status="consumed",
+def test_external_execution_receipt_cannot_reach_internal_claim(tmp_path: Path) -> None:
+    receipt = ExecutionReceiptV1(
+        schema_version="rsd.lifecycle-execution-receipt.v1",
+        status="committed",
         operation_id="forged-operation",
-        disposal_owner="forged-owner",
-        retention_expires_at="2030-01-01T00:00:00Z",
-        proposal_sha256="a" * 64,
-        contract_sha256="b" * 64,
-        evidence_sha256=("c" * 64,) * 6,
-        provider_provenance_sha256="d" * 64,
-        journal_entry_sha256="e" * 64,
-        consumed_at="2026-08-27T12:00:00Z",
+        idempotency_key="a" * 64,
+        effect_receipt_sha256="b" * 64,
+        proposal_sha256="c" * 64,
+        contract_sha256="d" * 64,
+        provider_provenance_sha256="e" * 64,
+        committed_at="2026-08-27T12:00:00Z",
     )
 
     with pytest.raises(AuthorizationError, match="journal"):
-        _journal(tmp_path)._claim_verified(grant)  # type: ignore[arg-type]
+        _journal(tmp_path)._claim_verified(receipt)  # type: ignore[arg-type]
 
 
 def test_phase_b_rejects_marker_tampering_even_when_phase_a_hashes_are_refreshed(
@@ -872,7 +1062,7 @@ def test_phase_b_rejects_marker_tampering_even_when_phase_a_hashes_are_refreshed
     _refresh_sidecar(root, "runtime-contract.yaml", key, resign=True)
 
     with pytest.raises(AuthorizationError, match="signature_marker"):
-        authorize_and_consume(
+        authorize_and_execute(
             AuthorizationPaths(root),
             signer=signer,
             provider=_Provider(fingerprints),
@@ -880,6 +1070,7 @@ def test_phase_b_rejects_marker_tampering_even_when_phase_a_hashes_are_refreshed
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=_journal(tmp_path),
+            effect=_effect,
             now=_NOW,
         )
 
@@ -893,7 +1084,7 @@ def test_phase_b_rejects_sidecar_swap_and_noncanonical_base64_alias(tmp_path: Pa
     proposal_sidecar.chmod(0o600)
 
     with pytest.raises(AuthorizationError, match="signature_binding"):
-        authorize_and_consume(
+        authorize_and_execute(
             AuthorizationPaths(root),
             signer=signer,
             provider=_Provider(fingerprints),
@@ -901,6 +1092,7 @@ def test_phase_b_rejects_sidecar_swap_and_noncanonical_base64_alias(tmp_path: Pa
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=_journal(tmp_path),
+            effect=_effect,
             now=_NOW,
         )
 
@@ -919,7 +1111,7 @@ def test_phase_b_rejects_sidecar_swap_and_noncanonical_base64_alias(tmp_path: Pa
     proposal_sidecar.chmod(0o600)
 
     with pytest.raises(AuthorizationError, match="signature_artifact"):
-        authorize_and_consume(
+        authorize_and_execute(
             AuthorizationPaths(alias_root),
             signer=signer,
             provider=_Provider(fingerprints),
@@ -927,5 +1119,6 @@ def test_phase_b_rejects_sidecar_swap_and_noncanonical_base64_alias(tmp_path: Pa
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=_journal(tmp_path),
+            effect=_effect,
             now=_NOW,
         )

@@ -1,4 +1,4 @@
-"""Durability and replay tests for the owner-only SQLite authorization journal."""
+"""Durability, replay, and recovery tests for the SQLite operation journal."""
 
 from __future__ import annotations
 
@@ -14,10 +14,12 @@ import pytest
 from omninode_rsd.lifecycle.authorization import (
     _VERIFIED_CAPABILITY,
     AuthorizationError,
+    AuthorizationOperationState,
     SQLiteAuthorizationJournal,
-    _VerifiedAuthorization,
+    VerifiedExecutionContext,
+    _VerifiedExecution,
 )
-from omninode_rsd.lifecycle.infisical_disposable import PreflightReceiptV1
+from omninode_rsd.lifecycle.infisical_disposable import ProposalV1, RuntimeContractV1
 
 
 class _StartGate(Protocol):
@@ -28,22 +30,19 @@ class _ResultQueue(Protocol):
     def put(self, value: str) -> None: ...
 
 
-def _verified(nonce: str) -> _VerifiedAuthorization:
-    return _VerifiedAuthorization(
-        receipt=PreflightReceiptV1(
-            schema_version="rsd.disposable-preflight-receipt.v1",
-            status="compiled",
-            authorization_state="not_authorized_pending_live_provenance",
-            operation_id="123e4567-e89b-42d3-a456-426614174000",
-            contract_sha256="a" * 64,
-            proposal_sha256="b" * 64,
-            candidate_composite_sha256="c" * 64,
-            retention_expires_at="2030-01-01T00:00:00Z",
-            disposal_owner="acceptance-owner",
-            emitted_at="2026-08-27T12:00:00Z",
-            evidence_sha256=("d" * 64,) * 6,
-        ),
-        provider_provenance_sha256="e" * 64,
+def _verified(nonce: str, operation_id: str = "operation-one") -> _VerifiedExecution:
+    context = VerifiedExecutionContext(
+        operation_id=operation_id,
+        idempotency_key="a" * 64,
+        proposal=ProposalV1.model_construct(),
+        final_contract=RuntimeContractV1.model_construct(),
+        provider_expectations=(),
+        proposal_sha256="b" * 64,
+        contract_sha256="c" * 64,
+        provider_provenance_sha256="d" * 64,
+    )
+    return _VerifiedExecution(
+        context=context,
         nonce=nonce,
         authorized_at="2026-08-27T12:00:00Z",
         capability=_VERIFIED_CAPABILITY,
@@ -57,54 +56,42 @@ def _journal(tmp_path: Path) -> SQLiteAuthorizationJournal:
     return SQLiteAuthorizationJournal(root / "authorization.sqlite3")
 
 
-def _claim_worker(path: str, nonce: str, start: _StartGate, queue: _ResultQueue) -> None:
+def _claim_worker(
+    path: str,
+    nonce: str,
+    operation_id: str,
+    start: _StartGate,
+    queue: _ResultQueue,
+) -> None:
     start.wait()
     try:
-        SQLiteAuthorizationJournal(Path(path))._claim_verified(_verified(nonce))
+        SQLiteAuthorizationJournal(Path(path))._claim_verified(_verified(nonce, operation_id))
     except AuthorizationError as error:
         queue.put(error.phase)
     else:
         queue.put("claimed")
 
 
-def _crash_worker(path: str, nonce: str) -> None:
+def _crash_worker(path: str, nonce: str, operation_id: str) -> None:
     journal = SQLiteAuthorizationJournal(Path(path))
-    connection = journal._connect()
-    connection.execute("BEGIN IMMEDIATE")
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS authorization_nonce_journal (
-            nonce TEXT PRIMARY KEY NOT NULL,
-            operation_id TEXT NOT NULL,
-            receipt_sha256 TEXT NOT NULL,
-            claimed_at TEXT NOT NULL
-        ) WITHOUT ROWID
-        """
-    )
-    connection.execute(
-        """
-        INSERT INTO authorization_nonce_journal (nonce, operation_id, receipt_sha256, claimed_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (nonce, "crash-operation", "a" * 64, "2026-08-27T12:00:00Z"),
-    )
+    verified = _verified(nonce, operation_id)
+    journal._claim_verified(verified)
+    journal._begin_effect(verified)
     os._exit(0)
 
 
-def test_claim_is_durable_and_replayed_across_new_instances(tmp_path: Path) -> None:
+def test_claim_is_durable_and_same_operation_rejects_fresh_nonce(tmp_path: Path) -> None:
     journal = _journal(tmp_path)
-    verified = _verified("a" * 32)
+    journal._claim_verified(_verified("a" * 32))
 
-    journal._claim_verified(verified)
-    with pytest.raises(AuthorizationError, match="nonce_replayed"):
-        SQLiteAuthorizationJournal(journal._path)._claim_verified(verified)
+    with pytest.raises(AuthorizationError, match="operation_replayed"):
+        SQLiteAuthorizationJournal(journal._path)._claim_verified(_verified("b" * 32))
 
 
 def test_journal_rejects_a_caller_constructed_verified_shape(tmp_path: Path) -> None:
     verified = _verified("9" * 32)
-    forged = _VerifiedAuthorization(
-        receipt=verified.receipt,
-        provider_provenance_sha256=verified.provider_provenance_sha256,
+    forged = _VerifiedExecution(
+        context=verified.context,
         nonce=verified.nonce,
         authorized_at=verified.authorized_at,
         capability=object(),
@@ -119,7 +106,10 @@ def test_claim_is_atomic_for_threads_and_processes(tmp_path: Path) -> None:
     nonce = "b" * 32
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(journal._claim_verified, _verified(nonce)) for _ in range(2)]
+        futures = [
+            executor.submit(journal._claim_verified, _verified(nonce, f"thread-{index}"))
+            for index in range(2)
+        ]
     results = []
     for future in futures:
         try:
@@ -133,12 +123,13 @@ def test_claim_is_atomic_for_threads_and_processes(tmp_path: Path) -> None:
     context = multiprocessing.get_context("spawn")
     start = context.Event()
     queue = context.Queue()
-    process_nonce = "c" * 32
+    operation_id = "shared-operation"
     workers = [
         context.Process(
-            target=_claim_worker, args=(str(journal._path), process_nonce, start, queue)
+            target=_claim_worker,
+            args=(str(journal._path), f"{index + 3}" * 32, operation_id, start, queue),
         )
-        for _ in range(2)
+        for index in range(2)
     ]
     for worker in workers:
         worker.start()
@@ -147,19 +138,33 @@ def test_claim_is_atomic_for_threads_and_processes(tmp_path: Path) -> None:
     for worker in workers:
         worker.join(timeout=10)
         assert worker.exitcode == 0
-    assert sorted(observed) == ["claimed", "nonce_replayed"]
+    assert sorted(observed) == ["claimed", "operation_replayed"]
 
 
-def test_uncommitted_crash_is_recovered_without_false_claim(tmp_path: Path) -> None:
+def test_crash_restart_leaves_in_progress_and_requires_explicit_recovery(tmp_path: Path) -> None:
     journal = _journal(tmp_path)
     context = multiprocessing.get_context("spawn")
-    worker = context.Process(target=_crash_worker, args=(str(journal._path), "d" * 32))
+    worker = context.Process(
+        target=_crash_worker,
+        args=(str(journal._path), "d" * 32, "crash-operation"),
+    )
 
     worker.start()
     worker.join(timeout=10)
 
     assert worker.exitcode == 0
-    journal._claim_verified(_verified("d" * 32))
+    restarted = SQLiteAuthorizationJournal(journal._path)
+    assert restarted.operation_state("crash-operation") is AuthorizationOperationState.IN_PROGRESS
+    with pytest.raises(AuthorizationError, match="operation_replayed"):
+        restarted._claim_verified(_verified("e" * 32, "crash-operation"))
+    assert (
+        restarted.require_recovery("crash-operation")
+        is AuthorizationOperationState.FAILED_RECOVERY_REQUIRED
+    )
+    assert (
+        restarted.operation_state("crash-operation")
+        is AuthorizationOperationState.FAILED_RECOVERY_REQUIRED
+    )
 
 
 def test_journal_rejects_non_owner_mode_symlink_and_wrong_schema(tmp_path: Path) -> None:
@@ -184,7 +189,7 @@ def test_journal_rejects_non_owner_mode_symlink_and_wrong_schema(tmp_path: Path)
     schema_root.chmod(0o700)
     schema_path = schema_root / "authorization.sqlite3"
     connection = sqlite3.connect(schema_path)
-    connection.execute("CREATE TABLE authorization_nonce_journal (wrong TEXT)")
+    connection.execute("CREATE TABLE authorization_operation_journal (wrong TEXT)")
     connection.commit()
     connection.close()
     schema_path.chmod(0o600)
@@ -198,4 +203,4 @@ def test_journal_rejects_relaxed_database_mode(tmp_path: Path) -> None:
     journal._path.chmod(0o644)
 
     with pytest.raises(AuthorizationError, match="journal_path"):
-        journal._claim_verified(_verified("2" * 32))
+        journal._claim_verified(_verified("2" * 32, "operation-two"))

@@ -1,9 +1,10 @@
-"""Phase-B signature and provenance verification with durable nonce consumption.
+"""Locked Phase-B verification and effect execution for lifecycle artifacts.
 
-The sole public mutation-admission operation is ``authorize_and_consume``.
-It verifies the complete artifact set, then records a fresh nonce in an
-owner-only SQLite journal before returning a non-consumable audit grant. This
-module never retrieves provider values or invokes an external service.
+``authorize_and_execute`` is the sole public mutation-admission boundary. It
+holds an owner-only artifact-root advisory lock, verifies signed artifacts and
+leased provider provenance, durably records an operation, invokes one effect,
+and durably records the terminal outcome. It never retrieves provider values
+or invokes an external service itself.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import argparse
 import base64
 import binascii
 import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -19,10 +21,11 @@ import re
 import secrets
 import sqlite3
 import stat
-from collections.abc import Mapping, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Final, Literal, Protocol
 
@@ -41,6 +44,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     ProviderDeclarationV1,
     ProviderReferenceV1,
     RegistryVerificationV1,
+    RuntimeContractV1,
     TargetAttestationV1,
     _OwnerOnlyReader,
     _UniqueLoader,
@@ -60,14 +64,25 @@ _ARTIFACT_NAMES: Final[tuple[str, ...]] = (
     "postgres-overlay.yaml",
 )
 _MARKED_EVIDENCE_NAMES: Final[frozenset[str]] = frozenset(_ARTIFACT_NAMES[2:-1])
-_SIGNATURE_DOMAIN: Final = b"omninode-rsd.authorization.ed25519.v2\x00"
+_SIGNATURE_DOMAIN: Final = b"omninode-rsd.authorization.ed25519.v3\x00"
+_IDEMPOTENCY_DOMAIN: Final = b"omninode-rsd.authorization.effect.v1\x00"
+_ARTIFACT_LOCK_NAME: Final = ".rsd-authorization.lock"
 _VERIFIED_CAPABILITY: Final = object()
-_JOURNAL_SCHEMA: Final = """
-CREATE TABLE IF NOT EXISTS authorization_nonce_journal (
-    nonce TEXT PRIMARY KEY NOT NULL,
-    operation_id TEXT NOT NULL,
-    receipt_sha256 TEXT NOT NULL,
-    claimed_at TEXT NOT NULL
+_OPERATION_TABLE: Final = "authorization_operation_journal"
+_OPERATION_SCHEMA: Final = f"""
+CREATE TABLE IF NOT EXISTS {_OPERATION_TABLE} (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    nonce TEXT NOT NULL UNIQUE,
+    proposal_sha256 TEXT NOT NULL,
+    contract_sha256 TEXT NOT NULL,
+    provider_provenance_sha256 TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    state TEXT NOT NULL,
+    effect_receipt_sha256 TEXT,
+    failure_phase TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (state IN ('claimed', 'in_progress', 'committed', 'failed_recovery_required'))
 ) WITHOUT ROWID
 """
 
@@ -84,10 +99,19 @@ class AuthorizationError(RuntimeError):
         super().__init__(f"authorization failed at phase: {phase}")
 
 
+class AuthorizationOperationState(StrEnum):
+    """Durable lifecycle states for one one-shot authorization operation."""
+
+    CLAIMED = "claimed"
+    IN_PROGRESS = "in_progress"
+    COMMITTED = "committed"
+    FAILED_RECOVERY_REQUIRED = "failed_recovery_required"
+
+
 class DetachedAuthorizationSignatureV1(_Model):
     """Detached sidecar for one raw artifact and its canonical signed content."""
 
-    schema_version: Literal["rsd.authorization-signature.v2"]
+    schema_version: Literal["rsd.authorization-signature.v3"]
     artifact_name: str = Field(pattern=r"^[a-z][a-z0-9-]*[.]yaml$")
     artifact_sha256: str = Field(pattern=_SHA256)
     signed_content_sha256: str = Field(pattern=_SHA256)
@@ -124,7 +148,7 @@ class TrustedEd25519SignerV1(_Model):
 
 @dataclass(frozen=True, slots=True)
 class ProviderProvenance:
-    """Value-free metadata returned by a caller-supplied trusted boundary."""
+    """Value-free metadata supplied by one provider snapshot lease."""
 
     provider: str
     service: str
@@ -134,26 +158,74 @@ class ProviderProvenance:
     fingerprint_sha256: str
 
 
-class ProviderProvenanceAdapter(Protocol):
-    """Inspect metadata only; provider values are outside this contract."""
+class ProviderSnapshotLease(Protocol):
+    """A lease that keeps referenced provider metadata stable through an effect.
+
+    ``recheck`` must fail or return different metadata if the referenced item
+    can no longer be proven to be the same version and fingerprint observed by
+    ``inspect``. Implementations that retrieve values do so only inside their
+    own lease and never expose those values through this package.
+    """
 
     def inspect(self, reference: ProviderReferenceV1) -> ProviderProvenance | None: ...
 
+    def recheck(self, reference: ProviderReferenceV1) -> ProviderProvenance | None: ...
 
-class AuthorizationGrantV1(_Model):
-    """Audit record only; it carries no journal-consumption capability."""
 
-    schema_version: Literal["rsd.lifecycle-authorization-grant.v1"]
-    status: Literal["consumed"]
+class ProviderProvenanceAdapter(Protocol):
+    """Acquire one leased provider snapshot for the supplied references."""
+
+    def acquire(
+        self, references: tuple[ProviderReferenceV1, ...]
+    ) -> AbstractContextManager[ProviderSnapshotLease]: ...
+
+
+class ProviderExpectationV1(_Model):
+    """Exact value-free provider binding visible to the effect callback."""
+
+    provider: str = Field(pattern=_IDENTIFIER)
+    service: str = Field(pattern=_IDENTIFIER)
+    account: str = Field(pattern=_IDENTIFIER)
+    version: int = Field(ge=1)
+    reference_sha256: str = Field(pattern=_SHA256)
+    fingerprint_sha256: str = Field(pattern=_SHA256)
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedExecutionContext:
+    """Immutable effect input with no artifact root, nonce, or journal handle."""
+
     operation_id: str
-    disposal_owner: str
-    retention_expires_at: str
+    idempotency_key: str
+    proposal: ProposalV1
+    final_contract: RuntimeContractV1
+    provider_expectations: tuple[ProviderExpectationV1, ...]
+    proposal_sha256: str
+    contract_sha256: str
+    provider_provenance_sha256: str
+
+
+class EffectReceiptV1(_Model):
+    """Effect-owned receipt explicitly bound to one execution context."""
+
+    schema_version: Literal["rsd.lifecycle-effect-receipt.v1"]
+    operation_id: str
+    idempotency_key: str = Field(pattern=_SHA256)
+    effect_receipt_sha256: str = Field(pattern=_SHA256)
+
+
+class ExecutionReceiptV1(_Model):
+    """Non-consumable audit result returned only after a committed effect."""
+
+    schema_version: Literal["rsd.lifecycle-execution-receipt.v1"]
+    status: Literal["committed"]
+    operation_id: str
+    idempotency_key: str = Field(pattern=_SHA256)
+    effect_receipt_sha256: str = Field(pattern=_SHA256)
     proposal_sha256: str = Field(pattern=_SHA256)
     contract_sha256: str = Field(pattern=_SHA256)
-    evidence_sha256: tuple[str, str, str, str, str, str]
     provider_provenance_sha256: str = Field(pattern=_SHA256)
-    journal_entry_sha256: str = Field(pattern=_SHA256)
-    consumed_at: str
+    committed_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,30 +243,20 @@ class AuthorizationPaths:
 
 
 @dataclass(frozen=True, slots=True)
-class _VerifiedAuthorization:
-    """Internal one-shot material that is never returned through the public API."""
-
+class _ArtifactVerification:
     receipt: PreflightReceiptV1
-    provider_provenance_sha256: str
+    proposal: ProposalV1
+    final_contract: RuntimeContractV1
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedExecution:
+    """Opaque internal operation material that the public API never returns."""
+
+    context: VerifiedExecutionContext
     nonce: str
     authorized_at: str
     capability: object = field(repr=False, compare=False)
-
-    def receipt_sha256(self) -> str:
-        body = json.dumps(
-            {
-                "authorized_at": self.authorized_at,
-                "contract_sha256": self.receipt.contract_sha256,
-                "evidence_sha256": self.receipt.evidence_sha256,
-                "nonce": self.nonce,
-                "operation_id": self.receipt.operation_id,
-                "proposal_sha256": self.receipt.proposal_sha256,
-                "provider_provenance_sha256": self.provider_provenance_sha256,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        return _digest(body.encode())
 
 
 def _digest(data: bytes) -> str:
@@ -235,9 +297,9 @@ def _parse_signature(raw: bytes) -> DetachedAuthorizationSignatureV1:
 def _canonical_signed_content(artifact_name: str, artifact: bytes) -> bytes:
     """Canonical JSON with only the evidence signature digest omitted.
 
-    The omitted digest is derived from the real sidecar signature after that
-    signature is calculated. All other marker fields remain covered by
-    Ed25519. Raw artifact hashes remain checked against Phase-A bindings.
+    The omitted marker is SHA-256 of the actual sidecar signature. The signer,
+    key fingerprint, algorithm, and every other artifact field remain covered
+    by Ed25519; raw hashes are independently checked against Phase-A bindings.
     """
 
     document = _parse_document(artifact, phase="artifact_content")
@@ -261,7 +323,7 @@ def _canonical_signed_content(artifact_name: str, artifact: bytes) -> bytes:
 
 
 def _signature_message(artifact_name: str, signed_content_sha256: str) -> bytes:
-    """Domain-separated Ed25519 bytes: domain, artifact name, canonical digest."""
+    """Ed25519 input: fixed domain, artifact name, canonical-content digest."""
 
     return (
         _SIGNATURE_DOMAIN
@@ -330,58 +392,15 @@ def _receipt_snapshot(
     return receipt, snapshot
 
 
-def _provider_commitment(
-    *,
-    references: tuple[ProviderReferenceV1, ...],
-    adapter: ProviderProvenanceAdapter,
-    fingerprints: Mapping[str, str],
-) -> str:
-    if set(fingerprints) != {reference.reference_sha256 for reference in references}:
-        raise AuthorizationError("provider_policy")
-    if any(
-        type(value) is not str or re.fullmatch(_SHA256, value) is None
-        for value in fingerprints.values()
-    ):
-        raise AuthorizationError("provider_policy")
-    observed: list[dict[str, object]] = []
-    for reference in references:
-        item = adapter.inspect(reference)
-        if item is None or (
-            item.provider != reference.provider
-            or item.service != reference.service
-            or item.account != reference.account
-            or item.version != reference.version
-            or item.reference_sha256 != reference.reference_sha256
-            or item.fingerprint_sha256 != fingerprints[reference.reference_sha256]
-        ):
-            raise AuthorizationError("provider_provenance")
-        observed.append(
-            {
-                "account": item.account,
-                "fingerprint_sha256": item.fingerprint_sha256,
-                "provider": item.provider,
-                "reference_sha256": item.reference_sha256,
-                "service": item.service,
-                "version": item.version,
-            }
-        )
-    return _digest(json.dumps(observed, sort_keys=True, separators=(",", ":")).encode())
-
-
-def _verify_authorization(
+def _verify_artifact_snapshot(
     paths: AuthorizationPaths,
     *,
     signer: TrustedEd25519SignerV1,
-    provider: ProviderProvenanceAdapter,
-    provider_fingerprints: Mapping[str, str],
     expected_disposal_owner: str,
     expected_approver_identity: str,
-    now: datetime | None,
-) -> _VerifiedAuthorization:
-    clock = datetime.now(UTC) if now is None else now
-    if clock.tzinfo is None or clock.utcoffset() is None:
-        raise AuthorizationError("clock")
-    first, snapshot = _receipt_snapshot(paths, now=clock)
+    now: datetime,
+) -> tuple[_ArtifactVerification, dict[str, bytes]]:
+    first, snapshot = _receipt_snapshot(paths, now=now)
     evidence_models: dict[str, BaseModel] = {}
     model_types: Mapping[str, type[BaseModel] | None] = {
         "approval.yaml": ApprovalEvidenceV1,
@@ -411,9 +430,12 @@ def _verify_authorization(
         proposal = ProposalV1.model_validate(
             _parse_document(snapshot["proposal.yaml"], phase="proposal")
         )
+        final_contract = RuntimeContractV1.model_validate(
+            _parse_document(snapshot["runtime-contract.yaml"], phase="contract")
+        )
     except (AuthorizationError, ValidationError):
-        raise AuthorizationError("proposal") from None
-    if datetime.fromisoformat(proposal.retention_expires_at.removesuffix("Z") + "+00:00") <= clock:
+        raise AuthorizationError("proposal_contract") from None
+    if datetime.fromisoformat(proposal.retention_expires_at.removesuffix("Z") + "+00:00") <= now:
         raise AuthorizationError("retention")
     approval = evidence_models.get("approval.yaml")
     if (
@@ -424,26 +446,174 @@ def _verify_authorization(
         or approval.approver_identity != expected_approver_identity
     ):
         raise AuthorizationError("owner_approval")
-    provenance_sha256 = _provider_commitment(
-        references=proposal.provider_references.all(),
-        adapter=provider,
-        fingerprints=provider_fingerprints,
+    return _ArtifactVerification(first, proposal, final_contract), snapshot
+
+
+def _provider_commitment(
+    *,
+    references: tuple[ProviderReferenceV1, ...],
+    lease: ProviderSnapshotLease,
+    fingerprints: Mapping[str, str],
+    recheck: bool,
+) -> tuple[str, tuple[ProviderExpectationV1, ...]]:
+    if set(fingerprints) != {reference.reference_sha256 for reference in references}:
+        raise AuthorizationError("provider_policy")
+    if any(
+        type(value) is not str or re.fullmatch(_SHA256, value) is None
+        for value in fingerprints.values()
+    ):
+        raise AuthorizationError("provider_policy")
+    expected: list[ProviderExpectationV1] = []
+    observed: list[dict[str, object]] = []
+    inspect = lease.recheck if recheck else lease.inspect
+    for reference in references:
+        item = inspect(reference)
+        expected_fingerprint = fingerprints[reference.reference_sha256]
+        if item is None or (
+            item.provider != reference.provider
+            or item.service != reference.service
+            or item.account != reference.account
+            or item.version != reference.version
+            or item.reference_sha256 != reference.reference_sha256
+            or item.fingerprint_sha256 != expected_fingerprint
+        ):
+            raise AuthorizationError("provider_provenance")
+        expected.append(
+            ProviderExpectationV1(
+                provider=item.provider,
+                service=item.service,
+                account=item.account,
+                version=item.version,
+                reference_sha256=item.reference_sha256,
+                fingerprint_sha256=item.fingerprint_sha256,
+            )
+        )
+        observed.append(expected[-1].model_dump(mode="json"))
+    return (
+        _digest(json.dumps(observed, sort_keys=True, separators=(",", ":")).encode()),
+        tuple(expected),
     )
-    second, repeated = _receipt_snapshot(paths, now=clock)
-    if first != second or snapshot != repeated:
-        raise AuthorizationError("artifact_race")
-    authorized_at = clock.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-    return _VerifiedAuthorization(
-        receipt=first,
-        provider_provenance_sha256=provenance_sha256,
-        nonce=secrets.token_hex(16),
-        authorized_at=authorized_at,
-        capability=_VERIFIED_CAPABILITY,
-    )
+
+
+def _idempotency_key(
+    *, operation_id: str, proposal_sha256: str, contract_sha256: str, provider_sha256: str
+) -> str:
+    material = "\x00".join(
+        (operation_id, proposal_sha256, contract_sha256, provider_sha256)
+    ).encode("ascii")
+    return _digest(_IDEMPOTENCY_DOMAIN + material)
+
+
+class ArtifactRootLease:
+    """Exclusive advisory lock for an owner-only artifact root.
+
+    Cooperating artifact writers use the same lease. Noncooperating changes are
+    still fail-closed by the locked before/after artifact snapshots.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        self._lock_path = root / _ARTIFACT_LOCK_NAME
+        self._file_descriptor: int | None = None
+
+    @staticmethod
+    def _validate_root(root: Path) -> tuple[int, int]:
+        try:
+            details = os.lstat(root)
+        except OSError:
+            raise AuthorizationError("artifact_lock_root") from None
+        if (
+            not stat.S_ISDIR(details.st_mode)
+            or stat.S_ISLNK(details.st_mode)
+            or details.st_uid != os.getuid()
+            or stat.S_IMODE(details.st_mode) != 0o700
+        ):
+            raise AuthorizationError("artifact_lock_root")
+        return (details.st_dev, details.st_ino)
+
+    @staticmethod
+    def _validate_file(path: Path) -> tuple[int, int]:
+        try:
+            details = os.lstat(path)
+        except OSError:
+            raise AuthorizationError("artifact_lock_file") from None
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or stat.S_ISLNK(details.st_mode)
+            or details.st_uid != os.getuid()
+            or stat.S_IMODE(details.st_mode) != 0o600
+            or details.st_nlink != 1
+        ):
+            raise AuthorizationError("artifact_lock_file")
+        return (details.st_dev, details.st_ino)
+
+    def _open_file(self) -> int:
+        self._validate_root(self._root)
+        try:
+            before = self._validate_file(self._lock_path)
+        except AuthorizationError:
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                file_descriptor = os.open(self._lock_path, flags, 0o600)
+            except FileExistsError:
+                before = self._validate_file(self._lock_path)
+            except OSError:
+                raise AuthorizationError("artifact_lock_file") from None
+            else:
+                with suppress(OSError):
+                    os.close(file_descriptor)
+                before = self._validate_file(self._lock_path)
+        try:
+            file_descriptor = os.open(
+                self._lock_path,
+                os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            after = os.fstat(file_descriptor)
+        except OSError:
+            raise AuthorizationError("artifact_lock_file") from None
+        if before != (after.st_dev, after.st_ino):
+            with suppress(OSError):
+                os.close(file_descriptor)
+            raise AuthorizationError("artifact_lock_file")
+        return file_descriptor
+
+    def __enter__(self) -> ArtifactRootLease:
+        file_descriptor = self._open_file()
+        try:
+            fcntl.flock(file_descriptor, fcntl.LOCK_EX)
+            self._validate_root(self._root)
+            locked = os.fstat(file_descriptor)
+            if (locked.st_dev, locked.st_ino) != self._validate_file(self._lock_path):
+                raise AuthorizationError("artifact_lock_file")
+        except AuthorizationError:
+            with suppress(OSError):
+                fcntl.flock(file_descriptor, fcntl.LOCK_UN)
+            with suppress(OSError):
+                os.close(file_descriptor)
+            raise
+        except OSError:
+            with suppress(OSError):
+                fcntl.flock(file_descriptor, fcntl.LOCK_UN)
+            with suppress(OSError):
+                os.close(file_descriptor)
+            raise AuthorizationError("artifact_lock_file") from None
+        self._file_descriptor = file_descriptor
+        return self
+
+    def __exit__(self, exception_type: object, exception: object, traceback: object) -> None:
+        del exception_type, exception, traceback
+        if self._file_descriptor is None:
+            return
+        with suppress(OSError):
+            fcntl.flock(self._file_descriptor, fcntl.LOCK_UN)
+        with suppress(OSError):
+            os.close(self._file_descriptor)
+        self._file_descriptor = None
 
 
 class SQLiteAuthorizationJournal:
-    """Owner-only SQLite nonce ledger with durable, atomic single-use claims."""
+    """Owner-only SQLite store for one-shot operation state transitions."""
 
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -545,50 +715,58 @@ class SQLiteAuthorizationJournal:
 
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
-        rows = connection.execute("PRAGMA table_info(authorization_nonce_journal)").fetchall()
+        rows = connection.execute(f"PRAGMA table_info({_OPERATION_TABLE})").fetchall()
         expected = [
-            (0, "nonce", "TEXT", 1, None, 1),
-            (1, "operation_id", "TEXT", 1, None, 0),
-            (2, "receipt_sha256", "TEXT", 1, None, 0),
-            (3, "claimed_at", "TEXT", 1, None, 0),
+            (0, "operation_id", "TEXT", 1, None, 1),
+            (1, "nonce", "TEXT", 1, None, 0),
+            (2, "proposal_sha256", "TEXT", 1, None, 0),
+            (3, "contract_sha256", "TEXT", 1, None, 0),
+            (4, "provider_provenance_sha256", "TEXT", 1, None, 0),
+            (5, "idempotency_key", "TEXT", 1, None, 0),
+            (6, "state", "TEXT", 1, None, 0),
+            (7, "effect_receipt_sha256", "TEXT", 0, None, 0),
+            (8, "failure_phase", "TEXT", 0, None, 0),
+            (9, "created_at", "TEXT", 1, None, 0),
+            (10, "updated_at", "TEXT", 1, None, 0),
         ]
         if rows != expected:
             raise AuthorizationError("journal_schema")
-
-    def _claim_verified(self, verified: _VerifiedAuthorization) -> str:
-        """Internal-only claim; no public API accepts a decision object."""
-
-        if (
-            type(verified) is not _VerifiedAuthorization
-            or verified.capability is not _VERIFIED_CAPABILITY
-        ):
-            raise AuthorizationError("journal")
-        connection = self._connect()
-        receipt_sha256 = verified.receipt_sha256()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(_JOURNAL_SCHEMA)
-            self._validate_schema(connection)
-            result = connection.execute(
-                """
-                INSERT INTO authorization_nonce_journal
-                    (nonce, operation_id, receipt_sha256, claimed_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(nonce) DO NOTHING
-                """,
-                (
-                    verified.nonce,
-                    verified.receipt.operation_id,
-                    receipt_sha256,
-                    verified.authorized_at,
+        index_rows = connection.execute(f"PRAGMA index_list({_OPERATION_TABLE})").fetchall()
+        indexes = {
+            (
+                bool(index[2]),
+                index[3],
+                tuple(
+                    column[2]
+                    for column in connection.execute(f"PRAGMA index_info({index[1]})").fetchall()
                 ),
             )
-            if result.rowcount != 1:
-                connection.execute("ROLLBACK")
-                raise AuthorizationError("nonce_replayed")
+            for index in index_rows
+        }
+        if indexes != {(True, "pk", ("operation_id",)), (True, "u", ("nonce",))}:
+            raise AuthorizationError("journal_schema")
+        schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (_OPERATION_TABLE,)
+        ).fetchone()
+        expected_sql = re.sub(r"\s+", "", _OPERATION_SCHEMA.replace("IF NOT EXISTS ", "").lower())
+        if (
+            schema is None
+            or type(schema[0]) is not str
+            or re.sub(r"\s+", "", schema[0].lower()) != expected_sql
+        ):
+            raise AuthorizationError("journal_schema")
+
+    def _transaction(self, action: Callable[[sqlite3.Connection], str | None]) -> str | None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(_OPERATION_SCHEMA)
+            self._validate_schema(connection)
+            result = action(connection)
             connection.execute("COMMIT")
             self._validate_owner_file(self._path)
             self._validate_companions()
+            return result
         except AuthorizationError:
             with suppress(sqlite3.Error):
                 connection.execute("ROLLBACK")
@@ -596,23 +774,235 @@ class SQLiteAuthorizationJournal:
         except sqlite3.Error:
             with suppress(sqlite3.Error):
                 connection.execute("ROLLBACK")
-            raise AuthorizationError("journal_claim") from None
+            raise AuthorizationError("journal_transaction") from None
         finally:
             connection.close()
-        return _digest(
-            json.dumps(
-                {
-                    "nonce": verified.nonce,
-                    "operation_id": verified.receipt.operation_id,
-                    "receipt_sha256": receipt_sha256,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
+
+    @staticmethod
+    def _require_verified(verified: _VerifiedExecution) -> None:
+        if (
+            type(verified) is not _VerifiedExecution
+            or verified.capability is not _VERIFIED_CAPABILITY
+        ):
+            raise AuthorizationError("journal")
+
+    @staticmethod
+    def _bindings(verified: _VerifiedExecution) -> tuple[str, str, str, str]:
+        context = verified.context
+        return (
+            context.proposal_sha256,
+            context.contract_sha256,
+            context.provider_provenance_sha256,
+            context.idempotency_key,
         )
 
+    def _claim_verified(self, verified: _VerifiedExecution) -> None:
+        self._require_verified(verified)
+        proposal_sha256, contract_sha256, provider_sha256, idempotency_key = self._bindings(
+            verified
+        )
 
-def authorize_and_consume(
+        def claim(connection: sqlite3.Connection) -> None:
+            existing = connection.execute(
+                f"SELECT state FROM {_OPERATION_TABLE} WHERE operation_id = ?",
+                (verified.context.operation_id,),
+            ).fetchone()
+            if existing is not None:
+                raise AuthorizationError("operation_replayed")
+            nonce = connection.execute(
+                f"SELECT operation_id FROM {_OPERATION_TABLE} WHERE nonce = ?", (verified.nonce,)
+            ).fetchone()
+            if nonce is not None:
+                raise AuthorizationError("nonce_replayed")
+            connection.execute(
+                f"""
+                INSERT INTO {_OPERATION_TABLE} (
+                    operation_id, nonce, proposal_sha256, contract_sha256,
+                    provider_provenance_sha256, idempotency_key, state,
+                    effect_receipt_sha256, failure_phase, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                """,
+                (
+                    verified.context.operation_id,
+                    verified.nonce,
+                    proposal_sha256,
+                    contract_sha256,
+                    provider_sha256,
+                    idempotency_key,
+                    AuthorizationOperationState.CLAIMED.value,
+                    verified.authorized_at,
+                    verified.authorized_at,
+                ),
+            )
+            return None
+
+        self._transaction(claim)
+
+    def _begin_effect(self, verified: _VerifiedExecution) -> None:
+        self._require_verified(verified)
+        proposal_sha256, contract_sha256, provider_sha256, idempotency_key = self._bindings(
+            verified
+        )
+
+        def begin(connection: sqlite3.Connection) -> None:
+            result = connection.execute(
+                f"""
+                UPDATE {_OPERATION_TABLE}
+                SET state = ?, updated_at = ?
+                WHERE operation_id = ? AND nonce = ? AND proposal_sha256 = ?
+                  AND contract_sha256 = ? AND provider_provenance_sha256 = ?
+                  AND idempotency_key = ? AND state = ?
+                """,
+                (
+                    AuthorizationOperationState.IN_PROGRESS.value,
+                    verified.authorized_at,
+                    verified.context.operation_id,
+                    verified.nonce,
+                    proposal_sha256,
+                    contract_sha256,
+                    provider_sha256,
+                    idempotency_key,
+                    AuthorizationOperationState.CLAIMED.value,
+                ),
+            )
+            if result.rowcount != 1:
+                raise AuthorizationError("operation_state")
+            return None
+
+        self._transaction(begin)
+
+    def _commit_effect(self, verified: _VerifiedExecution, effect_receipt: EffectReceiptV1) -> None:
+        self._require_verified(verified)
+        proposal_sha256, contract_sha256, provider_sha256, idempotency_key = self._bindings(
+            verified
+        )
+
+        def commit(connection: sqlite3.Connection) -> None:
+            result = connection.execute(
+                f"""
+                UPDATE {_OPERATION_TABLE}
+                SET state = ?, effect_receipt_sha256 = ?, failure_phase = NULL, updated_at = ?
+                WHERE operation_id = ? AND nonce = ? AND proposal_sha256 = ?
+                  AND contract_sha256 = ? AND provider_provenance_sha256 = ?
+                  AND idempotency_key = ? AND state = ?
+                """,
+                (
+                    AuthorizationOperationState.COMMITTED.value,
+                    effect_receipt.effect_receipt_sha256,
+                    verified.authorized_at,
+                    verified.context.operation_id,
+                    verified.nonce,
+                    proposal_sha256,
+                    contract_sha256,
+                    provider_sha256,
+                    idempotency_key,
+                    AuthorizationOperationState.IN_PROGRESS.value,
+                ),
+            )
+            if result.rowcount != 1:
+                raise AuthorizationError("operation_state")
+            return None
+
+        self._transaction(commit)
+
+    def _fail_effect(self, verified: _VerifiedExecution) -> None:
+        self._require_verified(verified)
+
+        def fail(connection: sqlite3.Connection) -> None:
+            result = connection.execute(
+                f"""
+                UPDATE {_OPERATION_TABLE}
+                SET state = ?, failure_phase = ?, updated_at = ?
+                WHERE operation_id = ? AND nonce = ? AND state = ?
+                """,
+                (
+                    AuthorizationOperationState.FAILED_RECOVERY_REQUIRED.value,
+                    "effect",
+                    verified.authorized_at,
+                    verified.context.operation_id,
+                    verified.nonce,
+                    AuthorizationOperationState.IN_PROGRESS.value,
+                ),
+            )
+            if result.rowcount != 1:
+                raise AuthorizationError("operation_state")
+            return None
+
+        self._transaction(fail)
+
+    def operation_state(self, operation_id: str) -> AuthorizationOperationState | None:
+        if type(operation_id) is not str or not operation_id:
+            raise AuthorizationError("operation_id")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(_OPERATION_SCHEMA)
+            self._validate_schema(connection)
+            row = connection.execute(
+                f"SELECT state FROM {_OPERATION_TABLE} WHERE operation_id = ?", (operation_id,)
+            ).fetchone()
+            connection.execute("COMMIT")
+        except AuthorizationError:
+            with suppress(sqlite3.Error):
+                connection.execute("ROLLBACK")
+            raise
+        except sqlite3.Error:
+            with suppress(sqlite3.Error):
+                connection.execute("ROLLBACK")
+            raise AuthorizationError("journal_transaction") from None
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        try:
+            return AuthorizationOperationState(row[0])
+        except (TypeError, ValueError):
+            raise AuthorizationError("journal_schema") from None
+
+    def require_recovery(self, operation_id: str) -> AuthorizationOperationState:
+        """Explicitly mark a stranded claimed/in-progress operation unretryable."""
+
+        if type(operation_id) is not str or not operation_id:
+            raise AuthorizationError("operation_id")
+
+        def recover(connection: sqlite3.Connection) -> str:
+            result = connection.execute(
+                f"""
+                UPDATE {_OPERATION_TABLE}
+                SET state = ?, failure_phase = ?, updated_at = ?
+                WHERE operation_id = ? AND state IN (?, ?)
+                """,
+                (
+                    AuthorizationOperationState.FAILED_RECOVERY_REQUIRED.value,
+                    "explicit_recovery",
+                    datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                    operation_id,
+                    AuthorizationOperationState.CLAIMED.value,
+                    AuthorizationOperationState.IN_PROGRESS.value,
+                ),
+            )
+            if result.rowcount != 1:
+                raise AuthorizationError("operation_state")
+            return AuthorizationOperationState.FAILED_RECOVERY_REQUIRED.value
+
+        result = self._transaction(recover)
+        assert result is not None
+        return AuthorizationOperationState(result)
+
+
+def _validate_effect_receipt(context: VerifiedExecutionContext, value: object) -> EffectReceiptV1:
+    if type(value) is not EffectReceiptV1:
+        raise AuthorizationError("effect_receipt")
+    receipt = value
+    if (
+        receipt.operation_id != context.operation_id
+        or receipt.idempotency_key != context.idempotency_key
+    ):
+        raise AuthorizationError("effect_receipt")
+    return receipt
+
+
+def authorize_and_execute(
     paths: AuthorizationPaths,
     *,
     signer: TrustedEd25519SignerV1,
@@ -621,35 +1011,99 @@ def authorize_and_consume(
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
+    effect: Callable[[VerifiedExecutionContext], EffectReceiptV1],
     now: datetime | None = None,
-) -> AuthorizationGrantV1:
-    """Verify then atomically consume one nonce before yielding an audit grant."""
+) -> ExecutionReceiptV1:
+    """Lock, verify, claim, execute once, and commit an effect receipt.
 
-    if type(journal) is not SQLiteAuthorizationJournal:
-        raise AuthorizationError("journal")
-    verified = _verify_authorization(
-        paths,
-        signer=signer,
-        provider=provider,
-        provider_fingerprints=provider_fingerprints,
-        expected_disposal_owner=expected_disposal_owner,
-        expected_approver_identity=expected_approver_identity,
-        now=now,
-    )
-    journal_entry_sha256 = journal._claim_verified(verified)
-    return AuthorizationGrantV1(
-        schema_version="rsd.lifecycle-authorization-grant.v1",
-        status="consumed",
-        operation_id=verified.receipt.operation_id,
-        disposal_owner=verified.receipt.disposal_owner,
-        retention_expires_at=verified.receipt.retention_expires_at,
-        proposal_sha256=verified.receipt.proposal_sha256,
-        contract_sha256=verified.receipt.contract_sha256,
-        evidence_sha256=verified.receipt.evidence_sha256,
-        provider_provenance_sha256=verified.provider_provenance_sha256,
-        journal_entry_sha256=journal_entry_sha256,
-        consumed_at=verified.authorized_at,
-    )
+    A failed callback and any process interruption after ``_begin_effect`` leave
+    the operation in a non-retryable recovery-required state. The callback gets
+    only immutable verified material and must use ``idempotency_key`` for its
+    own side effect.
+    """
+
+    if type(journal) is not SQLiteAuthorizationJournal or not callable(effect):
+        raise AuthorizationError("journal_effect")
+    clock = datetime.now(UTC) if now is None else now
+    if clock.tzinfo is None or clock.utcoffset() is None:
+        raise AuthorizationError("clock")
+    with ArtifactRootLease(paths.root):
+        artifacts, snapshot = _verify_artifact_snapshot(
+            paths,
+            signer=signer,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            now=clock,
+        )
+        references = artifacts.proposal.provider_references.all()
+        with provider.acquire(references) as lease:
+            initial_provider_sha256, expectations = _provider_commitment(
+                references=references,
+                lease=lease,
+                fingerprints=provider_fingerprints,
+                recheck=False,
+            )
+            repeated_receipt, repeated_snapshot = _receipt_snapshot(paths, now=clock)
+            if artifacts.receipt != repeated_receipt or snapshot != repeated_snapshot:
+                raise AuthorizationError("artifact_race")
+            final_provider_sha256, final_expectations = _provider_commitment(
+                references=references,
+                lease=lease,
+                fingerprints=provider_fingerprints,
+                recheck=True,
+            )
+            if (
+                initial_provider_sha256 != final_provider_sha256
+                or expectations != final_expectations
+            ):
+                raise AuthorizationError("provider_race")
+            idempotency_key = _idempotency_key(
+                operation_id=artifacts.receipt.operation_id,
+                proposal_sha256=artifacts.receipt.proposal_sha256,
+                contract_sha256=artifacts.receipt.contract_sha256,
+                provider_sha256=final_provider_sha256,
+            )
+            context = VerifiedExecutionContext(
+                operation_id=artifacts.receipt.operation_id,
+                idempotency_key=idempotency_key,
+                proposal=artifacts.proposal,
+                final_contract=artifacts.final_contract,
+                provider_expectations=final_expectations,
+                proposal_sha256=artifacts.receipt.proposal_sha256,
+                contract_sha256=artifacts.receipt.contract_sha256,
+                provider_provenance_sha256=final_provider_sha256,
+            )
+            authorized_at = (
+                clock.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+            )
+            verified = _VerifiedExecution(
+                context=context,
+                nonce=secrets.token_hex(16),
+                authorized_at=authorized_at,
+                capability=_VERIFIED_CAPABILITY,
+            )
+            journal._claim_verified(verified)
+            journal._begin_effect(verified)
+            try:
+                effect_receipt = _validate_effect_receipt(context, effect(context))
+            except Exception as error:
+                try:
+                    journal._fail_effect(verified)
+                except AuthorizationError:
+                    raise AuthorizationError("effect_failed_recovery_required") from error
+                raise AuthorizationError("effect_failed_recovery_required") from error
+            journal._commit_effect(verified, effect_receipt)
+            return ExecutionReceiptV1(
+                schema_version="rsd.lifecycle-execution-receipt.v1",
+                status="committed",
+                operation_id=context.operation_id,
+                idempotency_key=context.idempotency_key,
+                effect_receipt_sha256=effect_receipt.effect_receipt_sha256,
+                proposal_sha256=context.proposal_sha256,
+                contract_sha256=context.contract_sha256,
+                provider_provenance_sha256=context.provider_provenance_sha256,
+                committed_at=authorized_at,
+            )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

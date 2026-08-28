@@ -95,21 +95,33 @@ library.
 
 ## Phase-B authorization
 
-`omninode_rsd.lifecycle.authorize_and_consume()` is the single
+`omninode_rsd.lifecycle.authorize_and_execute()` is the single
 mutation-admission boundary for a disposable acceptance workflow. It accepts
-an injected Ed25519 trust anchor, provider-provenance adapter, provider
-fingerprint policy, and an owner-only `SQLiteAuthorizationJournal`. It requires
-actual detached-signature sidecars for the proposal, final contract, and
-evidence artifacts; Phase-A signature markers alone never authorize.
+an injected Ed25519 trust anchor, leased provider-provenance adapter, provider
+fingerprint policy, owner-only `SQLiteAuthorizationJournal`, and one effect
+callback. It requires actual detached-signature sidecars for the proposal,
+final contract, and evidence artifacts; Phase-A signature markers alone never
+authorize.
 
 The verifier reads bounded owner-only artifact files, runs Phase-A before and
 after provider inspection, and rejects changed content, sidecars, unsafe file
 metadata, stale evidence, expired retention, signer mismatch, provider
-mismatch, and replayed journal claims. The SQLite journal requires an
-owner-only directory and database file, uses `BEGIN IMMEDIATE`, `DELETE`
-journaling, and `FULL` synchronous durability. It records the nonce before the
-function returns an `AuthorizationGrantV1`; that audit grant is
-non-consumable. This package performs no service mutation.
+mismatch, and replayed journal claims. It first acquires a strict owner-only
+artifact-root advisory lock and holds it through provider leasing, journal
+claim, effect execution, and terminal journal transition. Cooperating writers
+use the same lock; noncooperating file changes are rejected by the final
+snapshot check before an effect starts.
+
+The callback receives only immutable `VerifiedExecutionContext`: parsed
+proposal/final-contract models, exact provider expectations, and a derived
+idempotency key. It receives no artifact path, nonce, or journal handle. It
+must return an `EffectReceiptV1` bound to that operation and idempotency key.
+The SQLite journal requires an owner-only directory and database file, uses
+`BEGIN IMMEDIATE`, `DELETE` journaling, and `FULL` synchronous durability. Its
+operation ID is unique and binds the proposal/final hashes. It records
+`claimed`, `in_progress`, `committed`, or `failed_recovery_required`; a fresh
+nonce cannot retry an existing operation. A crash after an effect starts is
+never retried automatically and must be explicitly marked for recovery.
 
 Detached sidecars use canonical standard base64 and Ed25519 domain-separated
 bytes containing the artifact name and SHA-256 of canonical signed content.
