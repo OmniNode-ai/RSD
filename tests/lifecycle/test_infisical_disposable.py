@@ -7,14 +7,16 @@ import hashlib
 import inspect
 import multiprocessing
 import os
+import shutil
 import sqlite3
 import traceback
+import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Event
-from typing import Protocol
+from threading import Event, Lock
+from typing import Literal, Protocol
 
 import pytest
 import yaml
@@ -27,6 +29,8 @@ from omninode_rsd.lifecycle.authorization import (
     AuthorizationPaths,
     EffectReceiptV1,
     ExecutionReceiptV1,
+    JournalGenesisReceiptV1,
+    JournalGenesisReconciliationReceiptV1,
     JournalMigrationStatus,
     ProviderProvenance,
     SQLiteAuthorizationJournal,
@@ -34,8 +38,13 @@ from omninode_rsd.lifecycle.authorization import (
     VerifiedExecutionContext,
     _authorize_and_execute_for_test,
     _canonical_signed_content,
+    _journal_genesis_message,
+    _journal_genesis_reconciliation_message,
+    _provision_journal_for_test,
     _signature_message,
     authorize_and_execute,
+    provision_journal,
+    reconcile_journal_genesis,
 )
 from omninode_rsd.lifecycle.authorization import (
     main as authorization_main,
@@ -77,6 +86,8 @@ _COMMIT = "a" * 40
 _HASH = "b" * 64
 _IMAGE = ImageReferenceV1(reference=f"registry.example.test/infisical@sha256:{'c' * 64}")
 _CACHE_IMAGE = ImageReferenceV1(reference=f"registry.example.test/valkey@sha256:{'d' * 64}")
+_TEST_SIGNING_KEYS: dict[str, Ed25519PrivateKey] = {}
+_TEST_PROVISION_LOCK = Lock()
 
 
 class _StringQueue(Protocol):
@@ -685,6 +696,7 @@ def _authorize_materials(
         public_key_base64=base64.b64encode(public).decode(),
         public_key_fingerprint_sha256=_digest(public),
     )
+    _TEST_SIGNING_KEYS[signer.public_key_fingerprint_sha256] = key
     evidence_names = (
         "approval.yaml",
         "governed-baseline.yaml",
@@ -799,7 +811,7 @@ def _refresh_sidecar(root: Path, name: str, key: Ed25519PrivateKey, *, resign: b
 
 def _journal(tmp_path: Path) -> SQLiteAuthorizationJournal:
     root = tmp_path / "journal"
-    root.mkdir(mode=0o700, exist_ok=True)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
     root.chmod(0o700)
     return SQLiteAuthorizationJournal(root / "authorization.sqlite3")
 
@@ -825,6 +837,103 @@ def _effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
     )
 
 
+def _journal_genesis_receipt(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    journal: SQLiteAuthorizationJournal,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+) -> JournalGenesisReceiptV1:
+    key = _TEST_SIGNING_KEYS[signer.public_key_fingerprint_sha256]
+    created = _NOW
+    compiled = compile_preflight(paths.preflight(), now=created)
+    unsigned = JournalGenesisReceiptV1(
+        schema_version="rsd.authorization-journal-genesis.v1",
+        operation_domain="rsd.disposable-acceptance-operation.v1",
+        operation_id=compiled.operation_id,
+        proposal_sha256=compiled.proposal_sha256,
+        contract_sha256=compiled.contract_sha256,
+        disposal_owner=expected_disposal_owner,
+        approver_identity=expected_approver_identity,
+        journal_path=str(journal._path),
+        journal_path_sha256=journal._path_sha256(),
+        journal_uuid=str(uuid.uuid4()),
+        journal_schema_sha256=journal.journal_schema_sha256(),
+        created_at=created.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        signer_key_id=signer.key_id,
+        signature_base64=base64.b64encode(b"0" * 64).decode(),
+    )
+    return unsigned.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                key.sign(_journal_genesis_message(unsigned))
+            ).decode()
+        }
+    )
+
+
+def _ensure_test_journal_provisioned(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteAuthorizationJournal,
+) -> None:
+    """Use the explicit public provisioning boundary; authorization never does this."""
+
+    with _TEST_PROVISION_LOCK:
+        if journal.migration_status() is not JournalMigrationStatus.ABSENT:
+            return
+        receipt = _journal_genesis_receipt(
+            paths,
+            signer=signer,
+            journal=journal,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+        )
+        _provision_journal_for_test(
+            paths,
+            signer=signer,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            journal=journal,
+            receipt=receipt,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+
+
+def _genesis_reconciliation_receipt(
+    receipt: JournalGenesisReceiptV1,
+    *,
+    signer: TrustedEd25519SignerV1,
+    outcome: Literal["provisioning_completed", "provisioning_abandoned"],
+) -> JournalGenesisReconciliationReceiptV1:
+    key = _TEST_SIGNING_KEYS[signer.public_key_fingerprint_sha256]
+    genesis_sha256 = _digest(
+        yaml.safe_dump(receipt.model_dump(mode="json"), sort_keys=True).encode()
+    )
+    unsigned = JournalGenesisReconciliationReceiptV1(
+        schema_version="rsd.authorization-journal-genesis-reconciliation.v1",
+        outcome=outcome,
+        journal_uuid=receipt.journal_uuid,
+        journal_path_sha256=receipt.journal_path_sha256,
+        genesis_sha256=genesis_sha256,
+        created_at=_NOW.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        signer_key_id=signer.key_id,
+        signature_base64=base64.b64encode(b"0" * 64).decode(),
+    )
+    return unsigned.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                key.sign(_journal_genesis_reconciliation_message(unsigned))
+            ).decode()
+        }
+    )
+
+
 def _execute_for_test(
     paths: AuthorizationPaths,
     *,
@@ -836,7 +945,16 @@ def _execute_for_test(
     journal: SQLiteAuthorizationJournal,
     effect: Callable[[VerifiedExecutionContext], EffectReceiptV1],
     now: datetime = _NOW,
+    provision: bool = True,
 ) -> ExecutionReceiptV1:
+    if provision:
+        _ensure_test_journal_provisioned(
+            paths,
+            signer=signer,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            journal=journal,
+        )
     return _authorize_and_execute_for_test(
         paths,
         signer=signer,
@@ -876,6 +994,8 @@ def test_public_execution_has_no_caller_controlled_clock(tmp_path: Path) -> None
     signer, fingerprints, _ = _authorize_materials(root)
 
     assert "now" not in inspect.signature(authorize_and_execute).parameters
+    assert "now" not in inspect.signature(provision_journal).parameters
+    assert "_clock" not in inspect.signature(provision_journal).parameters
     with pytest.raises(TypeError, match="unexpected keyword argument 'now'"):
         authorize_and_execute(
             AuthorizationPaths(root),
@@ -901,6 +1021,408 @@ def test_public_execution_has_no_caller_controlled_clock(tmp_path: Path) -> None
             _clock=lambda: _NOW,
             _capability=object(),
         )
+
+
+def test_phase_b_absent_journal_never_initializes_or_provisions(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints, _ = _authorize_materials(root)
+    journal = _journal(tmp_path)
+    called = False
+
+    def effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
+        nonlocal called
+        called = True
+        return _effect(context)
+
+    with pytest.raises(AuthorizationError, match="journal_absent"):
+        _execute_for_test(
+            AuthorizationPaths(root),
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            effect=effect,
+            now=_NOW,
+            provision=False,
+        )
+
+    assert not called
+    assert journal.migration_status() is JournalMigrationStatus.ABSENT
+    assert not journal._path.exists()
+    assert not journal._anchor_path().exists()
+    assert not journal._genesis_marker_path().exists()
+    assert not (root / AuthorizationPaths.journal_genesis_name()).exists()
+
+
+def test_genesis_blocks_pair_removal_replay_and_identity_file_removal(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints, _ = _authorize_materials(root)
+    journal = _journal(tmp_path)
+    paths = AuthorizationPaths(root)
+    genesis = _journal_genesis_receipt(
+        paths,
+        signer=signer,
+        journal=journal,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+    )
+    _provision_journal_for_test(
+        paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        receipt=genesis,
+        _clock=lambda: _NOW,
+        _capability=_TEST_CLOCK_CAPABILITY,
+    )
+    effects: list[str] = []
+
+    def effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
+        effects.append(context.operation_id)
+        return _effect(context)
+
+    _execute_for_test(
+        paths,
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        effect=effect,
+        provision=False,
+    )
+    assert effects == [_proposal().operation_id]
+
+    journal._path.unlink()
+    journal._anchor_path().unlink()
+    assert journal.migration_status() is JournalMigrationStatus.JOURNAL_MISSING
+    with pytest.raises(AuthorizationError, match="journal_missing"):
+        _execute_for_test(
+            paths,
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            effect=effect,
+            provision=False,
+        )
+    assert effects == [_proposal().operation_id]
+    assert not journal._path.exists()
+    assert not journal._anchor_path().exists()
+
+    journal._genesis_marker_path().unlink()
+    assert journal.migration_status() is JournalMigrationStatus.ABSENT
+    with pytest.raises(AuthorizationError, match="journal_absent"):
+        _execute_for_test(
+            paths,
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            effect=effect,
+            provision=False,
+        )
+    assert effects == [_proposal().operation_id]
+    assert not journal._path.exists()
+    assert not journal._anchor_path().exists()
+    assert (root / AuthorizationPaths.journal_genesis_name()).exists()
+    with pytest.raises(AuthorizationError, match="journal_genesis_replayed"):
+        _provision_journal_for_test(
+            paths,
+            signer=signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            receipt=genesis,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+
+
+def test_genesis_copy_or_removal_blocks_effect_before_claim(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    signer, fingerprints, _ = _authorize_materials(source)
+    target = tmp_path / "target"
+    shutil.copytree(source, target)
+    source_journal = _journal(tmp_path / "source-journal")
+    target_journal = _journal(tmp_path / "target-journal")
+    source_paths = AuthorizationPaths(source)
+    target_paths = AuthorizationPaths(target)
+    for paths, journal in ((source_paths, source_journal), (target_paths, target_journal)):
+        _provision_journal_for_test(
+            paths,
+            signer=signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            receipt=_journal_genesis_receipt(
+                paths,
+                signer=signer,
+                journal=journal,
+                expected_disposal_owner="acceptance-owner",
+                expected_approver_identity="approval-owner",
+            ),
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+    target_genesis = target / AuthorizationPaths.journal_genesis_name()
+    target_genesis.unlink()
+    shutil.copy2(source / AuthorizationPaths.journal_genesis_name(), target_genesis)
+    target_genesis.chmod(0o600)
+    called = False
+
+    def effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
+        nonlocal called
+        called = True
+        return _effect(context)
+
+    with pytest.raises(AuthorizationError, match="journal_genesis_binding"):
+        _execute_for_test(
+            target_paths,
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=target_journal,
+            effect=effect,
+            provision=False,
+        )
+    assert not called
+
+    source_genesis = source / AuthorizationPaths.journal_genesis_name()
+    source_genesis.unlink()
+    with pytest.raises(AuthorizationError, match="journal_genesis_artifact"):
+        _execute_for_test(
+            source_paths,
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=source_journal,
+            effect=effect,
+            provision=False,
+        )
+    assert not called
+
+
+def test_genesis_rejects_second_provision_and_signed_mismatch(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, _, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    journal = _journal(tmp_path)
+    receipt = _journal_genesis_receipt(
+        paths,
+        signer=signer,
+        journal=journal,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+    )
+    _provision_journal_for_test(
+        paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        receipt=receipt,
+        _clock=lambda: _NOW,
+        _capability=_TEST_CLOCK_CAPABILITY,
+    )
+    with pytest.raises(AuthorizationError, match="journal_genesis_replayed"):
+        _provision_journal_for_test(
+            paths,
+            signer=signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            receipt=receipt,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+
+    mismatch_root = tmp_path / "mismatch-artifacts"
+    mismatch_signer, _, _ = _authorize_materials(mismatch_root)
+    mismatch_paths = AuthorizationPaths(mismatch_root)
+    mismatch_journal = _journal(tmp_path / "mismatch-journal")
+    valid = _journal_genesis_receipt(
+        mismatch_paths,
+        signer=mismatch_signer,
+        journal=mismatch_journal,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+    )
+    invalid_signature = valid.model_copy(
+        update={"signature_base64": base64.b64encode(b"1" * 64).decode()}
+    )
+    with pytest.raises(AuthorizationError, match="journal_genesis_signature"):
+        _provision_journal_for_test(
+            mismatch_paths,
+            signer=mismatch_signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=mismatch_journal,
+            receipt=invalid_signature,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+    assert mismatch_journal.migration_status() is JournalMigrationStatus.ABSENT
+    assert not (mismatch_root / AuthorizationPaths.journal_genesis_name()).exists()
+
+    wrong_owner = _journal_genesis_receipt(
+        mismatch_paths,
+        signer=mismatch_signer,
+        journal=mismatch_journal,
+        expected_disposal_owner="wrong-owner",
+        expected_approver_identity="approval-owner",
+    )
+    with pytest.raises(AuthorizationError, match="journal_genesis_binding"):
+        _provision_journal_for_test(
+            mismatch_paths,
+            signer=mismatch_signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=mismatch_journal,
+            receipt=wrong_owner,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+    assert mismatch_journal.migration_status() is JournalMigrationStatus.ABSENT
+
+
+def test_genesis_crash_windows_require_signed_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "artifacts"
+    signer, _, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    journal = _journal(tmp_path)
+    receipt = _journal_genesis_receipt(
+        paths,
+        signer=signer,
+        journal=journal,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+    )
+    original_write_once = ArtifactRootLease.write_once
+
+    def crash_before_artifact(
+        lease: ArtifactRootLease, name: str, payload: bytes, *, phase: str
+    ) -> None:
+        del lease, name, payload, phase
+        raise AuthorizationError("simulated_crash")
+
+    monkeypatch.setattr(ArtifactRootLease, "write_once", crash_before_artifact)
+    with pytest.raises(AuthorizationError, match="simulated_crash"):
+        _provision_journal_for_test(
+            paths,
+            signer=signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            receipt=receipt,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+    monkeypatch.setattr(ArtifactRootLease, "write_once", original_write_once)
+    assert journal.migration_status() is JournalMigrationStatus.PROVISIONING_INCOMPLETE
+    assert not journal._path.exists()
+    with pytest.raises(AuthorizationError, match="provisioning_incomplete"):
+        _provision_journal_for_test(
+            paths,
+            signer=signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            receipt=receipt,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+    assert (
+        reconcile_journal_genesis(
+            journal,
+            _genesis_reconciliation_receipt(
+                receipt, signer=signer, outcome="provisioning_abandoned"
+            ),
+            signer=signer,
+        )
+        is JournalMigrationStatus.PROVISIONING_INCOMPLETE
+    )
+
+    completed_root = tmp_path / "completed-artifacts"
+    completed_signer, completed_fingerprints, _ = _authorize_materials(completed_root)
+    completed_paths = AuthorizationPaths(completed_root)
+    completed_journal = _journal(tmp_path / "completed-journal")
+    completed_receipt = _journal_genesis_receipt(
+        completed_paths,
+        signer=completed_signer,
+        journal=completed_journal,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+    )
+    original_set_state = completed_journal._set_genesis_marker_state
+
+    def crash_after_database(marker: object, state: object) -> object:
+        del marker, state
+        raise AuthorizationError("simulated_crash")
+
+    monkeypatch.setattr(completed_journal, "_set_genesis_marker_state", crash_after_database)
+    with pytest.raises(AuthorizationError, match="simulated_crash"):
+        _provision_journal_for_test(
+            completed_paths,
+            signer=completed_signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=completed_journal,
+            receipt=completed_receipt,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+    monkeypatch.setattr(completed_journal, "_set_genesis_marker_state", original_set_state)
+    assert completed_journal.migration_status() is JournalMigrationStatus.PROVISIONING_INCOMPLETE
+    assert completed_journal._path.exists()
+    assert completed_journal._anchor_path().exists()
+    with pytest.raises(AuthorizationError, match="provisioning_incomplete"):
+        _provision_journal_for_test(
+            completed_paths,
+            signer=completed_signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=completed_journal,
+            receipt=completed_receipt,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+    assert (
+        reconcile_journal_genesis(
+            completed_journal,
+            _genesis_reconciliation_receipt(
+                completed_receipt, signer=completed_signer, outcome="provisioning_completed"
+            ),
+            signer=completed_signer,
+        )
+        is JournalMigrationStatus.CURRENT
+    )
+    receipt_after_recovery = _execute_for_test(
+        completed_paths,
+        signer=completed_signer,
+        provider=_Provider(completed_fingerprints),
+        provider_fingerprints=completed_fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=completed_journal,
+        effect=_effect,
+        provision=False,
+    )
+    assert receipt_after_recovery.status == "committed"
 
 
 def test_phase_b_detects_legacy_journal_before_effect(tmp_path: Path) -> None:
@@ -1474,7 +1996,7 @@ def test_phase_b_rejects_artifact_and_provider_mutation_before_effect(tmp_path: 
             provider_fingerprints=fingerprints,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
-            journal=_journal(tmp_path),
+            journal=_journal(tmp_path / "provider-journal"),
             effect=_effect,
             now=_NOW,
         )
@@ -1499,6 +2021,7 @@ def test_phase_b_rejects_marker_only_signature_and_cli_is_read_only(tmp_path: Pa
         )
     assert authorization_main(["authorize", "--root", str(root)]) == 2
     assert main(["authorize", "--root", str(root)]) == 2
+    assert not (root / AuthorizationPaths.journal_genesis_name()).exists()
 
 
 def test_phase_b_rejects_disposal_owner_or_approval_mismatch(tmp_path: Path) -> None:

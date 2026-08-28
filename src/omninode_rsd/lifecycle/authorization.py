@@ -66,22 +66,32 @@ _ARTIFACT_NAMES: Final[tuple[str, ...]] = (
     "registry-verification.yaml",
     "postgres-overlay.yaml",
 )
+_JOURNAL_GENESIS_ARTIFACT_NAME: Final = "journal-genesis.yaml"
 _MARKED_EVIDENCE_NAMES: Final[frozenset[str]] = frozenset(_ARTIFACT_NAMES[2:-1])
 _SIGNATURE_DOMAIN: Final = b"omninode-rsd.authorization.ed25519.v3\x00"
 _IDEMPOTENCY_DOMAIN: Final = b"omninode-rsd.authorization.effect.v1\x00"
 _RECONCILIATION_DOMAIN: Final = b"omninode-rsd.authorization.reconciliation.v1\x00"
+_JOURNAL_GENESIS_DOMAIN: Final = b"omninode-rsd.authorization.journal-genesis.v1\x00"
+_JOURNAL_GENESIS_RECONCILIATION_DOMAIN: Final = (
+    b"omninode-rsd.authorization.journal-genesis-reconciliation.v1\x00"
+)
 _ARTIFACT_LOCK_PREFIX: Final = ".rsd-authorization-root-"
 _OPERATION_LEASE_PREFIX: Final = ".rsd-authorization-operation-"
 _JOURNAL_IDENTITY_LEASE_PREFIX: Final = ".rsd-authorization-journal-identity-"
 _JOURNAL_ANCHOR_PREFIX: Final = ".rsd-authorization-journal-anchor-"
+_JOURNAL_GENESIS_MARKER_PREFIX: Final = ".rsd-authorization-journal-genesis-"
 _VERIFIED_CAPABILITY: Final = object()
+_GENESIS_CAPABILITY: Final = object()
 _TEST_CLOCK_CAPABILITY: Final = object()
+_SYSTEM_CLOCK_CAPABILITY: Final = object()
 _SAFE_CALL_FAILURE: Final = object()
 _OPERATION_TABLE: Final = "authorization_operation_journal"
 _JOURNAL_METADATA_TABLE: Final = "authorization_journal_metadata"
 _LEGACY_OPERATION_TABLE: Final = "authorization_nonce_journal"
 _JOURNAL_SCHEMA_VERSION: Final = "rsd.authorization-journal.v1"
 _JOURNAL_ANCHOR_SCHEMA_VERSION: Final = "rsd.authorization-journal-anchor.v1"
+_JOURNAL_GENESIS_MARKER_SCHEMA_VERSION: Final = "rsd.authorization-journal-genesis-marker.v1"
+_JOURNAL_OPERATION_DOMAIN: Final = "rsd.disposable-acceptance-operation.v1"
 _OPERATION_SCHEMA: Final = f"""
 CREATE TABLE IF NOT EXISTS {_OPERATION_TABLE} (
     operation_id TEXT PRIMARY KEY NOT NULL,
@@ -105,6 +115,7 @@ CREATE TABLE IF NOT EXISTS {_JOURNAL_METADATA_TABLE} (
     journal_path_sha256 TEXT NOT NULL,
     operation_schema_sha256 TEXT NOT NULL,
     metadata_schema_sha256 TEXT NOT NULL,
+    genesis_sha256 TEXT NOT NULL,
     anchor_dev INTEGER NOT NULL,
     anchor_ino INTEGER NOT NULL,
     anchor_nlink INTEGER NOT NULL,
@@ -144,7 +155,9 @@ class JournalMigrationStatus(StrEnum):
     CURRENT = "current"
     LEGACY_DETECTED = "legacy_detected"
     ANCHOR_MISSING = "anchor_missing"
+    GENESIS_MISSING = "genesis_missing"
     JOURNAL_MISSING = "journal_missing"
+    PROVISIONING_INCOMPLETE = "provisioning_incomplete"
     IDENTITY_MISMATCH = "identity_mismatch"
     UNKNOWN = "unknown"
 
@@ -273,6 +286,84 @@ class ReconciliationReceiptV1(_Model):
         return self
 
 
+class JournalGenesisReceiptV1(_Model):
+    """Signed, one-time journal identity authorization for one artifact set."""
+
+    schema_version: Literal["rsd.authorization-journal-genesis.v1"]
+    operation_domain: Literal["rsd.disposable-acceptance-operation.v1"]
+    operation_id: str = Field(min_length=1, max_length=256)
+    proposal_sha256: str = Field(pattern=_SHA256)
+    contract_sha256: str = Field(pattern=_SHA256)
+    disposal_owner: str = Field(pattern=_IDENTIFIER)
+    approver_identity: str = Field(pattern=_IDENTIFIER)
+    journal_path: str = Field(min_length=1, max_length=4096)
+    journal_path_sha256: str = Field(pattern=_SHA256)
+    journal_uuid: str = Field(min_length=36, max_length=36)
+    journal_schema_sha256: str = Field(pattern=_SHA256)
+    created_at: str = Field(min_length=20, max_length=40)
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @model_validator(mode="after")
+    def canonical_fields(self) -> JournalGenesisReceiptV1:
+        try:
+            parsed_uuid = uuid.UUID(self.journal_uuid)
+            created = datetime.fromisoformat(self.created_at.removesuffix("Z") + "+00:00")
+        except ValueError:
+            raise ValueError("journal genesis fields are invalid") from None
+        if (
+            str(parsed_uuid) != self.journal_uuid
+            or not self.created_at.endswith("Z")
+            or not Path(self.journal_path).is_absolute()
+            or os.path.normpath(self.journal_path) != self.journal_path
+            or created.tzinfo is None
+            or created.utcoffset() is None
+            or len(_canonical_base64(self.signature_base64)) != 64
+        ):
+            raise ValueError("journal genesis fields are invalid")
+        return self
+
+
+class JournalGenesisReconciliationReceiptV1(_Model):
+    """Signed reconciliation for an interrupted one-time journal genesis."""
+
+    schema_version: Literal["rsd.authorization-journal-genesis-reconciliation.v1"]
+    outcome: Literal["provisioning_completed", "provisioning_abandoned"]
+    journal_uuid: str = Field(min_length=36, max_length=36)
+    journal_path_sha256: str = Field(pattern=_SHA256)
+    genesis_sha256: str = Field(pattern=_SHA256)
+    created_at: str = Field(min_length=20, max_length=40)
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @model_validator(mode="after")
+    def canonical_fields(self) -> JournalGenesisReconciliationReceiptV1:
+        try:
+            parsed_uuid = uuid.UUID(self.journal_uuid)
+            created = datetime.fromisoformat(self.created_at.removesuffix("Z") + "+00:00")
+        except ValueError:
+            raise ValueError("journal genesis reconciliation fields are invalid") from None
+        if (
+            str(parsed_uuid) != self.journal_uuid
+            or not self.created_at.endswith("Z")
+            or created.tzinfo is None
+            or created.utcoffset() is None
+            or len(_canonical_base64(self.signature_base64)) != 64
+        ):
+            raise ValueError("journal genesis reconciliation fields are invalid")
+        return self
+
+
+class JournalProvisioningReceiptV1(_Model):
+    """Value-free result of explicit, one-time journal provisioning."""
+
+    schema_version: Literal["rsd.authorization-journal-provisioning-receipt.v1"]
+    status: Literal["provisioned"]
+    journal_uuid: str
+    genesis_sha256: str = Field(pattern=_SHA256)
+    provisioned_at: str
+
+
 class ExecutionReceiptV1(_Model):
     """Non-consumable audit result returned only after a committed effect."""
 
@@ -300,6 +391,10 @@ class AuthorizationPaths:
     def signature_name(artifact_name: str) -> str:
         return f"{artifact_name}.authorization.yaml"
 
+    @staticmethod
+    def journal_genesis_name() -> str:
+        return _JOURNAL_GENESIS_ARTIFACT_NAME
+
 
 @dataclass(frozen=True, slots=True)
 class _ArtifactVerification:
@@ -315,6 +410,15 @@ class _VerifiedExecution:
     context: VerifiedExecutionContext
     nonce: str
     authorized_at: str
+    capability: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedGenesis:
+    """Opaque result of signed genesis verification used only by provisioning."""
+
+    receipt: JournalGenesisReceiptV1
+    artifact_sha256: str
     capability: object = field(repr=False, compare=False)
 
 
@@ -390,6 +494,36 @@ def _signature_message(artifact_name: str, signed_content_sha256: str) -> bytes:
         + b"\x00"
         + signed_content_sha256.encode("ascii")
     )
+
+
+def _journal_genesis_message(receipt: JournalGenesisReceiptV1) -> bytes:
+    material = receipt.model_dump(mode="json", exclude={"signature_base64"})
+    return _JOURNAL_GENESIS_DOMAIN + json.dumps(
+        material, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _verify_journal_genesis_signature(
+    receipt: JournalGenesisReceiptV1, *, signer: TrustedEd25519SignerV1
+) -> None:
+    if (
+        type(receipt) is not JournalGenesisReceiptV1
+        or type(signer) is not TrustedEd25519SignerV1
+        or receipt.signer_key_id != signer.key_id
+    ):
+        raise AuthorizationError("journal_genesis_signature")
+    try:
+        signature = _canonical_base64(receipt.signature_base64)
+        signer.key().verify(signature, _journal_genesis_message(receipt))
+    except (InvalidSignature, ValueError, binascii.Error):
+        raise AuthorizationError("journal_genesis_signature") from None
+
+
+def _journal_genesis_artifact_bytes(receipt: JournalGenesisReceiptV1) -> bytes:
+    try:
+        return yaml.safe_dump(receipt.model_dump(mode="json"), sort_keys=True).encode("utf-8")
+    except (TypeError, ValueError, yaml.YAMLError):
+        raise AuthorizationError("journal_genesis_artifact") from None
 
 
 def _verify_signature(
@@ -515,6 +649,112 @@ def _verify_artifact_snapshot(
     ):
         raise AuthorizationError("owner_approval")
     return _ArtifactVerification(first, proposal, final_contract), snapshot
+
+
+def _verify_journal_genesis_artifact(
+    paths: AuthorizationPaths,
+    *,
+    artifacts: _ArtifactVerification,
+    signer: TrustedEd25519SignerV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteAuthorizationJournal,
+    now: datetime,
+    reader: _OwnerOnlyReader,
+) -> tuple[_VerifiedGenesis, bytes]:
+    """Verify the signed root genesis artifact against this exact journal path."""
+
+    try:
+        raw = reader.read(paths.journal_genesis_name())
+    except DisposablePreflightError:
+        raise AuthorizationError("journal_genesis_artifact") from None
+    try:
+        receipt = JournalGenesisReceiptV1.model_validate(
+            _parse_document(raw, phase="journal_genesis_artifact")
+        )
+    except (AuthorizationError, ValidationError, ValueError):
+        raise AuthorizationError("journal_genesis_artifact") from None
+    _verify_journal_genesis_binding(
+        receipt,
+        artifacts=artifacts,
+        signer=signer,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        journal=journal,
+        now=now,
+    )
+    return (
+        _VerifiedGenesis(
+            receipt=receipt,
+            artifact_sha256=_digest(raw),
+            capability=_GENESIS_CAPABILITY,
+        ),
+        raw,
+    )
+
+
+def _verify_journal_genesis_binding(
+    receipt: JournalGenesisReceiptV1,
+    *,
+    artifacts: _ArtifactVerification,
+    signer: TrustedEd25519SignerV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteAuthorizationJournal,
+    now: datetime,
+) -> None:
+    _verify_journal_genesis_signature(receipt, signer=signer)
+    try:
+        created = datetime.fromisoformat(receipt.created_at.removesuffix("Z") + "+00:00")
+    except ValueError:
+        raise AuthorizationError("journal_genesis_artifact") from None
+    if (
+        created.tzinfo is None
+        or created.utcoffset() is None
+        or created.astimezone(UTC) > now
+        or receipt.operation_domain != _JOURNAL_OPERATION_DOMAIN
+        or receipt.operation_id != artifacts.receipt.operation_id
+        or receipt.proposal_sha256 != artifacts.receipt.proposal_sha256
+        or receipt.contract_sha256 != artifacts.receipt.contract_sha256
+        or receipt.disposal_owner != expected_disposal_owner
+        or receipt.approver_identity != expected_approver_identity
+        or receipt.journal_path != str(journal._path)
+        or receipt.journal_path_sha256 != journal._path_sha256()
+        or receipt.journal_schema_sha256 != journal.journal_schema_sha256()
+    ):
+        raise AuthorizationError("journal_genesis_binding")
+
+
+def _verify_authorization_artifact_snapshot(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteAuthorizationJournal,
+    now: datetime,
+    reader: _OwnerOnlyReader,
+) -> tuple[_ArtifactVerification, _VerifiedGenesis, dict[str, bytes]]:
+    artifacts, snapshot = _verify_artifact_snapshot(
+        paths,
+        signer=signer,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        now=now,
+        reader=reader,
+    )
+    genesis, raw = _verify_journal_genesis_artifact(
+        paths,
+        artifacts=artifacts,
+        signer=signer,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        journal=journal,
+        now=now,
+        reader=reader,
+    )
+    snapshot[paths.journal_genesis_name()] = raw
+    return artifacts, genesis, snapshot
 
 
 def _safe_call(call: Callable[[], object]) -> object:
@@ -946,6 +1186,56 @@ class ArtifactRootLease:
         assert self._root_descriptor is not None
         return _OwnerOnlyReader(self._canonical_root, root_fd=self._root_descriptor)
 
+    def write_once(self, name: str, payload: bytes, *, phase: str) -> None:
+        """Create one bounded, owner-only artifact through the locked root fd."""
+
+        if "/" in name or name.startswith(".") or type(payload) is not bytes or len(payload) > 4096:
+            raise AuthorizationError(phase)
+        self.assert_stable()
+        assert self._root_descriptor is not None
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(name, flags, 0o600, dir_fd=self._root_descriptor)
+        except FileExistsError:
+            raise AuthorizationError(phase) from None
+        except OSError:
+            raise AuthorizationError(phase) from None
+        try:
+            details = self._validate_file_details(os.fstat(descriptor), phase)
+            remaining = memoryview(payload)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise AuthorizationError(phase)
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+            if details != self._file_identity_at(self._root_descriptor, name, phase):
+                raise AuthorizationError(phase)
+        except AuthorizationError:
+            raise
+        except OSError:
+            raise AuthorizationError(phase) from None
+        finally:
+            with suppress(OSError):
+                os.close(descriptor)
+        self.assert_stable()
+
+    def assert_absent(self, name: str, *, phase: str) -> None:
+        """Require that an artifact name is absent through the locked root fd."""
+
+        if "/" in name or name.startswith("."):
+            raise AuthorizationError(phase)
+        self.assert_stable()
+        assert self._root_descriptor is not None
+        try:
+            os.lstat(name, dir_fd=self._root_descriptor)
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise AuthorizationError(phase) from None
+        raise AuthorizationError(phase)
+
     def __exit__(self, exception_type: object, exception: object, traceback: object) -> None:
         del exception_type, exception, traceback
         self._close_descriptors(
@@ -1135,12 +1425,30 @@ class _JournalIdentity:
     journal_path_sha256: str
     operation_schema_sha256: str
     metadata_schema_sha256: str
+    genesis_sha256: str
     anchor_dev: int
     anchor_ino: int
     anchor_nlink: int
     database_dev: int
     database_ino: int
     database_nlink: int
+
+
+@dataclass(frozen=True, slots=True)
+class _JournalGenesisMarker:
+    """Owner-only durable state for one signed journal genesis receipt."""
+
+    state: Literal["pending", "current", "abandon"]
+    journal_uuid: str
+    journal_path_sha256: str
+    journal_schema_sha256: str
+    genesis_sha256: str
+    proposal_sha256: str
+    contract_sha256: str
+    operation_id: str
+    disposal_owner: str
+    approver_identity: str
+    created_at: str
 
 
 class SQLiteAuthorizationJournal:
@@ -1171,6 +1479,13 @@ class SQLiteAuthorizationJournal:
         digest = _digest(os.fsencode(str(self._path)))
         return self._path.parent / f"{_JOURNAL_ANCHOR_PREFIX}{digest}.json"
 
+    def _genesis_marker_path(self) -> Path:
+        """Return the durable receipt marker that forbids genesis replay."""
+
+        self._validate_path()
+        digest = _digest(os.fsencode(str(self._path)))
+        return self._path.parent / f"{_JOURNAL_GENESIS_MARKER_PREFIX}{digest}.json"
+
     @staticmethod
     def _schema_sha256(schema: str) -> str:
         normalized = re.sub(r"\s+", "", schema.replace("IF NOT EXISTS ", "").lower())
@@ -1186,6 +1501,17 @@ class SQLiteAuthorizationJournal:
 
     def _path_sha256(self) -> str:
         return _digest(os.fsencode(str(self._path)))
+
+    @classmethod
+    def journal_schema_sha256(cls) -> str:
+        """Stable commitment required by a signed genesis receipt."""
+
+        material = {
+            "metadata_schema_sha256": cls._expected_metadata_schema_sha256(),
+            "operation_schema_sha256": cls._expected_operation_schema_sha256(),
+            "schema_version": _JOURNAL_SCHEMA_VERSION,
+        }
+        return _digest(json.dumps(material, sort_keys=True, separators=(",", ":")).encode())
 
     def _identity_lease(self) -> _OperationLease:
         self._validate_path()
@@ -1220,8 +1546,23 @@ class SQLiteAuthorizationJournal:
         database_details = self._owner_file_details_or_none(self._path, "journal_path")
         anchor_path = self._anchor_path()
         anchor_details = self._owner_file_details_or_none(anchor_path, "journal_anchor")
+        marker_details = self._owner_file_details_or_none(
+            self._genesis_marker_path(), "journal_genesis_marker"
+        )
+        marker: _JournalGenesisMarker | None = None
+        if marker_details is not None:
+            try:
+                marker = self._read_genesis_marker()
+            except AuthorizationError:
+                return JournalMigrationStatus.IDENTITY_MISMATCH
+            if marker.state != "current":
+                return JournalMigrationStatus.PROVISIONING_INCOMPLETE
         if database_details is None and anchor_details is None:
-            return JournalMigrationStatus.ABSENT
+            return (
+                JournalMigrationStatus.JOURNAL_MISSING
+                if marker is not None
+                else JournalMigrationStatus.ABSENT
+            )
         if database_details is None:
             return JournalMigrationStatus.JOURNAL_MISSING
         self._validate_companions()
@@ -1239,6 +1580,8 @@ class SQLiteAuthorizationJournal:
             names = self._table_names(connection)
             if _LEGACY_OPERATION_TABLE in names:
                 return JournalMigrationStatus.LEGACY_DETECTED
+            if marker is None:
+                return JournalMigrationStatus.GENESIS_MISSING
             if anchor_details is None:
                 return JournalMigrationStatus.ANCHOR_MISSING
             try:
@@ -1259,6 +1602,8 @@ class SQLiteAuthorizationJournal:
             except AuthorizationError:
                 return JournalMigrationStatus.IDENTITY_MISMATCH
             if anchor != metadata:
+                return JournalMigrationStatus.IDENTITY_MISMATCH
+            if not self._marker_matches_identity(marker, metadata):
                 return JournalMigrationStatus.IDENTITY_MISMATCH
             return JournalMigrationStatus.CURRENT
         except AuthorizationError:
@@ -1346,12 +1691,248 @@ class SQLiteAuthorizationJournal:
             self._owner_file_details(candidate, "journal_path")
 
     @staticmethod
+    def _marker_bytes(marker: _JournalGenesisMarker) -> bytes:
+        payload = {
+            "approver_identity": marker.approver_identity,
+            "contract_sha256": marker.contract_sha256,
+            "created_at": marker.created_at,
+            "disposal_owner": marker.disposal_owner,
+            "genesis_sha256": marker.genesis_sha256,
+            "journal_path_sha256": marker.journal_path_sha256,
+            "journal_schema_sha256": marker.journal_schema_sha256,
+            "journal_uuid": marker.journal_uuid,
+            "marker_schema_version": _JOURNAL_GENESIS_MARKER_SCHEMA_VERSION,
+            "operation_id": marker.operation_id,
+            "proposal_sha256": marker.proposal_sha256,
+            "state": marker.state,
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+
+    @staticmethod
+    def _marker_from_verified(
+        verified: _VerifiedGenesis, *, state: Literal["pending", "current", "abandon"]
+    ) -> _JournalGenesisMarker:
+        receipt = verified.receipt
+        return _JournalGenesisMarker(
+            state=state,
+            journal_uuid=receipt.journal_uuid,
+            journal_path_sha256=receipt.journal_path_sha256,
+            journal_schema_sha256=receipt.journal_schema_sha256,
+            genesis_sha256=verified.artifact_sha256,
+            proposal_sha256=receipt.proposal_sha256,
+            contract_sha256=receipt.contract_sha256,
+            operation_id=receipt.operation_id,
+            disposal_owner=receipt.disposal_owner,
+            approver_identity=receipt.approver_identity,
+            created_at=receipt.created_at,
+        )
+
+    def _write_genesis_marker(self, marker: _JournalGenesisMarker) -> None:
+        path = self._genesis_marker_path()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileExistsError:
+            raise AuthorizationError("journal_genesis_replayed") from None
+        except OSError:
+            raise AuthorizationError("journal_genesis_marker") from None
+        try:
+            self._validate_owner_file_details(os.fstat(descriptor), "journal_genesis_marker")
+            remaining = memoryview(self._marker_bytes(marker))
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise AuthorizationError("journal_genesis_marker")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        except AuthorizationError:
+            raise
+        except OSError:
+            raise AuthorizationError("journal_genesis_marker") from None
+        finally:
+            with suppress(OSError):
+                os.close(descriptor)
+
+    def _read_genesis_marker(self) -> _JournalGenesisMarker:
+        path = self._genesis_marker_path()
+        self._owner_file_details(path, "journal_genesis_marker")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError:
+            raise AuthorizationError("journal_genesis_marker") from None
+        try:
+            self._validate_owner_file_details(os.fstat(descriptor), "journal_genesis_marker")
+            payload = bytearray()
+            while len(payload) <= 4096:
+                chunk = os.read(descriptor, 4097 - len(payload))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) > 4096:
+                raise AuthorizationError("journal_genesis_marker")
+        except AuthorizationError:
+            raise
+        except OSError:
+            raise AuthorizationError("journal_genesis_marker") from None
+        finally:
+            with suppress(OSError):
+                os.close(descriptor)
+        try:
+            raw = json.loads(bytes(payload).decode("ascii"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise AuthorizationError("journal_genesis_marker") from None
+        keys = {
+            "approver_identity",
+            "contract_sha256",
+            "created_at",
+            "disposal_owner",
+            "genesis_sha256",
+            "journal_path_sha256",
+            "journal_schema_sha256",
+            "journal_uuid",
+            "marker_schema_version",
+            "operation_id",
+            "proposal_sha256",
+            "state",
+        }
+        if not isinstance(raw, dict) or set(raw) != keys:
+            raise AuthorizationError("journal_genesis_marker")
+        string_fields = keys - {"state"}
+        if any(type(raw[field]) is not str for field in string_fields):
+            raise AuthorizationError("journal_genesis_marker")
+        if raw["marker_schema_version"] != _JOURNAL_GENESIS_MARKER_SCHEMA_VERSION:
+            raise AuthorizationError("journal_genesis_marker")
+        if type(raw["state"]) is not str or raw["state"] not in {
+            "pending",
+            "current",
+            "abandon",
+        }:
+            raise AuthorizationError("journal_genesis_marker")
+        if (
+            raw["journal_path_sha256"] != self._path_sha256()
+            or raw["journal_schema_sha256"] != self.journal_schema_sha256()
+            or any(
+                re.fullmatch(_SHA256, raw[field]) is None
+                for field in (
+                    "contract_sha256",
+                    "genesis_sha256",
+                    "journal_path_sha256",
+                    "journal_schema_sha256",
+                    "proposal_sha256",
+                )
+            )
+        ):
+            raise AuthorizationError("journal_genesis_marker")
+        try:
+            parsed_uuid = uuid.UUID(raw["journal_uuid"])
+            created = datetime.fromisoformat(raw["created_at"].removesuffix("Z") + "+00:00")
+        except (AttributeError, ValueError):
+            raise AuthorizationError("journal_genesis_marker") from None
+        if (
+            str(parsed_uuid) != raw["journal_uuid"]
+            or created.tzinfo is None
+            or created.utcoffset() is None
+            or not raw["operation_id"]
+            or re.fullmatch(_IDENTIFIER, raw["disposal_owner"]) is None
+            or re.fullmatch(_IDENTIFIER, raw["approver_identity"]) is None
+        ):
+            raise AuthorizationError("journal_genesis_marker")
+        return _JournalGenesisMarker(
+            state=cast(Literal["pending", "current", "abandon"], raw["state"]),
+            journal_uuid=raw["journal_uuid"],
+            journal_path_sha256=raw["journal_path_sha256"],
+            journal_schema_sha256=raw["journal_schema_sha256"],
+            genesis_sha256=raw["genesis_sha256"],
+            proposal_sha256=raw["proposal_sha256"],
+            contract_sha256=raw["contract_sha256"],
+            operation_id=raw["operation_id"],
+            disposal_owner=raw["disposal_owner"],
+            approver_identity=raw["approver_identity"],
+            created_at=raw["created_at"],
+        )
+
+    def _set_genesis_marker_state(
+        self,
+        marker: _JournalGenesisMarker,
+        state: Literal["current", "abandon"],
+    ) -> _JournalGenesisMarker:
+        if marker.state != "pending":
+            raise AuthorizationError("provisioning_incomplete")
+        replacement = _JournalGenesisMarker(
+            state=state,
+            journal_uuid=marker.journal_uuid,
+            journal_path_sha256=marker.journal_path_sha256,
+            journal_schema_sha256=marker.journal_schema_sha256,
+            genesis_sha256=marker.genesis_sha256,
+            proposal_sha256=marker.proposal_sha256,
+            contract_sha256=marker.contract_sha256,
+            operation_id=marker.operation_id,
+            disposal_owner=marker.disposal_owner,
+            approver_identity=marker.approver_identity,
+            created_at=marker.created_at,
+        )
+        path = self._genesis_marker_path()
+        before = self._owner_file_details(path, "journal_genesis_marker")
+        flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError:
+            raise AuthorizationError("journal_genesis_marker") from None
+        try:
+            if (
+                self._validate_owner_file_details(os.fstat(descriptor), "journal_genesis_marker")
+                != before
+                or self._read_genesis_marker() != marker
+            ):
+                raise AuthorizationError("journal_genesis_marker")
+            os.ftruncate(descriptor, 0)
+            remaining = memoryview(self._marker_bytes(replacement))
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise AuthorizationError("journal_genesis_marker")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+            if (
+                self._validate_owner_file_details(os.fstat(descriptor), "journal_genesis_marker")
+                != before
+                or self._owner_file_details(path, "journal_genesis_marker") != before
+            ):
+                raise AuthorizationError("journal_genesis_marker")
+            return replacement
+        except AuthorizationError:
+            raise
+        except OSError:
+            raise AuthorizationError("journal_genesis_marker") from None
+        finally:
+            with suppress(OSError):
+                os.close(descriptor)
+
+    @staticmethod
+    def _marker_matches_verified(marker: _JournalGenesisMarker, verified: _VerifiedGenesis) -> bool:
+        return marker == SQLiteAuthorizationJournal._marker_from_verified(
+            verified, state=marker.state
+        ) and marker.state in {"pending", "current", "abandon"}
+
+    @staticmethod
+    def _marker_matches_identity(marker: _JournalGenesisMarker, identity: _JournalIdentity) -> bool:
+        return (
+            marker.state == "current"
+            and marker.journal_uuid == identity.journal_uuid
+            and marker.genesis_sha256 == identity.genesis_sha256
+            and marker.journal_path_sha256 == identity.journal_path_sha256
+        )
+
+    @staticmethod
     def _anchor_bytes(identity: _JournalIdentity) -> bytes:
         payload = {
             "anchor_schema_version": _JOURNAL_ANCHOR_SCHEMA_VERSION,
             "database_dev": identity.database_dev,
             "database_ino": identity.database_ino,
             "database_nlink": identity.database_nlink,
+            "genesis_sha256": identity.genesis_sha256,
             "journal_path_sha256": identity.journal_path_sha256,
             "journal_uuid": identity.journal_uuid,
             "metadata_schema_sha256": identity.metadata_schema_sha256,
@@ -1425,6 +2006,7 @@ class SQLiteAuthorizationJournal:
             "database_dev",
             "database_ino",
             "database_nlink",
+            "genesis_sha256",
             "journal_path_sha256",
             "journal_uuid",
             "metadata_schema_sha256",
@@ -1434,6 +2016,7 @@ class SQLiteAuthorizationJournal:
             raise AuthorizationError("journal_anchor")
         strings = (
             "anchor_schema_version",
+            "genesis_sha256",
             "journal_path_sha256",
             "journal_uuid",
             "metadata_schema_sha256",
@@ -1447,6 +2030,7 @@ class SQLiteAuthorizationJournal:
         if (
             raw["anchor_schema_version"] != _JOURNAL_ANCHOR_SCHEMA_VERSION
             or raw["journal_path_sha256"] != self._path_sha256()
+            or re.fullmatch(_SHA256, raw["genesis_sha256"]) is None
             or raw["operation_schema_sha256"] != self._expected_operation_schema_sha256()
             or raw["metadata_schema_sha256"] != self._expected_metadata_schema_sha256()
             or re.fullmatch(_SHA256, raw["journal_path_sha256"]) is None
@@ -1466,6 +2050,7 @@ class SQLiteAuthorizationJournal:
             journal_path_sha256=raw["journal_path_sha256"],
             operation_schema_sha256=raw["operation_schema_sha256"],
             metadata_schema_sha256=raw["metadata_schema_sha256"],
+            genesis_sha256=raw["genesis_sha256"],
             anchor_dev=anchor_details[0],
             anchor_ino=anchor_details[1],
             anchor_nlink=anchor_details[2],
@@ -1480,19 +2065,20 @@ class SQLiteAuthorizationJournal:
         rows = connection.execute(
             f"""
             SELECT journal_uuid, journal_path_sha256, operation_schema_sha256,
-                   metadata_schema_sha256, anchor_dev, anchor_ino, anchor_nlink,
-                   schema_version
+                   metadata_schema_sha256, genesis_sha256, anchor_dev, anchor_ino,
+                   anchor_nlink, schema_version
             FROM {_JOURNAL_METADATA_TABLE}
             WHERE singleton = 1
             """
         ).fetchall()
-        if len(rows) != 1 or len(rows[0]) != 8:
+        if len(rows) != 1 or len(rows[0]) != 9:
             raise AuthorizationError("journal_schema")
         (
             journal_uuid,
             path_sha256,
             operation_schema_sha256,
             metadata_schema_sha256,
+            genesis_sha256,
             anchor_dev,
             anchor_ino,
             anchor_nlink,
@@ -1503,6 +2089,7 @@ class SQLiteAuthorizationJournal:
             or type(path_sha256) is not str
             or type(operation_schema_sha256) is not str
             or type(metadata_schema_sha256) is not str
+            or type(genesis_sha256) is not str
             or type(anchor_dev) is not int
             or type(anchor_ino) is not int
             or type(anchor_nlink) is not int
@@ -1510,6 +2097,7 @@ class SQLiteAuthorizationJournal:
             or path_sha256 != self._path_sha256()
             or operation_schema_sha256 != self._expected_operation_schema_sha256()
             or metadata_schema_sha256 != self._expected_metadata_schema_sha256()
+            or re.fullmatch(_SHA256, genesis_sha256) is None
             or anchor_dev < 1
             or anchor_ino < 1
             or anchor_nlink != 1
@@ -1526,6 +2114,7 @@ class SQLiteAuthorizationJournal:
             journal_path_sha256=path_sha256,
             operation_schema_sha256=operation_schema_sha256,
             metadata_schema_sha256=metadata_schema_sha256,
+            genesis_sha256=genesis_sha256,
             anchor_dev=anchor_dev,
             anchor_ino=anchor_ino,
             anchor_nlink=anchor_nlink,
@@ -1535,7 +2124,11 @@ class SQLiteAuthorizationJournal:
         )
 
     def _validate_identity(
-        self, connection: sqlite3.Connection, expected: _JournalIdentity
+        self,
+        connection: sqlite3.Connection,
+        expected: _JournalIdentity,
+        *,
+        allow_pending_marker: bool = False,
     ) -> None:
         self._validate_path()
         self._validate_companions()
@@ -1552,14 +2145,71 @@ class SQLiteAuthorizationJournal:
         self._validate_schema(connection)
         if self._metadata_identity(connection, database_details) != expected:
             raise AuthorizationError("journal_identity_mismatch")
+        marker = self._read_genesis_marker()
+        if not self._marker_matches_identity(marker, expected) and not (
+            allow_pending_marker
+            and marker.state == "pending"
+            and marker.journal_uuid == expected.journal_uuid
+            and marker.genesis_sha256 == expected.genesis_sha256
+            and marker.journal_path_sha256 == expected.journal_path_sha256
+        ):
+            raise AuthorizationError("journal_identity_mismatch")
 
-    def _initialize_identity(self) -> _JournalIdentity:
+    @staticmethod
+    def _require_verified_genesis(verified: _VerifiedGenesis) -> None:
+        if type(verified) is not _VerifiedGenesis or verified.capability is not _GENESIS_CAPABILITY:
+            raise AuthorizationError("journal_genesis")
+
+    def _begin_verified_genesis(self, verified: _VerifiedGenesis) -> None:
+        """Persist the one-time pending marker before any database creation."""
+
+        self._require_verified_genesis(verified)
+        with self._identity_lease() as lease:
+            lease.assert_stable()
+            marker_details = self._owner_file_details_or_none(
+                self._genesis_marker_path(), "journal_genesis_marker"
+            )
+            database_details = self._owner_file_details_or_none(self._path, "journal_path")
+            anchor_details = self._owner_file_details_or_none(self._anchor_path(), "journal_anchor")
+            if marker_details is not None:
+                marker = self._read_genesis_marker()
+                if marker.state == "pending" and self._marker_matches_verified(marker, verified):
+                    raise AuthorizationError("provisioning_incomplete")
+                raise AuthorizationError("journal_genesis_replayed")
+            if database_details is not None or anchor_details is not None:
+                raise AuthorizationError("journal_genesis_missing")
+            self._write_genesis_marker(self._marker_from_verified(verified, state="pending"))
+            lease.assert_stable()
+
+    def _complete_verified_genesis(self, verified: _VerifiedGenesis) -> _JournalIdentity:
+        """Create the database/anchor only after a pending signed marker exists."""
+
+        self._require_verified_genesis(verified)
+        with self._identity_lease() as lease:
+            lease.assert_stable()
+            marker = self._read_genesis_marker()
+            if marker.state != "pending" or not self._marker_matches_verified(marker, verified):
+                raise AuthorizationError("provisioning_incomplete")
+            if (
+                self._owner_file_details_or_none(self._path, "journal_path") is not None
+                or self._owner_file_details_or_none(self._anchor_path(), "journal_anchor")
+                is not None
+            ):
+                raise AuthorizationError("provisioning_incomplete")
+            identity = self._initialize_identity(verified, marker)
+            lease.assert_stable()
+            return identity
+
+    def _initialize_identity(
+        self, verified: _VerifiedGenesis, marker: _JournalGenesisMarker
+    ) -> _JournalIdentity:
         database_details = self._create_database_file()
         identity = _JournalIdentity(
-            journal_uuid=str(uuid.uuid4()),
+            journal_uuid=verified.receipt.journal_uuid,
             journal_path_sha256=self._path_sha256(),
             operation_schema_sha256=self._expected_operation_schema_sha256(),
             metadata_schema_sha256=self._expected_metadata_schema_sha256(),
+            genesis_sha256=verified.artifact_sha256,
             anchor_dev=0,
             anchor_ino=0,
             anchor_nlink=0,
@@ -1595,6 +2245,7 @@ class SQLiteAuthorizationJournal:
                 journal_path_sha256=identity.journal_path_sha256,
                 operation_schema_sha256=identity.operation_schema_sha256,
                 metadata_schema_sha256=identity.metadata_schema_sha256,
+                genesis_sha256=identity.genesis_sha256,
                 anchor_dev=anchor_details[0],
                 anchor_ino=anchor_details[1],
                 anchor_nlink=anchor_details[2],
@@ -1607,15 +2258,16 @@ class SQLiteAuthorizationJournal:
                 f"""
                 INSERT INTO {_JOURNAL_METADATA_TABLE} (
                     singleton, journal_uuid, journal_path_sha256,
-                    operation_schema_sha256, metadata_schema_sha256,
+                    operation_schema_sha256, metadata_schema_sha256, genesis_sha256,
                     anchor_dev, anchor_ino, anchor_nlink, schema_version
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     identity.journal_uuid,
                     identity.journal_path_sha256,
                     identity.operation_schema_sha256,
                     identity.metadata_schema_sha256,
+                    identity.genesis_sha256,
                     identity.anchor_dev,
                     identity.anchor_ino,
                     identity.anchor_nlink,
@@ -1630,6 +2282,8 @@ class SQLiteAuthorizationJournal:
                 != database_details
             ):
                 raise AuthorizationError("journal_identity_mismatch")
+            self._validate_identity(connection, identity, allow_pending_marker=True)
+            self._set_genesis_marker_state(marker, "current")
             self._validate_identity(connection, identity)
             return identity
         except AuthorizationError:
@@ -1649,12 +2303,18 @@ class SQLiteAuthorizationJournal:
             lease.assert_stable()
             database_details = self._owner_file_details_or_none(self._path, "journal_path")
             anchor_details = self._owner_file_details_or_none(self._anchor_path(), "journal_anchor")
-            if database_details is None and anchor_details is None:
-                identity = self._initialize_identity()
-                lease.assert_stable()
-                return identity
+            marker_details = self._owner_file_details_or_none(
+                self._genesis_marker_path(), "journal_genesis_marker"
+            )
+            if marker_details is None:
+                if database_details is None and anchor_details is None:
+                    raise AuthorizationError("journal_absent")
+                raise AuthorizationError("journal_genesis_missing")
+            marker = self._read_genesis_marker()
+            if marker.state != "current":
+                raise AuthorizationError("provisioning_incomplete")
             if database_details is None:
-                raise AuthorizationError("journal_identity_missing")
+                raise AuthorizationError("journal_missing")
             if anchor_details is None:
                 raise AuthorizationError("journal_anchor_missing")
             self._validate_companions()
@@ -1676,14 +2336,49 @@ class SQLiteAuthorizationJournal:
     def assert_identity(self) -> None:
         """Recheck the anchored database identity without creating any journal."""
 
-        self._validate_path()
+        self._established_identity()
+
+    def assert_genesis(self, verified: _VerifiedGenesis) -> None:
+        """Require the signed root artifact to match the durable current identity."""
+
+        self._require_verified_genesis(verified)
+        identity = self._established_identity()
+        marker = self._read_genesis_marker()
+        if (
+            not self._marker_matches_verified(marker, verified)
+            or marker.state != "current"
+            or identity.journal_uuid != verified.receipt.journal_uuid
+            or identity.genesis_sha256 != verified.artifact_sha256
+        ):
+            raise AuthorizationError("journal_genesis_mismatch")
+
+    def reconcile_genesis(
+        self,
+        receipt: JournalGenesisReconciliationReceiptV1,
+        *,
+        signer: TrustedEd25519SignerV1,
+    ) -> JournalMigrationStatus:
+        """Resolve a pending genesis only with typed signed operator evidence."""
+
+        _verify_journal_genesis_reconciliation_receipt(receipt, signer=signer)
         with self._identity_lease() as lease:
             lease.assert_stable()
+            marker = self._read_genesis_marker()
+            if (
+                marker.state != "pending"
+                or receipt.journal_uuid != marker.journal_uuid
+                or receipt.journal_path_sha256 != marker.journal_path_sha256
+                or receipt.genesis_sha256 != marker.genesis_sha256
+            ):
+                raise AuthorizationError("provisioning_incomplete")
+            if receipt.outcome == "provisioning_abandoned":
+                self._set_genesis_marker_state(marker, "abandon")
+                lease.assert_stable()
+                return JournalMigrationStatus.PROVISIONING_INCOMPLETE
             database_details = self._owner_file_details_or_none(self._path, "journal_path")
-            if database_details is None:
-                raise AuthorizationError("journal_identity_missing")
-            if self._owner_file_details_or_none(self._anchor_path(), "journal_anchor") is None:
-                raise AuthorizationError("journal_anchor_missing")
+            anchor_details = self._owner_file_details_or_none(self._anchor_path(), "journal_anchor")
+            if database_details is None or anchor_details is None:
+                raise AuthorizationError("provisioning_incomplete")
             try:
                 connection = sqlite3.connect(
                     f"{self._path.as_uri()}?mode=ro", uri=True, isolation_level=None, timeout=5.0
@@ -1693,10 +2388,13 @@ class SQLiteAuthorizationJournal:
             try:
                 connection.execute("PRAGMA trusted_schema = OFF")
                 identity = self._read_anchor()
+                self._validate_identity(connection, identity, allow_pending_marker=True)
+                self._set_genesis_marker_state(marker, "current")
                 self._validate_identity(connection, identity)
-                lease.assert_stable()
             finally:
                 connection.close()
+            lease.assert_stable()
+            return JournalMigrationStatus.CURRENT
 
     def _connect(self) -> tuple[sqlite3.Connection, _JournalIdentity]:
         identity = self._established_identity()
@@ -1775,10 +2473,11 @@ class SQLiteAuthorizationJournal:
             (2, "journal_path_sha256", "TEXT", 1, None, 0),
             (3, "operation_schema_sha256", "TEXT", 1, None, 0),
             (4, "metadata_schema_sha256", "TEXT", 1, None, 0),
-            (5, "anchor_dev", "INTEGER", 1, None, 0),
-            (6, "anchor_ino", "INTEGER", 1, None, 0),
-            (7, "anchor_nlink", "INTEGER", 1, None, 0),
-            (8, "schema_version", "TEXT", 1, None, 0),
+            (5, "genesis_sha256", "TEXT", 1, None, 0),
+            (6, "anchor_dev", "INTEGER", 1, None, 0),
+            (7, "anchor_ino", "INTEGER", 1, None, 0),
+            (8, "anchor_nlink", "INTEGER", 1, None, 0),
+            (9, "schema_version", "TEXT", 1, None, 0),
         ]
         if metadata_rows != expected_metadata_rows:
             raise AuthorizationError("journal_schema")
@@ -2121,6 +2820,33 @@ def _reconciliation_message(receipt: ReconciliationReceiptV1) -> bytes:
     ).encode("ascii")
 
 
+def _journal_genesis_reconciliation_message(
+    receipt: JournalGenesisReconciliationReceiptV1,
+) -> bytes:
+    material = receipt.model_dump(mode="json", exclude={"signature_base64"})
+    return _JOURNAL_GENESIS_RECONCILIATION_DOMAIN + json.dumps(
+        material, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _verify_journal_genesis_reconciliation_receipt(
+    receipt: JournalGenesisReconciliationReceiptV1,
+    *,
+    signer: TrustedEd25519SignerV1,
+) -> None:
+    if (
+        type(receipt) is not JournalGenesisReconciliationReceiptV1
+        or type(signer) is not TrustedEd25519SignerV1
+        or receipt.signer_key_id != signer.key_id
+    ):
+        raise AuthorizationError("journal_genesis_reconciliation_signature")
+    try:
+        signature = _canonical_base64(receipt.signature_base64)
+        signer.key().verify(signature, _journal_genesis_reconciliation_message(receipt))
+    except (InvalidSignature, ValueError, binascii.Error):
+        raise AuthorizationError("journal_genesis_reconciliation_signature") from None
+
+
 def _verify_reconciliation_receipt(
     receipt: ReconciliationReceiptV1, *, signer: TrustedEd25519SignerV1
 ) -> None:
@@ -2206,6 +2932,158 @@ def _check_execution_stability(
     journal.assert_identity()
 
 
+def _provision_journal_with_clock(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteAuthorizationJournal,
+    receipt: JournalGenesisReceiptV1,
+    clock: Callable[[], datetime],
+    _capability: object,
+) -> JournalProvisioningReceiptV1:
+    """Explicit one-time journal genesis; never called by authorization/effect paths."""
+
+    if _capability is not _TEST_CLOCK_CAPABILITY and _capability is not _SYSTEM_CLOCK_CAPABILITY:
+        raise AuthorizationError("test_clock")
+    if (
+        type(paths) is not AuthorizationPaths
+        or type(signer) is not TrustedEd25519SignerV1
+        or type(journal) is not SQLiteAuthorizationJournal
+        or type(receipt) is not JournalGenesisReceiptV1
+    ):
+        raise AuthorizationError("journal_genesis")
+    now = _read_clock(clock)
+    with ArtifactRootLease(paths.root) as artifact_lease:
+        artifacts, _ = _verify_artifact_snapshot(
+            paths,
+            signer=signer,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            now=now,
+            reader=artifact_lease.reader(),
+        )
+        _verify_journal_genesis_binding(
+            receipt,
+            artifacts=artifacts,
+            signer=signer,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            journal=journal,
+            now=now,
+        )
+        raw = _journal_genesis_artifact_bytes(receipt)
+        verified = _VerifiedGenesis(
+            receipt=receipt,
+            artifact_sha256=_digest(raw),
+            capability=_GENESIS_CAPABILITY,
+        )
+        status = journal.migration_status()
+        if status is JournalMigrationStatus.PROVISIONING_INCOMPLETE:
+            raise AuthorizationError("provisioning_incomplete")
+        if status is not JournalMigrationStatus.ABSENT:
+            raise AuthorizationError("journal_genesis_replayed")
+        artifact_lease.assert_absent(paths.journal_genesis_name(), phase="journal_genesis_replayed")
+        journal._begin_verified_genesis(verified)
+        artifact_lease.write_once(
+            paths.journal_genesis_name(), raw, phase="journal_genesis_replayed"
+        )
+        journal._complete_verified_genesis(verified)
+        artifact_lease.assert_stable()
+    return JournalProvisioningReceiptV1(
+        schema_version="rsd.authorization-journal-provisioning-receipt.v1",
+        status="provisioned",
+        journal_uuid=receipt.journal_uuid,
+        genesis_sha256=verified.artifact_sha256,
+        provisioned_at=now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+    )
+
+
+def provision_journal(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteAuthorizationJournal,
+    receipt: JournalGenesisReceiptV1,
+) -> JournalProvisioningReceiptV1:
+    """Provision exactly one signed journal identity for the supplied artifacts."""
+
+    return _provision_journal_with_clock(
+        paths,
+        signer=signer,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        journal=journal,
+        receipt=receipt,
+        clock=_system_utc_clock,
+        _capability=_SYSTEM_CLOCK_CAPABILITY,
+    )
+
+
+def _provision_journal_for_test(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteAuthorizationJournal,
+    receipt: JournalGenesisReceiptV1,
+    _clock: Callable[[], datetime],
+    _capability: object,
+) -> JournalProvisioningReceiptV1:
+    """Test-only clock seam, unavailable from the public provisioning entry point."""
+
+    if _capability is not _TEST_CLOCK_CAPABILITY:
+        raise AuthorizationError("test_clock")
+    return _provision_journal_with_clock(
+        paths,
+        signer=signer,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        journal=journal,
+        receipt=receipt,
+        clock=_clock,
+        _capability=_TEST_CLOCK_CAPABILITY,
+    )
+
+
+def reconcile_journal_genesis(
+    journal: SQLiteAuthorizationJournal,
+    receipt: JournalGenesisReconciliationReceiptV1,
+    *,
+    signer: TrustedEd25519SignerV1,
+) -> JournalMigrationStatus:
+    """Apply signed recovery evidence to an interrupted journal genesis only."""
+
+    if (
+        type(journal) is not SQLiteAuthorizationJournal
+        or type(receipt) is not JournalGenesisReconciliationReceiptV1
+        or type(signer) is not TrustedEd25519SignerV1
+    ):
+        raise AuthorizationError("journal_genesis_reconciliation")
+    return journal.reconcile_genesis(receipt, signer=signer)
+
+
+def _require_current_journal(status: JournalMigrationStatus) -> None:
+    if status is JournalMigrationStatus.CURRENT:
+        return
+    phases = {
+        JournalMigrationStatus.ABSENT: "journal_absent",
+        JournalMigrationStatus.ANCHOR_MISSING: "journal_anchor_missing",
+        JournalMigrationStatus.GENESIS_MISSING: "journal_genesis_missing",
+        JournalMigrationStatus.JOURNAL_MISSING: "journal_missing",
+        JournalMigrationStatus.PROVISIONING_INCOMPLETE: "provisioning_incomplete",
+        JournalMigrationStatus.IDENTITY_MISMATCH: "journal_identity_mismatch",
+        JournalMigrationStatus.LEGACY_DETECTED: "journal_legacy_detected",
+        JournalMigrationStatus.EMPTY: "journal_schema",
+        JournalMigrationStatus.UNKNOWN: "journal_schema",
+    }
+    raise AuthorizationError(phases[status])
+
+
 def _authorize_and_execute_with_clock(
     paths: AuthorizationPaths,
     *,
@@ -2232,28 +3110,21 @@ def _authorize_and_execute_with_clock(
         or not callable(effect)
     ):
         raise AuthorizationError("journal_effect")
-    journal_status = journal.migration_status()
-    if journal_status is JournalMigrationStatus.LEGACY_DETECTED:
-        raise AuthorizationError("journal_legacy_detected")
-    if journal_status is JournalMigrationStatus.ANCHOR_MISSING:
-        raise AuthorizationError("journal_anchor_missing")
-    if journal_status is JournalMigrationStatus.JOURNAL_MISSING:
-        raise AuthorizationError("journal_identity_missing")
-    if journal_status is JournalMigrationStatus.IDENTITY_MISMATCH:
-        raise AuthorizationError("journal_identity_mismatch")
-    if journal_status in {JournalMigrationStatus.EMPTY, JournalMigrationStatus.UNKNOWN}:
-        raise AuthorizationError("journal_schema")
     fingerprints = _normalized_fingerprints(provider_fingerprints)
     with ArtifactRootLease(paths.root) as artifact_lease:
         artifact_lease.assert_stable()
-        artifacts, snapshot = _verify_artifact_snapshot(
+        _require_current_journal(journal.migration_status())
+        artifacts, genesis, snapshot = _verify_authorization_artifact_snapshot(
             paths,
             signer=signer,
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
+            journal=journal,
             now=_read_clock(clock),
             reader=artifact_lease.reader(),
         )
+        artifact_lease.assert_stable()
+        journal.assert_genesis(genesis)
         artifact_lease.assert_stable()
         references = artifacts.proposal.provider_references.all()
         manager, provider_lease = _acquire_provider_lease(provider, references)
@@ -2267,14 +3138,21 @@ def _authorize_and_execute_with_clock(
                 recheck=False,
             )
             artifact_lease.assert_stable()
-            repeated_receipt, repeated_snapshot = _receipt_snapshot(
-                paths,
-                now=_read_clock(clock),
-                reader=artifact_lease.reader(),
+            repeated_artifacts, repeated_genesis, repeated_snapshot = (
+                _verify_authorization_artifact_snapshot(
+                    paths,
+                    signer=signer,
+                    expected_disposal_owner=expected_disposal_owner,
+                    expected_approver_identity=expected_approver_identity,
+                    journal=journal,
+                    now=_read_clock(clock),
+                    reader=artifact_lease.reader(),
+                )
             )
             artifact_lease.assert_stable()
             if (
-                not _same_artifact_receipt(artifacts.receipt, repeated_receipt)
+                not _same_artifact_receipt(artifacts.receipt, repeated_artifacts.receipt)
+                or genesis != repeated_genesis
                 or snapshot != repeated_snapshot
             ):
                 raise AuthorizationError("artifact_race")
@@ -2291,15 +3169,23 @@ def _authorize_and_execute_with_clock(
             ):
                 raise AuthorizationError("provider_race")
             authorization_clock = _read_clock(clock)
-            terminal_receipt, terminal_snapshot = _receipt_snapshot(
-                paths,
-                now=authorization_clock,
-                reader=artifact_lease.reader(),
+            terminal_artifacts, terminal_genesis, terminal_snapshot = (
+                _verify_authorization_artifact_snapshot(
+                    paths,
+                    signer=signer,
+                    expected_disposal_owner=expected_disposal_owner,
+                    expected_approver_identity=expected_approver_identity,
+                    journal=journal,
+                    now=authorization_clock,
+                    reader=artifact_lease.reader(),
+                )
             )
             artifact_lease.assert_stable()
             if (
-                not _same_artifact_receipt(artifacts.receipt, repeated_receipt)
-                or not _same_artifact_receipt(artifacts.receipt, terminal_receipt)
+                not _same_artifact_receipt(artifacts.receipt, repeated_artifacts.receipt)
+                or not _same_artifact_receipt(artifacts.receipt, terminal_artifacts.receipt)
+                or genesis != repeated_genesis
+                or genesis != terminal_genesis
                 or snapshot != repeated_snapshot
                 or snapshot != terminal_snapshot
             ):

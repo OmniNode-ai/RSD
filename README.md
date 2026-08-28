@@ -120,15 +120,27 @@ The callback receives only immutable `VerifiedExecutionContext`: parsed
 proposal/final-contract models, exact provider expectations, and a derived
 idempotency key. It receives no artifact path, nonce, or journal handle. It
 must return an `EffectReceiptV1` bound to that operation and idempotency key.
+Before any effect can be admitted, a separate caller must explicitly invoke
+`provision_journal()` once with a trusted Ed25519-signed
+`JournalGenesisReceiptV1`. That receipt commits to the operation/proposal/final
+hashes, expected owner and approver, canonical journal path, fresh journal ID,
+and journal schema digest. Provisioning writes a signed `journal-genesis.yaml`
+artifact and an owner-only pending marker before it creates the database. The
+authorization path never provisions or recreates a journal: an absent journal,
+missing genesis artifact, moved database/anchor, or incomplete genesis blocks
+before an effect. A pending genesis can become current only through signed
+`JournalGenesisReconciliationReceiptV1` recovery evidence; abandoned and
+rotated identities remain blocked.
+
 The SQLite journal requires an owner-only directory and database file, uses
 `BEGIN IMMEDIATE`, `DELETE` journaling, and `FULL` synchronous durability. A
 one-time, `O_EXCL` anchor in that directory binds a random journal ID, canonical
 path digest, schema digests, and database device/inode/link-count to matching
-database metadata; that metadata also pins the anchor file identity. Every
-open rechecks those bindings; a missing, renamed, replaced, copied, or
-mismatched database/anchor fails closed and is surfaced by the read-only
-`migration_status()` diagnostic. Rotation and automatic
-recreation are intentionally unsupported. Its operation ID is unique and binds
+database metadata; that metadata also pins the anchor file identity and signed
+genesis digest. Every open rechecks those bindings; a missing, renamed,
+replaced, copied, or mismatched database/anchor/genesis fails closed and is
+surfaced by the read-only `migration_status()` diagnostic. Rotation and
+automatic recreation are intentionally unsupported. Its operation ID is unique and binds
 the proposal/final hashes. Legacy nonce-ledger tables are detected before any
 effect and are never silently replaced. A durable per-operation OS lease is
 held through the effect and commit, so recovery rejects a live executor. It

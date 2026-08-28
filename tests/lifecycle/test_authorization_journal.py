@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import shutil
 import sqlite3
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
@@ -17,16 +18,21 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from omninode_rsd.lifecycle.authorization import (
+    _GENESIS_CAPABILITY,
     _VERIFIED_CAPABILITY,
     AuthorizationError,
     AuthorizationOperationState,
+    JournalGenesisReceiptV1,
     JournalMigrationStatus,
     ReconciliationReceiptV1,
     SQLiteAuthorizationJournal,
     TrustedEd25519SignerV1,
     VerifiedExecutionContext,
+    _journal_genesis_artifact_bytes,
+    _journal_genesis_message,
     _reconciliation_message,
     _VerifiedExecution,
+    _VerifiedGenesis,
 )
 from omninode_rsd.lifecycle.infisical_disposable import ProposalV1, RuntimeContractV1
 
@@ -58,17 +64,66 @@ def _verified(nonce: str, operation_id: str = "operation-one") -> _VerifiedExecu
     )
 
 
-def _journal(tmp_path: Path) -> SQLiteAuthorizationJournal:
+def _seed_current_journal(journal: SQLiteAuthorizationJournal) -> None:
+    """Create a genuinely signed test genesis before exercising journal internals."""
+
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes_raw()
+    signer = TrustedEd25519SignerV1(
+        key_id="journal-genesis-signer",
+        public_key_base64=base64.b64encode(public).decode(),
+        public_key_fingerprint_sha256=_digest(public),
+    )
+    unsigned = JournalGenesisReceiptV1(
+        schema_version="rsd.authorization-journal-genesis.v1",
+        operation_domain="rsd.disposable-acceptance-operation.v1",
+        operation_id="operation-one",
+        proposal_sha256="b" * 64,
+        contract_sha256="c" * 64,
+        disposal_owner="journal-owner",
+        approver_identity="journal-approver",
+        journal_path=str(journal._path),
+        journal_path_sha256=journal._path_sha256(),
+        journal_uuid=str(uuid.uuid4()),
+        journal_schema_sha256=journal.journal_schema_sha256(),
+        created_at="2026-08-27T12:00:00Z",
+        signer_key_id=signer.key_id,
+        signature_base64=base64.b64encode(b"0" * 64).decode(),
+    )
+    receipt = unsigned.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                key.sign(_journal_genesis_message(unsigned))
+            ).decode()
+        }
+    )
+    raw = _journal_genesis_artifact_bytes(receipt)
+    verified = _VerifiedGenesis(
+        receipt=receipt,
+        artifact_sha256=_digest(raw),
+        capability=_GENESIS_CAPABILITY,
+    )
+    journal._begin_verified_genesis(verified)
+    journal._complete_verified_genesis(verified)
+
+
+def _journal(tmp_path: Path, *, seeded: bool = True) -> SQLiteAuthorizationJournal:
     root = tmp_path / "journal"
     root.mkdir(mode=0o700)
     root.chmod(0o700)
-    return SQLiteAuthorizationJournal(root / "authorization.sqlite3")
+    journal = SQLiteAuthorizationJournal(root / "authorization.sqlite3")
+    if seeded:
+        _seed_current_journal(journal)
+    return journal
 
 
-def _journal_at(root: Path) -> SQLiteAuthorizationJournal:
+def _journal_at(root: Path, *, seeded: bool = True) -> SQLiteAuthorizationJournal:
     root.mkdir(mode=0o700)
     root.chmod(0o700)
-    return SQLiteAuthorizationJournal(root / "authorization.sqlite3")
+    journal = SQLiteAuthorizationJournal(root / "authorization.sqlite3")
+    if seeded:
+        _seed_current_journal(journal)
+    return journal
 
 
 def _digest(value: bytes) -> str:
@@ -140,11 +195,14 @@ def test_claim_is_durable_and_same_operation_rejects_fresh_nonce(tmp_path: Path)
 
 
 def test_migration_status_is_read_only_and_classifies_current_journal(tmp_path: Path) -> None:
-    journal = _journal(tmp_path)
+    journal = _journal(tmp_path, seeded=False)
 
     assert journal.migration_status() is JournalMigrationStatus.ABSENT
     assert not journal._path.exists()
-    journal._claim_verified(_verified("a" * 32))
+    with pytest.raises(AuthorizationError, match="journal_absent"):
+        journal._claim_verified(_verified("a" * 32))
+    assert not journal._path.exists()
+    _seed_current_journal(journal)
     assert journal.migration_status() is JournalMigrationStatus.CURRENT
 
 
@@ -276,7 +334,7 @@ def test_journal_rejects_non_owner_mode_symlink_and_wrong_schema(tmp_path: Path)
             _verified("e" * 32)
         )
 
-    journal = _journal(tmp_path)
+    journal = _journal(tmp_path, seeded=False)
     target = tmp_path / "target.sqlite3"
     target.write_bytes(b"not-a-journal")
     target.chmod(0o600)
@@ -293,7 +351,7 @@ def test_journal_rejects_non_owner_mode_symlink_and_wrong_schema(tmp_path: Path)
     connection.commit()
     connection.close()
     schema_path.chmod(0o600)
-    with pytest.raises(AuthorizationError, match="journal_anchor_missing"):
+    with pytest.raises(AuthorizationError, match="journal_genesis_missing"):
         SQLiteAuthorizationJournal(schema_path)._claim_verified(_verified("0" * 32))
 
 
@@ -328,7 +386,7 @@ def test_journal_rejects_database_deletion_without_recreating_it(tmp_path: Path)
     journal._path.unlink()
 
     assert journal.migration_status() is JournalMigrationStatus.JOURNAL_MISSING
-    with pytest.raises(AuthorizationError, match="journal_identity_missing"):
+    with pytest.raises(AuthorizationError, match="journal_missing"):
         SQLiteAuthorizationJournal(journal._path)._claim_verified(_verified("6" * 32))
     assert not journal._path.exists()
 
@@ -378,8 +436,12 @@ def test_journal_rejects_anchor_swap_and_copied_journal(tmp_path: Path) -> None:
     copied._path.chmod(0o600)
     shutil.copy2(second._anchor_path(), copied._anchor_path())
     copied._anchor_path().chmod(0o600)
+    shutil.copy2(second._genesis_marker_path(), copied._genesis_marker_path())
+    copied._genesis_marker_path().chmod(0o600)
     assert copied.migration_status() is JournalMigrationStatus.IDENTITY_MISMATCH
-    with pytest.raises(AuthorizationError, match=r"journal_anchor|journal_identity_mismatch"):
+    with pytest.raises(
+        AuthorizationError, match=r"journal_anchor|journal_genesis_marker|journal_identity_mismatch"
+    ):
         copied._claim_verified(_verified("e" * 32, "copied-operation"))
 
 
