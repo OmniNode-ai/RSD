@@ -95,19 +95,29 @@ library.
 
 ## Phase-B authorization
 
-`omninode_rsd.lifecycle.authorize()` is a separate, read-only trust boundary
-for a disposable acceptance workflow. It accepts an injected Ed25519 trust
-anchor, provider-provenance adapter, and provider fingerprint policy. It
-requires actual detached-signature sidecars for the proposal, final contract,
-and evidence artifacts; Phase-A signature markers alone never authorize.
+`omninode_rsd.lifecycle.authorize_and_consume()` is the single
+mutation-admission boundary for a disposable acceptance workflow. It accepts
+an injected Ed25519 trust anchor, provider-provenance adapter, provider
+fingerprint policy, and an owner-only `SQLiteAuthorizationJournal`. It requires
+actual detached-signature sidecars for the proposal, final contract, and
+evidence artifacts; Phase-A signature markers alone never authorize.
 
 The verifier reads bounded owner-only artifact files, runs Phase-A before and
 after provider inspection, and rejects changed content, sidecars, unsafe file
 metadata, stale evidence, expired retention, signer mismatch, provider
-mismatch, and replayed journal claims. A positive `AuthorizationDecisionV1`
-contains a nonce and receipt hash. A mutating runtime must first call
-`consume_authorization()` with its durable atomic journal; this package has no
-such runtime and performs no mutation.
+mismatch, and replayed journal claims. The SQLite journal requires an
+owner-only directory and database file, uses `BEGIN IMMEDIATE`, `DELETE`
+journaling, and `FULL` synchronous durability. It records the nonce before the
+function returns an `AuthorizationGrantV1`; that audit grant is
+non-consumable. This package performs no service mutation.
+
+Detached sidecars use canonical standard base64 and Ed25519 domain-separated
+bytes containing the artifact name and SHA-256 of canonical signed content.
+For evidence models, canonical signed content omits only the embedded
+`detached_signature_sha256` marker. The marker must equal the SHA-256 of the
+actual sidecar signature, so it is covered without a circular signature input.
+The raw artifact digest is independently checked against both the sidecar and
+the Phase-A final contract.
 
 The `rsd-infisical-disposable-lifecycle authorize --root <directory>` and
 `rsd-lifecycle-authorize authorize --root <directory>` commands are

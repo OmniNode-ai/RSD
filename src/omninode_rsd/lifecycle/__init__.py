@@ -1,15 +1,14 @@
 """Event creation, reduction, projection, and replay primitives."""
 
 from omninode_rsd.lifecycle.authorization import (
-    AuthorizationDecisionV1,
     AuthorizationError,
-    AuthorizationJournal,
+    AuthorizationGrantV1,
     AuthorizationPaths,
     ProviderProvenance,
     ProviderProvenanceAdapter,
+    SQLiteAuthorizationJournal,
     TrustedEd25519SignerV1,
-    authorize,
-    consume_authorization,
+    authorize_and_consume,
 )
 from omninode_rsd.lifecycle.event_log import InMemoryEventLog
 from omninode_rsd.lifecycle.ingress import LifecycleEventIngress
@@ -54,9 +53,8 @@ from omninode_rsd.lifecycle.validation import (
 
 __all__ = [
     "AppliedLifecycleMigration",
-    "AuthorizationDecisionV1",
     "AuthorizationError",
-    "AuthorizationJournal",
+    "AuthorizationGrantV1",
     "AuthorizationPaths",
     "DurableLifecycleEventLog",
     "InMemoryEventLog",
@@ -86,9 +84,9 @@ __all__ = [
     "PostgresMigrationConnectionFactory",
     "ProviderProvenance",
     "ProviderProvenanceAdapter",
+    "SQLiteAuthorizationJournal",
     "TrustedEd25519SignerV1",
-    "authorize",
-    "consume_authorization",
+    "authorize_and_consume",
     "load_lifecycle_description",
     "parse_lifecycle_description",
     "reduce_lifecycle_event",

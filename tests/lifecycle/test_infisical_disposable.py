@@ -14,12 +14,14 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from omninode_rsd.lifecycle.authorization import (
     AuthorizationError,
+    AuthorizationGrantV1,
     AuthorizationPaths,
     ProviderProvenance,
+    SQLiteAuthorizationJournal,
     TrustedEd25519SignerV1,
+    _canonical_signed_content,
     _signature_message,
-    authorize,
-    consume_authorization,
+    authorize_and_consume,
 )
 from omninode_rsd.lifecycle.authorization import (
     main as authorization_main,
@@ -612,19 +614,9 @@ class _Provider:
         )
 
 
-class _Journal:
-    def __init__(self) -> None:
-        self.claims: set[tuple[str, str, str]] = set()
-
-    def claim(self, *, operation_id: str, nonce: str, receipt_sha256: str) -> bool:
-        item = (operation_id, nonce, receipt_sha256)
-        if item in self.claims:
-            return False
-        self.claims.add(item)
-        return True
-
-
-def _authorize_materials(root: Path) -> tuple[TrustedEd25519SignerV1, dict[str, str]]:
+def _authorize_materials(
+    root: Path,
+) -> tuple[TrustedEd25519SignerV1, dict[str, str], Ed25519PrivateKey]:
     """Create value-free sidecars after Phase-A materials have been compiled."""
 
     _materials(root)
@@ -651,6 +643,29 @@ def _authorize_materials(root: Path) -> tuple[TrustedEd25519SignerV1, dict[str, 
         signature["signer_public_key_fingerprint_sha256"] = signer.public_key_fingerprint_sha256
         (root / name).write_bytes(yaml.safe_dump(raw, sort_keys=True).encode())
         (root / name).chmod(0o600)
+    artifact_names = (
+        "proposal.yaml",
+        "runtime-contract.yaml",
+        "approval.yaml",
+        "governed-baseline.yaml",
+        "target-attestation.yaml",
+        "provider-declaration.yaml",
+        "registry-verification.yaml",
+        "postgres-overlay.yaml",
+    )
+    signatures: dict[str, bytes] = {}
+    for name in evidence_names:
+        content = (root / name).read_bytes()
+        signed_content_sha256 = _digest(_canonical_signed_content(name, content))
+        signature = key.sign(_signature_message(name, signed_content_sha256))
+        signatures[name] = signature
+        raw = yaml.safe_load(content)
+        assert type(raw) is dict
+        marker = raw["signature"]
+        assert type(marker) is dict
+        marker["detached_signature_sha256"] = _digest(signature)
+        (root / name).write_bytes(yaml.safe_dump(raw, sort_keys=True).encode())
+        (root / name).chmod(0o600)
     contract = yaml.safe_load((root / "runtime-contract.yaml").read_text(encoding="utf-8"))
     assert type(contract) is dict
     evidence = contract["evidence"]
@@ -666,26 +681,19 @@ def _authorize_materials(root: Path) -> tuple[TrustedEd25519SignerV1, dict[str, 
         evidence[field] = _digest((root / name).read_bytes())
     (root / "runtime-contract.yaml").write_bytes(yaml.safe_dump(contract, sort_keys=True).encode())
     (root / "runtime-contract.yaml").chmod(0o600)
-    for name in (
-        "proposal.yaml",
-        "runtime-contract.yaml",
-        "approval.yaml",
-        "governed-baseline.yaml",
-        "target-attestation.yaml",
-        "provider-declaration.yaml",
-        "registry-verification.yaml",
-        "postgres-overlay.yaml",
-    ):
+    for name in artifact_names:
+        content = (root / name).read_bytes()
         artifact_sha256 = _digest((root / name).read_bytes())
+        signed_content_sha256 = _digest(_canonical_signed_content(name, content))
+        signature = signatures.get(name, key.sign(_signature_message(name, signed_content_sha256)))
         sidecar = {
             "algorithm": "ed25519",
             "artifact_name": name,
             "artifact_sha256": artifact_sha256,
-            "schema_version": "rsd.authorization-signature.v1",
-            "signature_base64": base64.b64encode(
-                key.sign(_signature_message(name, artifact_sha256))
-            ).decode(),
+            "schema_version": "rsd.authorization-signature.v2",
+            "signature_base64": base64.b64encode(signature).decode(),
             "signer_key_id": signer.key_id,
+            "signed_content_sha256": signed_content_sha256,
         }
         target = root / AuthorizationPaths.signature_name(name)
         target.write_bytes(yaml.safe_dump(sidecar, sort_keys=True).encode())
@@ -694,44 +702,83 @@ def _authorize_materials(root: Path) -> tuple[TrustedEd25519SignerV1, dict[str, 
         reference.reference_sha256: _digest(f"fingerprint:{index}".encode())
         for index, reference in enumerate(_proposal().provider_references.all())
     }
-    return signer, fingerprints
+    return signer, fingerprints, key
 
 
-def test_phase_b_authorizes_real_signatures_and_consumes_one_nonce(tmp_path: Path) -> None:
+def _refresh_contract_evidence_hashes(root: Path) -> None:
+    contract = yaml.safe_load((root / "runtime-contract.yaml").read_text(encoding="utf-8"))
+    assert type(contract) is dict
+    evidence = contract["evidence"]
+    assert type(evidence) is dict
+    for name, field in (
+        ("approval.yaml", "approval_sha256"),
+        ("governed-baseline.yaml", "governed_baseline_sha256"),
+        ("target-attestation.yaml", "target_attestation_sha256"),
+        ("provider-declaration.yaml", "provider_declaration_sha256"),
+        ("registry-verification.yaml", "registry_verification_sha256"),
+        ("postgres-overlay.yaml", "postgres_overlay_sha256"),
+    ):
+        evidence[field] = _digest((root / name).read_bytes())
+    (root / "runtime-contract.yaml").write_bytes(yaml.safe_dump(contract, sort_keys=True).encode())
+    (root / "runtime-contract.yaml").chmod(0o600)
+
+
+def _refresh_sidecar(root: Path, name: str, key: Ed25519PrivateKey, *, resign: bool) -> None:
+    target = root / AuthorizationPaths.signature_name(name)
+    sidecar = yaml.safe_load(target.read_text(encoding="utf-8"))
+    assert type(sidecar) is dict
+    content = (root / name).read_bytes()
+    signed_content_sha256 = _digest(_canonical_signed_content(name, content))
+    sidecar["artifact_sha256"] = _digest(content)
+    sidecar["signed_content_sha256"] = signed_content_sha256
+    if resign:
+        sidecar["signature_base64"] = base64.b64encode(
+            key.sign(_signature_message(name, signed_content_sha256))
+        ).decode()
+    target.write_bytes(yaml.safe_dump(sidecar, sort_keys=True).encode())
+    target.chmod(0o600)
+
+
+def _journal(tmp_path: Path) -> SQLiteAuthorizationJournal:
+    root = tmp_path / "journal"
+    root.mkdir(mode=0o700, exist_ok=True)
+    root.chmod(0o700)
+    return SQLiteAuthorizationJournal(root / "authorization.sqlite3")
+
+
+def test_phase_b_authorizes_then_consumes_before_returning_audit_grant(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
-    signer, fingerprints = _authorize_materials(root)
+    signer, fingerprints, _ = _authorize_materials(root)
 
-    decision = authorize(
+    grant = authorize_and_consume(
         AuthorizationPaths(root),
         signer=signer,
         provider=_Provider(fingerprints),
         provider_fingerprints=fingerprints,
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
+        journal=_journal(tmp_path),
         now=_NOW,
-        nonce_factory=lambda: "a" * 32,
     )
 
-    assert decision.status == "authorized"
-    journal = _Journal()
-    consume_authorization(decision, journal)
-    with pytest.raises(AuthorizationError, match="nonce_replayed"):
-        consume_authorization(decision, journal)
+    assert grant.status == "consumed"
+    assert "nonce" not in grant.model_dump()
 
 
 def test_phase_b_rejects_sidecar_race_and_provider_mismatch(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
-    signer, fingerprints = _authorize_materials(root)
+    signer, fingerprints, _ = _authorize_materials(root)
     raced_sidecar = root / AuthorizationPaths.signature_name("proposal.yaml")
 
     with pytest.raises(AuthorizationError, match="artifact_race"):
-        authorize(
+        authorize_and_consume(
             AuthorizationPaths(root),
             signer=signer,
             provider=_Provider(fingerprints, mutate=raced_sidecar),
             provider_fingerprints=fingerprints,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
+            journal=_journal(tmp_path),
             now=_NOW,
         )
 
@@ -739,30 +786,32 @@ def test_phase_b_rejects_sidecar_race_and_provider_mismatch(tmp_path: Path) -> N
     first = next(iter(wrong))
     wrong[first] = "0" * 64
     with pytest.raises(AuthorizationError, match="provider_provenance"):
-        authorize(
+        authorize_and_consume(
             AuthorizationPaths(root),
             signer=signer,
             provider=_Provider(fingerprints),
             provider_fingerprints=wrong,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
+            journal=_journal(tmp_path),
             now=_NOW,
         )
 
 
 def test_phase_b_rejects_marker_only_signature_and_cli_is_read_only(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
-    signer, fingerprints = _authorize_materials(root)
+    signer, fingerprints, _ = _authorize_materials(root)
     (root / AuthorizationPaths.signature_name("approval.yaml")).unlink()
 
     with pytest.raises(AuthorizationError, match="artifact_snapshot"):
-        authorize(
+        authorize_and_consume(
             AuthorizationPaths(root),
             signer=signer,
             provider=_Provider(fingerprints),
             provider_fingerprints=fingerprints,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
+            journal=_journal(tmp_path),
             now=_NOW,
         )
     assert authorization_main(["authorize", "--root", str(root)]) == 2
@@ -771,15 +820,112 @@ def test_phase_b_rejects_marker_only_signature_and_cli_is_read_only(tmp_path: Pa
 
 def test_phase_b_rejects_disposal_owner_or_approval_mismatch(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
-    signer, fingerprints = _authorize_materials(root)
+    signer, fingerprints, _ = _authorize_materials(root)
 
     with pytest.raises(AuthorizationError, match="owner_approval"):
-        authorize(
+        authorize_and_consume(
             AuthorizationPaths(root),
             signer=signer,
             provider=_Provider(fingerprints),
             provider_fingerprints=fingerprints,
             expected_disposal_owner="wrong-owner",
             expected_approver_identity="approval-owner",
+            journal=_journal(tmp_path),
+            now=_NOW,
+        )
+
+
+def test_audit_grant_cannot_be_consumed_as_a_forged_decision(tmp_path: Path) -> None:
+    grant = AuthorizationGrantV1(
+        schema_version="rsd.lifecycle-authorization-grant.v1",
+        status="consumed",
+        operation_id="forged-operation",
+        disposal_owner="forged-owner",
+        retention_expires_at="2030-01-01T00:00:00Z",
+        proposal_sha256="a" * 64,
+        contract_sha256="b" * 64,
+        evidence_sha256=("c" * 64,) * 6,
+        provider_provenance_sha256="d" * 64,
+        journal_entry_sha256="e" * 64,
+        consumed_at="2026-08-27T12:00:00Z",
+    )
+
+    with pytest.raises(AuthorizationError, match="journal"):
+        _journal(tmp_path)._claim_verified(grant)  # type: ignore[arg-type]
+
+
+def test_phase_b_rejects_marker_tampering_even_when_phase_a_hashes_are_refreshed(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints, key = _authorize_materials(root)
+    approval_path = root / "approval.yaml"
+    approval = yaml.safe_load(approval_path.read_text(encoding="utf-8"))
+    assert type(approval) is dict
+    marker = approval["signature"]
+    assert type(marker) is dict
+    marker["detached_signature_sha256"] = "0" * 64
+    approval_path.write_bytes(yaml.safe_dump(approval, sort_keys=True).encode())
+    approval_path.chmod(0o600)
+    _refresh_contract_evidence_hashes(root)
+    _refresh_sidecar(root, "approval.yaml", key, resign=False)
+    _refresh_sidecar(root, "runtime-contract.yaml", key, resign=True)
+
+    with pytest.raises(AuthorizationError, match="signature_marker"):
+        authorize_and_consume(
+            AuthorizationPaths(root),
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=_journal(tmp_path),
+            now=_NOW,
+        )
+
+
+def test_phase_b_rejects_sidecar_swap_and_noncanonical_base64_alias(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints, _ = _authorize_materials(root)
+    proposal_sidecar = root / AuthorizationPaths.signature_name("proposal.yaml")
+    approval_sidecar = root / AuthorizationPaths.signature_name("approval.yaml")
+    proposal_sidecar.write_bytes(approval_sidecar.read_bytes())
+    proposal_sidecar.chmod(0o600)
+
+    with pytest.raises(AuthorizationError, match="signature_binding"):
+        authorize_and_consume(
+            AuthorizationPaths(root),
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=_journal(tmp_path),
+            now=_NOW,
+        )
+
+    alias_root = tmp_path / "aliased-artifacts"
+    signer, fingerprints, _ = _authorize_materials(alias_root)
+    proposal_sidecar = alias_root / AuthorizationPaths.signature_name("proposal.yaml")
+    sidecar = yaml.safe_load(proposal_sidecar.read_text(encoding="utf-8"))
+    assert type(sidecar) is dict
+    encoded = sidecar["signature_base64"]
+    assert type(encoded) is str and encoded.endswith("==")
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    final_index = alphabet.index(encoded[-3])
+    alias = alphabet[(final_index & 0b110000) | ((final_index + 1) & 0b001111)]
+    sidecar["signature_base64"] = f"{encoded[:-3]}{alias}=="
+    proposal_sidecar.write_bytes(yaml.safe_dump(sidecar, sort_keys=True).encode())
+    proposal_sidecar.chmod(0o600)
+
+    with pytest.raises(AuthorizationError, match="signature_artifact"):
+        authorize_and_consume(
+            AuthorizationPaths(alias_root),
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=_journal(tmp_path),
             now=_NOW,
         )
