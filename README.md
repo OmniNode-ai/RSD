@@ -335,9 +335,46 @@ models a fresh signed `rsd.start-runtime-intent.v2` with `start_runtime_v2`
 scope, a globally fresh delivery nonce, external replay tombstone, durable
 start journal state, and fresh bounded Keychain redelivery for every start or
 restart. No existing start or materialization receipt can be reused as restart
-authority. Concrete SSH, executor, Docker, and process-delivery transport
-remain future separately authorized effects; this package does not start a
-runtime today.
+authority.
+
+### Remote executor transport boundary
+
+The library now supplies an offline-testable transport boundary for a separately
+authorized remote executor. It canonical-loads signed transport and installation
+artifacts through owner-only, no-follow descriptors; sends versioned bounded
+binary frames with value-free JSON metadata and five opaque delivery chunks;
+and requires the daemon to durably claim a session before accepting any chunk.
+Both ends impose one-session deadlines and aggregate frame limits; a stalled,
+partial, duplicate, or oversized stream fails closed and a fresh authorization
+is required after any delivery attempt.
+The client builds one fixed OpenSSH invocation with strict host-key checking,
+no forwarding, no interactive authentication, no control socket, and pinned
+owner-only known-hosts and identity references inherited by descriptor at exec.
+It never puts a delivery value in
+arguments, its child environment, metadata, a receipt, or an exception.
+
+On the executor side, the ForceCommand relay is a bounded frame relay to an
+AF_UNIX daemon. After forwarding its one request, it waits for client EOF,
+rejects any trailing byte, emits a relay-authentication clean-EOF frame, and only then
+half-closes the UDS. The daemon requires both that frame and UDS EOF before a
+backend can observe delivery bytes; a bare close is never effect authority.
+The terminal client receipt parser likewise requires clean Secure Shell stdout EOF, so
+unknown appended frames cannot be ignored. The daemon validates kernel peer
+credentials, disables core dumps, requires signed swap/page-lock preflight,
+uses an attestation key loaded from a systemd credential descriptor, and records `MATERIALIZED`,
+`START_CLAIMED`, `START_AMBIGUOUS`, `STARTED`, or `ABANDONED` durable states.
+An ambiguous session has no automatic retry path. Recovery requires a receipt
+signed by the verified signer-genesis trust anchor and bound to the exact
+journal, allocation, transport policy, and request/session commitments. The
+render-only installation CLI emits non-secret systemd and sshd text plus a
+complete restricted `authorized_keys` entry whose public-key blob is bound to
+the pinned client-key fingerprint; it never writes or installs any output.
+
+This release still provides no configured executor installation, network
+connection, Docker, PostgreSQL, or service-mutation backend. `NoMutationBackend`
+is the safe default. A future deployment must separately install and attest the
+rendered policy, bind a concrete typed backend, and satisfy the existing
+signed authorization and external replay gates.
 
 The observed SQLite journal requires an owner-only directory and database file, uses
 `BEGIN IMMEDIATE`, `DELETE` journaling, and `FULL` synchronous durability. A

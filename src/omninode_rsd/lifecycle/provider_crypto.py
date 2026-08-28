@@ -78,6 +78,7 @@ _MATERIAL_GENESIS_DOMAIN: Final = b"omninode-rsd.provider-crypto.material-genesi
 _MATERIAL_GENERATION_RECEIPT_DOMAIN: Final = (
     b"omninode-rsd.provider-crypto.material-generation-receipt.v1\x00"
 )
+_EXECUTOR_TRANSPORT_METADATA_DOMAIN: Final = b"omninode-rsd.executor-transport-metadata.v2\x00"
 _ALLOCATION_INTENT_SIGNATURE_DOMAIN: Final = b"omninode-rsd.allocation-intent.ed25519.v2\x00"
 _MATERIAL_POLICY_NAME: Final = "provider-material-policy.yaml"
 _MATERIAL_GENESIS_NAME: Final = "provider-material-genesis.yaml"
@@ -781,6 +782,49 @@ def material_generation_receipt_message(receipt: MaterialGenerationReceiptV1) ->
     if type(receipt) is not MaterialGenerationReceiptV1:
         raise ProviderCryptoError("material_generation_receipt")
     return _signature_message(_MATERIAL_GENERATION_RECEIPT_DOMAIN, receipt)
+
+
+def executor_transport_metadata_message(
+    *,
+    allocation_intent_sha256: str,
+    operation_scope: str,
+    operation_id: str,
+    metadata_sha256: str,
+) -> bytes:
+    """Build the sole Keychain-signable remote executor metadata domain.
+
+    The Keychain-held bootstrap signer is intentionally not a generic signing
+    oracle.  A transport caller may request a signature only for the exact
+    allocation intent anchored by its genesis, a known runtime scope, one
+    canonical operation UUID, and a SHA-256 commitment to canonical
+    value-free metadata.  The remote transport module validates that metadata
+    independently before requesting or accepting this signature.
+    """
+
+    if (
+        type(allocation_intent_sha256) is not str
+        or re.fullmatch(_SHA256, allocation_intent_sha256) is None
+        or type(operation_scope) is not str
+        or operation_scope not in {"materialize_and_start_runtime_v1", "start_runtime_v2"}
+        or type(operation_id) is not str
+        or type(metadata_sha256) is not str
+        or re.fullmatch(_SHA256, metadata_sha256) is None
+    ):
+        raise ProviderCryptoError("executor_transport_signature")
+    try:
+        parsed_operation = uuid.UUID(operation_id)
+    except ValueError:
+        raise ProviderCryptoError("executor_transport_signature") from None
+    if str(parsed_operation) != operation_id:
+        raise ProviderCryptoError("executor_transport_signature")
+    return _EXECUTOR_TRANSPORT_METADATA_DOMAIN + _canonical_json(
+        {
+            "allocation_intent_sha256": allocation_intent_sha256,
+            "metadata_sha256": metadata_sha256,
+            "operation_id": operation_id,
+            "operation_scope": operation_scope,
+        }
+    )
 
 
 def replay_authority_policy_sha256(service: str, account_prefix: str) -> str:
@@ -1729,7 +1773,11 @@ class _MacOSGenericPasswordStore:
                 raise RuntimeError("Security.framework lookup failed")
             length = self._core.CFDataGetLength(result)
             pointer = self._core.CFDataGetBytePtr(result)
-            if length < 0 or not pointer:
+            # Bound before allocating a mutable copy.  Every signed material
+            # policy has a tighter purpose-specific bound, but the raw
+            # Security.framework bridge must not allocate an attacker-sized
+            # CFData object before that policy reaches the caller.
+            if length < 0 or length > _MAX_ARTIFACT_BYTES or not pointer:
                 raise RuntimeError("Security.framework lookup failed")
             value = bytearray(length)
             if length:
@@ -1904,6 +1952,38 @@ class KeychainEd25519Signer:
             return Ed25519PrivateKey.from_private_bytes(seed).sign(message)
         except ValueError:
             raise ProviderCryptoError("keychain_signer") from None
+        finally:
+            _zeroize(seed)
+
+    def sign_executor_transport_metadata(
+        self,
+        *,
+        allocation_intent_sha256: str,
+        operation_scope: str,
+        operation_id: str,
+        metadata_sha256: str,
+    ) -> bytes:
+        """Sign one intent-bound remote executor metadata commitment.
+
+        This is a separate, domain-separated narrow capability.  It cannot be
+        used to sign arbitrary bytes or an artifact for another allocation
+        intent.  The caller must still validate the complete metadata model
+        and the daemon independently verifies it against signed policy.
+        """
+
+        if allocation_intent_sha256 != self._genesis.allocation_intent_sha256:
+            raise ProviderCryptoError("executor_transport_signature")
+        message = executor_transport_metadata_message(
+            allocation_intent_sha256=allocation_intent_sha256,
+            operation_scope=operation_scope,
+            operation_id=operation_id,
+            metadata_sha256=metadata_sha256,
+        )
+        seed = self._seed()
+        try:
+            return Ed25519PrivateKey.from_private_bytes(seed).sign(message)
+        except ValueError:
+            raise ProviderCryptoError("executor_transport_signature") from None
         finally:
             _zeroize(seed)
 
@@ -3785,6 +3865,7 @@ __all__: Sequence[str] = (
     "ProviderMaterialSpecV1",
     "ReplayAuthorityPolicyArtifactV1",
     "SignerGenesisV1",
+    "executor_transport_metadata_message",
     "load_keychain_ed25519_signer",
     "load_verified_provider_material_bundle",
     "load_verified_signer_genesis",

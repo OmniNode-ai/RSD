@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 rsd-infisical-disposable-lifecycle = "omninode_rsd.lifecycle.infisical_disposable:main"
+rsd-executor-installation-render = "omninode_rsd.lifecycle.executor_installation:main"
 rsd-lifecycle-authorize = "omninode_rsd.lifecycle.authorization:main"
 
 [dependency-groups]
