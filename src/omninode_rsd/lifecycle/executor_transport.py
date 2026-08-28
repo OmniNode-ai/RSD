@@ -18,6 +18,7 @@ import os
 import re
 import select
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -88,6 +89,8 @@ _SECRET_CAPABILITY_POLICY_DOMAIN: Final = b"omninode-rsd.secret-capability-polic
 _SECRET_HANDLING_POLICY_DOMAIN: Final = b"omninode-rsd.secret-handling-policy.ed25519.v1\x00"
 _MAX_FILE_BYTES: Final = 131_072
 _MAX_SESSION_SECONDS: Final = 60
+_ED25519_PUBLIC_KEY_BLOB_BYTES: Final = 51
+_ED25519_PUBLIC_KEY_BASE64_BYTES: Final = 68
 _EXPECTED_PURPOSES: Final[tuple[str, str, str, str, str]] = (
     "encryption_key",
     "auth_secret",
@@ -321,7 +324,10 @@ class ExecutorTransportPolicyV2(_Model):
     ssh_policy: SSHConnectionPolicyV1
     daemon_socket_path: str
     daemon_socket_policy_sha256: str = Field(pattern=_SHA256)
-    daemon_peer_uid: int = Field(ge=0, le=2_147_483_647)
+    force_command_user_uid: int = Field(ge=1, le=2_147_483_647)
+    daemon_socket_group: str = Field(pattern=_IDENTIFIER)
+    daemon_socket_group_gid: int = Field(ge=1, le=2_147_483_647)
+    daemon_socket_mode: Literal[432]
     host_key_fingerprint_sha256: str = Field(pattern=_SHA256)
     package_sha256: str = Field(pattern=_SHA256)
     template_bundle_sha256: str = Field(pattern=_SHA256)
@@ -362,6 +368,7 @@ class ExecutorTransportPolicyV2(_Model):
         if (
             self.endpoint_sha256 != _digest(self.endpoint.encode("ascii"))
             or len(set(commitments)) != len(commitments)
+            or self.daemon_socket_group == "root"
             or _timestamp(self.expires_at) <= _timestamp(self.created_at)
             or len(_canonical_base64(self.signature_base64)) != 64
         ):
@@ -1442,24 +1449,57 @@ def _known_host_fingerprints(raw: bytes, *, endpoint: str) -> frozenset[str]:
     return frozenset(result)
 
 
-def _public_key_fingerprint(raw: bytes) -> str:
-    """Verify one owner-only OpenSSH public-key reference without shelling out."""
+def _ssh_ed25519_blob(raw: bytes) -> bytes:
+    """Parse exactly one canonical OpenSSH Ed25519 public-key blob.
+
+    The outer key type is not security authority: OpenSSH fingerprints the
+    binary wire blob.  This parser therefore verifies both length-prefixed
+    strings, the fixed algorithm marker, the exact 32-byte public key, and
+    the absence of trailing fields before a fingerprint is accepted.
+    """
+
+    def read_string(offset: int) -> tuple[bytes, int]:
+        if offset + 4 > len(raw):
+            raise ValueError
+        length = struct.unpack("!I", raw[offset : offset + 4])[0]
+        end = offset + 4 + length
+        if end < offset or end > len(raw):
+            raise ValueError
+        return raw[offset + 4 : end], end
 
     try:
-        line = raw.decode("ascii").strip()
+        if type(raw) is not bytes or len(raw) != _ED25519_PUBLIC_KEY_BLOB_BYTES:
+            raise ValueError
+        algorithm, offset = read_string(0)
+        public_key, offset = read_string(offset)
+        if algorithm != b"ssh-ed25519" or len(public_key) != 32 or offset != len(raw):
+            raise ValueError
+    except (TypeError, ValueError, struct.error):
+        raise ExecutorTransportError("identity_reference") from None
+    return raw
+
+
+def _public_key_fingerprint(raw: bytes) -> str:
+    """Verify one owner-only canonical OpenSSH Ed25519 public-key reference."""
+
+    try:
+        if (
+            len(raw) != _ED25519_PUBLIC_KEY_BASE64_BYTES + 1 + len(b"ssh-ed25519 ")
+            or not raw.endswith(b"\n")
+            or raw.count(b"\n") != 1
+            or b"\r" in raw
+        ):
+            raise ValueError
+        line = raw[:-1].decode("ascii")
         fields = line.split(" ")
-        if len(fields) not in {2, 3} or fields[0] not in {
-            "ssh-ed25519",
-            "ecdsa-sha2-nistp256",
-            "rsa-sha2-512",
-        }:
+        if len(fields) != 2 or fields[0] != "ssh-ed25519":
             raise ValueError
         decoded = base64.b64decode(fields[1], validate=True)
         if base64.b64encode(decoded).decode("ascii") != fields[1]:
             raise ValueError
-    except (UnicodeDecodeError, ValueError, binascii.Error):
+        return _digest(_ssh_ed25519_blob(decoded))
+    except (UnicodeDecodeError, ValueError, binascii.Error, ExecutorTransportError):
         raise ExecutorTransportError("identity_reference") from None
-    return _digest(decoded)
 
 
 def _validate_executable(path: str, *, expected_sha256: str) -> None:

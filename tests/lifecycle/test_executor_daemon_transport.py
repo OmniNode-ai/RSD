@@ -11,8 +11,10 @@ import base64
 import hashlib
 import io
 import json
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from uuid import UUID
 
@@ -199,7 +201,10 @@ def _policy() -> tuple[ExecutorTransportPolicyV2, ExecutorIdentityV1]:
             ssh_policy=ssh,
             daemon_socket_path="/run/executor/socket",
             daemon_socket_policy_sha256=values[5],
-            daemon_peer_uid=1001,
+            force_command_user_uid=1001,
+            daemon_socket_group="executor-relay",
+            daemon_socket_group_gid=1002,
+            daemon_socket_mode=0o660,
             host_key_fingerprint_sha256=values[6],
             package_sha256=values[7],
             template_bundle_sha256=values[8],
@@ -472,6 +477,118 @@ def test_peer_uid_mismatch_does_not_consume_or_mutate(tmp_path: Path) -> None:
         engine._serve_for_test(source, io.BytesIO(), peer_uid=1002)
     assert source._calls == 0
     assert backend.calls == 0
+
+
+def test_force_command_requires_the_signed_socket_group_before_any_uds_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The forced Secure Shell identity cannot reach a root-owned socket by UID alone."""
+
+    policy, _ = _policy()
+    artifacts = _artifacts(policy, _genesis(Ed25519PrivateKey.from_private_bytes(b"c" * 32)))
+    relay = daemon.ForceCommandRelay(artifacts)
+    calls: list[str] = []
+    monkeypatch.setattr(daemon.os, "geteuid", lambda: policy.force_command_user_uid)
+    monkeypatch.setattr(daemon.os, "getegid", lambda: 1003)
+    monkeypatch.setattr(daemon.os, "getgroups", lambda: [1003])
+    monkeypatch.setattr(
+        daemon,
+        "_DeadlineStandardStreams",
+        lambda **kwargs: calls.append("stdio"),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_connect_force_command_uds",
+        lambda value: calls.append("uds"),
+    )
+
+    with pytest.raises(ExecutorDaemonError, match="uds_peer"):
+        relay.forward()
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "update",
+    (
+        {"daemon_socket_group_gid": 1003},
+        {"daemon_socket_mode": 0o600},
+    ),
+)
+def test_force_command_uds_requires_exact_signed_root_group_and_mode_before_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    update: dict[str, int],
+) -> None:
+    policy, _ = _policy()
+    altered = policy.model_copy(update=update)
+    socket_status = SimpleNamespace(
+        st_mode=stat.S_IFSOCK | 0o660,
+        st_uid=0,
+        st_gid=1002,
+        st_nlink=1,
+        st_dev=1,
+        st_ino=2,
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(daemon.os, "lstat", lambda path: socket_status)
+    monkeypatch.setattr(
+        daemon.socket,
+        "socket",
+        lambda family, kind: calls.append("connect") or cast(object, None),
+    )
+
+    with pytest.raises(ExecutorDaemonError, match="force_command"):
+        daemon._connect_force_command_uds(altered)
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "listen_pid,listen_fds,listen_names",
+    (
+        ("2", "1", "omninode-rsd-executor"),
+        ("1", "2", "omninode-rsd-executor"),
+        ("1", "1", "unexpected-listener"),
+    ),
+)
+def test_systemd_activation_rejects_any_unexpected_descriptor_contract_before_fd_use(
+    monkeypatch: pytest.MonkeyPatch,
+    listen_pid: str,
+    listen_fds: str,
+    listen_names: str,
+) -> None:
+    monkeypatch.setattr(daemon.sys, "platform", "linux")
+    monkeypatch.setattr(daemon.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(daemon.os, "getpid", lambda: 1)
+    monkeypatch.setenv("LISTEN_PID", listen_pid)
+    monkeypatch.setenv("LISTEN_FDS", listen_fds)
+    monkeypatch.setenv("LISTEN_FDNAMES", listen_names)
+
+    with pytest.raises(ExecutorDaemonError, match="activated_socket"):
+        daemon._systemd_activated_listener()
+
+
+def test_systemd_activated_session_refuses_default_backend_before_accepting_material(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy, _ = _policy()
+    journal = ExecutorSessionJournal.provision(tmp_path / "journal.sqlite3", journal_id=_UUIDS[0])
+    engine = daemon._executor_daemon_session_engine_for_test(
+        policy=policy,
+        signer_genesis=_genesis(Ed25519PrivateKey.from_private_bytes(b"c" * 32)),
+        attestation_signer=_Attestation(),
+        journal=journal,
+        memory_safety=_Memory(),
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(
+        daemon,
+        "_systemd_activated_listener",
+        lambda: calls.append("listener"),
+    )
+
+    with pytest.raises(ExecutorDaemonError, match="backend_unavailable"):
+        daemon.serve_systemd_activated_session(engine)
+    assert calls == []
 
 
 def test_live_daemon_constructor_rejects_caller_model_bundle(tmp_path: Path) -> None:

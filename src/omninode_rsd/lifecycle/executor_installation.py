@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,8 @@ from omninode_rsd.lifecycle.infisical_disposable import ExecutorInstallationPoli
 _IDENTIFIER: Final = r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$"
 _SHA256: Final = r"^[0-9a-f]{64}$"
 _SAFE_ABSOLUTE_PATH: Final = re.compile(r"^/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$")
+_ED25519_PUBLIC_KEY_BLOB_BYTES: Final = 51
+_ED25519_AUTHORIZED_KEY_CHARACTERS: Final = 80
 
 
 class ExecutorInstallationRenderError(RuntimeError):
@@ -63,17 +66,43 @@ def _path(value: str) -> str:
     return value
 
 
-def _authorized_key_fingerprint(value: str) -> str:
-    """Return the exact public-key blob fingerprint after canonical parsing."""
+def _ed25519_key_blob(value: str) -> bytes:
+    """Parse exactly one canonical OpenSSH Ed25519 public-key line."""
+
+    def read_string(raw: bytes, offset: int) -> tuple[bytes, int]:
+        if offset + 4 > len(raw):
+            raise ValueError
+        length = struct.unpack("!I", raw[offset : offset + 4])[0]
+        end = offset + 4 + length
+        if end < offset or end > len(raw):
+            raise ValueError
+        return raw[offset + 4 : end], end
 
     try:
-        _key_type, encoded = value.split(" ")
-        raw = base64.b64decode(encoded, validate=True)
-        if not raw or base64.b64encode(raw).decode("ascii") != encoded:
+        if type(value) is not str:
             raise ValueError
-    except (ValueError, UnicodeError, binascii.Error):
+        key_type, encoded = value.split(" ")
+        if key_type != "ssh-ed25519":
+            raise ValueError
+        raw = base64.b64decode(encoded, validate=True)
+        if (
+            len(raw) != _ED25519_PUBLIC_KEY_BLOB_BYTES
+            or base64.b64encode(raw).decode("ascii") != encoded
+        ):
+            raise ValueError
+        algorithm, offset = read_string(raw, 0)
+        public_key, offset = read_string(raw, offset)
+        if algorithm != b"ssh-ed25519" or len(public_key) != 32 or offset != len(raw):
+            raise ValueError
+    except (ValueError, UnicodeError, binascii.Error, struct.error):
         raise ExecutorInstallationRenderError("installation_manifest") from None
-    return hashlib.sha256(raw).hexdigest()
+    return raw
+
+
+def _authorized_key_fingerprint(value: str) -> str:
+    """Return the exact validated OpenSSH Ed25519 blob fingerprint."""
+
+    return hashlib.sha256(_ed25519_key_blob(value)).hexdigest()
 
 
 class ExecutorInstallationManifestV2(_Model):
@@ -81,24 +110,33 @@ class ExecutorInstallationManifestV2(_Model):
 
     schema_version: Literal["rsd.executor-installation-manifest.v2"]
     executor_id: str = Field(pattern=_IDENTIFIER)
-    daemon_user: str = Field(pattern=_IDENTIFIER)
-    daemon_group: str = Field(pattern=_IDENTIFIER)
+    force_command_user: str = Field(pattern=_IDENTIFIER)
+    force_command_user_uid: int = Field(ge=1, le=2_147_483_647)
+    daemon_socket_group: str = Field(pattern=_IDENTIFIER)
+    daemon_socket_group_gid: int = Field(ge=1, le=2_147_483_647)
     credential_name: str = Field(pattern=_IDENTIFIER)
+    state_directory_name: str = Field(pattern=_IDENTIFIER)
     daemon_executable_path: str
     force_command_path: str
     systemd_unit_path: str
+    socket_unit_path: str
     sshd_fragment_path: str
     authorized_key_policy_path: str
     daemon_socket_path: str
-    client_authorized_key: str
-    socket_mode: Literal[384]
+    client_authorized_key: str = Field(
+        min_length=_ED25519_AUTHORIZED_KEY_CHARACTERS,
+        max_length=_ED25519_AUTHORIZED_KEY_CHARACTERS,
+    )
+    daemon_socket_mode: Literal[432]
     daemon_file_mode: Literal[448]
     config_file_mode: Literal[420]
+    authorized_key_file_mode: Literal[384]
 
     @field_validator(
         "daemon_executable_path",
         "force_command_path",
         "systemd_unit_path",
+        "socket_unit_path",
         "sshd_fragment_path",
         "authorized_key_policy_path",
         "daemon_socket_path",
@@ -113,15 +151,8 @@ class ExecutorInstallationManifestV2(_Model):
         """Accept one complete, comment-free OpenSSH public-key entry."""
 
         try:
-            if type(value) is not str:
-                raise ValueError
-            key_type, encoded = value.split(" ")
-            if key_type not in {"ssh-ed25519", "ecdsa-sha2-nistp256", "rsa-sha2-512"}:
-                raise ValueError
-            raw = base64.b64decode(encoded, validate=True)
-            if not raw or base64.b64encode(raw).decode("ascii") != encoded:
-                raise ValueError
-        except (ValueError, UnicodeError, binascii.Error):
+            _ed25519_key_blob(value)
+        except ExecutorInstallationRenderError:
             raise ValueError("authorized key is invalid") from None
         return value
 
@@ -131,11 +162,18 @@ class ExecutorInstallationManifestV2(_Model):
             self.daemon_executable_path,
             self.force_command_path,
             self.systemd_unit_path,
+            self.socket_unit_path,
             self.sshd_fragment_path,
             self.authorized_key_policy_path,
             self.daemon_socket_path,
         )
-        if len(set(paths)) != len(paths):
+        if (
+            len(set(paths)) != len(paths)
+            or self.force_command_user == "root"
+            or self.daemon_socket_group == "root"
+            or not self.systemd_unit_path.endswith(".service")
+            or not self.socket_unit_path.endswith(".socket")
+        ):
             raise ValueError("installation manifest is invalid")
         return self
 
@@ -157,7 +195,7 @@ class RenderedExecutorInstallationV2:
     """Value-free output; rendering itself has no install side effect."""
 
     manifest_sha256: str
-    files: tuple[RenderedExecutorFileV1, RenderedExecutorFileV1, RenderedExecutorFileV1]
+    files: tuple[RenderedExecutorFileV1, ...]
     template_bundle_sha256: str
 
 
@@ -202,6 +240,11 @@ def render_executor_installation(
         canonical_manifest != manifest
         or manifest.executor_id != transport_policy.executor_id
         or manifest.executor_id != installation_policy.executor.executor_id
+        or manifest.force_command_user != transport_policy.ssh_policy.dedicated_user
+        or manifest.force_command_user_uid != transport_policy.force_command_user_uid
+        or manifest.daemon_socket_group != transport_policy.daemon_socket_group
+        or manifest.daemon_socket_group_gid != transport_policy.daemon_socket_group_gid
+        or manifest.daemon_socket_mode != transport_policy.daemon_socket_mode
         or manifest.daemon_socket_path != transport_policy.daemon_socket_path
         or transport_policy.package_sha256 != installation_policy.package_sha256
         or transport_policy.template_bundle_sha256 != installation_policy.template_bundle_sha256
@@ -214,18 +257,23 @@ def render_executor_installation(
         != transport_policy.ssh_policy.client_key_fingerprint_sha256
     ):
         raise ExecutorInstallationRenderError("installation_binding")
+    socket_unit_name = Path(manifest.socket_unit_path).name
+    service_unit_name = Path(manifest.systemd_unit_path).name
     unit = "\n".join(
         (
             "[Unit]",
             "Description=OmniNode RSD executor daemon",
-            "After=network.target",
+            f"Requires={socket_unit_name}",
+            f"After={socket_unit_name}",
             "",
             "[Service]",
             "Type=exec",
-            f"User={manifest.daemon_user}",
-            f"Group={manifest.daemon_group}",
             f"LoadCredentialEncrypted={manifest.credential_name}",
-            f"ExecStart={manifest.daemon_executable_path} --uds {manifest.daemon_socket_path}",
+            f"StateDirectory={manifest.state_directory_name}",
+            "StateDirectoryMode=0700",
+            f"WorkingDirectory=%S/{manifest.state_directory_name}",
+            f"ReadWritePaths=%S/{manifest.state_directory_name}",
+            f"ExecStart={manifest.daemon_executable_path}",
             "UMask=0077",
             "LimitCORE=0",
             "NoNewPrivileges=yes",
@@ -251,9 +299,30 @@ def render_executor_installation(
             "",
         )
     )
+    socket_unit = "\n".join(
+        (
+            "[Unit]",
+            "Description=OmniNode RSD executor local socket",
+            "",
+            "[Socket]",
+            f"ListenStream={manifest.daemon_socket_path}",
+            "SocketUser=root",
+            f"SocketGroup={manifest.daemon_socket_group}",
+            f"SocketMode=0{manifest.daemon_socket_mode:o}",
+            "FileDescriptorName=omninode-rsd-executor",
+            "Accept=no",
+            f"Service={service_unit_name}",
+            "RemoveOnStop=yes",
+            "",
+            "[Install]",
+            "WantedBy=sockets.target",
+            "",
+        )
+    )
     sshd = "\n".join(
         (
-            f"Match User {transport_policy.ssh_policy.dedicated_user}",
+            f"Match User {manifest.force_command_user}",
+            f"    AuthorizedKeysFile {manifest.authorized_key_policy_path}",
             f"    ForceCommand {manifest.force_command_path}",
             "    DisableForwarding yes",
             "    PermitTTY no",
@@ -287,6 +356,12 @@ def render_executor_installation(
             content=unit,
         ),
         _rendered_file(
+            path=manifest.socket_unit_path,
+            group="root",
+            mode=manifest.config_file_mode,
+            content=socket_unit,
+        ),
+        _rendered_file(
             path=manifest.sshd_fragment_path,
             group="root",
             mode=manifest.config_file_mode,
@@ -295,7 +370,7 @@ def render_executor_installation(
         _rendered_file(
             path=manifest.authorized_key_policy_path,
             group="root",
-            mode=manifest.config_file_mode,
+            mode=manifest.authorized_key_file_mode,
             content=key_policy,
         ),
     )

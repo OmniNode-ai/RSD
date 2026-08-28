@@ -76,6 +76,7 @@ from omninode_rsd.lifecycle.executor_daemon import (
     MemorySafetyPreflight,
     NoMutationBackend,
     SystemdCredentialAttestationSigner,
+    serve_systemd_activated_session,
     unix_peer_uid,
     verify_executor_recovery_receipt,
 )
@@ -442,6 +443,7 @@ __all__ = [
     "render_executor_installation",
     "replay_lifecycle",
     "request_from_delivery",
+    "serve_systemd_activated_session",
     "sign_executor_transport_request",
     "unix_peer_uid",
     "validate_observed_allocation_transition",

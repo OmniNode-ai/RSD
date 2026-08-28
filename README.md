@@ -354,7 +354,10 @@ It never puts a delivery value in
 arguments, its child environment, metadata, a receipt, or an exception.
 
 On the executor side, the ForceCommand relay is a bounded frame relay to an
-AF_UNIX daemon. After forwarding its one request, it waits for client EOF,
+AF_UNIX daemon. A signed non-root Secure Shell user UID and signed non-root
+socket group/GID are both required: the render-only installation creates the
+socket through a root-owned systemd socket unit at exact `0660` mode, while the
+daemon separately validates the kernel peer UID. After forwarding its one request, it waits for client EOF,
 rejects any trailing byte, emits a relay-authentication clean-EOF frame, and only then
 half-closes the UDS. The daemon requires both that frame and UDS EOF before a
 backend can observe delivery bytes; a bare close is never effect authority.
@@ -366,9 +369,24 @@ uses an attestation key loaded from a systemd credential descriptor, and records
 An ambiguous session has no automatic retry path. Recovery requires a receipt
 signed by the verified signer-genesis trust anchor and bound to the exact
 journal, allocation, transport policy, and request/session commitments. The
-render-only installation CLI emits non-secret systemd and sshd text plus a
-complete restricted `authorized_keys` entry whose public-key blob is bound to
-the pinned client-key fingerprint; it never writes or installs any output.
+render-only installation CLI emits non-secret systemd socket/service and sshd
+text, including an explicit `AuthorizedKeysFile`, plus a complete restricted
+`authorized_keys` entry whose exact `ssh-ed25519` wire blob is bound to the
+pinned client-key fingerprint; it never writes or installs any output. The
+future installation effect must account for the signed account-to-UID and
+group-to-GID mappings before the transport becomes usable; the relay and
+daemon independently recheck them at runtime. The service renderer also
+creates an exact owner-only systemd state directory and grants only that
+directory write access through `ProtectSystem=strict`, so a separately
+provisioned SQLite session journal has a durable bounded location. Its named
+socket descriptor is consumed only by `serve_systemd_activated_session()`,
+which validates the root-owned path identity, group, mode, descriptor name,
+and one-listener systemd activation contract before accepting a connection.
+The exact rendered executable is a separately signed installation artifact
+that must construct the sealed daemon engine and call that adapter. The
+default `NoMutationBackend` is rejected before the activated listener is
+opened, so this public package cannot accidentally accept delivery material
+without a separately reviewed concrete backend.
 
 This release still provides no configured executor installation, network
 connection, Docker, PostgreSQL, or service-mutation backend. `NoMutationBackend`

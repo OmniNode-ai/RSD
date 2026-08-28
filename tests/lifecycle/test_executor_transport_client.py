@@ -6,6 +6,7 @@ import base64
 import hashlib
 import io
 import json
+import struct
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -18,6 +19,7 @@ import omninode_rsd.lifecycle.executor_daemon as daemon
 import omninode_rsd.lifecycle.executor_transport as transport
 from omninode_rsd.lifecycle.executor_installation import (
     ExecutorInstallationManifestV2,
+    ExecutorInstallationRenderError,
     render_executor_installation,
 )
 from omninode_rsd.lifecycle.infisical_disposable import (
@@ -71,6 +73,16 @@ _UUIDS = (
 )
 
 
+def _ssh_ed25519_blob(public_key: bytes) -> bytes:
+    assert len(public_key) == 32
+    return (
+        struct.pack("!I", len(b"ssh-ed25519"))
+        + b"ssh-ed25519"
+        + struct.pack("!I", len(public_key))
+        + public_key
+    )
+
+
 def _policy() -> transport.ExecutorTransportPolicyV2:
     host = _H("host-key")
     client = _H("client-key")
@@ -111,7 +123,10 @@ def _policy() -> transport.ExecutorTransportPolicyV2:
         ssh_policy=ssh,
         daemon_socket_path="/run/omninode-rsd/executor.sock",
         daemon_socket_policy_sha256=_H("socket-policy"),
-        daemon_peer_uid=1001,
+        force_command_user_uid=1001,
+        daemon_socket_group="executor-relay",
+        daemon_socket_group_gid=1002,
+        daemon_socket_mode=0o660,
         host_key_fingerprint_sha256=host,
         package_sha256=_H("package"),
         template_bundle_sha256=_H("template"),
@@ -223,7 +238,8 @@ def test_frame_reader_rejects_bounds_without_echoing_payload(bad_size: int) -> N
 def test_fixed_ssh_argv_has_no_shell_or_material_and_pins_known_hosts(tmp_path: Path) -> None:
     policy = _policy()
     raw_key = b"host-public-key"
-    public = b"ssh-ed25519 " + base64.b64encode(b"client-public-key") + b" comment\n"
+    client_blob = _ssh_ed25519_blob(b"c" * 32)
+    public = b"ssh-ed25519 " + base64.b64encode(client_blob) + b"\n"
     known = b"executor.example.test ssh-ed25519 " + base64.b64encode(raw_key) + b"\n"
     key = tmp_path / "key"
     key.write_bytes(b"opaque-key-material")
@@ -242,13 +258,13 @@ def test_fixed_ssh_argv_has_no_shell_or_material_and_pins_known_hosts(tmp_path: 
                 update={
                     "key_path": str(key),
                     "public_key_path": str(public_path),
-                    "public_key_fingerprint_sha256": _H("client-public-key"),
+                    "public_key_fingerprint_sha256": hashlib.sha256(client_blob).hexdigest(),
                 }
             ),
             "host_key_fingerprint_sha256": _H("host-public-key"),
             "ssh_policy": policy.ssh_policy.model_copy(
                 update={"host_key_fingerprints_sha256": (_H("host-public-key"),)}
-                | {"client_key_fingerprint_sha256": _H("client-public-key")}
+                | {"client_key_fingerprint_sha256": hashlib.sha256(client_blob).hexdigest()}
             ),
         }
     )
@@ -292,6 +308,41 @@ def test_fixed_ssh_argv_has_no_shell_or_material_and_pins_known_hosts(tmp_path: 
             executable_validator=lambda path, digest: None,
             owner_reader=lambda path, maximum, phase: known if phase == "known_hosts" else public,
         ).launch_spec()
+
+
+@pytest.mark.parametrize(
+    "public_key",
+    (
+        b"rsa-sha2-512 " + base64.b64encode(_ssh_ed25519_blob(b"r" * 32)) + b"\n",
+        b"ssh-ed25519 " + base64.b64encode(b"not-an-open-ssh-key") + b"\n",
+        b"ssh-ed25519 "
+        + base64.b64encode(
+            struct.pack("!I", len(b"ssh-ed25519"))
+            + b"ssh-ed25519"
+            + struct.pack("!I", 31)
+            + b"x" * 31
+        )
+        + b"\n",
+        b"ssh-ed25519 " + base64.b64encode(_ssh_ed25519_blob(b"r" * 32)) + b" comment\n",
+    ),
+)
+def test_identity_reference_requires_a_canonical_ed25519_key_blob(public_key: bytes) -> None:
+    """An outer Base64 token or key-type label is not a trust boundary."""
+
+    with pytest.raises(transport.ExecutorTransportError, match="identity_reference"):
+        transport._public_key_fingerprint(public_key)
+
+
+def test_transport_policy_rejects_root_or_unbound_socket_identity() -> None:
+    policy = _policy()
+    for update in (
+        {"force_command_user_uid": 0},
+        {"daemon_socket_group": "root"},
+        {"daemon_socket_group_gid": 0},
+        {"daemon_socket_mode": 0o600},
+    ):
+        with pytest.raises(ValueError):
+            transport.ExecutorTransportPolicyV2.model_validate(policy.model_dump() | update)
 
 
 @pytest.mark.parametrize(
@@ -491,7 +542,7 @@ def test_request_verifier_rejects_expired_or_cross_session_metadata(
 
 def test_renderer_is_value_free_and_has_no_write_side_effect(tmp_path: Path) -> None:
     policy = _policy()
-    client_key_blob = b"client-public-key"
+    client_key_blob = _ssh_ed25519_blob(b"c" * 32)
     client_key = "ssh-ed25519 " + base64.b64encode(client_key_blob).decode("ascii")
     client_fingerprint = hashlib.sha256(client_key_blob).hexdigest()
     policy = policy.model_copy(
@@ -515,19 +566,24 @@ def test_renderer_is_value_free_and_has_no_write_side_effect(tmp_path: Path) -> 
     manifest = ExecutorInstallationManifestV2(
         schema_version="rsd.executor-installation-manifest.v2",
         executor_id="executor-1",
-        daemon_user="rsd-daemon",
-        daemon_group="rsd-daemon",
+        force_command_user="executor-user",
+        force_command_user_uid=1001,
+        daemon_socket_group="executor-relay",
+        daemon_socket_group_gid=1002,
         credential_name="rsd-credential",
+        state_directory_name="rsd-executor-state",
         daemon_executable_path=str(tmp_path / "daemon"),
         force_command_path=str(tmp_path / "force"),
-        systemd_unit_path=str(tmp_path / "unit"),
+        systemd_unit_path=str(tmp_path / "unit.service"),
+        socket_unit_path=str(tmp_path / "socket.socket"),
         sshd_fragment_path=str(tmp_path / "sshd"),
         authorized_key_policy_path=str(tmp_path / "authorized"),
         daemon_socket_path=policy.daemon_socket_path,
         client_authorized_key=client_key,
-        socket_mode=0o600,
+        daemon_socket_mode=0o660,
         daemon_file_mode=0o700,
         config_file_mode=0o644,
+        authorized_key_file_mode=0o600,
     )
     rendered = render_executor_installation(
         manifest, transport_policy=policy, installation_policy=installation
@@ -535,13 +591,64 @@ def test_renderer_is_value_free_and_has_no_write_side_effect(tmp_path: Path) -> 
     assert rendered.files
     assert all(not Path(item.path).exists() for item in rendered.files)
     assert all("password" not in item.content.lower() for item in rendered.files)
-    assert "DisableForwarding yes" in rendered.files[1].content
-    assert "no-agent-forwarding" in rendered.files[2].content
-    assert rendered.files[2].content == (
+    assert len(rendered.files) == 4
+    assert "SocketUser=root" in rendered.files[1].content
+    assert "SocketGroup=executor-relay" in rendered.files[1].content
+    assert "SocketMode=0660" in rendered.files[1].content
+    assert "FileDescriptorName=omninode-rsd-executor" in rendered.files[1].content
+    assert "StateDirectory=rsd-executor-state" in rendered.files[0].content
+    assert "StateDirectoryMode=0700" in rendered.files[0].content
+    assert "ReadWritePaths=%S/rsd-executor-state" in rendered.files[0].content
+    assert "WorkingDirectory=%S/rsd-executor-state" in rendered.files[0].content
+    assert "AuthorizedKeysFile " + manifest.authorized_key_policy_path in rendered.files[2].content
+    assert "DisableForwarding yes" in rendered.files[2].content
+    assert "no-agent-forwarding" in rendered.files[3].content
+    assert rendered.files[3].mode == 0o600
+    assert rendered.files[3].content == (
         f'command="{manifest.force_command_path}",restrict,'
         "no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding "
         f"{client_key}\n"
     )
+
+    with pytest.raises(ExecutorInstallationRenderError, match="installation_binding"):
+        render_executor_installation(
+            manifest.model_copy(update={"force_command_user_uid": 1003}),
+            transport_policy=policy,
+            installation_policy=installation,
+        )
+
+
+@pytest.mark.parametrize(
+    "key",
+    (
+        "rsa-sha2-512 " + base64.b64encode(_ssh_ed25519_blob(b"r" * 32)).decode("ascii"),
+        "ssh-ed25519 " + base64.b64encode(b"not-an-open-ssh-key").decode("ascii"),
+    ),
+)
+def test_installation_manifest_rejects_noncanonical_or_non_ed25519_key_blob(key: str) -> None:
+    with pytest.raises(ValueError):
+        ExecutorInstallationManifestV2(
+            schema_version="rsd.executor-installation-manifest.v2",
+            executor_id="executor-1",
+            force_command_user="executor-user",
+            force_command_user_uid=1001,
+            daemon_socket_group="executor-relay",
+            daemon_socket_group_gid=1002,
+            credential_name="rsd-credential",
+            state_directory_name="rsd-executor-state",
+            daemon_executable_path="/opt/executor/daemon",
+            force_command_path="/opt/executor/force",
+            systemd_unit_path="/opt/executor/executor.service",
+            socket_unit_path="/opt/executor/executor.socket",
+            sshd_fragment_path="/opt/executor/sshd",
+            authorized_key_policy_path="/opt/executor/authorized-key",
+            daemon_socket_path="/run/executor/socket",
+            client_authorized_key=key,
+            daemon_socket_mode=0o660,
+            daemon_file_mode=0o700,
+            config_file_mode=0o644,
+            authorized_key_file_mode=0o600,
+        )
 
 
 @pytest.mark.parametrize(
@@ -560,19 +667,26 @@ def test_installation_manifest_rejects_command_injecting_paths(unsafe_path: str)
         ExecutorInstallationManifestV2(
             schema_version="rsd.executor-installation-manifest.v2",
             executor_id="executor-1",
-            daemon_user="rsd-daemon",
-            daemon_group="rsd-daemon",
+            force_command_user="executor-user",
+            force_command_user_uid=1001,
+            daemon_socket_group="executor-relay",
+            daemon_socket_group_gid=1002,
             credential_name="rsd-credential",
+            state_directory_name="rsd-executor-state",
             daemon_executable_path="/opt/executor/daemon",
             force_command_path=unsafe_path,
-            systemd_unit_path="/opt/executor/unit",
+            systemd_unit_path="/opt/executor/unit.service",
+            socket_unit_path="/opt/executor/socket.socket",
             sshd_fragment_path="/opt/executor/sshd",
             authorized_key_policy_path="/opt/executor/authorized-key",
             daemon_socket_path="/run/executor/socket",
-            client_authorized_key="ssh-ed25519 Y2xpZW50LXB1YmxpYy1rZXk=",
-            socket_mode=0o600,
+            client_authorized_key=(
+                "ssh-ed25519 " + base64.b64encode(_ssh_ed25519_blob(b"c" * 32)).decode("ascii")
+            ),
+            daemon_socket_mode=0o660,
             daemon_file_mode=0o700,
             config_file_mode=0o644,
+            authorized_key_file_mode=0o600,
         )
 
 

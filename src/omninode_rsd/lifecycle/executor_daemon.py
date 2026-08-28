@@ -85,6 +85,10 @@ _FRAME_HEADER: Final = struct.Struct("!4sBBII")
 _RELAY_EOF_FRAME: Final = _FRAME_HEADER.pack(FRAME_MAGIC, FRAME_VERSION, 3, 0, 0)
 _DAEMON_ENGINE_CAPABILITY: Final = object()
 _ATTESTATION_SIGNER_CAPABILITY: Final = object()
+_SYSTEMD_LISTEN_FD: Final = 3
+_SYSTEMD_LISTEN_FD_COUNT: Final = "1"
+_SYSTEMD_LISTEN_FD_NAME: Final = "omninode-rsd-executor"
+_SOCK_TYPE_MASK: Final = 0xF
 
 
 class ExecutorDaemonError(RuntimeError):
@@ -1141,7 +1145,7 @@ class ExecutorDaemonSessionEngine:
     ) -> ExecutorTransportReceiptV2:
         """Internal fake-frame seam; installed flows use ``serve_socket`` only."""
 
-        if type(peer_uid) is not int or peer_uid != self._policy.daemon_peer_uid:
+        if type(peer_uid) is not int or peer_uid != self._policy.force_command_user_uid:
             raise ExecutorDaemonError("uds_peer")
         if not self._active.acquire(blocking=False):
             raise ExecutorDaemonError("session_busy")
@@ -1323,7 +1327,7 @@ class ExecutorDaemonSessionEngine:
         )
         try:
             peer_uid = unix_peer_uid(connection)
-            if peer_uid != self._policy.daemon_peer_uid:
+            if peer_uid != self._policy.force_command_user_uid:
                 raise ExecutorDaemonError("uds_peer")
             if not self._active.acquire(blocking=False):
                 raise ExecutorDaemonError("session_busy")
@@ -1337,6 +1341,126 @@ class ExecutorDaemonSessionEngine:
             # rather than leaving unread trailing frames available to another
             # operation on the same peer socket.
             stream.close()
+
+
+def _systemd_activated_listener() -> socket.socket:
+    """Adopt only the one named listener passed by the root-owned socket unit."""
+
+    try:
+        if (
+            sys.platform != "linux"
+            or os.geteuid() != 0
+            or os.environ.get("LISTEN_PID") != str(os.getpid())
+            or os.environ.get("LISTEN_FDS") != _SYSTEMD_LISTEN_FD_COUNT
+            or os.environ.get("LISTEN_FDNAMES") != _SYSTEMD_LISTEN_FD_NAME
+        ):
+            raise ValueError
+        return socket.socket(fileno=_SYSTEMD_LISTEN_FD)
+    except Exception:
+        raise ExecutorDaemonError("activated_socket") from None
+
+
+def _activated_listener_identity(
+    listener: socket.socket,
+    policy: ExecutorTransportPolicyV2,
+) -> tuple[int, int, int, int, int, int]:
+    """Pin the inherited listener to the signed root-owned path and mode."""
+
+    try:
+        if (
+            type(listener) is not socket.socket
+            or listener.family != socket.AF_UNIX
+            or listener.type & _SOCK_TYPE_MASK != socket.SOCK_STREAM
+            or not hasattr(socket, "SO_ACCEPTCONN")
+            or listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1
+            or listener.getsockname() != policy.daemon_socket_path
+        ):
+            raise ValueError
+        path_status = os.lstat(policy.daemon_socket_path)
+        descriptor_status = os.fstat(listener.fileno())
+        if (
+            not stat.S_ISSOCK(path_status.st_mode)
+            or path_status.st_uid != 0
+            or path_status.st_gid != policy.daemon_socket_group_gid
+            or stat.S_IMODE(path_status.st_mode) != policy.daemon_socket_mode
+            or path_status.st_nlink != 1
+            or (
+                path_status.st_dev,
+                path_status.st_ino,
+                path_status.st_nlink,
+                path_status.st_uid,
+                path_status.st_gid,
+            )
+            != (
+                descriptor_status.st_dev,
+                descriptor_status.st_ino,
+                descriptor_status.st_nlink,
+                descriptor_status.st_uid,
+                descriptor_status.st_gid,
+            )
+        ):
+            raise ValueError
+        return (
+            path_status.st_dev,
+            path_status.st_ino,
+            path_status.st_nlink,
+            path_status.st_uid,
+            path_status.st_gid,
+            stat.S_IMODE(path_status.st_mode),
+        )
+    except Exception:
+        raise ExecutorDaemonError("activated_socket") from None
+
+
+def _serve_activated_listener(
+    engine: ExecutorDaemonSessionEngine,
+    listener: socket.socket,
+) -> ExecutorTransportReceiptV2:
+    """Accept exactly one signed local connection from a systemd listener."""
+
+    if type(engine) is not ExecutorDaemonSessionEngine:
+        raise ExecutorDaemonError("activated_socket")
+    connection: socket.socket | None = None
+    try:
+        before = _activated_listener_identity(listener, engine._policy)
+        listener.settimeout(engine._policy.max_session_seconds)
+        connection, _address = listener.accept()
+        if _activated_listener_identity(listener, engine._policy) != before:
+            raise ValueError
+        result = engine.serve_socket(connection)
+        connection = None
+        return result
+    except ExecutorDaemonError:
+        raise
+    except Exception:
+        raise ExecutorDaemonError("activated_socket") from None
+    finally:
+        if connection is not None:
+            with suppress(Exception):
+                connection.close()
+
+
+def serve_systemd_activated_session(
+    engine: ExecutorDaemonSessionEngine,
+) -> ExecutorTransportReceiptV2:
+    """Serve one session from the exact systemd socket-activation descriptor.
+
+    A signed, separately installed executable must construct the sealed engine
+    and call this adapter.  This library never provisions that executable,
+    starts a service, or supplies a mutation backend.
+    """
+
+    if (
+        type(engine) is not ExecutorDaemonSessionEngine
+        or type(engine._backend) is NoMutationBackend
+    ):
+        raise ExecutorDaemonError("backend_unavailable")
+    listener = _systemd_activated_listener()
+    try:
+        return _serve_activated_listener(engine, listener)
+    finally:
+        with suppress(Exception):
+            listener.close()
 
 
 def _executor_daemon_session_engine_for_test(
@@ -1649,7 +1773,7 @@ class _ForceCommandUdsChannel:
 
 
 def _connect_force_command_uds(policy: ExecutorTransportPolicyV2) -> _ForceCommandUdsChannel:
-    """Open one signed, root-owned local UDS without shell or network fallback."""
+    """Open one signed root-owned/group-gated UDS without a network fallback."""
 
     path = Path(policy.daemon_socket_path)
     connection: socket.socket | None = None
@@ -1658,7 +1782,8 @@ def _connect_force_command_uds(policy: ExecutorTransportPolicyV2) -> _ForceComma
         if (
             not stat.S_ISSOCK(before.st_mode)
             or before.st_uid != 0
-            or stat.S_IMODE(before.st_mode) & 0o022
+            or before.st_gid != policy.daemon_socket_group_gid
+            or stat.S_IMODE(before.st_mode) != policy.daemon_socket_mode
             or before.st_nlink != 1
         ):
             raise ValueError
@@ -1666,11 +1791,13 @@ def _connect_force_command_uds(policy: ExecutorTransportPolicyV2) -> _ForceComma
         connection.settimeout(policy.max_session_seconds)
         connection.connect(os.fspath(path))
         after = os.lstat(path)
-        if (before.st_dev, before.st_ino, before.st_nlink) != (
+        if (before.st_dev, before.st_ino, before.st_nlink, before.st_uid, before.st_gid) != (
             after.st_dev,
             after.st_ino,
             after.st_nlink,
-        ):
+            after.st_uid,
+            after.st_gid,
+        ) or stat.S_IMODE(after.st_mode) != policy.daemon_socket_mode:
             raise ValueError
         return _ForceCommandUdsChannel(connection, timeout_seconds=policy.max_session_seconds)
     except Exception:
@@ -1804,7 +1931,14 @@ class ForceCommandRelay:
         """
 
         policy = self._artifacts.policy
-        if os.geteuid() != policy.daemon_peer_uid:
+        try:
+            group_ids = frozenset((*os.getgroups(), os.getegid()))
+        except Exception:
+            raise ExecutorDaemonError("uds_peer") from None
+        if (
+            os.geteuid() != policy.force_command_user_uid
+            or policy.daemon_socket_group_gid not in group_ids
+        ):
             raise ExecutorDaemonError("uds_peer")
         stdio = _DeadlineStandardStreams(timeout_seconds=policy.max_session_seconds)
         channel = _connect_force_command_uds(policy)
@@ -1813,7 +1947,7 @@ class ForceCommandRelay:
                 stdio,
                 stdio,
                 daemon_connector=lambda: channel,
-                expected_uid=policy.daemon_peer_uid,
+                expected_uid=policy.force_command_user_uid,
             )
         finally:
             channel.close()
@@ -1837,6 +1971,7 @@ __all__ = [
     "MemorySafetyPreflight",
     "NoMutationBackend",
     "SystemdCredentialAttestationSigner",
+    "serve_systemd_activated_session",
     "unix_peer_uid",
     "verify_executor_recovery_receipt",
 ]
