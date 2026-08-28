@@ -108,22 +108,30 @@ reads bounded owner-only artifact files through one open root-directory
 descriptor, runs Phase-A before and after provider inspection, and rejects
 changed content, sidecars, unsafe file metadata, stale evidence, expired
 retention, signer mismatch, provider mismatch, and replayed journal claims.
-It first acquires a strict canonical-parent advisory lock keyed to that root
-and holds the root descriptor through provider leasing, journal claim, effect
-execution, and terminal journal transition. Root replacement, rename, or lock
-replacement is checked before and after each boundary; cooperating writers use
-the same lock, while noncooperating changes fail closed.
+It first acquires a strict canonical-parent advisory lock keyed by the opened
+parent/root device-and-inode identities and holds the root descriptor through
+provider leasing, journal claim, effect execution, and terminal journal
+transition. Path spelling aliases therefore converge on one lock, while root
+replacement, rename, or lock replacement is checked before and after each
+boundary. Lock acquisition is bounded: a concurrent writer receives a typed
+busy error and a recursive lease receives a typed reentrant error.
 
 The callback receives only immutable `VerifiedExecutionContext`: parsed
 proposal/final-contract models, exact provider expectations, and a derived
 idempotency key. It receives no artifact path, nonce, or journal handle. It
 must return an `EffectReceiptV1` bound to that operation and idempotency key.
 The SQLite journal requires an owner-only directory and database file, uses
-`BEGIN IMMEDIATE`, `DELETE` journaling, and `FULL` synchronous durability. Its
-operation ID is unique and binds the proposal/final hashes. Legacy nonce-ledger
-tables are detected by the read-only `migration_status()` diagnostic and block
-all effects; they are never silently replaced. A durable per-operation OS lease
-is held through the effect and commit, so recovery rejects a live executor. It
+`BEGIN IMMEDIATE`, `DELETE` journaling, and `FULL` synchronous durability. A
+one-time, `O_EXCL` anchor in that directory binds a random journal ID, canonical
+path digest, schema digests, and database device/inode/link-count to matching
+database metadata; that metadata also pins the anchor file identity. Every
+open rechecks those bindings; a missing, renamed, replaced, copied, or
+mismatched database/anchor fails closed and is surfaced by the read-only
+`migration_status()` diagnostic. Rotation and automatic
+recreation are intentionally unsupported. Its operation ID is unique and binds
+the proposal/final hashes. Legacy nonce-ledger tables are detected before any
+effect and are never silently replaced. A durable per-operation OS lease is
+held through the effect and commit, so recovery rejects a live executor. It
 records `claimed`, `in_progress`, `committed`, or
 `failed_recovery_required`; a fresh nonce cannot retry an existing operation.
 A crash after an effect starts is never retried automatically. An operator may

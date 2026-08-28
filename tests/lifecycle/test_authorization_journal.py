@@ -6,9 +6,11 @@ import base64
 import hashlib
 import multiprocessing
 import os
+import shutil
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from typing import Protocol
 
 import pytest
@@ -58,6 +60,12 @@ def _verified(nonce: str, operation_id: str = "operation-one") -> _VerifiedExecu
 
 def _journal(tmp_path: Path) -> SQLiteAuthorizationJournal:
     root = tmp_path / "journal"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    return SQLiteAuthorizationJournal(root / "authorization.sqlite3")
+
+
+def _journal_at(root: Path) -> SQLiteAuthorizationJournal:
     root.mkdir(mode=0o700)
     root.chmod(0o700)
     return SQLiteAuthorizationJournal(root / "authorization.sqlite3")
@@ -285,7 +293,7 @@ def test_journal_rejects_non_owner_mode_symlink_and_wrong_schema(tmp_path: Path)
     connection.commit()
     connection.close()
     schema_path.chmod(0o600)
-    with pytest.raises(AuthorizationError, match="journal_schema"):
+    with pytest.raises(AuthorizationError, match="journal_anchor_missing"):
         SQLiteAuthorizationJournal(schema_path)._claim_verified(_verified("0" * 32))
 
 
@@ -296,3 +304,109 @@ def test_journal_rejects_relaxed_database_mode(tmp_path: Path) -> None:
 
     with pytest.raises(AuthorizationError, match="journal_path"):
         journal._claim_verified(_verified("2" * 32, "operation-two"))
+
+
+def test_journal_rejects_replacement_with_fresh_database_and_preserves_replay_guard(
+    tmp_path: Path,
+) -> None:
+    journal = _journal(tmp_path)
+    journal._claim_verified(_verified("3" * 32))
+    archived = journal._path.with_name("authorization-before-replacement.sqlite3")
+    os.replace(journal._path, archived)
+    connection = sqlite3.connect(journal._path)
+    connection.close()
+    journal._path.chmod(0o600)
+
+    assert journal.migration_status() is JournalMigrationStatus.IDENTITY_MISMATCH
+    with pytest.raises(AuthorizationError, match="journal_identity_mismatch"):
+        SQLiteAuthorizationJournal(journal._path)._claim_verified(_verified("4" * 32))
+
+
+def test_journal_rejects_database_deletion_without_recreating_it(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+    journal._claim_verified(_verified("5" * 32))
+    journal._path.unlink()
+
+    assert journal.migration_status() is JournalMigrationStatus.JOURNAL_MISSING
+    with pytest.raises(AuthorizationError, match="journal_identity_missing"):
+        SQLiteAuthorizationJournal(journal._path)._claim_verified(_verified("6" * 32))
+    assert not journal._path.exists()
+
+
+def test_journal_rejects_anchor_deletion_without_recreating_it(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+    journal._claim_verified(_verified("7" * 32))
+    journal._anchor_path().unlink()
+
+    assert journal.migration_status() is JournalMigrationStatus.ANCHOR_MISSING
+    with pytest.raises(AuthorizationError, match="journal_anchor_missing"):
+        SQLiteAuthorizationJournal(journal._path)._claim_verified(_verified("8" * 32))
+    assert not journal._anchor_path().exists()
+
+
+def test_journal_rejects_byte_identical_anchor_replacement(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+    journal._claim_verified(_verified("9" * 32))
+    replacement = tmp_path / "same-anchor-content.json"
+    shutil.copy2(journal._anchor_path(), replacement)
+    replacement.chmod(0o600)
+    os.replace(replacement, journal._anchor_path())
+
+    assert journal.migration_status() is JournalMigrationStatus.IDENTITY_MISMATCH
+    with pytest.raises(AuthorizationError, match="journal_identity_mismatch"):
+        SQLiteAuthorizationJournal(journal._path)._claim_verified(_verified("a" * 32))
+
+
+def test_journal_rejects_anchor_swap_and_copied_journal(tmp_path: Path) -> None:
+    first = _journal_at(tmp_path / "first")
+    second = _journal_at(tmp_path / "second")
+    first._claim_verified(_verified("b" * 32, "first-operation"))
+    second._claim_verified(_verified("c" * 32, "second-operation"))
+
+    first_anchor = first._anchor_path()
+    first_anchor.unlink()
+    shutil.copy2(second._anchor_path(), first_anchor)
+    first_anchor.chmod(0o600)
+    assert first.migration_status() is JournalMigrationStatus.IDENTITY_MISMATCH
+    with pytest.raises(AuthorizationError, match=r"journal_anchor|journal_identity_mismatch"):
+        SQLiteAuthorizationJournal(first._path)._claim_verified(
+            _verified("d" * 32, "first-operation")
+        )
+
+    copied = _journal_at(tmp_path / "copied")
+    shutil.copy2(second._path, copied._path)
+    copied._path.chmod(0o600)
+    shutil.copy2(second._anchor_path(), copied._anchor_path())
+    copied._anchor_path().chmod(0o600)
+    assert copied.migration_status() is JournalMigrationStatus.IDENTITY_MISMATCH
+    with pytest.raises(AuthorizationError, match=r"journal_anchor|journal_identity_mismatch"):
+        copied._claim_verified(_verified("e" * 32, "copied-operation"))
+
+
+def test_journal_replacement_racing_a_waiting_claim_fails_closed(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+    journal._claim_verified(_verified("f" * 32, "anchored-operation"))
+    entered = Event()
+
+    def claim_after_lease() -> str:
+        entered.set()
+        try:
+            SQLiteAuthorizationJournal(journal._path)._claim_verified(
+                _verified("0" * 32, "new-operation")
+            )
+        except AuthorizationError as error:
+            return error.phase
+        return "claimed"
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with journal._identity_lease():
+            pending = executor.submit(claim_after_lease)
+            assert entered.wait(timeout=5)
+            archived = journal._path.with_name("authorization-raced.sqlite3")
+            os.replace(journal._path, archived)
+            connection = sqlite3.connect(journal._path)
+            connection.close()
+            journal._path.chmod(0o600)
+        outcome = pending.result(timeout=5)
+
+    assert outcome == "journal_identity_mismatch"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import inspect
+import multiprocessing
 import os
 import sqlite3
 import traceback
@@ -13,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
+from typing import Protocol
 
 import pytest
 import yaml
@@ -75,6 +77,18 @@ _COMMIT = "a" * 40
 _HASH = "b" * 64
 _IMAGE = ImageReferenceV1(reference=f"registry.example.test/infisical@sha256:{'c' * 64}")
 _CACHE_IMAGE = ImageReferenceV1(reference=f"registry.example.test/valkey@sha256:{'d' * 64}")
+
+
+class _StringQueue(Protocol):
+    def put(self, value: str) -> None: ...
+
+
+def _artifact_lock_worker(root: str, queue: _StringQueue) -> None:
+    try:
+        with ArtifactRootLease(Path(root)):
+            queue.put("acquired")
+    except AuthorizationError as error:
+        queue.put(error.phase)
 
 
 def _digest(data: bytes) -> str:
@@ -792,7 +806,13 @@ def _journal(tmp_path: Path) -> SQLiteAuthorizationJournal:
 
 def _root_lock_path(root: Path) -> Path:
     canonical = root.resolve(strict=True)
-    return canonical.parent / f".rsd-authorization-root-{_digest(os.fsencode(str(canonical)))}.lock"
+    parent_details = os.lstat(canonical.parent)
+    root_details = os.lstat(canonical)
+    name, _ = ArtifactRootLease._lock_name_for_identities(
+        (parent_details.st_dev, parent_details.st_ino),
+        (root_details.st_dev, root_details.st_ino),
+    )
+    return canonical.parent / name
 
 
 def _effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
@@ -935,6 +955,48 @@ def test_phase_b_detects_legacy_journal_before_effect(tmp_path: Path) -> None:
     assert journal.migration_status() is JournalMigrationStatus.LEGACY_DETECTED
 
 
+def test_phase_b_blocks_replaced_journal_before_effect(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints, _ = _authorize_materials(root)
+    journal = _journal(tmp_path)
+    _execute_for_test(
+        AuthorizationPaths(root),
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        effect=_effect,
+        now=_NOW,
+    )
+    archived = journal._path.with_name("authorization-before-replacement.sqlite3")
+    os.replace(journal._path, archived)
+    connection = sqlite3.connect(journal._path)
+    connection.close()
+    journal._path.chmod(0o600)
+    called = False
+
+    def effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
+        nonlocal called
+        called = True
+        return _effect(context)
+
+    with pytest.raises(AuthorizationError, match="journal_identity_mismatch"):
+        _execute_for_test(
+            AuthorizationPaths(root),
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            effect=effect,
+            now=_NOW,
+        )
+    assert not called
+
+
 def test_same_operation_with_fresh_nonce_executes_effect_once(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     signer, fingerprints, _ = _authorize_materials(root)
@@ -965,8 +1027,9 @@ def test_same_operation_with_fresh_nonce_executes_effect_once(tmp_path: Path) ->
     with ThreadPoolExecutor(max_workers=2) as executor:
         outcomes = list(executor.map(lambda _: execute(), range(2)))
 
-    assert sorted(outcomes) == ["committed", "operation_replayed"]
+    assert sorted(outcomes) == ["artifact_lock_busy", "committed"]
     assert len(effects) == 1
+    assert execute() == "operation_replayed"
 
 
 def test_effect_failure_requires_recovery_and_never_replays(tmp_path: Path) -> None:
@@ -1100,12 +1163,11 @@ def test_provider_and_effect_failures_do_not_expose_adapter_values(tmp_path: Pat
     assert row == ("effect",)
 
 
-def test_owner_lock_blocks_cooperating_artifact_writer(tmp_path: Path) -> None:
+def test_owner_lock_rejects_cooperating_artifact_writer_without_waiting(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     signer, fingerprints, _ = _authorize_materials(root)
     entered_provider = Event()
     release_provider = Event()
-    writer_acquired = Event()
 
     class BlockingProvider(_Provider):
         def inspect(self, reference: ProviderReferenceV1) -> ProviderProvenance | None:
@@ -1126,19 +1188,93 @@ def test_owner_lock_blocks_cooperating_artifact_writer(tmp_path: Path) -> None:
             now=_NOW,
         )
 
-    def writer() -> None:
-        with ArtifactRootLease(root):
-            writer_acquired.set()
+    def writer() -> str:
+        try:
+            with ArtifactRootLease(root):
+                return "acquired"
+        except AuthorizationError as error:
+            return error.phase
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         running = executor.submit(execute)
         assert entered_provider.wait(timeout=5)
         blocked_writer = executor.submit(writer)
-        assert not writer_acquired.wait(timeout=0.1)
+        assert blocked_writer.result(timeout=5) == "artifact_lock_busy"
         release_provider.set()
         running.result(timeout=5)
-        blocked_writer.result(timeout=5)
-    assert writer_acquired.is_set()
+
+
+def test_owner_lock_rejects_competing_process_without_waiting(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    _materials(root)
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    worker = context.Process(target=_artifact_lock_worker, args=(str(root), queue))
+
+    with ArtifactRootLease(root):
+        worker.start()
+        assert queue.get(timeout=10) == "artifact_lock_busy"
+        worker.join(timeout=10)
+
+    assert worker.exitcode == 0
+
+
+def test_owner_lock_rejects_recursive_effect_lease(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints, _ = _authorize_materials(root)
+
+    def effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
+        with (
+            pytest.raises(AuthorizationError, match="artifact_lock_reentrant"),
+            ArtifactRootLease(root),
+        ):
+            pass
+        return _effect(context)
+
+    receipt = _execute_for_test(
+        AuthorizationPaths(root),
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=_journal(tmp_path),
+        effect=effect,
+        now=_NOW,
+    )
+
+    assert receipt.status == "committed"
+
+
+def test_owner_lock_converges_case_variants_on_same_root(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    _materials(root)
+    variant = root.with_name(root.name.swapcase())
+    if not variant.exists():
+        pytest.skip("filesystem is case-sensitive")
+    assert _root_lock_path(root) == _root_lock_path(variant)
+    entered = Event()
+    release = Event()
+
+    def hold() -> None:
+        with ArtifactRootLease(root):
+            entered.set()
+            assert release.wait(timeout=5)
+
+    def acquire_variant() -> str:
+        try:
+            with ArtifactRootLease(variant):
+                return "acquired"
+        except AuthorizationError as error:
+            return error.phase
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        held = executor.submit(hold)
+        assert entered.wait(timeout=5)
+        contender = executor.submit(acquire_variant)
+        assert contender.result(timeout=5) == "artifact_lock_busy"
+        release.set()
+        held.result(timeout=5)
 
 
 @pytest.mark.parametrize("mutation", ("root_replace", "lock_unlink"))

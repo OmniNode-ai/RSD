@@ -13,6 +13,7 @@ import argparse
 import base64
 import binascii
 import copy
+import errno
 import fcntl
 import hashlib
 import json
@@ -21,12 +22,14 @@ import re
 import secrets
 import sqlite3
 import stat
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from threading import Lock, get_ident
 from typing import Final, Literal, Protocol, cast
 
 import yaml
@@ -69,11 +72,16 @@ _IDEMPOTENCY_DOMAIN: Final = b"omninode-rsd.authorization.effect.v1\x00"
 _RECONCILIATION_DOMAIN: Final = b"omninode-rsd.authorization.reconciliation.v1\x00"
 _ARTIFACT_LOCK_PREFIX: Final = ".rsd-authorization-root-"
 _OPERATION_LEASE_PREFIX: Final = ".rsd-authorization-operation-"
+_JOURNAL_IDENTITY_LEASE_PREFIX: Final = ".rsd-authorization-journal-identity-"
+_JOURNAL_ANCHOR_PREFIX: Final = ".rsd-authorization-journal-anchor-"
 _VERIFIED_CAPABILITY: Final = object()
 _TEST_CLOCK_CAPABILITY: Final = object()
 _SAFE_CALL_FAILURE: Final = object()
 _OPERATION_TABLE: Final = "authorization_operation_journal"
+_JOURNAL_METADATA_TABLE: Final = "authorization_journal_metadata"
 _LEGACY_OPERATION_TABLE: Final = "authorization_nonce_journal"
+_JOURNAL_SCHEMA_VERSION: Final = "rsd.authorization-journal.v1"
+_JOURNAL_ANCHOR_SCHEMA_VERSION: Final = "rsd.authorization-journal-anchor.v1"
 _OPERATION_SCHEMA: Final = f"""
 CREATE TABLE IF NOT EXISTS {_OPERATION_TABLE} (
     operation_id TEXT PRIMARY KEY NOT NULL,
@@ -90,6 +98,21 @@ CREATE TABLE IF NOT EXISTS {_OPERATION_TABLE} (
     CHECK (state IN ('claimed', 'in_progress', 'committed', 'failed_recovery_required'))
 ) WITHOUT ROWID
 """
+_JOURNAL_METADATA_SCHEMA: Final = f"""
+CREATE TABLE IF NOT EXISTS {_JOURNAL_METADATA_TABLE} (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+    journal_uuid TEXT NOT NULL,
+    journal_path_sha256 TEXT NOT NULL,
+    operation_schema_sha256 TEXT NOT NULL,
+    metadata_schema_sha256 TEXT NOT NULL,
+    anchor_dev INTEGER NOT NULL,
+    anchor_ino INTEGER NOT NULL,
+    anchor_nlink INTEGER NOT NULL,
+    schema_version TEXT NOT NULL
+) WITHOUT ROWID
+"""
+_ARTIFACT_LOCK_REGISTRY: dict[tuple[int, int, int, int], int] = {}
+_ARTIFACT_LOCK_REGISTRY_GUARD = Lock()
 
 
 class _Model(BaseModel):
@@ -120,6 +143,9 @@ class JournalMigrationStatus(StrEnum):
     EMPTY = "empty"
     CURRENT = "current"
     LEGACY_DETECTED = "legacy_detected"
+    ANCHOR_MISSING = "anchor_missing"
+    JOURNAL_MISSING = "journal_missing"
+    IDENTITY_MISMATCH = "identity_mismatch"
     UNKNOWN = "unknown"
 
 
@@ -619,6 +645,7 @@ class ArtifactRootLease:
         self._canonical_root: Path | None = None
         self._parent: Path | None = None
         self._lock_name: str | None = None
+        self._lock_key: tuple[int, int, int, int] | None = None
         self._parent_identity: tuple[int, int] | None = None
         self._root_identity: tuple[int, int] | None = None
         self._lock_identity: tuple[int, int] | None = None
@@ -765,21 +792,70 @@ class ArtifactRootLease:
         ArtifactRootLease._directory_identity(canonical, "artifact_lock_root")
         return canonical
 
+    @staticmethod
+    def _lock_name_for_identities(
+        parent_identity: tuple[int, int], root_identity: tuple[int, int]
+    ) -> tuple[str, tuple[int, int, int, int]]:
+        """Name one parent-anchored lock from opened directory identities.
+
+        The key deliberately contains device and inode values, not the spelling
+        of the path.  That makes aliases of the same directory converge while
+        the path checks in ``assert_stable`` still reject replacement.
+        """
+
+        key = (*parent_identity, *root_identity)
+        material = ":".join(str(value) for value in key).encode("ascii")
+        return f"{_ARTIFACT_LOCK_PREFIX}{_digest(material)}.lock", key
+
+    @staticmethod
+    def _claim_process_lock(key: tuple[int, int, int, int]) -> None:
+        """Reject same-process recursive and concurrent leases before flock.
+
+        BSD ``flock`` ownership is process-oriented, so a second descriptor in
+        the same process may not block itself.  This registry preserves the
+        one-effect-at-a-time invariant without relying on that platform detail.
+        """
+
+        current = get_ident()
+        with _ARTIFACT_LOCK_REGISTRY_GUARD:
+            owner = _ARTIFACT_LOCK_REGISTRY.get(key)
+            if owner is not None:
+                phase = "artifact_lock_reentrant" if owner == current else "artifact_lock_busy"
+                raise AuthorizationError(phase)
+            _ARTIFACT_LOCK_REGISTRY[key] = current
+
+    @staticmethod
+    def _release_process_lock(key: tuple[int, int, int, int] | None) -> None:
+        if key is None:
+            return
+        with _ARTIFACT_LOCK_REGISTRY_GUARD:
+            _ARTIFACT_LOCK_REGISTRY.pop(key, None)
+
     def __enter__(self) -> ArtifactRootLease:
         canonical = self._canonicalize_root(self._requested_root)
         parent = canonical.parent
         parent_descriptor: int | None = None
         root_descriptor: int | None = None
         lock_descriptor: int | None = None
+        lock_key: tuple[int, int, int, int] | None = None
+        process_lock_claimed = False
         try:
             parent_descriptor, parent_identity = self._open_directory(parent, "artifact_lock_root")
             root_descriptor, root_identity = self._open_directory(canonical, "artifact_lock_root")
-            lock_name = f"{_ARTIFACT_LOCK_PREFIX}{_digest(os.fsencode(str(canonical)))}.lock"
+            lock_name, lock_key = self._lock_name_for_identities(parent_identity, root_identity)
+            self._claim_process_lock(lock_key)
+            process_lock_claimed = True
             lock_descriptor, lock_identity = self._open_lock_file(parent_descriptor, lock_name)
-            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno in {errno.EACCES, errno.EAGAIN}:
+                    raise AuthorizationError("artifact_lock_busy") from None
+                raise AuthorizationError("artifact_lock_file") from None
             self._canonical_root = canonical
             self._parent = parent
             self._lock_name = lock_name
+            self._lock_key = lock_key
             self._parent_identity = parent_identity
             self._root_identity = root_identity
             self._lock_identity = lock_identity
@@ -790,9 +866,13 @@ class ArtifactRootLease:
             return self
         except AuthorizationError:
             self._close_descriptors(lock_descriptor, root_descriptor, parent_descriptor)
+            if process_lock_claimed:
+                self._release_process_lock(lock_key)
             raise
         except OSError:
             self._close_descriptors(lock_descriptor, root_descriptor, parent_descriptor)
+            if process_lock_claimed:
+                self._release_process_lock(lock_key)
             raise AuthorizationError("artifact_lock_file") from None
 
     @staticmethod
@@ -871,9 +951,11 @@ class ArtifactRootLease:
         self._close_descriptors(
             self._lock_descriptor, self._root_descriptor, self._parent_descriptor
         )
+        self._release_process_lock(self._lock_key)
         self._canonical_root = None
         self._parent = None
         self._lock_name = None
+        self._lock_key = None
         self._parent_identity = None
         self._root_identity = None
         self._lock_identity = None
@@ -886,7 +968,12 @@ class _OperationLease:
     """One durable, owner-only advisory lease file per operation identifier."""
 
     def __init__(
-        self, journal: SQLiteAuthorizationJournal, operation_id: str, *, nonblocking: bool
+        self,
+        journal: SQLiteAuthorizationJournal,
+        operation_id: str,
+        *,
+        nonblocking: bool,
+        prefix: str = _OPERATION_LEASE_PREFIX,
     ) -> None:
         self._journal = journal
         self._operation_id = operation_id
@@ -895,7 +982,7 @@ class _OperationLease:
         self._file_descriptor: int | None = None
         self._parent_identity: tuple[int, int] | None = None
         self._file_identity: tuple[int, int] | None = None
-        self._name = f"{_OPERATION_LEASE_PREFIX}{_digest(operation_id.encode())}.lock"
+        self._name = f"{prefix}{_digest(operation_id.encode())}.lock"
 
     @staticmethod
     def _open_file(parent_descriptor: int, name: str) -> tuple[int, tuple[int, int]]:
@@ -1040,11 +1127,74 @@ class _OperationLease:
         self._file_identity = None
 
 
+@dataclass(frozen=True, slots=True)
+class _JournalIdentity:
+    """Pinned identity shared by the SQLite metadata row and anchor file."""
+
+    journal_uuid: str
+    journal_path_sha256: str
+    operation_schema_sha256: str
+    metadata_schema_sha256: str
+    anchor_dev: int
+    anchor_ino: int
+    anchor_nlink: int
+    database_dev: int
+    database_ino: int
+    database_nlink: int
+
+
 class SQLiteAuthorizationJournal:
     """Owner-only SQLite store for one-shot operation state transitions."""
 
     def __init__(self, path: Path) -> None:
-        self._path = path
+        self._requested_path = path
+        self._path = Path(os.path.realpath(path))
+
+    def _validate_path(self) -> None:
+        requested = self._requested_path
+        if not requested.is_absolute() or not requested.name or requested.name in {".", ".."}:
+            raise AuthorizationError("journal_path")
+        self._validate_owner_directory(requested.parent)
+        try:
+            requested_details = os.lstat(requested)
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise AuthorizationError("journal_path") from None
+        if stat.S_ISLNK(requested_details.st_mode):
+            raise AuthorizationError("journal_path")
+
+    def _anchor_path(self) -> Path:
+        """Return the deterministic parent anchor path for diagnostics/tests."""
+
+        self._validate_path()
+        digest = _digest(os.fsencode(str(self._path)))
+        return self._path.parent / f"{_JOURNAL_ANCHOR_PREFIX}{digest}.json"
+
+    @staticmethod
+    def _schema_sha256(schema: str) -> str:
+        normalized = re.sub(r"\s+", "", schema.replace("IF NOT EXISTS ", "").lower())
+        return _digest(normalized.encode("ascii"))
+
+    @classmethod
+    def _expected_operation_schema_sha256(cls) -> str:
+        return cls._schema_sha256(_OPERATION_SCHEMA)
+
+    @classmethod
+    def _expected_metadata_schema_sha256(cls) -> str:
+        return cls._schema_sha256(_JOURNAL_METADATA_SCHEMA)
+
+    def _path_sha256(self) -> str:
+        return _digest(os.fsencode(str(self._path)))
+
+    def _identity_lease(self) -> _OperationLease:
+        self._validate_path()
+        return _OperationLease(
+            self,
+            self._path_sha256(),
+            nonblocking=False,
+            prefix=_JOURNAL_IDENTITY_LEASE_PREFIX,
+        )
 
     @staticmethod
     def _table_names(connection: sqlite3.Connection) -> set[str]:
@@ -1060,22 +1210,20 @@ class SQLiteAuthorizationJournal:
         names = cls._table_names(connection)
         if _LEGACY_OPERATION_TABLE in names:
             raise AuthorizationError("journal_legacy_detected")
-        if names - {_OPERATION_TABLE}:
+        if names - {_OPERATION_TABLE, _JOURNAL_METADATA_TABLE}:
             raise AuthorizationError("journal_schema")
 
     def migration_status(self) -> JournalMigrationStatus:
         """Inspect journal format without creating or changing any file."""
 
-        if not self._path.is_absolute() or not self._path.name or self._path.name in {".", ".."}:
-            raise AuthorizationError("journal_path")
-        self._validate_owner_directory(self._path.parent)
-        try:
-            os.lstat(self._path)
-        except FileNotFoundError:
+        self._validate_path()
+        database_details = self._owner_file_details_or_none(self._path, "journal_path")
+        anchor_path = self._anchor_path()
+        anchor_details = self._owner_file_details_or_none(anchor_path, "journal_anchor")
+        if database_details is None and anchor_details is None:
             return JournalMigrationStatus.ABSENT
-        except OSError:
-            raise AuthorizationError("journal_path") from None
-        self._validate_owner_file(self._path)
+        if database_details is None:
+            return JournalMigrationStatus.JOURNAL_MISSING
         self._validate_companions()
         try:
             connection = sqlite3.connect(
@@ -1091,14 +1239,27 @@ class SQLiteAuthorizationJournal:
             names = self._table_names(connection)
             if _LEGACY_OPERATION_TABLE in names:
                 return JournalMigrationStatus.LEGACY_DETECTED
-            if names == set():
-                return JournalMigrationStatus.EMPTY
-            if names != {_OPERATION_TABLE}:
+            if anchor_details is None:
+                return JournalMigrationStatus.ANCHOR_MISSING
+            try:
+                anchor = self._read_anchor()
+            except AuthorizationError:
+                return JournalMigrationStatus.IDENTITY_MISMATCH
+            if database_details != (
+                anchor.database_dev,
+                anchor.database_ino,
+                anchor.database_nlink,
+            ):
+                return JournalMigrationStatus.IDENTITY_MISMATCH
+            if names != {_OPERATION_TABLE, _JOURNAL_METADATA_TABLE}:
                 return JournalMigrationStatus.UNKNOWN
             try:
                 self._validate_schema(connection)
+                metadata = self._metadata_identity(connection, database_details)
             except AuthorizationError:
-                return JournalMigrationStatus.UNKNOWN
+                return JournalMigrationStatus.IDENTITY_MISMATCH
+            if anchor != metadata:
+                return JournalMigrationStatus.IDENTITY_MISMATCH
             return JournalMigrationStatus.CURRENT
         except AuthorizationError:
             raise
@@ -1123,11 +1284,7 @@ class SQLiteAuthorizationJournal:
         return (details.st_dev, details.st_ino)
 
     @staticmethod
-    def _validate_owner_file(path: Path) -> tuple[int, int]:
-        try:
-            details = os.lstat(path)
-        except OSError:
-            raise AuthorizationError("journal_path") from None
+    def _validate_owner_file_details(details: os.stat_result, phase: str) -> tuple[int, int, int]:
         if (
             not stat.S_ISREG(details.st_mode)
             or stat.S_ISLNK(details.st_mode)
@@ -1135,37 +1292,47 @@ class SQLiteAuthorizationJournal:
             or stat.S_IMODE(details.st_mode) != 0o600
             or details.st_nlink != 1
         ):
-            raise AuthorizationError("journal_path")
-        return (details.st_dev, details.st_ino)
+            raise AuthorizationError(phase)
+        return (details.st_dev, details.st_ino, details.st_nlink)
 
-    def _ensure_owner_file(self) -> tuple[int, int]:
-        if not self._path.is_absolute() or not self._path.name or self._path.name in {".", ".."}:
-            raise AuthorizationError("journal_path")
-        self._validate_owner_directory(self._path.parent)
+    @classmethod
+    def _owner_file_details(cls, path: Path, phase: str) -> tuple[int, int, int]:
         try:
-            return self._validate_owner_file(self._path)
+            details = os.lstat(path)
+        except OSError:
+            raise AuthorizationError(phase) from None
+        return cls._validate_owner_file_details(details, phase)
+
+    @classmethod
+    def _owner_file_details_or_none(cls, path: Path, phase: str) -> tuple[int, int, int] | None:
+        try:
+            details = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise AuthorizationError(phase) from None
+        return cls._validate_owner_file_details(details, phase)
+
+    def _create_database_file(self) -> tuple[int, int, int]:
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(self._path, flags, 0o600)
+        except FileExistsError:
+            raise AuthorizationError("journal_identity_mismatch") from None
+        except OSError:
+            raise AuthorizationError("journal_path") from None
+        try:
+            details = self._validate_owner_file_details(os.fstat(descriptor), "journal_path")
+            os.fsync(descriptor)
+            return details
         except AuthorizationError:
-            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-            try:
-                file_descriptor = os.open(self._path, flags, 0o600)
-            except FileExistsError:
-                return self._validate_owner_file(self._path)
-            except OSError:
-                raise AuthorizationError("journal_path") from None
-            try:
-                created = os.fstat(file_descriptor)
-                if (
-                    not stat.S_ISREG(created.st_mode)
-                    or created.st_uid != os.getuid()
-                    or stat.S_IMODE(created.st_mode) != 0o600
-                    or created.st_nlink != 1
-                ):
-                    raise AuthorizationError("journal_path")
-            finally:
-                with suppress(OSError):
-                    os.close(file_descriptor)
-            return self._validate_owner_file(self._path)
+            raise
+        except OSError:
+            raise AuthorizationError("journal_durability") from None
+        finally:
+            with suppress(OSError):
+                os.close(descriptor)
 
     def _validate_companions(self) -> None:
         for suffix in ("-journal", "-wal", "-shm"):
@@ -1176,26 +1343,379 @@ class SQLiteAuthorizationJournal:
                 continue
             except OSError:
                 raise AuthorizationError("journal_path") from None
-            self._validate_owner_file(candidate)
+            self._owner_file_details(candidate, "journal_path")
 
-    def _connect(self) -> sqlite3.Connection:
-        before = self._ensure_owner_file()
-        self._validate_companions()
+    @staticmethod
+    def _anchor_bytes(identity: _JournalIdentity) -> bytes:
+        payload = {
+            "anchor_schema_version": _JOURNAL_ANCHOR_SCHEMA_VERSION,
+            "database_dev": identity.database_dev,
+            "database_ino": identity.database_ino,
+            "database_nlink": identity.database_nlink,
+            "journal_path_sha256": identity.journal_path_sha256,
+            "journal_uuid": identity.journal_uuid,
+            "metadata_schema_sha256": identity.metadata_schema_sha256,
+            "operation_schema_sha256": identity.operation_schema_sha256,
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+
+    def _write_anchor(self, identity: _JournalIdentity) -> tuple[int, int, int]:
+        anchor_path = self._anchor_path()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
-            connection = sqlite3.connect(self._path, isolation_level=None, timeout=5.0)
+            descriptor = os.open(anchor_path, flags, 0o600)
+        except FileExistsError:
+            raise AuthorizationError("journal_identity_mismatch") from None
+        except OSError:
+            raise AuthorizationError("journal_anchor") from None
+        try:
+            anchor_details = self._validate_owner_file_details(
+                os.fstat(descriptor), "journal_anchor"
+            )
+            remaining = memoryview(self._anchor_bytes(identity))
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise AuthorizationError("journal_anchor")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+            return anchor_details
+        except AuthorizationError:
+            raise
+        except OSError:
+            raise AuthorizationError("journal_anchor") from None
+        finally:
+            with suppress(OSError):
+                os.close(descriptor)
+
+    def _read_anchor(self) -> _JournalIdentity:
+        anchor_path = self._anchor_path()
+        self._owner_file_details(anchor_path, "journal_anchor")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(anchor_path, flags)
+        except OSError:
+            raise AuthorizationError("journal_anchor") from None
+        try:
+            anchor_details = self._validate_owner_file_details(
+                os.fstat(descriptor), "journal_anchor"
+            )
+            payload = bytearray()
+            while len(payload) <= 4096:
+                chunk = os.read(descriptor, 4097 - len(payload))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) > 4096:
+                raise AuthorizationError("journal_anchor")
+        except AuthorizationError:
+            raise
+        except OSError:
+            raise AuthorizationError("journal_anchor") from None
+        finally:
+            with suppress(OSError):
+                os.close(descriptor)
+        try:
+            raw = json.loads(bytes(payload).decode("ascii"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise AuthorizationError("journal_anchor") from None
+        expected_keys = {
+            "anchor_schema_version",
+            "database_dev",
+            "database_ino",
+            "database_nlink",
+            "journal_path_sha256",
+            "journal_uuid",
+            "metadata_schema_sha256",
+            "operation_schema_sha256",
+        }
+        if not isinstance(raw, dict) or set(raw) != expected_keys:
+            raise AuthorizationError("journal_anchor")
+        strings = (
+            "anchor_schema_version",
+            "journal_path_sha256",
+            "journal_uuid",
+            "metadata_schema_sha256",
+            "operation_schema_sha256",
+        )
+        if any(type(raw[key]) is not str for key in strings):
+            raise AuthorizationError("journal_anchor")
+        integers = ("database_dev", "database_ino", "database_nlink")
+        if any(type(raw[key]) is not int or raw[key] < 1 for key in integers):
+            raise AuthorizationError("journal_anchor")
+        if (
+            raw["anchor_schema_version"] != _JOURNAL_ANCHOR_SCHEMA_VERSION
+            or raw["journal_path_sha256"] != self._path_sha256()
+            or raw["operation_schema_sha256"] != self._expected_operation_schema_sha256()
+            or raw["metadata_schema_sha256"] != self._expected_metadata_schema_sha256()
+            or re.fullmatch(_SHA256, raw["journal_path_sha256"]) is None
+            or re.fullmatch(_SHA256, raw["operation_schema_sha256"]) is None
+            or re.fullmatch(_SHA256, raw["metadata_schema_sha256"]) is None
+            or raw["database_nlink"] != 1
+        ):
+            raise AuthorizationError("journal_anchor")
+        try:
+            parsed_uuid = uuid.UUID(raw["journal_uuid"])
+        except (AttributeError, ValueError):
+            raise AuthorizationError("journal_anchor") from None
+        if str(parsed_uuid) != raw["journal_uuid"]:
+            raise AuthorizationError("journal_anchor")
+        return _JournalIdentity(
+            journal_uuid=raw["journal_uuid"],
+            journal_path_sha256=raw["journal_path_sha256"],
+            operation_schema_sha256=raw["operation_schema_sha256"],
+            metadata_schema_sha256=raw["metadata_schema_sha256"],
+            anchor_dev=anchor_details[0],
+            anchor_ino=anchor_details[1],
+            anchor_nlink=anchor_details[2],
+            database_dev=raw["database_dev"],
+            database_ino=raw["database_ino"],
+            database_nlink=raw["database_nlink"],
+        )
+
+    def _metadata_identity(
+        self, connection: sqlite3.Connection, database_details: tuple[int, int, int]
+    ) -> _JournalIdentity:
+        rows = connection.execute(
+            f"""
+            SELECT journal_uuid, journal_path_sha256, operation_schema_sha256,
+                   metadata_schema_sha256, anchor_dev, anchor_ino, anchor_nlink,
+                   schema_version
+            FROM {_JOURNAL_METADATA_TABLE}
+            WHERE singleton = 1
+            """
+        ).fetchall()
+        if len(rows) != 1 or len(rows[0]) != 8:
+            raise AuthorizationError("journal_schema")
+        (
+            journal_uuid,
+            path_sha256,
+            operation_schema_sha256,
+            metadata_schema_sha256,
+            anchor_dev,
+            anchor_ino,
+            anchor_nlink,
+            version,
+        ) = rows[0]
+        if (
+            type(journal_uuid) is not str
+            or type(path_sha256) is not str
+            or type(operation_schema_sha256) is not str
+            or type(metadata_schema_sha256) is not str
+            or type(anchor_dev) is not int
+            or type(anchor_ino) is not int
+            or type(anchor_nlink) is not int
+            or version != _JOURNAL_SCHEMA_VERSION
+            or path_sha256 != self._path_sha256()
+            or operation_schema_sha256 != self._expected_operation_schema_sha256()
+            or metadata_schema_sha256 != self._expected_metadata_schema_sha256()
+            or anchor_dev < 1
+            or anchor_ino < 1
+            or anchor_nlink != 1
+        ):
+            raise AuthorizationError("journal_schema")
+        try:
+            parsed_uuid = uuid.UUID(journal_uuid)
+        except ValueError:
+            raise AuthorizationError("journal_schema") from None
+        if str(parsed_uuid) != journal_uuid:
+            raise AuthorizationError("journal_schema")
+        return _JournalIdentity(
+            journal_uuid=journal_uuid,
+            journal_path_sha256=path_sha256,
+            operation_schema_sha256=operation_schema_sha256,
+            metadata_schema_sha256=metadata_schema_sha256,
+            anchor_dev=anchor_dev,
+            anchor_ino=anchor_ino,
+            anchor_nlink=anchor_nlink,
+            database_dev=database_details[0],
+            database_ino=database_details[1],
+            database_nlink=database_details[2],
+        )
+
+    def _validate_identity(
+        self, connection: sqlite3.Connection, expected: _JournalIdentity
+    ) -> None:
+        self._validate_path()
+        self._validate_companions()
+        database_details = self._owner_file_details(self._path, "journal_identity_mismatch")
+        if database_details != (
+            expected.database_dev,
+            expected.database_ino,
+            expected.database_nlink,
+        ):
+            raise AuthorizationError("journal_identity_mismatch")
+        if self._read_anchor() != expected:
+            raise AuthorizationError("journal_identity_mismatch")
+        self._reject_incompatible_tables(connection)
+        self._validate_schema(connection)
+        if self._metadata_identity(connection, database_details) != expected:
+            raise AuthorizationError("journal_identity_mismatch")
+
+    def _initialize_identity(self) -> _JournalIdentity:
+        database_details = self._create_database_file()
+        identity = _JournalIdentity(
+            journal_uuid=str(uuid.uuid4()),
+            journal_path_sha256=self._path_sha256(),
+            operation_schema_sha256=self._expected_operation_schema_sha256(),
+            metadata_schema_sha256=self._expected_metadata_schema_sha256(),
+            anchor_dev=0,
+            anchor_ino=0,
+            anchor_nlink=0,
+            database_dev=database_details[0],
+            database_ino=database_details[1],
+            database_nlink=database_details[2],
+        )
+        try:
+            connection = sqlite3.connect(
+                f"{self._path.as_uri()}?mode=rw", uri=True, isolation_level=None, timeout=5.0
+            )
         except sqlite3.Error:
             raise AuthorizationError("journal_open") from None
         try:
-            if before != self._validate_owner_file(self._path):
-                raise AuthorizationError("journal_path")
             connection.execute("PRAGMA trusted_schema = OFF")
-            self._reject_incompatible_tables(connection)
             row = connection.execute("PRAGMA journal_mode = DELETE").fetchone()
             if row != ("delete",):
                 raise AuthorizationError("journal_durability")
             connection.execute("PRAGMA synchronous = FULL")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(_OPERATION_SCHEMA)
+            connection.execute(_JOURNAL_METADATA_SCHEMA)
+            connection.execute("COMMIT")
             self._validate_companions()
-            return connection
+            if (
+                self._owner_file_details(self._path, "journal_identity_mismatch")
+                != database_details
+            ):
+                raise AuthorizationError("journal_identity_mismatch")
+            anchor_details = self._write_anchor(identity)
+            identity = _JournalIdentity(
+                journal_uuid=identity.journal_uuid,
+                journal_path_sha256=identity.journal_path_sha256,
+                operation_schema_sha256=identity.operation_schema_sha256,
+                metadata_schema_sha256=identity.metadata_schema_sha256,
+                anchor_dev=anchor_details[0],
+                anchor_ino=anchor_details[1],
+                anchor_nlink=anchor_details[2],
+                database_dev=identity.database_dev,
+                database_ino=identity.database_ino,
+                database_nlink=identity.database_nlink,
+            )
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                f"""
+                INSERT INTO {_JOURNAL_METADATA_TABLE} (
+                    singleton, journal_uuid, journal_path_sha256,
+                    operation_schema_sha256, metadata_schema_sha256,
+                    anchor_dev, anchor_ino, anchor_nlink, schema_version
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    identity.journal_uuid,
+                    identity.journal_path_sha256,
+                    identity.operation_schema_sha256,
+                    identity.metadata_schema_sha256,
+                    identity.anchor_dev,
+                    identity.anchor_ino,
+                    identity.anchor_nlink,
+                    _JOURNAL_SCHEMA_VERSION,
+                ),
+            )
+            self._validate_schema(connection)
+            connection.execute("COMMIT")
+            self._validate_companions()
+            if (
+                self._owner_file_details(self._path, "journal_identity_mismatch")
+                != database_details
+            ):
+                raise AuthorizationError("journal_identity_mismatch")
+            self._validate_identity(connection, identity)
+            return identity
+        except AuthorizationError:
+            with suppress(sqlite3.Error):
+                connection.execute("ROLLBACK")
+            raise
+        except sqlite3.Error:
+            with suppress(sqlite3.Error):
+                connection.execute("ROLLBACK")
+            raise AuthorizationError("journal_transaction") from None
+        finally:
+            connection.close()
+
+    def _established_identity(self) -> _JournalIdentity:
+        self._validate_path()
+        with self._identity_lease() as lease:
+            lease.assert_stable()
+            database_details = self._owner_file_details_or_none(self._path, "journal_path")
+            anchor_details = self._owner_file_details_or_none(self._anchor_path(), "journal_anchor")
+            if database_details is None and anchor_details is None:
+                identity = self._initialize_identity()
+                lease.assert_stable()
+                return identity
+            if database_details is None:
+                raise AuthorizationError("journal_identity_missing")
+            if anchor_details is None:
+                raise AuthorizationError("journal_anchor_missing")
+            self._validate_companions()
+            try:
+                connection = sqlite3.connect(
+                    f"{self._path.as_uri()}?mode=ro", uri=True, isolation_level=None, timeout=5.0
+                )
+            except sqlite3.Error:
+                raise AuthorizationError("journal_open") from None
+            try:
+                connection.execute("PRAGMA trusted_schema = OFF")
+                identity = self._read_anchor()
+                self._validate_identity(connection, identity)
+                lease.assert_stable()
+                return identity
+            finally:
+                connection.close()
+
+    def assert_identity(self) -> None:
+        """Recheck the anchored database identity without creating any journal."""
+
+        self._validate_path()
+        with self._identity_lease() as lease:
+            lease.assert_stable()
+            database_details = self._owner_file_details_or_none(self._path, "journal_path")
+            if database_details is None:
+                raise AuthorizationError("journal_identity_missing")
+            if self._owner_file_details_or_none(self._anchor_path(), "journal_anchor") is None:
+                raise AuthorizationError("journal_anchor_missing")
+            try:
+                connection = sqlite3.connect(
+                    f"{self._path.as_uri()}?mode=ro", uri=True, isolation_level=None, timeout=5.0
+                )
+            except sqlite3.Error:
+                raise AuthorizationError("journal_open") from None
+            try:
+                connection.execute("PRAGMA trusted_schema = OFF")
+                identity = self._read_anchor()
+                self._validate_identity(connection, identity)
+                lease.assert_stable()
+            finally:
+                connection.close()
+
+    def _connect(self) -> tuple[sqlite3.Connection, _JournalIdentity]:
+        identity = self._established_identity()
+        self._validate_companions()
+        try:
+            connection = sqlite3.connect(
+                f"{self._path.as_uri()}?mode=rw", uri=True, isolation_level=None, timeout=5.0
+            )
+        except sqlite3.Error:
+            raise AuthorizationError("journal_open") from None
+        try:
+            connection.execute("PRAGMA trusted_schema = OFF")
+            self._validate_identity(connection, identity)
+            row = connection.execute("PRAGMA journal_mode = DELETE").fetchone()
+            if row != ("delete",):
+                raise AuthorizationError("journal_durability")
+            connection.execute("PRAGMA synchronous = FULL")
+            self._validate_identity(connection, identity)
+            return connection, identity
         except AuthorizationError:
             connection.close()
             raise
@@ -1246,17 +1766,44 @@ class SQLiteAuthorizationJournal:
         ):
             raise AuthorizationError("journal_schema")
 
+        metadata_rows = connection.execute(
+            f"PRAGMA table_info({_JOURNAL_METADATA_TABLE})"
+        ).fetchall()
+        expected_metadata_rows = [
+            (0, "singleton", "INTEGER", 1, None, 1),
+            (1, "journal_uuid", "TEXT", 1, None, 0),
+            (2, "journal_path_sha256", "TEXT", 1, None, 0),
+            (3, "operation_schema_sha256", "TEXT", 1, None, 0),
+            (4, "metadata_schema_sha256", "TEXT", 1, None, 0),
+            (5, "anchor_dev", "INTEGER", 1, None, 0),
+            (6, "anchor_ino", "INTEGER", 1, None, 0),
+            (7, "anchor_nlink", "INTEGER", 1, None, 0),
+            (8, "schema_version", "TEXT", 1, None, 0),
+        ]
+        if metadata_rows != expected_metadata_rows:
+            raise AuthorizationError("journal_schema")
+        metadata_schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (_JOURNAL_METADATA_TABLE,),
+        ).fetchone()
+        expected_metadata_sql = re.sub(
+            r"\s+", "", _JOURNAL_METADATA_SCHEMA.replace("IF NOT EXISTS ", "").lower()
+        )
+        if (
+            metadata_schema is None
+            or type(metadata_schema[0]) is not str
+            or re.sub(r"\s+", "", metadata_schema[0].lower()) != expected_metadata_sql
+        ):
+            raise AuthorizationError("journal_schema")
+
     def _transaction(self, action: Callable[[sqlite3.Connection], str | None]) -> str | None:
-        connection = self._connect()
+        connection, identity = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            self._reject_incompatible_tables(connection)
-            connection.execute(_OPERATION_SCHEMA)
-            self._validate_schema(connection)
+            self._validate_identity(connection, identity)
             result = action(connection)
             connection.execute("COMMIT")
-            self._validate_owner_file(self._path)
-            self._validate_companions()
+            self._validate_identity(connection, identity)
             return result
         except AuthorizationError:
             with suppress(sqlite3.Error):
@@ -1429,16 +1976,15 @@ class SQLiteAuthorizationJournal:
     def operation_state(self, operation_id: str) -> AuthorizationOperationState | None:
         if type(operation_id) is not str or not operation_id:
             raise AuthorizationError("operation_id")
-        connection = self._connect()
+        connection, identity = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            self._reject_incompatible_tables(connection)
-            connection.execute(_OPERATION_SCHEMA)
-            self._validate_schema(connection)
+            self._validate_identity(connection, identity)
             row = connection.execute(
                 f"SELECT state FROM {_OPERATION_TABLE} WHERE operation_id = ?", (operation_id,)
             ).fetchone()
             connection.execute("COMMIT")
+            self._validate_identity(connection, identity)
         except AuthorizationError:
             with suppress(sqlite3.Error):
                 connection.execute("ROLLBACK")
@@ -1651,10 +2197,13 @@ def _mark_effect_ambiguous(
 
 
 def _check_execution_stability(
-    artifact_lease: ArtifactRootLease, operation_lease: _OperationLease
+    journal: SQLiteAuthorizationJournal,
+    artifact_lease: ArtifactRootLease,
+    operation_lease: _OperationLease,
 ) -> None:
     artifact_lease.assert_stable()
     operation_lease.assert_stable()
+    journal.assert_identity()
 
 
 def _authorize_and_execute_with_clock(
@@ -1686,7 +2235,13 @@ def _authorize_and_execute_with_clock(
     journal_status = journal.migration_status()
     if journal_status is JournalMigrationStatus.LEGACY_DETECTED:
         raise AuthorizationError("journal_legacy_detected")
-    if journal_status is JournalMigrationStatus.UNKNOWN:
+    if journal_status is JournalMigrationStatus.ANCHOR_MISSING:
+        raise AuthorizationError("journal_anchor_missing")
+    if journal_status is JournalMigrationStatus.JOURNAL_MISSING:
+        raise AuthorizationError("journal_identity_missing")
+    if journal_status is JournalMigrationStatus.IDENTITY_MISMATCH:
+        raise AuthorizationError("journal_identity_mismatch")
+    if journal_status in {JournalMigrationStatus.EMPTY, JournalMigrationStatus.UNKNOWN}:
         raise AuthorizationError("journal_schema")
     fingerprints = _normalized_fingerprints(provider_fingerprints)
     with ArtifactRootLease(paths.root) as artifact_lease:
@@ -1777,8 +2332,7 @@ def _authorize_and_execute_with_clock(
                 operation_lease.assert_stable()
                 journal._claim_verified(verified)
                 journal._begin_effect(verified)
-                artifact_lease.assert_stable()
-                operation_lease.assert_stable()
+                _check_execution_stability(journal, artifact_lease, operation_lease)
                 outcome = _safe_call(lambda: effect(context))
                 if outcome is _SAFE_CALL_FAILURE:
                     _mark_effect_ambiguous(journal, verified)
@@ -1788,7 +2342,7 @@ def _authorize_and_execute_with_clock(
                     _mark_effect_ambiguous(journal, verified)
                     raise AuthorizationError("effect_failed_recovery_required")
                 post_effect_stable = _safe_call(
-                    lambda: _check_execution_stability(artifact_lease, operation_lease)
+                    lambda: _check_execution_stability(journal, artifact_lease, operation_lease)
                 )
                 if post_effect_stable is _SAFE_CALL_FAILURE:
                     _mark_effect_ambiguous(journal, verified)
@@ -1798,7 +2352,7 @@ def _authorize_and_execute_with_clock(
                     _mark_effect_ambiguous(journal, verified)
                     raise AuthorizationError("effect_failed_recovery_required")
                 terminal_stable = _safe_call(
-                    lambda: _check_execution_stability(artifact_lease, operation_lease)
+                    lambda: _check_execution_stability(journal, artifact_lease, operation_lease)
                 )
                 if terminal_stable is _SAFE_CALL_FAILURE:
                     raise AuthorizationError("terminal_stability")
