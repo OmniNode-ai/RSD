@@ -612,12 +612,19 @@ class CandidateCompositeV1(_Model):
         components = (*services, *caches)
         if len({item.container_id for item in components}) != 4:
             raise ValueError("all component container identities must be distinct")
-        if len({item.network_id for item in components}) != 4:
-            raise ValueError("all component network identities must be distinct")
+        if (
+            self.primary_service.network_name != self.primary_valkey.network_name
+            or self.primary_service.network_id != self.primary_valkey.network_id
+            or self.restore_service.network_name != self.restore_valkey.network_name
+            or self.restore_service.network_id != self.restore_valkey.network_id
+            or self.primary_service.network_name == self.restore_service.network_name
+            or self.primary_service.network_id == self.restore_service.network_id
+        ):
+            raise ValueError(
+                "primary and restore component pairs must use distinct shared networks"
+            )
         if len({item.workload_id for item in components}) != 4:
             raise ValueError("all component workload identities must be distinct")
-        if len({item.network_name for item in components}) != 4:
-            raise ValueError("all component network names must be distinct")
         if len({item.workload_name for item in components}) != 4:
             raise ValueError("all component workload names must be distinct")
         if (
@@ -670,7 +677,7 @@ class ProposalV1(_Model):
     retention_expires_at: str
     disposal_owner: str = Field(pattern=_OWNER_IDENTITY)
     approval_reference_sha256: str = Field(pattern=_SHA256)
-    initial_provisioning_evidence: InitialProvisioningEvidenceBindingsV1
+    allocation_evidence: AllocationEvidenceBindingsV1
 
     @field_validator("retention_expires_at")
     @classmethod
@@ -749,20 +756,32 @@ class RuntimeContractV1(ProposalV1):
         return self
 
 
-class InitialProvisioningOperationKind(StrEnum):
-    """The only operation kind admitted before runtime identities exist."""
+class AllocationOperationKind(StrEnum):
+    """The only pre-runtime operation kind."""
 
-    INITIAL_PROVISIONING = "initial_provisioning_v1"
+    ALLOCATION = "allocation_v2"
 
 
-class InitialProvisioningScope(StrEnum):
-    """The bounded pre-observation effect scope."""
+class AllocationScope(StrEnum):
+    """The sole V2 allocation effect is intentionally resource-only."""
 
-    CREATE_ISOLATED_EMPTY_RESOURCES = "create_isolated_empty_resources_v1"
+    ALLOCATE_ISOLATED_EMPTY_RESOURCES = "allocate_isolated_empty_resources_v2"
+
+
+class MaterializationOperationKind(StrEnum):
+    """The post-allocation operation that may create and start runtime containers."""
+
+    MATERIALIZATION = "materialization_v1"
+
+
+class MaterializationScope(StrEnum):
+    """Materialization may only create the final isolated runtime."""
+
+    MATERIALIZE_AND_START_RUNTIME = "materialize_and_start_runtime_v1"
 
 
 class ObservedLifecycleOperationKind(StrEnum):
-    """The post-observation lifecycle operation kind."""
+    """The post-runtime lifecycle operation kind."""
 
     OBSERVED_LIFECYCLE = "observed_lifecycle_v1"
 
@@ -779,8 +798,484 @@ def _canonical_base64_bytes(value: str) -> bytes:
     return decoded
 
 
-class InitialProvisioningEvidenceBindingsV1(_Model):
-    """Signed commitments to the governed evidence required before creation."""
+def _isolated_ipv4(value: str, *, field: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{field} must be a canonical IPv4 literal")
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        raise ValueError(f"{field} must be a canonical IPv4 literal") from None
+    if (
+        address.version != 4
+        or not address.is_private
+        or address.is_loopback
+        or address.is_unspecified
+        or address.is_multicast
+        or address.is_link_local
+        or str(address) != value
+    ):
+        raise ValueError(f"{field} must be a non-public IPv4 literal")
+    return value
+
+
+def _isolated_ipv4_network(value: str) -> str:
+    if type(value) is not str:
+        raise ValueError("network subnet must be canonical")
+    try:
+        network = ipaddress.ip_network(value, strict=True)
+    except ValueError:
+        raise ValueError("network subnet must be canonical") from None
+    if network.version != 4 or not network.is_private or network.with_prefixlen != value:
+        raise ValueError("network subnet must be a non-public IPv4 CIDR")
+    return value
+
+
+class NetworkOptionV1(_Model):
+    """A non-secret, exact Docker-network or volume option binding."""
+
+    key: str = Field(pattern=_IDENTIFIER)
+    value: str = Field(pattern=r"^[A-Za-z0-9_.:/=-]{1,256}$")
+
+
+class IsolatedNetworkPlanV1(_Model):
+    """One internal IPAM network allocated before runtime materialization."""
+
+    name: str = Field(pattern=_IDENTIFIER)
+    driver: Literal["bridge"]
+    internal: Literal[True]
+    subnet: str
+    gateway: str
+    options: tuple[NetworkOptionV1, ...] = Field(default=(), max_length=16)
+
+    @field_validator("subnet")
+    @classmethod
+    def canonical_subnet(cls, value: str) -> str:
+        return _isolated_ipv4_network(value)
+
+    @field_validator("gateway")
+    @classmethod
+    def canonical_gateway(cls, value: str) -> str:
+        return _isolated_ipv4(value, field="network gateway")
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def declared_options(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="network options")
+
+    @model_validator(mode="after")
+    def exact_configuration(self) -> Self:
+        network = ipaddress.ip_network(self.subnet)
+        if ipaddress.ip_address(self.gateway) not in network:
+            raise ValueError("network gateway must belong to subnet")
+        pairs = tuple((option.key, option.value) for option in self.options)
+        if pairs != tuple(sorted(pairs)) or len(set(pairs)) != len(pairs):
+            raise ValueError("network options must be unique and canonical")
+        return self
+
+
+class AllocationVolumePlanV1(_Model):
+    """One empty volume allocated before any cache container exists."""
+
+    name: str = Field(pattern=_IDENTIFIER)
+    driver: Literal["local"]
+    options: tuple[NetworkOptionV1, ...] = Field(default=(), max_length=16)
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def declared_options(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="volume options")
+
+    @model_validator(mode="after")
+    def exact_configuration(self) -> Self:
+        pairs = tuple((option.key, option.value) for option in self.options)
+        if pairs != tuple(sorted(pairs)) or len(set(pairs)) != len(pairs):
+            raise ValueError("volume options must be unique and canonical")
+        return self
+
+
+class ComponentPlacementV1(_Model):
+    """The single permitted attachment and static address of a runtime component."""
+
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    network_name: str = Field(pattern=_IDENTIFIER)
+    alias: str = Field(pattern=_IDENTIFIER)
+    static_ipv4: str
+
+    @field_validator("static_ipv4")
+    @classmethod
+    def canonical_address(cls, value: str) -> str:
+        return _isolated_ipv4(value, field="component static IPv4")
+
+
+class ExecutorPlacementV1(_Model):
+    """The local executor's explicitly limited disposable-network attachment set."""
+
+    executor_id: str = Field(pattern=_IDENTIFIER)
+    placement: Literal["inside_disposable_networks_v1"]
+    attached_network_names: tuple[str, str]
+
+    @field_validator("attached_network_names", mode="before")
+    @classmethod
+    def declared_networks(cls, value: object) -> tuple[object, ...]:
+        networks = _items(value, field="executor attached networks")
+        if not all(
+            type(network) is str and re.fullmatch(_IDENTIFIER, network) is not None
+            for network in networks
+        ):
+            raise ValueError("executor attached networks must be identifiers")
+        return networks
+
+
+class AllocationTopologyV2(_Model):
+    """The complete allowed attachment graph; no component may join another network."""
+
+    primary_network: IsolatedNetworkPlanV1
+    restore_network: IsolatedNetworkPlanV1
+    primary_infisical: ComponentPlacementV1
+    primary_valkey: ComponentPlacementV1
+    restore_infisical: ComponentPlacementV1
+    restore_valkey: ComponentPlacementV1
+    executor: ExecutorPlacementV1
+
+    @model_validator(mode="after")
+    def exact_pair_isolation(self) -> Self:
+        primary = self.primary_network
+        restore = self.restore_network
+        placements = (
+            self.primary_infisical,
+            self.primary_valkey,
+            self.restore_infisical,
+            self.restore_valkey,
+        )
+        if primary.name == restore.name or ipaddress.ip_network(primary.subnet).overlaps(
+            ipaddress.ip_network(restore.subnet)
+        ):
+            raise ValueError("primary and restore networks must be distinct and non-overlapping")
+        if tuple(item.component for item in placements) != (
+            "primary_infisical",
+            "primary_valkey",
+            "restore_infisical",
+            "restore_valkey",
+        ):
+            raise ValueError("topology components are not canonical")
+        if (
+            self.primary_infisical.network_name != primary.name
+            or self.primary_valkey.network_name != primary.name
+            or self.restore_infisical.network_name != restore.name
+            or self.restore_valkey.network_name != restore.name
+        ):
+            raise ValueError("component attachment escapes its isolated pair")
+        addresses = tuple(item.static_ipv4 for item in placements)
+        aliases = tuple(item.alias for item in placements)
+        if len(set(addresses)) != len(addresses) or len(set(aliases)) != len(aliases):
+            raise ValueError("component aliases and static addresses must be distinct")
+        for placement, network in (
+            (self.primary_infisical, primary),
+            (self.primary_valkey, primary),
+            (self.restore_infisical, restore),
+            (self.restore_valkey, restore),
+        ):
+            address = ipaddress.ip_address(placement.static_ipv4)
+            if (
+                address not in ipaddress.ip_network(network.subnet)
+                or placement.static_ipv4 == network.gateway
+            ):
+                raise ValueError("component static address does not belong to its isolated network")
+        if self.executor.attached_network_names != (primary.name, restore.name):
+            raise ValueError("executor attachment set must be exactly both isolated networks")
+        return self
+
+
+class ExecutorIdentityV1(_Model):
+    """A non-secret identity for the local control boundary, never a network address."""
+
+    executor_id: str = Field(pattern=_IDENTIFIER)
+    platform: Literal["local_unix_v1"]
+    authenticated_transport: Literal["unix_peer_credential_v1"]
+    endpoint_sha256: str = Field(pattern=_SHA256)
+    host_fingerprint_sha256: str = Field(pattern=_SHA256)
+    control_capability_fingerprint_sha256: str = Field(pattern=_SHA256)
+
+    @model_validator(mode="after")
+    def distinct_identity_bindings(self) -> Self:
+        values = (
+            self.endpoint_sha256,
+            self.host_fingerprint_sha256,
+            self.control_capability_fingerprint_sha256,
+        )
+        if len(set(values)) != len(values):
+            raise ValueError("executor identity bindings must be distinct")
+        return self
+
+
+class ImageConfigBindingV1(_Model):
+    """A pinned image and non-secret immutable digest for one runtime component."""
+
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    image: ImageReferenceV1
+    config_sha256: str = Field(pattern=_SHA256)
+
+
+class ExecutorControlPolicyV1(_Model):
+    """Signed allowlist for the future local Docker/PostgreSQL executor."""
+
+    schema_version: Literal["rsd.executor-control-policy.v1"]
+    source_commit: str = Field(pattern=_COMMIT)
+    executor: ExecutorIdentityV1
+    engine_fingerprint_sha256: str = Field(pattern=_SHA256)
+    allowed_operations: tuple[
+        Literal["allocate_isolated_empty_resources_v2", "materialize_and_start_runtime_v1"],
+        Literal["allocate_isolated_empty_resources_v2", "materialize_and_start_runtime_v1"],
+    ]
+    image_configs: tuple[
+        ImageConfigBindingV1,
+        ImageConfigBindingV1,
+        ImageConfigBindingV1,
+        ImageConfigBindingV1,
+    ]
+    created_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("created_at")
+    @classmethod
+    def canonical_created_at(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @field_validator("allowed_operations", "image_configs", mode="before")
+    @classmethod
+    def declared_sequence(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="executor control policy sequence")
+
+    @model_validator(mode="after")
+    def bounded_control(self) -> Self:
+        if self.allowed_operations != (
+            "allocate_isolated_empty_resources_v2",
+            "materialize_and_start_runtime_v1",
+        ):
+            raise ValueError("executor operation allowlist is not exact")
+        if tuple(item.component for item in self.image_configs) != (
+            "primary_infisical",
+            "primary_valkey",
+            "restore_infisical",
+            "restore_valkey",
+        ):
+            raise ValueError("executor image bindings are not canonical")
+        if len(_canonical_base64_bytes(self.signature_base64)) != 64:
+            raise ValueError("executor control policy signature is invalid")
+        return self
+
+
+class PostgreSQLGrantPlanV1(_Model):
+    """One exact non-secret ACL grant that the allocation capability may create."""
+
+    role: str = Field(pattern=_IDENTIFIER)
+    grantee: str = Field(pattern=_IDENTIFIER)
+    privilege: Literal["USAGE", "CREATE", "SELECT", "INSERT", "UPDATE", "DELETE"]
+    schema_name: str = Field(pattern=_IDENTIFIER)
+
+
+class PostgreSQLControlPolicyV1(_Model):
+    """Signed bounded PostgreSQL control policy; it contains no connection value."""
+
+    schema_version: Literal["rsd.postgresql-control-policy.v1"]
+    source_commit: str = Field(pattern=_COMMIT)
+    executor_identity_sha256: str = Field(pattern=_SHA256)
+    authority: str
+    maintenance_reference_sha256: str = Field(pattern=_SHA256)
+    database_name: str = Field(pattern=_IDENTIFIER)
+    schema_name: str = Field(pattern=_IDENTIFIER)
+    owner_role: str = Field(pattern=_IDENTIFIER)
+    role_names: tuple[str, ...] = Field(min_length=1, max_length=16)
+    grants: tuple[PostgreSQLGrantPlanV1, ...] = Field(default=(), max_length=32)
+    created_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("authority")
+    @classmethod
+    def canonical_postgres(cls, value: str) -> str:
+        return _authority(value, schemes=frozenset({"postgresql"}))
+
+    @field_validator("role_names", "grants", mode="before")
+    @classmethod
+    def declared_sequence(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="PostgreSQL control policy sequence")
+
+    @field_validator("created_at")
+    @classmethod
+    def canonical_created_at(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def bounded_database_control(self) -> Self:
+        if (
+            self.owner_role not in self.role_names
+            or len(set(self.role_names)) != len(self.role_names)
+            or tuple(sorted(self.role_names)) != self.role_names
+            or any(
+                grant.role not in self.role_names or grant.grantee not in self.role_names
+                for grant in self.grants
+            )
+            or tuple(
+                (grant.role, grant.grantee, grant.privilege, grant.schema_name)
+                for grant in self.grants
+            )
+            != tuple(
+                sorted(
+                    (grant.role, grant.grantee, grant.privilege, grant.schema_name)
+                    for grant in self.grants
+                )
+            )
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("PostgreSQL control policy is invalid")
+        return self
+
+
+class SecretCapabilityPolicyV1(_Model):
+    """Signed binding for a future local secret-use capability, never secret material."""
+
+    schema_version: Literal["rsd.secret-capability-policy.v1"]
+    source_commit: str = Field(pattern=_COMMIT)
+    executor_identity_sha256: str = Field(pattern=_SHA256)
+    provider_identity_sha256: str = Field(pattern=_SHA256)
+    capability_fingerprint_sha256: str = Field(pattern=_SHA256)
+    secret_handling_policy_sha256: str = Field(pattern=_SHA256)
+    delivery_mode: Literal["local_executor_secret_lease_v1"]
+    allowed_purposes: tuple[
+        Literal[
+            "commitment_hmac",
+            "backup_encryption",
+            "encryption_key",
+            "auth_secret",
+            "primary_valkey_password",
+            "restore_valkey_password",
+        ],
+        ...,
+    ]
+    created_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("allowed_purposes", mode="before")
+    @classmethod
+    def declared_purposes(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="secret capability purposes")
+
+    @field_validator("created_at")
+    @classmethod
+    def canonical_created_at(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def bounded_secret_use(self) -> Self:
+        expected = (
+            "commitment_hmac",
+            "backup_encryption",
+            "encryption_key",
+            "auth_secret",
+            "primary_valkey_password",
+            "restore_valkey_password",
+        )
+        bindings = (
+            self.executor_identity_sha256,
+            self.provider_identity_sha256,
+            self.capability_fingerprint_sha256,
+            self.secret_handling_policy_sha256,
+        )
+        if (
+            self.allowed_purposes != expected
+            or len(set(bindings)) != len(bindings)
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("secret capability policy is invalid")
+        return self
+
+
+class SecretHandlingPolicyV1(_Model):
+    """Signed, deliberately narrow TCB boundary for a future secret lease.
+
+    This policy does not carry a value or grant a general container trust
+    relationship.  It describes only the two disposable target-process sinks
+    admitted by the accepted local executor boundary.  The executor must
+    reject every other sink before it asks a provider for a value.
+    """
+
+    schema_version: Literal["rsd.secret-handling-policy.v1"]
+    source_commit: str = Field(pattern=_COMMIT)
+    allocation_intent_sha256: str = Field(pattern=_SHA256)
+    executor_identity_sha256: str = Field(pattern=_SHA256)
+    provider_identity_sha256: str = Field(pattern=_SHA256)
+    capability_fingerprint_sha256: str = Field(pattern=_SHA256)
+    infisical_target_processes: tuple[Literal["primary_infisical"], Literal["restore_infisical"]]
+    valkey_stdin_config_processes: tuple[Literal["primary_valkey"], Literal["restore_valkey"]]
+    infisical_target_process_environment_allowed: Literal[True]
+    valkey_stdin_config_allowed: Literal[True]
+    environment_file_allowed: Literal[False]
+    host_environment_allowed: Literal[False]
+    docker_config_environment_allowed: Literal[False]
+    argv_allowed: Literal[False]
+    labels_allowed: Literal[False]
+    logs_allowed: Literal[False]
+    receipts_allowed: Literal[False]
+    disk_plaintext_allowed: Literal[False]
+    public_artifacts_allowed: Literal[False]
+    restart_policy: Literal["no"]
+    restart_authorization_schema: Literal["rsd.start-runtime-intent.v2"]
+    restart_authorization_scope: Literal["start_runtime_v2"]
+    fresh_keychain_redelivery_required: Literal[True]
+    created_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("infisical_target_processes", "valkey_stdin_config_processes", mode="before")
+    @classmethod
+    def declared_processes(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="secret handling target processes")
+
+    @field_validator("created_at")
+    @classmethod
+    def canonical_created_at(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def narrow_trusted_boundary(self) -> Self:
+        bindings = (
+            self.allocation_intent_sha256,
+            self.executor_identity_sha256,
+            self.provider_identity_sha256,
+            self.capability_fingerprint_sha256,
+        )
+        if (
+            self.infisical_target_processes != ("primary_infisical", "restore_infisical")
+            or self.valkey_stdin_config_processes != ("primary_valkey", "restore_valkey")
+            or self.infisical_target_process_environment_allowed is not True
+            or self.valkey_stdin_config_allowed is not True
+            or self.environment_file_allowed is not False
+            or len(set(bindings)) != len(bindings)
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("secret handling policy is invalid")
+        return self
+
+
+class AllocationEvidenceBindingsV1(_Model):
+    """Signed commitments required before the resource-only allocation effect."""
 
     approval_sha256: str = Field(pattern=_SHA256)
     governed_deny_sha256: str = Field(pattern=_SHA256)
@@ -788,186 +1283,106 @@ class InitialProvisioningEvidenceBindingsV1(_Model):
     collision_evidence_sha256: str = Field(pattern=_SHA256)
     registry_verification_sha256: str = Field(pattern=_SHA256)
     provider_declaration_sha256: str = Field(pattern=_SHA256)
+    executor_control_policy_sha256: str = Field(pattern=_SHA256)
+    postgres_control_policy_sha256: str = Field(pattern=_SHA256)
 
     @model_validator(mode="after")
     def distinct_bindings(self) -> Self:
         values = tuple(self.model_dump(mode="python").values())
         if len(set(values)) != len(values):
-            raise ValueError("initial evidence commitments must be distinct")
+            raise ValueError("allocation evidence commitments must be distinct")
         return self
 
 
-class InitialServicePlanV1(_Model):
-    """A planned service identity deliberately excluding runtime identifiers."""
-
-    authority: str | None = None
-    authority_sha256: str | None = Field(default=None, pattern=_SHA256)
-    machine_id: str = Field(pattern=_IDENTIFIER)
-    compose_project: str = Field(pattern=_IDENTIFIER)
-    service_name: str = Field(pattern=_IDENTIFIER)
-    network_name: str = Field(pattern=_IDENTIFIER)
-    workload_name: str = Field(pattern=_IDENTIFIER)
-    image: ImageReferenceV1
-    listener_binding: Literal["tls_lan", "loopback_only", "isolated_network_only"]
-    host_listener_port: int | None = Field(default=None, ge=1, le=65535)
-    isolated_network_alias: str | None = Field(default=None, pattern=_IDENTIFIER)
-
-    @field_validator("authority")
-    @classmethod
-    def canonical_service(cls, value: str | None) -> str | None:
-        if value is None:
-            return value
-        return _authority(value, schemes=frozenset({"http", "https"}))
-
-    @model_validator(mode="after")
-    def binds_listener(self) -> Self:
-        if self.authority is None:
-            if self.authority_sha256 is not None:
-                raise ValueError("missing planned authority cannot have a hash")
-            parsed = None
-        else:
-            parsed = urlsplit(self.authority)
-            assert parsed.port is not None and parsed.hostname is not None
-            if self.authority_sha256 != _digest(self.authority.encode()):
-                raise ValueError("planned authority hash does not bind authority")
-        if self.listener_binding == "isolated_network_only":
-            if self.host_listener_port is not None or self.isolated_network_alias is None:
-                raise ValueError("isolated planned service cannot publish a port")
-            if self.authority is not None:
-                assert parsed is not None and parsed.hostname is not None
-                address = ipaddress.ip_address(parsed.hostname)
-                if (
-                    parsed.scheme != "http"
-                    or address.is_loopback
-                    or not address.is_private
-                    or address.is_unspecified
-                    or address.is_multicast
-                    or address.is_link_local
-                ):
-                    raise ValueError("isolated planned authority must be internal HTTP")
-        elif self.authority is None or self.authority_sha256 is None:
-            raise ValueError("planned listener port must bind authority")
-        else:
-            assert parsed is not None and parsed.port is not None
-            if self.isolated_network_alias is not None or self.host_listener_port != parsed.port:
-                raise ValueError("planned listener port must bind authority")
-        return self
-
-
-class InitialPostgreSQLPlanV1(_Model):
-    """Target database names and roles, without an OID or live fingerprints."""
+class AllocationPostgreSQLPlanV2(_Model):
+    """The empty database/schema/role objects allocation may create through a future capability."""
 
     authority: str
     database_name: str = Field(pattern=_IDENTIFIER)
     schema_name: str = Field(pattern=_IDENTIFIER)
     owner_role: str = Field(pattern=_IDENTIFIER)
     role_names: tuple[str, ...] = Field(min_length=1, max_length=16)
+    grants: tuple[PostgreSQLGrantPlanV1, ...] = Field(default=(), max_length=32)
     stage_database_prefix: str = Field(pattern=_IDENTIFIER)
     restore_database_prefix: str = Field(pattern=_IDENTIFIER)
+    control_policy_sha256: str = Field(pattern=_SHA256)
 
     @field_validator("authority")
     @classmethod
     def canonical_postgres(cls, value: str) -> str:
         return _authority(value, schemes=frozenset({"postgresql"}))
 
-    @field_validator("role_names", mode="before")
+    @field_validator("role_names", "grants", mode="before")
     @classmethod
-    def declared_roles(cls, value: object) -> tuple[object, ...]:
-        roles = _items(value, field="role_names")
-        if not all(
-            type(role) is str and re.fullmatch(_IDENTIFIER, role) is not None for role in roles
-        ):
-            raise ValueError("planned PostgreSQL roles must be declared identifiers")
-        return roles
+    def declared_sequence(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="allocation PostgreSQL sequence")
 
     @model_validator(mode="after")
-    def names_differ(self) -> Self:
-        if len({self.database_name, self.stage_database_prefix, self.restore_database_prefix}) != 3:
-            raise ValueError("planned database name and prefixes must differ")
-        if self.owner_role not in self.role_names or len(set(self.role_names)) != len(
-            self.role_names
+    def names_and_acl_are_bounded(self) -> Self:
+        if (
+            len({self.database_name, self.stage_database_prefix, self.restore_database_prefix}) != 3
+            or self.owner_role not in self.role_names
+            or len(set(self.role_names)) != len(self.role_names)
+            or tuple(sorted(self.role_names)) != self.role_names
+            or any(
+                grant.role not in self.role_names or grant.grantee not in self.role_names
+                for grant in self.grants
+            )
+            or tuple(
+                (grant.role, grant.grantee, grant.privilege, grant.schema_name)
+                for grant in self.grants
+            )
+            != tuple(
+                sorted(
+                    (grant.role, grant.grantee, grant.privilege, grant.schema_name)
+                    for grant in self.grants
+                )
+            )
         ):
-            raise ValueError("planned PostgreSQL roles must be distinct and include the owner")
+            raise ValueError("allocation PostgreSQL plan is invalid")
         return self
 
 
-class InitialValkeyPlanV1(_Model):
-    """Planned cache names, image, and provider reference without object IDs."""
-
-    compose_project: str = Field(pattern=_IDENTIFIER)
-    service_name: str = Field(pattern=_IDENTIFIER)
-    network_name: str = Field(pattern=_IDENTIFIER)
-    volume_name: str = Field(pattern=_IDENTIFIER)
-    workload_name: str = Field(pattern=_IDENTIFIER)
-    logical_namespace: str = Field(pattern=_IDENTIFIER)
-    credential_reference_sha256: str = Field(pattern=_SHA256)
-    image: ImageReferenceV1
-
-
-class InitialProvisioningPlanV1(_Model):
-    """Complete, name-only pre-creation plan for an isolated empty candidate."""
+class AllocationPlanV2(_Model):
+    """V2 resource-only plan with networks, volumes, and empty PostgreSQL objects."""
 
     transport: TransportContractV1
-    primary_service: InitialServicePlanV1
-    restore_service: InitialServicePlanV1
-    postgres: InitialPostgreSQLPlanV1
-    primary_valkey: InitialValkeyPlanV1
-    restore_valkey: InitialValkeyPlanV1
+    topology: AllocationTopologyV2
+    primary_valkey_volume: AllocationVolumePlanV1
+    restore_valkey_volume: AllocationVolumePlanV1
+    postgres: AllocationPostgreSQLPlanV2
 
     @model_validator(mode="after")
-    def isolated_pairs(self) -> Self:
-        primary = self.primary_service
-        restore = self.restore_service
+    def resource_only_non_tls_plan(self) -> Self:
+        topology = self.topology
+        parsed = urlsplit(self.transport.authority)
         if (
-            primary.authority != self.transport.authority
-            or primary.authority_sha256 != self.transport.authority_sha256
-            or primary.listener_binding != self.transport.listener_binding
-            or primary.host_listener_port != self.transport.host_listener_port
+            type(self.transport.profile) is not DisposableTransportProfile
+            or _is_tls_verified_profile(self.transport.profile)
+            or self.transport.listener_binding != "isolated_network_only"
+            or self.transport.host_listener_port is not None
+            or self.transport.isolated_network_name != topology.primary_network.name
+            or self.transport.isolated_network_alias != topology.primary_infisical.alias
+            or parsed.scheme != "http"
+            or parsed.hostname != topology.primary_infisical.static_ipv4
+            or self.primary_valkey_volume.name == self.restore_valkey_volume.name
+            or self.primary_valkey_volume == self.restore_valkey_volume
         ):
-            raise ValueError("planned transport must bind primary service")
-        if self.transport.listener_binding == "isolated_network_only" and (
-            primary.network_name != self.transport.isolated_network_name
-            or primary.isolated_network_alias != self.transport.isolated_network_alias
-        ):
-            raise ValueError("planned isolated transport must bind primary network alias")
-        if (
-            restore.listener_binding != "isolated_network_only"
-            or restore.host_listener_port is not None
-            or restore.authority is not None
-            or restore.authority_sha256 is not None
-            or restore.isolated_network_alias is None
-        ):
-            raise ValueError("planned restore service must be unpublished and isolated")
-        services = (primary, restore)
-        caches = (self.primary_valkey, self.restore_valkey)
-        components = (*services, *caches)
-        if len({item.network_name for item in components}) != 4:
-            raise ValueError("planned component networks must be distinct")
-        if len({item.workload_name for item in components}) != 4:
-            raise ValueError("planned component workloads must be distinct")
-        if len({(item.compose_project, item.service_name) for item in components}) != 4:
-            raise ValueError("planned compose identities must be distinct")
-        if (
-            len({item.volume_name for item in caches}) != 2
-            or len({item.logical_namespace for item in caches}) != 2
-        ):
-            raise ValueError("planned Valkey storage must be distinct")
-        if primary.image != restore.image:
-            raise ValueError("planned primary and restore images must share one digest")
+            raise ValueError("allocation plan is not an unpublished isolated resource plan")
         return self
 
 
-class InitialProvisioningIntentV1(_Model):
-    """Signed pre-creation authority limited to isolated empty resource creation."""
+class AllocationIntentV2(_Model):
+    """Signed authority for exactly the V2 allocation scope and nothing data-bearing."""
 
-    schema_version: Literal["rsd.initial-provisioning-intent.v1"]
-    operation_kind: Literal["initial_provisioning_v1"]
-    operation_scope: Literal["create_isolated_empty_resources_v1"]
-    provisioning_operation_id: str = Field(pattern=_UUID)
+    schema_version: Literal["rsd.allocation-intent.v2"]
+    operation_kind: Literal["allocation_v2"]
+    operation_scope: Literal["allocate_isolated_empty_resources_v2"]
+    allocation_operation_id: str = Field(pattern=_UUID)
     source_commit: str = Field(pattern=_COMMIT)
-    plan: InitialProvisioningPlanV1
+    plan: AllocationPlanV2
     provider_references: ProviderReferencesV1
-    evidence: InitialProvisioningEvidenceBindingsV1
+    evidence: AllocationEvidenceBindingsV1
     retention_expires_at: str
     disposal_owner: str = Field(pattern=_OWNER_IDENTITY)
     approver_identity: str = Field(pattern=_OWNER_IDENTITY)
@@ -988,108 +1403,193 @@ class InitialProvisioningIntentV1(_Model):
         return value
 
     @model_validator(mode="after")
-    def binds_precreation_plan(self) -> Self:
+    def binds_preallocation_plan(self) -> Self:
         if (
             not Path(self.journal_path).is_absolute()
             or os.path.normpath(self.journal_path) != self.journal_path
             or self.journal_path_sha256 != _digest(os.fsencode(self.journal_path))
             or _timestamp(self.retention_expires_at) <= _timestamp(self.created_at)
             or len(_canonical_base64_bytes(self.signature_base64)) != 64
+            or self.plan.postgres.control_policy_sha256
+            != self.evidence.postgres_control_policy_sha256
+            or self.provider_references.tls_trust_anchor is not None
         ):
-            raise ValueError("initial provisioning intent fields are invalid")
-        if (
-            self.plan.primary_valkey.credential_reference_sha256
-            != self.provider_references.primary_valkey_password.reference_sha256
-            or self.plan.restore_valkey.credential_reference_sha256
-            != self.provider_references.restore_valkey_password.reference_sha256
-        ):
-            raise ValueError("initial plan provider references do not bind caches")
-        anchor = self.provider_references.tls_trust_anchor
-        if type(self.plan.transport.profile) is not DisposableTransportProfile:
-            raise ValueError("transport profile must be canonical")
-        if _is_tls_verified_profile(self.plan.transport.profile):
-            if (
-                anchor is None
-                or anchor.reference_sha256 != self.plan.transport.tls_trust_anchor_reference_sha256
-            ):
-                raise ValueError("initial TLS plan must bind trust reference")
-        elif anchor is not None:
-            raise ValueError("initial unpublished plan cannot carry TLS trust reference")
+            raise ValueError("allocation intent fields are invalid")
         return self
 
 
-def strict_canonical_initial_provisioning_intent(
-    intent: InitialProvisioningIntentV1,
-) -> InitialProvisioningIntentV1:
-    """Return the only typed form admissible at a Phase-B mutation boundary.
+def strict_canonical_allocation_intent(intent: AllocationIntentV2) -> AllocationIntentV2:
+    """Return the only allocation form admissible at a V2 mutation boundary."""
 
-    This is deliberately separate from signature verification: the caller must
-    verify the returned canonical model under its domain-specific trust anchor
-    before performing any effect.  The round-trip prevents a caller from using
-    Pydantic's construction/copy escape hatches to smuggle raw strings or
-    subclasses into enum- or type-sensitive code.
-    """
-
-    return _strict_canonical_model(intent, InitialProvisioningIntentV1)
+    return _strict_canonical_model(intent, AllocationIntentV2)
 
 
-class ObservedServiceResourcesV1(_Model):
-    """Runtime identifiers observed only after the bounded creation effect."""
+def allocation_intent_sha256(intent: AllocationIntentV2) -> str:
+    if type(intent) is not AllocationIntentV2:
+        raise ValueError("allocation intent is invalid")
+    return canonical_sha256(intent)
 
-    network_name: str = Field(pattern=_IDENTIFIER)
+
+class AllocatedNetworkObservationV1(_Model):
+    """Exact engine observation for one allocated internal network."""
+
+    name: str = Field(pattern=_IDENTIFIER)
     network_id: str = Field(pattern=r"^[0-9a-f]{64}$")
-    container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
-    workload_name: str = Field(pattern=_IDENTIFIER)
-    workload_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    driver: Literal["bridge"]
+    internal: Literal[True]
+    subnet: str
+    gateway: str
+    options: tuple[NetworkOptionV1, ...] = Field(default=(), max_length=16)
 
+    @field_validator("subnet")
+    @classmethod
+    def canonical_subnet(cls, value: str) -> str:
+        return _isolated_ipv4_network(value)
 
-class ObservedValkeyResourcesV1(ObservedServiceResourcesV1):
-    """Observed cache identity including its concrete volume ID."""
+    @field_validator("gateway")
+    @classmethod
+    def canonical_gateway(cls, value: str) -> str:
+        return _isolated_ipv4(value, field="observed network gateway")
 
-    volume_name: str = Field(pattern=_IDENTIFIER)
-    volume_id: str = Field(pattern=r"^[0-9a-f]{64}$")
-
-
-class ObservedResourceSetV1(_Model):
-    """The IDs emitted by initial creation, before any data-bearing action."""
-
-    postgres_system_identifier: str = Field(pattern=r"^[0-9]{8,32}$")
-    postgres_database_oid: int = Field(ge=1)
-    primary_service: ObservedServiceResourcesV1
-    restore_service: ObservedServiceResourcesV1
-    primary_valkey: ObservedValkeyResourcesV1
-    restore_valkey: ObservedValkeyResourcesV1
+    @field_validator("options", mode="before")
+    @classmethod
+    def declared_options(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="observed network options")
 
     @model_validator(mode="after")
-    def distinct_resources(self) -> Self:
-        services = (self.primary_service, self.restore_service)
-        caches = (self.primary_valkey, self.restore_valkey)
-        components = (*services, *caches)
-        if (
-            len({item.network_name for item in components}) != 4
-            or len({item.network_id for item in components}) != 4
-            or len({item.container_id for item in components}) != 4
-            or len({item.workload_name for item in components}) != 4
-            or len({item.workload_id for item in components}) != 4
-            or len({item.volume_name for item in caches}) != 2
-            or len({item.volume_id for item in caches}) != 2
-        ):
-            raise ValueError("observed resources must be distinct")
+    def exact_configuration(self) -> Self:
+        if ipaddress.ip_address(self.gateway) not in ipaddress.ip_network(self.subnet):
+            raise ValueError("observed network gateway must belong to subnet")
+        pairs = tuple((option.key, option.value) for option in self.options)
+        if pairs != tuple(sorted(pairs)) or len(set(pairs)) != len(pairs):
+            raise ValueError("observed network options must be canonical")
         return self
 
 
-class InitialProvisioningEffectReceiptV1(_Model):
-    """Effect output for the sole pre-observation creation scope."""
+class AllocatedVolumeObservationV1(_Model):
+    """Exact engine observation for one empty volume."""
 
-    schema_version: Literal["rsd.initial-provisioning-effect-receipt.v1"]
-    operation_kind: Literal["initial_provisioning_v1"]
-    operation_scope: Literal["create_isolated_empty_resources_v1"]
-    status: Literal["created_isolated_empty_resources"]
-    provisioning_operation_id: str = Field(pattern=_UUID)
-    intent_sha256: str = Field(pattern=_SHA256)
+    name: str = Field(pattern=_IDENTIFIER)
+    volume_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    driver: Literal["local"]
+    options: tuple[NetworkOptionV1, ...] = Field(default=(), max_length=16)
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def declared_options(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="observed volume options")
+
+    @model_validator(mode="after")
+    def exact_configuration(self) -> Self:
+        pairs = tuple((option.key, option.value) for option in self.options)
+        if pairs != tuple(sorted(pairs)) or len(set(pairs)) != len(pairs):
+            raise ValueError("observed volume options must be canonical")
+        return self
+
+
+class PostgreSQLRoleObservationV1(_Model):
+    role: str = Field(pattern=_IDENTIFIER)
+    role_oid: int = Field(ge=1)
+
+
+class PostgreSQLGrantObservationV1(_Model):
+    role: str = Field(pattern=_IDENTIFIER)
+    grantee: str = Field(pattern=_IDENTIFIER)
+    privilege: Literal["USAGE", "CREATE", "SELECT", "INSERT", "UPDATE", "DELETE"]
+    schema_name: str = Field(pattern=_IDENTIFIER)
+
+
+class AllocatedPostgreSQLObservationV1(_Model):
+    """The empty PostgreSQL stage identity and ACL observation; no row data is admitted."""
+
+    system_identifier: str = Field(pattern=r"^[0-9]{8,32}$")
+    database_name: str = Field(pattern=_IDENTIFIER)
+    database_oid: int = Field(ge=1)
+    schema_name: str = Field(pattern=_IDENTIFIER)
+    schema_oid: int = Field(ge=1)
+    owner_role: str = Field(pattern=_IDENTIFIER)
+    owner_role_oid: int = Field(ge=1)
+    role_oids: tuple[PostgreSQLRoleObservationV1, ...] = Field(min_length=1, max_length=16)
+    grants: tuple[PostgreSQLGrantObservationV1, ...] = Field(default=(), max_length=32)
+    acl_sha256: str = Field(pattern=_SHA256)
+
+    @field_validator("role_oids", "grants", mode="before")
+    @classmethod
+    def declared_sequence(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="observed PostgreSQL sequence")
+
+    @model_validator(mode="after")
+    def exact_acl(self) -> Self:
+        roles = tuple(item.role for item in self.role_oids)
+        if (
+            self.owner_role not in roles
+            or len(set(roles)) != len(roles)
+            or tuple(sorted(roles)) != roles
+            or tuple(
+                (grant.role, grant.grantee, grant.privilege, grant.schema_name)
+                for grant in self.grants
+            )
+            != tuple(
+                sorted(
+                    (grant.role, grant.grantee, grant.privilege, grant.schema_name)
+                    for grant in self.grants
+                )
+            )
+        ):
+            raise ValueError("observed PostgreSQL ACL is invalid")
+        return self
+
+
+class EngineIdentityObservationV1(_Model):
+    engine_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    engine_fingerprint_sha256: str = Field(pattern=_SHA256)
+
+
+class NoHostPublicationGroundworkV1(_Model):
+    """Allocation proves zero containers and records the exact future attachment graph."""
+
+    container_ids: tuple[str, ...] = Field(default=(), max_length=0)
+    host_network: Literal[False]
+    publish_all_ports: Literal[False]
+    published_port_bindings: tuple[str, ...] = Field(default=(), max_length=0)
+    allowed_attachment_set_sha256: str = Field(pattern=_SHA256)
+
+
+class AllocatedResourceSetV2(_Model):
+    """All and only the resources V2 allocation may report."""
+
+    engine: EngineIdentityObservationV1
+    primary_network: AllocatedNetworkObservationV1
+    restore_network: AllocatedNetworkObservationV1
+    primary_cache_volume: AllocatedVolumeObservationV1
+    restore_cache_volume: AllocatedVolumeObservationV1
+    postgres: AllocatedPostgreSQLObservationV1
+    no_host_publication: NoHostPublicationGroundworkV1
+
+    @model_validator(mode="after")
+    def distinct_empty_resources(self) -> Self:
+        if (
+            self.primary_network.name == self.restore_network.name
+            or self.primary_network.network_id == self.restore_network.network_id
+            or self.primary_cache_volume.name == self.restore_cache_volume.name
+            or self.primary_cache_volume.volume_id == self.restore_cache_volume.volume_id
+        ):
+            raise ValueError("allocated resources must be distinct")
+        return self
+
+
+class AllocationEffectReceiptV2(_Model):
+    """Effect output for the only allocation scope; it contains no runtime container identity."""
+
+    schema_version: Literal["rsd.allocation-effect-receipt.v2"]
+    operation_kind: Literal["allocation_v2"]
+    operation_scope: Literal["allocate_isolated_empty_resources_v2"]
+    status: Literal["allocated_isolated_empty_resources"]
+    allocation_operation_id: str = Field(pattern=_UUID)
+    allocation_intent_sha256: str = Field(pattern=_SHA256)
     journal_uuid: str = Field(pattern=_UUID)
     idempotency_key: str = Field(pattern=_SHA256)
-    observed_resources: ObservedResourceSetV1
+    allocated_resources: AllocatedResourceSetV2
     effect_receipt_sha256: str = Field(pattern=_SHA256)
     completed_at: str
 
@@ -1100,37 +1600,22 @@ class InitialProvisioningEffectReceiptV1(_Model):
         return value
 
 
-def initial_provisioning_intent_sha256(intent: InitialProvisioningIntentV1) -> str:
-    """Commit the complete signed pre-creation intent for stage hand-off."""
-
-    if type(intent) is not InitialProvisioningIntentV1:
-        raise ValueError("initial provisioning intent is invalid")
-    return canonical_sha256(intent)
-
-
-def initial_provisioning_effect_receipt_sha256(
-    receipt: InitialProvisioningEffectReceiptV1,
-) -> str:
-    """Commit the bounded-effect receipt later signed by the observer."""
-
-    if type(receipt) is not InitialProvisioningEffectReceiptV1:
-        raise ValueError("initial provisioning effect receipt is invalid")
+def allocation_effect_receipt_sha256(receipt: AllocationEffectReceiptV2) -> str:
+    if type(receipt) is not AllocationEffectReceiptV2:
+        raise ValueError("allocation effect receipt is invalid")
     return canonical_sha256(receipt)
 
 
-class ObservedCandidateAttestationV1(_Model):
-    """Signed post-creation attestation adding real IDs to the planned intent."""
+class ObservedAllocationAttestationV1(_Model):
+    """Signed attestation of the resource-only allocation and isolation groundwork."""
 
-    schema_version: Literal["rsd.observed-candidate-attestation.v1"]
-    operation_kind: Literal["observed_lifecycle_v1"]
-    provisioning_operation_id: str = Field(pattern=_UUID)
-    observed_operation_id: str = Field(pattern=_UUID)
-    initial_provisioning_intent_sha256: str = Field(pattern=_SHA256)
-    provisioning_effect_receipt_sha256: str = Field(pattern=_SHA256)
-    proposal_sha256: str = Field(pattern=_SHA256)
-    candidate: CandidateCompositeV1
-    candidate_composite_sha256: str = Field(pattern=_SHA256)
-    observed_resources: ObservedResourceSetV1
+    schema_version: Literal["rsd.observed-allocation-attestation.v1"]
+    operation_kind: Literal["allocation_v2"]
+    allocation_operation_id: str = Field(pattern=_UUID)
+    allocation_intent_sha256: str = Field(pattern=_SHA256)
+    allocation_effect_receipt_sha256: str = Field(pattern=_SHA256)
+    allocation_topology_sha256: str = Field(pattern=_SHA256)
+    allocated_resources: AllocatedResourceSetV2
     observed_at: str
     signer_key_id: str = Field(pattern=_IDENTIFIER)
     signature_base64: str = Field(min_length=4, max_length=256)
@@ -1142,162 +1627,454 @@ class ObservedCandidateAttestationV1(_Model):
         return value
 
     @model_validator(mode="after")
-    def binds_observed_candidate(self) -> Self:
+    def binds_allocation(self) -> Self:
+        if len(_canonical_base64_bytes(self.signature_base64)) != 64:
+            raise ValueError("observed allocation signature is invalid")
+        return self
+
+
+def observed_allocation_attestation_sha256(attestation: ObservedAllocationAttestationV1) -> str:
+    if type(attestation) is not ObservedAllocationAttestationV1:
+        raise ValueError("observed allocation attestation is invalid")
+    return canonical_sha256(attestation)
+
+
+class MaterializationComponentPlanV1(_Model):
+    """One final runtime component plan. It carries no container ID or secret value."""
+
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    compose_project: str = Field(pattern=_IDENTIFIER)
+    service_name: str = Field(pattern=_IDENTIFIER)
+    workload_name: str = Field(pattern=_IDENTIFIER)
+    image: ImageReferenceV1
+    config_sha256: str = Field(pattern=_SHA256)
+    network_name: str = Field(pattern=_IDENTIFIER)
+    network_alias: str = Field(pattern=_IDENTIFIER)
+    static_ipv4: str
+    volume_name: str | None = Field(default=None, pattern=_IDENTIFIER)
+    logical_namespace: str | None = Field(default=None, pattern=_IDENTIFIER)
+    required_purposes: tuple[
+        Literal[
+            "commitment_hmac",
+            "backup_encryption",
+            "encryption_key",
+            "auth_secret",
+            "primary_valkey_password",
+            "restore_valkey_password",
+        ],
+        ...,
+    ]
+
+    @field_validator("static_ipv4")
+    @classmethod
+    def canonical_address(cls, value: str) -> str:
+        return _isolated_ipv4(value, field="materialization static IPv4")
+
+    @field_validator("required_purposes", mode="before")
+    @classmethod
+    def declared_purposes(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="materialization purposes")
+
+    @model_validator(mode="after")
+    def bounded_component(self) -> Self:
+        expected: dict[str, tuple[str, ...]] = {
+            "primary_infisical": ("encryption_key", "auth_secret", "primary_valkey_password"),
+            "primary_valkey": ("primary_valkey_password",),
+            "restore_infisical": ("encryption_key", "auth_secret", "restore_valkey_password"),
+            "restore_valkey": ("restore_valkey_password",),
+        }
+        cache = self.component.endswith("valkey")
+        if (
+            self.required_purposes != expected[self.component]
+            or (cache and (self.volume_name is None or self.logical_namespace is None))
+            or (not cache and (self.volume_name is not None or self.logical_namespace is not None))
+        ):
+            raise ValueError("materialization component is invalid")
+        return self
+
+
+class MaterializationPlanV1(_Model):
+    """The final container plan, admitted only after allocation observation."""
+
+    primary_infisical: MaterializationComponentPlanV1
+    primary_valkey: MaterializationComponentPlanV1
+    restore_infisical: MaterializationComponentPlanV1
+    restore_valkey: MaterializationComponentPlanV1
+
+    @model_validator(mode="after")
+    def canonical_components(self) -> Self:
+        components = (
+            self.primary_infisical,
+            self.primary_valkey,
+            self.restore_infisical,
+            self.restore_valkey,
+        )
+        if tuple(item.component for item in components) != (
+            "primary_infisical",
+            "primary_valkey",
+            "restore_infisical",
+            "restore_valkey",
+        ):
+            raise ValueError("materialization components are not canonical")
+        if len({(item.compose_project, item.service_name) for item in components}) != 4:
+            raise ValueError("materialization compose identities must be distinct")
+        if len({item.workload_name for item in components}) != 4:
+            raise ValueError("materialization workload names must be distinct")
+        return self
+
+
+class MaterializationEvidenceBindingsV1(_Model):
+    """Signed chain from allocation observation to the one materialization operation."""
+
+    allocation_intent_sha256: str = Field(pattern=_SHA256)
+    allocation_effect_receipt_sha256: str = Field(pattern=_SHA256)
+    observed_allocation_attestation_sha256: str = Field(pattern=_SHA256)
+    executor_control_policy_sha256: str = Field(pattern=_SHA256)
+    secret_capability_policy_sha256: str = Field(pattern=_SHA256)
+    secret_handling_policy_sha256: str = Field(pattern=_SHA256)
+    provider_material_attestation_sha256: str = Field(pattern=_SHA256)
+
+    @model_validator(mode="after")
+    def distinct_bindings(self) -> Self:
+        if len(set(self.model_dump(mode="python").values())) != 7:
+            raise ValueError("materialization evidence bindings must be distinct")
+        return self
+
+
+class MaterializationIntentV1(_Model):
+    """Signed post-allocation authority for creating and starting final containers once."""
+
+    schema_version: Literal["rsd.materialization-intent.v1"]
+    operation_kind: Literal["materialization_v1"]
+    operation_scope: Literal["materialize_and_start_runtime_v1"]
+    materialization_operation_id: str = Field(pattern=_UUID)
+    allocation_operation_id: str = Field(pattern=_UUID)
+    source_commit: str = Field(pattern=_COMMIT)
+    allocation_intent_sha256: str = Field(pattern=_SHA256)
+    allocation_effect_receipt_sha256: str = Field(pattern=_SHA256)
+    observed_allocation_attestation_sha256: str = Field(pattern=_SHA256)
+    topology: AllocationTopologyV2
+    plan: MaterializationPlanV1
+    provider_references: ProviderReferencesV1
+    evidence: MaterializationEvidenceBindingsV1
+    retention_expires_at: str
+    disposal_owner: str = Field(pattern=_OWNER_IDENTITY)
+    approver_identity: str = Field(pattern=_OWNER_IDENTITY)
+    approval_reference_sha256: str = Field(pattern=_SHA256)
+    journal_uuid: str = Field(pattern=_UUID)
+    replay_policy_sha256: str = Field(pattern=_SHA256)
+    created_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("retention_expires_at", "created_at")
+    @classmethod
+    def canonical_time(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def binds_allocation_and_provider(self) -> Self:
+        components = (
+            self.plan.primary_infisical,
+            self.plan.primary_valkey,
+            self.plan.restore_infisical,
+            self.plan.restore_valkey,
+        )
+        topology = self.topology
+        expected = (
+            (self.plan.primary_infisical, topology.primary_infisical),
+            (self.plan.primary_valkey, topology.primary_valkey),
+            (self.plan.restore_infisical, topology.restore_infisical),
+            (self.plan.restore_valkey, topology.restore_valkey),
+        )
+        if (
+            _timestamp(self.retention_expires_at) <= _timestamp(self.created_at)
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+            or self.provider_references.tls_trust_anchor is not None
+            or self.evidence.allocation_intent_sha256 != self.allocation_intent_sha256
+            or self.evidence.allocation_effect_receipt_sha256
+            != self.allocation_effect_receipt_sha256
+            or self.evidence.observed_allocation_attestation_sha256
+            != self.observed_allocation_attestation_sha256
+            or self.evidence.executor_control_policy_sha256
+            == self.evidence.secret_capability_policy_sha256
+            or any(
+                component.network_name != placement.network_name
+                or component.network_alias != placement.alias
+                or component.static_ipv4 != placement.static_ipv4
+                for component, placement in expected
+            )
+            or len({component.config_sha256 for component in components}) != 4
+        ):
+            raise ValueError("materialization intent is invalid")
+        return self
+
+
+def strict_canonical_materialization_intent(
+    intent: MaterializationIntentV1,
+) -> MaterializationIntentV1:
+    return _strict_canonical_model(intent, MaterializationIntentV1)
+
+
+def materialization_intent_sha256(intent: MaterializationIntentV1) -> str:
+    if type(intent) is not MaterializationIntentV1:
+        raise ValueError("materialization intent is invalid")
+    return canonical_sha256(intent)
+
+
+class RuntimeNetworkAttachmentV1(_Model):
+    network_name: str = Field(pattern=_IDENTIFIER)
+    network_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    alias: str = Field(pattern=_IDENTIFIER)
+    static_ipv4: str
+
+    @field_validator("static_ipv4")
+    @classmethod
+    def canonical_address(cls, value: str) -> str:
+        return _isolated_ipv4(value, field="runtime static IPv4")
+
+
+class NoHostPublicationEvidenceV1(_Model):
+    """Observed container configuration proving that Docker did not publish a host port."""
+
+    network_mode: Literal["isolated_user_network_v1"]
+    host_network: Literal[False]
+    publish_all_ports: Literal[False]
+    port_bindings: tuple[str, ...] = Field(default=(), max_length=0)
+
+
+class RuntimeContainerObservationV1(_Model):
+    """Value-free final container evidence emitted by the future executor."""
+
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    workload_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    image: ImageReferenceV1
+    config_sha256: str = Field(pattern=_SHA256)
+    attachments: tuple[RuntimeNetworkAttachmentV1, ...] = Field(min_length=1, max_length=1)
+    no_host_publication: NoHostPublicationEvidenceV1
+
+    @field_validator("attachments", mode="before")
+    @classmethod
+    def declared_attachments(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="runtime attachments")
+
+
+class MaterializationEffectReceiptV1(_Model):
+    """The one value-free receipt that can introduce final runtime container IDs."""
+
+    schema_version: Literal["rsd.materialization-effect-receipt.v1"]
+    operation_kind: Literal["materialization_v1"]
+    operation_scope: Literal["materialize_and_start_runtime_v1"]
+    status: Literal["materialized_and_started_runtime"]
+    materialization_operation_id: str = Field(pattern=_UUID)
+    materialization_intent_sha256: str = Field(pattern=_SHA256)
+    allocation_operation_id: str = Field(pattern=_UUID)
+    allocation_effect_receipt_sha256: str = Field(pattern=_SHA256)
+    observed_allocation_attestation_sha256: str = Field(pattern=_SHA256)
+    journal_uuid: str = Field(pattern=_UUID)
+    idempotency_key: str = Field(pattern=_SHA256)
+    executor_receipt_sha256: str = Field(pattern=_SHA256)
+    primary_infisical: RuntimeContainerObservationV1
+    primary_valkey: RuntimeContainerObservationV1
+    restore_infisical: RuntimeContainerObservationV1
+    restore_valkey: RuntimeContainerObservationV1
+    effect_receipt_sha256: str = Field(pattern=_SHA256)
+    completed_at: str
+
+    @field_validator("completed_at")
+    @classmethod
+    def completed_time(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def exact_runtime_components(self) -> Self:
+        components = (
+            self.primary_infisical,
+            self.primary_valkey,
+            self.restore_infisical,
+            self.restore_valkey,
+        )
+        if (
+            tuple(item.component for item in components)
+            != ("primary_infisical", "primary_valkey", "restore_infisical", "restore_valkey")
+            or len({item.container_id for item in components}) != 4
+            or len({item.workload_id for item in components}) != 4
+        ):
+            raise ValueError("materialization receipt components are invalid")
+        return self
+
+
+def materialization_effect_receipt_sha256(receipt: MaterializationEffectReceiptV1) -> str:
+    if type(receipt) is not MaterializationEffectReceiptV1:
+        raise ValueError("materialization effect receipt is invalid")
+    return canonical_sha256(receipt)
+
+
+class ObservedRuntimeAttestationV1(_Model):
+    """Signed final observation linking materialization evidence to a post-runtime candidate."""
+
+    schema_version: Literal["rsd.observed-runtime-attestation.v1"]
+    operation_kind: Literal["materialization_v1"]
+    materialization_operation_id: str = Field(pattern=_UUID)
+    materialization_intent_sha256: str = Field(pattern=_SHA256)
+    materialization_effect_receipt_sha256: str = Field(pattern=_SHA256)
+    observed_allocation_attestation_sha256: str = Field(pattern=_SHA256)
+    proposal_sha256: str = Field(pattern=_SHA256)
+    candidate: CandidateCompositeV1
+    candidate_composite_sha256: str = Field(pattern=_SHA256)
+    observed_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("observed_at")
+    @classmethod
+    def observation_time(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def binds_candidate(self) -> Self:
         if (
             self.candidate_composite_sha256 != canonical_sha256(self.candidate)
             or len(_canonical_base64_bytes(self.signature_base64)) != 64
         ):
-            raise ValueError("observed candidate attestation is invalid")
-        resources = self.observed_resources
-        candidate = self.candidate
-        if (
-            resources.postgres_system_identifier != candidate.postgres.system_identifier
-            or resources.postgres_database_oid != candidate.postgres.database_oid
-            or not _matches_observed_service(resources.primary_service, candidate.primary_service)
-            or not _matches_observed_service(resources.restore_service, candidate.restore_service)
-            or not _matches_observed_valkey(resources.primary_valkey, candidate.primary_valkey)
-            or not _matches_observed_valkey(resources.restore_valkey, candidate.restore_valkey)
-        ):
-            raise ValueError("observed resources do not bind candidate")
+            raise ValueError("observed runtime attestation is invalid")
         return self
 
 
-def _matches_observed_service(
-    observed: ObservedServiceResourcesV1, candidate: ServiceIdentityV1 | ValkeyIdentityV1
-) -> bool:
-    return (
-        observed.network_name == candidate.network_name
-        and observed.network_id == candidate.network_id
-        and observed.container_id == candidate.container_id
-        and observed.workload_name == candidate.workload_name
-        and observed.workload_id == candidate.workload_id
-    )
-
-
-def _matches_observed_valkey(
-    observed: ObservedValkeyResourcesV1, candidate: ValkeyIdentityV1
-) -> bool:
-    return (
-        _matches_observed_service(observed, candidate)
-        and observed.volume_name == candidate.volume_name
-        and observed.volume_id == candidate.volume_id
-    )
-
-
-def observed_candidate_attestation_sha256(attestation: ObservedCandidateAttestationV1) -> str:
-    """Return the full signed observation commitment."""
-
-    if type(attestation) is not ObservedCandidateAttestationV1:
-        raise ValueError("observed candidate attestation is invalid")
+def observed_runtime_attestation_sha256(attestation: ObservedRuntimeAttestationV1) -> str:
+    if type(attestation) is not ObservedRuntimeAttestationV1:
+        raise ValueError("observed runtime attestation is invalid")
     return canonical_sha256(attestation)
 
 
-def validate_observed_candidate_transition(
-    intent: InitialProvisioningIntentV1,
-    receipt: InitialProvisioningEffectReceiptV1,
-    attestation: ObservedCandidateAttestationV1,
+def validate_observed_allocation_transition(
+    intent: AllocationIntentV2,
+    receipt: AllocationEffectReceiptV2,
+    attestation: ObservedAllocationAttestationV1,
+) -> None:
+    """Require a signed allocation observation before materialization can be considered."""
+
+    if (
+        type(intent) is not AllocationIntentV2
+        or type(receipt) is not AllocationEffectReceiptV2
+        or type(attestation) is not ObservedAllocationAttestationV1
+    ):
+        raise ValueError("allocation observation transition is invalid")
+    if (
+        receipt.allocation_operation_id != intent.allocation_operation_id
+        or receipt.allocation_intent_sha256 != allocation_intent_sha256(intent)
+        or receipt.journal_uuid != intent.journal_uuid
+        or attestation.allocation_operation_id != intent.allocation_operation_id
+        or attestation.allocation_intent_sha256 != allocation_intent_sha256(intent)
+        or attestation.allocation_effect_receipt_sha256 != allocation_effect_receipt_sha256(receipt)
+        or attestation.allocation_topology_sha256 != canonical_sha256(intent.plan.topology)
+        or attestation.allocated_resources != receipt.allocated_resources
+        or attestation.allocated_resources.primary_network.name
+        != intent.plan.topology.primary_network.name
+        or attestation.allocated_resources.restore_network.name
+        != intent.plan.topology.restore_network.name
+        or attestation.allocated_resources.primary_cache_volume.name
+        != intent.plan.primary_valkey_volume.name
+        or attestation.allocated_resources.restore_cache_volume.name
+        != intent.plan.restore_valkey_volume.name
+        or attestation.allocated_resources.postgres.database_name
+        != intent.plan.postgres.database_name
+        or attestation.allocated_resources.postgres.schema_name != intent.plan.postgres.schema_name
+        or attestation.allocated_resources.postgres.owner_role != intent.plan.postgres.owner_role
+        or tuple(item.role for item in attestation.allocated_resources.postgres.role_oids)
+        != intent.plan.postgres.role_names
+    ):
+        raise ValueError("allocation observation transition is invalid")
+
+
+def _matches_runtime_component(
+    observed: RuntimeContainerObservationV1,
+    candidate: ServiceIdentityV1 | ValkeyIdentityV1,
+) -> bool:
+    attachment = observed.attachments[0]
+    return (
+        observed.container_id == candidate.container_id
+        and observed.workload_id == candidate.workload_id
+        and observed.image == candidate.image
+        and attachment.network_name == candidate.network_name
+        and attachment.network_id == candidate.network_id
+    )
+
+
+def validate_observed_runtime_transition(
+    allocation: ObservedAllocationAttestationV1,
+    intent: MaterializationIntentV1,
+    receipt: MaterializationEffectReceiptV1,
+    attestation: ObservedRuntimeAttestationV1,
     proposal: ProposalV1,
     contract: RuntimeContractV1,
 ) -> None:
-    """Require a signed planned-to-observed transition before lifecycle effects.
-
-    The intent contains names and policies only.  The effect receipt introduces
-    IDs, and the signed attestation must bind those IDs to the exact final
-    candidate/proposal before the observed lifecycle boundary can proceed.
-    """
+    """Require the full V2 allocation/materialization chain before observed effects."""
 
     if (
-        type(intent) is not InitialProvisioningIntentV1
-        or type(receipt) is not InitialProvisioningEffectReceiptV1
-        or type(attestation) is not ObservedCandidateAttestationV1
+        type(allocation) is not ObservedAllocationAttestationV1
+        or type(intent) is not MaterializationIntentV1
+        or type(receipt) is not MaterializationEffectReceiptV1
+        or type(attestation) is not ObservedRuntimeAttestationV1
         or type(proposal) is not ProposalV1
         or type(contract) is not RuntimeContractV1
     ):
-        raise ValueError("initial stage transition is invalid")
-    intent_hash = initial_provisioning_intent_sha256(intent)
-    receipt_hash = initial_provisioning_effect_receipt_sha256(receipt)
+        raise ValueError("runtime observation transition is invalid")
     if (
-        receipt.provisioning_operation_id != intent.provisioning_operation_id
-        or receipt.intent_sha256 != intent_hash
+        intent.observed_allocation_attestation_sha256
+        != observed_allocation_attestation_sha256(allocation)
+        or intent.allocation_operation_id != allocation.allocation_operation_id
+        or intent.allocation_intent_sha256 != allocation.allocation_intent_sha256
+        or intent.allocation_effect_receipt_sha256 != allocation.allocation_effect_receipt_sha256
+        or receipt.materialization_operation_id != intent.materialization_operation_id
+        or receipt.materialization_intent_sha256 != materialization_intent_sha256(intent)
+        or receipt.allocation_operation_id != intent.allocation_operation_id
+        or receipt.allocation_effect_receipt_sha256 != intent.allocation_effect_receipt_sha256
+        or receipt.observed_allocation_attestation_sha256
+        != intent.observed_allocation_attestation_sha256
         or receipt.journal_uuid != intent.journal_uuid
-        or attestation.provisioning_operation_id != intent.provisioning_operation_id
-        or attestation.observed_operation_id != proposal.operation_id
-        or attestation.initial_provisioning_intent_sha256 != intent_hash
-        or attestation.provisioning_effect_receipt_sha256 != receipt_hash
-        or attestation.observed_resources != receipt.observed_resources
+        or attestation.materialization_operation_id != intent.materialization_operation_id
+        or attestation.materialization_intent_sha256 != materialization_intent_sha256(intent)
+        or attestation.materialization_effect_receipt_sha256
+        != materialization_effect_receipt_sha256(receipt)
+        or attestation.observed_allocation_attestation_sha256
+        != intent.observed_allocation_attestation_sha256
         or attestation.proposal_sha256 != proposal_sha256(proposal)
         or attestation.candidate != proposal.candidate
         or contract.model_dump(mode="json", include=set(ProposalV1.model_fields))
         != proposal.model_dump(mode="json")
+        or not _matches_runtime_component(
+            receipt.primary_infisical, proposal.candidate.primary_service
+        )
+        or not _matches_runtime_component(
+            receipt.restore_infisical, proposal.candidate.restore_service
+        )
+        or not _matches_runtime_component(receipt.primary_valkey, proposal.candidate.primary_valkey)
+        or not _matches_runtime_component(receipt.restore_valkey, proposal.candidate.restore_valkey)
+        or allocation.allocated_resources.postgres.system_identifier
+        != proposal.candidate.postgres.system_identifier
+        or allocation.allocated_resources.postgres.database_oid
+        != proposal.candidate.postgres.database_oid
     ):
-        raise ValueError("initial stage transition is invalid")
-    if (
-        intent.source_commit != proposal.source_commit
-        or intent.retention_expires_at != proposal.retention_expires_at
-        or intent.disposal_owner != proposal.disposal_owner
-        or intent.approval_reference_sha256 != proposal.approval_reference_sha256
-        or intent.provider_references != proposal.provider_references
-        or intent.plan.transport != proposal.transport
-    ):
-        raise ValueError("initial plan does not match observed proposal")
-    plan = intent.plan
-    candidate = proposal.candidate
-    if (
-        not _planned_service_matches(plan.primary_service, candidate.primary_service)
-        or not _planned_service_matches(plan.restore_service, candidate.restore_service)
-        or not _planned_postgres_matches(plan.postgres, candidate.postgres)
-        or not _planned_valkey_matches(plan.primary_valkey, candidate.primary_valkey)
-        or not _planned_valkey_matches(plan.restore_valkey, candidate.restore_valkey)
-        or intent.evidence != proposal.initial_provisioning_evidence
-    ):
-        raise ValueError("initial plan does not match observed proposal")
+        raise ValueError("runtime observation transition is invalid")
 
 
-def _planned_service_matches(plan: InitialServicePlanV1, observed: ServiceIdentityV1) -> bool:
-    return (
-        plan.authority == observed.authority
-        and plan.authority_sha256 == observed.authority_sha256
-        and plan.machine_id == observed.machine_id
-        and plan.compose_project == observed.compose_project
-        and plan.service_name == observed.service_name
-        and plan.network_name == observed.network_name
-        and plan.workload_name == observed.workload_name
-        and plan.image == observed.image
-        and plan.listener_binding == observed.listener_binding
-        and plan.host_listener_port == observed.host_listener_port
-        and plan.isolated_network_alias == observed.isolated_network_alias
-    )
-
-
-def _planned_postgres_matches(
-    plan: InitialPostgreSQLPlanV1, observed: PostgreSQLContractV1
-) -> bool:
-    return (
-        plan.authority == observed.authority
-        and plan.database_name == observed.database_name
-        and plan.schema_name == observed.schema_name
-        and plan.owner_role == observed.owner_role
-        and plan.role_names == observed.role_names
-        and plan.stage_database_prefix == observed.stage_database_prefix
-        and plan.restore_database_prefix == observed.restore_database_prefix
-    )
-
-
-def _planned_valkey_matches(plan: InitialValkeyPlanV1, observed: ValkeyIdentityV1) -> bool:
-    return (
-        plan.compose_project == observed.compose_project
-        and plan.service_name == observed.service_name
-        and plan.network_name == observed.network_name
-        and plan.volume_name == observed.volume_name
-        and plan.workload_name == observed.workload_name
-        and plan.logical_namespace == observed.logical_namespace
-        and plan.credential_reference_sha256 == observed.credential_reference_sha256
-        and plan.image == observed.image
-    )
-
-
-# ``ProposalV1`` intentionally refers forward to the pre-creation evidence
-# model so its observed artifact commits the original governed plan too.
+# ``ProposalV1`` intentionally refers forward to allocation evidence so Phase-A
+# remains a compiler while the V2 stages bind the later runtime candidate.
 ProposalV1.model_rebuild()
 RuntimeContractV1.model_rebuild()
 

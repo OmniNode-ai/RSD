@@ -98,36 +98,48 @@ library.
 Phase-B has two non-interchangeable authorization stages. Phase-A remains a
 compiler only and never authorizes either stage.
 
-1. `InitialProvisioningIntentV1` is a signed pre-creation contract. It
-   contains planned stable names, host authority, database/schema/role intent,
-   immutable images, provider references, native transport policy, retention,
-   owner/approver, and governed evidence hashes. It deliberately has no
-   database OID, container ID, network ID, workload ID, volume ID, or runtime
-   fingerprint. `provision_initial_journal()` explicitly creates its separate
-   durable journal and external genesis tombstone. No authorization path
-   creates or recreates that journal implicitly.
-2. `authorize_initial_provisioning_and_execute()` accepts only the typed
-   `create_isolated_empty_resources_v1` scope. Its callback receives an
-   immutable `InitialProvisioningExecutionContext` containing the planned
-   intent and provider expectations, not an observed proposal or a journal.
-   The only accepted callback result is an
-   `InitialProvisioningEffectReceiptV1` with newly observed resource IDs.
-   Seed, backup, restore, reset, swap, and data-access operations are outside
-   that scope.
-3. A trusted signer must then issue `ObservedCandidateAttestationV1`. It binds
-   the exact intent hash and creation-receipt hash to the actual PostgreSQL
-   OID and service/network/workload/volume/container IDs. The existing
-   `ProposalV1` and `RuntimeContractV1` are post-observation contracts: their
-   actual identities, planned fields, and evidence must exactly match the
-   attestation before `authorize_and_execute()` can admit an observed
-   lifecycle effect.
+1. `AllocationIntentV2` is a signed pre-creation contract. It
+   contains only the two isolated-network plans, empty volume plans, and exact
+   empty PostgreSQL database/schema/role/ACL plan, plus its future topology,
+   provider references, native transport policy, retention,
+   owner/approver, executor/PostgreSQL-control policy commitments, and governed
+   evidence hashes. It deliberately has no database OID, container ID, network
+   ID, workload ID, volume ID, or runtime fingerprint.
+   `provision_allocation_journal()` explicitly creates its separate durable
+   journal and external genesis tombstone. No authorization path creates or
+   recreates that journal implicitly.
+2. `authorize_allocation_and_execute()` accepts only the typed
+   `allocate_isolated_empty_resources_v2` scope. It supplies a value-free,
+   immutable `AllocationExecutionContext` only to an injected
+   `AllocationExecutor` while holding separate bounded executor and PostgreSQL
+   control leases. The only accepted effect output is an
+   `AllocationEffectReceiptV2` with newly observed network/volume/database and
+   ACL identities and an explicit zero-container/no-publication assertion.
+   Seed, backup, restore, reset, swap, data access, application/cache container
+   creation, and service start are outside that scope.
+3. A trusted signer must issue `ObservedAllocationAttestationV1` over that
+   exact allocation receipt before a second stage is even considered.
+   `MaterializationIntentV1` then binds that allocation observation, the exact
+   future four-component topology, immutable image/config commitments,
+   provider-material attestation, executor policy, secret-capability policy,
+   and secret-handling policy.
+   `authorize_materialization_and_execute()` is the only boundary that can
+   pass the future executor an opaque `SecretMaterialLease`; it cannot return
+   or construct a raw secret mapping.
+4. `MaterializationEffectReceiptV1` is the first receipt permitted to record
+   the four final container/workload identities. It requires exactly one
+   allowed attachment per component, fixed IP/alias bindings, isolated user
+   network mode, empty port bindings, and disabled host networking/publication.
+   A trusted `ObservedRuntimeAttestationV1` binds that receipt to the actual
+   post-runtime `ProposalV1` and `RuntimeContractV1` before
+   `authorize_and_execute()` can admit an observed lifecycle effect.
 
-Both stages have distinct Ed25519 signature domains, SQLite operation kinds,
+Allocation and materialization have distinct Ed25519 signature domains, SQLite operation kinds,
 journal state machines, idempotency domains, and external replay-tombstone
 kinds. A receipt from either stage is audit data, never a bearer grant.
-`InitialProvisioningJournalStatus` exposes only read-only diagnostics. An
-interrupted initial genesis remains blocked until a signed
-`InitialJournalGenesisReconciliationReceiptV1` either confirms the already
+`AllocationJournalStatus` exposes only read-only diagnostics. An
+interrupted allocation genesis remains blocked until a signed
+`AllocationJournalGenesisReconciliationReceiptV1` either confirms the already
 durable database-and-anchor pair or records an abandonment; reconciliation
 never retries creation or clears the external tombstone.
 
@@ -156,7 +168,7 @@ TLS-profile provider state is not reported as usable.
 mutation-admission boundary for a disposable acceptance workflow. It accepts
 an injected Ed25519 trust anchor, leased provider-provenance adapter, owner-only
 `SQLiteAuthorizationJournal` and
-`SQLiteInitialProvisioningJournal`, mandatory `ProtocolReplayAuthority` plus
+`SQLiteAllocationJournal`, mandatory `ProtocolReplayAuthority` plus
 typed `ReplayAuthorityPolicyV1`, and one effect callback. It requires actual
 detached-signature sidecars for the proposal, final contract, and evidence
 artifacts; Phase-A signature markers alone never authorize.
@@ -182,15 +194,16 @@ proposal/final-contract models, exact provider expectations, and a derived
 idempotency key. It receives no artifact path, nonce, or journal handle. It
 must return an `EffectReceiptV1` bound to that operation and idempotency key.
 Before any observed effect can be admitted, a separate caller must explicitly
-complete the initial stage above and invoke `provision_journal()` once with a
+complete the allocation stage above and invoke `provision_journal()` once with a
 trusted Ed25519-signed `JournalGenesisReceiptV1`. That receipt commits to the
 operation/proposal/final hashes, expected owner and approver, canonical journal path, fresh journal ID,
 and journal schema digest, including the exact replay-policy digest.
-Observed journal genesis also requires the caller's exact signed initial intent
-and a committed `provisioned_empty` predecessor in the initial journal. Before
+Observed journal genesis also requires the caller's exact signed allocation intent,
+a committed `allocated` predecessor, and a committed materialization predecessor
+in the allocation journal. Before
 it can claim its external tombstone, it descriptor-reopens and verifies the
-immutable initial replay-policy artifact; a transient caller policy, a missing
-preimage, or an observed-genesis-before-initial attempt fails closed.
+immutable allocation replay-policy artifact; a transient caller policy, a missing
+preimage, or an observed-genesis-before-allocation attempt fails closed.
 Provisioning writes an owner-only pending marker before it claims a
 create-once external genesis tombstone and creates the database. The
 authorization path claims a second, operation tombstone before its local
@@ -226,13 +239,13 @@ therefore cannot make a logical operation claimable again.
 Provider material has a separate create-only bootstrap boundary. It is not a
 runtime secret-delivery API and it does not authorize an effect by itself.
 `SignerGenesisV1` is issuer-signed with its own Ed25519 domain and binds the
-initial-intent digest, Keychain service/account/version/reference hash, seed
+allocation-intent digest, Keychain service/account/version/reference hash, seed
 fingerprint, derived public key, and public-key fingerprint. The signer can
 only be provisioned or loaded after that signature and intent binding are
 verified; duplicate Keychain rows fail closed.
 
 `ReplayAuthorityPolicyArtifactV1` signs the exact replay service and account
-prefix plus the typed replay-policy digest. Initial journal provisioning writes
+prefix plus the typed replay-policy digest. Allocation journal provisioning writes
 that immutable artifact before it claims a tombstone, and both authorization
 stages re-read and verify it before they can claim an operation tombstone.
 
@@ -295,6 +308,24 @@ certificate and associated signing-key generation, custody, installation, and
 runtime termination are not defined or authorized here; they require a separate
 signed intent and policy amendment. Consequently, a TLS-profile intent is
 blocked before any provisioning work in this release.
+
+### Narrow secret-handling boundary
+
+`SecretHandlingPolicyV1` records the only accepted disposable secret sinks for
+this profile: the two named Infisical target processes may receive their
+bounded values through their target-process environment, and the two named
+Valkey target processes may receive their bounded values through stdin-backed
+configuration. It is not a general trust grant for host processes, governed
+services, other containers, or arbitrary workloads. The signed policy requires
+host environment, Docker configuration environment, command arguments, labels,
+logs, receipts, disk plaintext, and public artifacts to remain forbidden.
+The future executor receives only an opaque `SecretMaterialLease` and must
+enforce those sink restrictions before any provider read.
+
+The policy fixes restart behavior to `no`. A future restart is outside this
+release and must require a fresh signed `rsd.start-runtime-intent.v2` with
+`start_runtime_v2` scope and fresh Keychain redelivery; no existing start or
+materialization receipt can be reused as restart authority.
 
 The observed SQLite journal requires an owner-only directory and database file, uses
 `BEGIN IMMEDIATE`, `DELETE` journaling, and `FULL` synchronous durability. A

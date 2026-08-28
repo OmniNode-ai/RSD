@@ -94,7 +94,7 @@ def _policy() -> ProviderMaterialPolicyV1:
     }
     return ProviderMaterialPolicyV1(
         schema_version="rsd.provider-crypto.material-policy.v1",
-        initial_intent_sha256="a" * 64,
+        allocation_intent_sha256="a" * 64,
         disposal_owner="owner",
         approver_identity="approver",
         policy_id="123e4567-e89b-42d3-a456-426614174011",
