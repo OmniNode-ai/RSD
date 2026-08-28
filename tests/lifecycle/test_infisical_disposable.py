@@ -10,7 +10,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import inspect
+import multiprocessing
 import os
+import shutil
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -22,14 +26,18 @@ import omninode_rsd.lifecycle.authorization as authorization
 from omninode_rsd.lifecycle.authorization import (
     AllocationExecutionContext,
     AllocationJournalStatus,
+    AllocationOperationState,
     ArtifactRootLease,
     AuthorizationError,
     AuthorizationPaths,
+    DetachedAuthorizationSignatureV1,
     ExecutorControlExpectationV1,
+    MacOSKeychainReplayAuthority,
     MaterializationExecutionContext,
     MaterializationOperationState,
     PostgreSQLControlExpectationV1,
     ProviderExpectationV1,
+    ProviderProvenance,
     ReplayAuthorityClaimResult,
     ReplayAuthorityPolicyV1,
     ReplayTombstoneV1,
@@ -53,6 +61,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     AllocationTopologyV2,
     AllocationVolumePlanV1,
     ComponentPlacementV1,
+    DetachedSignatureV1,
     DisposableTransportProfile,
     EngineIdentityObservationV1,
     ExecutorControlPolicyV1,
@@ -104,6 +113,10 @@ _NOW = "2026-08-28T12:00:00Z"
 _RETAINS = "2026-08-28T12:20:00Z"
 _SIGNATURE = base64.b64encode(b"s" * 64).decode("ascii")
 _TEST_CLOCK = datetime(2026, 8, 28, 12, 5, tzinfo=UTC)
+
+
+class _TLSProfileAlias(str):
+    """A hostile scalar subclass used only at the model-construction boundary."""
 
 
 def _hash(label: str) -> str:
@@ -356,6 +369,33 @@ class _AtomicReplayAuthority:
             if existing == value
             else ReplayAuthorityClaimResult.DUPLICATE_CONFLICT
         )
+
+
+def _hold_allocation_operation_lease(
+    journal_path: str,
+    operation_id: str,
+    acquired: object,
+    release: object,
+) -> None:
+    """Hold an OS lease in a child process for a recovery-race regression."""
+
+    # ``multiprocessing.Event`` intentionally has no useful static interface
+    # here; these are test-process objects only and never cross a public API.
+    journal = SQLiteAllocationJournal(Path(journal_path))
+    with journal._operation_lease(operation_id):
+        cast(Any, acquired).set()
+        cast(Any, release).wait(timeout=10)
+
+
+def _try_artifact_root_lock(root: str, queue: object) -> None:
+    """Exercise the actual advisory root lock from a separate process."""
+
+    try:
+        with ArtifactRootLease(Path(root)):
+            outcome = "acquired"
+    except AuthorizationError as error:
+        outcome = error.phase
+    cast(Any, queue).put(outcome)
 
 
 def _trusted_signer() -> tuple[TrustedEd25519SignerV1, Ed25519PrivateKey]:
@@ -1354,6 +1394,45 @@ def test_allocation_genesis_crash_leaves_a_terminal_pending_state(
     assert authority.calls == 1
 
 
+def test_v2_allocation_journal_unknown_or_legacy_local_state_blocks_without_recreation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unrelated legacy-shaped database is neither adopted nor migrated by V2."""
+
+    monkeypatch.setattr(authorization, "_system_utc_clock", lambda: _TEST_CLOCK)
+    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
+        tmp_path
+    )
+    connection = sqlite3.connect(journal._path)
+    try:
+        connection.execute("CREATE TABLE authorization_nonce_journal (nonce TEXT PRIMARY KEY)")
+        connection.commit()
+    finally:
+        connection.close()
+    journal._path.chmod(0o600)
+    root = tmp_path / "artifacts"
+    root.mkdir(mode=0o700)
+    authority = _AtomicReplayAuthority()
+
+    assert journal.migration_status() is AllocationJournalStatus.JOURNAL_MISSING
+    with pytest.raises(AuthorizationError, match="allocation_journal_replayed"):
+        provision_allocation_journal(
+            AuthorizationPaths(root=root),
+            signer=signer,
+            expected_disposal_owner=_OWNER,
+            expected_approver_identity=_APPROVER,
+            journal=journal,
+            intent=intent,
+            executor_control_policy=executor,
+            postgres_control_policy=postgres,
+            replay_authority=authority,
+            replay_policy=policy,
+            replay_policy_artifact=artifact,
+        )
+    assert authority.calls == 0
+    assert journal._path.exists()
+
+
 def test_external_allocation_genesis_tombstone_blocks_a_second_local_journal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1516,3 +1595,665 @@ def test_provider_and_effect_error_text_is_not_exposed_by_safe_boundary() -> Non
 
     assert result is authorization._SAFE_CALL_FAILURE
     assert marker not in repr(result)
+
+
+def _provisioned_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[
+    AuthorizationPaths,
+    TrustedEd25519SignerV1,
+    AllocationIntentV2,
+    ExecutorControlPolicyV1,
+    PostgreSQLControlPolicyV1,
+    SQLiteAllocationJournal,
+    ReplayAuthorityPolicyV1,
+    _AtomicReplayAuthority,
+]:
+    """Create a durable V2 allocation fixture through the signed boundary."""
+
+    monkeypatch.setattr(authorization, "_system_utc_clock", lambda: _TEST_CLOCK)
+    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
+        tmp_path
+    )
+    root = tmp_path / "artifacts"
+    root.mkdir(mode=0o700)
+    paths = AuthorizationPaths(root=root)
+    authority = _AtomicReplayAuthority(root=root)
+    provision_allocation_journal(
+        paths,
+        signer=signer,
+        expected_disposal_owner=_OWNER,
+        expected_approver_identity=_APPROVER,
+        journal=journal,
+        intent=intent,
+        executor_control_policy=executor,
+        postgres_control_policy=postgres,
+        replay_authority=authority,
+        replay_policy=policy,
+        replay_policy_artifact=artifact,
+    )
+    return paths, signer, intent, executor, postgres, journal, policy, authority
+
+
+def _verified_allocation(
+    intent: AllocationIntentV2, nonce: str
+) -> authorization._VerifiedAllocation:
+    return authorization._VerifiedAllocation(
+        context=_allocation_context(intent),
+        nonce=nonce,
+        authorized_at=_NOW,
+        capability=authorization._ALLOCATION_VERIFIED_CAPABILITY,
+    )
+
+
+def test_v2_allocation_operation_replay_rejects_a_fresh_nonce(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, intent, _, _, journal, _, _ = _provisioned_allocation(tmp_path, monkeypatch)
+    verified = _verified_allocation(intent, "first-allocation-nonce")
+    receipt = _allocation_receipt(intent).model_copy(
+        update={"idempotency_key": verified.context.idempotency_key}
+    )
+
+    journal._claim_verified(verified)
+    journal._begin_effect(verified)
+    journal._commit_effect(verified, receipt)
+
+    assert (
+        journal.operation_state(intent.allocation_operation_id)
+        is AllocationOperationState.ALLOCATED
+    )
+    with pytest.raises(AuthorizationError, match="allocation_operation_replayed"):
+        journal._claim_verified(_verified_allocation(intent, "fresh-allocation-nonce"))
+
+
+def test_v2_allocation_effect_failure_is_terminal_and_never_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, intent, _, _, journal, _, _ = _provisioned_allocation(tmp_path, monkeypatch)
+    verified = _verified_allocation(intent, "failed-allocation-nonce")
+    journal._claim_verified(verified)
+    journal._begin_effect(verified)
+    journal._fail_effect(verified)
+
+    assert (
+        journal.operation_state(intent.allocation_operation_id)
+        is AllocationOperationState.FAILED_RECOVERY_REQUIRED
+    )
+    with pytest.raises(AuthorizationError, match="allocation_operation_replayed"):
+        journal._claim_verified(_verified_allocation(intent, "retry-allocation-nonce"))
+    with pytest.raises(AuthorizationError, match="allocation_operation_state"):
+        journal.require_recovery(intent.allocation_operation_id)
+
+
+def test_v2_materialization_failure_is_terminal_and_never_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, intent, executor, _, journal, _, _ = _provisioned_allocation(tmp_path, monkeypatch)
+    allocation = _verified_allocation(intent, "allocation-nonce")
+    allocation_receipt = _allocation_receipt(intent).model_copy(
+        update={"idempotency_key": allocation.context.idempotency_key}
+    )
+    attestation = _allocation_attestation(intent, allocation_receipt)
+    verified_intent = authorization._VerifiedAllocationIntent(
+        intent=intent,
+        intent_sha256=allocation_intent_sha256(intent),
+        capability=authorization._ALLOCATION_INTENT_CAPABILITY,
+    )
+    journal._claim_verified(allocation)
+    journal._begin_effect(allocation)
+    journal._commit_effect(allocation, allocation_receipt)
+    journal.assert_committed_allocation_stage(verified_intent, allocation_receipt, attestation)
+    materialization, _, _ = _materialization_intent(
+        intent, executor, allocation_receipt, attestation
+    )
+    context = _materialization_context(materialization, attestation)
+    verified = authorization._VerifiedMaterialization(
+        context=context,
+        nonce="failed-materialization-nonce",
+        authorized_at=_NOW,
+        capability=authorization._MATERIALIZATION_VERIFIED_CAPABILITY,
+    )
+    journal._claim_materialization_verified(verified)
+    journal._begin_materialization_effect(verified)
+    journal._fail_materialization_effect(verified)
+
+    assert (
+        journal.materialization_operation_state(materialization.materialization_operation_id)
+        is MaterializationOperationState.FAILED_RECOVERY_REQUIRED
+    )
+    with pytest.raises(AuthorizationError, match="materialization_operation_replayed"):
+        journal._claim_materialization_verified(
+            authorization._VerifiedMaterialization(
+                context=context,
+                nonce="retry-materialization-nonce",
+                authorized_at=_NOW,
+                capability=authorization._MATERIALIZATION_VERIFIED_CAPABILITY,
+            )
+        )
+
+
+def test_v2_external_tombstone_blocks_a_local_operation_row_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, intent, _, _, journal, policy, authority = _provisioned_allocation(tmp_path, monkeypatch)
+    verified = _verified_allocation(intent, "rollback-allocation-nonce")
+    tombstone = authorization._allocation_operation_tombstone(policy, verified)
+    authorization._claim_replay_tombstone(
+        authority, tombstone, phase="allocation_replay_authority_replayed"
+    )
+    journal._claim_verified(verified)
+
+    connection = sqlite3.connect(journal._path)
+    try:
+        connection.execute("DELETE FROM allocation_operation_journal")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(AuthorizationError, match="allocation_replay_authority_replayed"):
+        authorization._claim_replay_tombstone(
+            authority,
+            authorization._allocation_operation_tombstone(
+                policy, _verified_allocation(intent, "rollback-fresh-nonce")
+            ),
+            phase="allocation_replay_authority_replayed",
+        )
+
+
+def test_v2_allocation_genesis_crash_after_tombstone_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(authorization, "_system_utc_clock", lambda: _TEST_CLOCK)
+    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
+        tmp_path
+    )
+    root = tmp_path / "artifacts"
+    root.mkdir(mode=0o700)
+    paths = AuthorizationPaths(root=root)
+    authority = _AtomicReplayAuthority(root=root)
+    original = ArtifactRootLease.write_once
+
+    def fail_intent(lease: ArtifactRootLease, name: str, payload: bytes, *, phase: str) -> None:
+        if name == paths.allocation_intent_name():
+            raise AuthorizationError("simulated_crash")
+        original(lease, name, payload, phase=phase)
+
+    monkeypatch.setattr(ArtifactRootLease, "write_once", fail_intent)
+    with pytest.raises(AuthorizationError, match="simulated_crash"):
+        provision_allocation_journal(
+            paths,
+            signer=signer,
+            expected_disposal_owner=_OWNER,
+            expected_approver_identity=_APPROVER,
+            journal=journal,
+            intent=intent,
+            executor_control_policy=executor,
+            postgres_control_policy=postgres,
+            replay_authority=authority,
+            replay_policy=policy,
+            replay_policy_artifact=artifact,
+        )
+    assert authority.calls == 1
+    assert journal.migration_status() is AllocationJournalStatus.PROVISIONING_INCOMPLETE
+    assert (root / paths.replay_policy_name()).is_file()
+    with pytest.raises(AuthorizationError, match="allocation_journal_replayed"):
+        provision_allocation_journal(
+            paths,
+            signer=signer,
+            expected_disposal_owner=_OWNER,
+            expected_approver_identity=_APPROVER,
+            journal=journal,
+            intent=intent,
+            executor_control_policy=executor,
+            postgres_control_policy=postgres,
+            replay_authority=authority,
+            replay_policy=policy,
+            replay_policy_artifact=artifact,
+        )
+
+
+def test_v2_artifact_root_replacement_and_lock_unlink_block_stability(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir(mode=0o700)
+    with ArtifactRootLease(root) as lease:
+        displaced = tmp_path / "displaced-artifacts"
+        root.rename(displaced)
+        root.mkdir(mode=0o700)
+        with pytest.raises(AuthorizationError, match="artifact_lock_root"):
+            lease.assert_stable()
+
+    shutil.rmtree(root)
+    root.mkdir(mode=0o700)
+    with ArtifactRootLease(root) as lease:
+        assert lease._parent is not None
+        assert lease._lock_name is not None
+        (lease._parent / lease._lock_name).unlink()
+        with pytest.raises(AuthorizationError, match="artifact_lock_file"):
+            lease.assert_stable()
+
+
+def test_v2_artifact_lock_rejects_a_cooperating_thread_without_waiting(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir(mode=0o700)
+    with ArtifactRootLease(root), ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(lambda: ArtifactRootLease(root).__enter__())
+        with pytest.raises(AuthorizationError, match="artifact_lock_busy"):
+            future.result()
+
+
+def test_v2_artifact_lock_rejects_a_competing_process_without_waiting(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir(mode=0o700)
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    contender = context.Process(target=_try_artifact_root_lock, args=(str(root), queue))
+
+    with ArtifactRootLease(root):
+        contender.start()
+        assert queue.get(timeout=10) == "artifact_lock_busy"
+        contender.join(timeout=10)
+    assert contender.exitcode == 0
+
+
+def test_v2_artifact_lock_converges_case_variants_by_opened_root_identity(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifact-root"
+    root.mkdir(mode=0o700)
+    variant = root.with_name(root.name.swapcase())
+    if not variant.exists():
+        pytest.skip("filesystem does not resolve spelling variants to one inode")
+
+    with ArtifactRootLease(root), ThreadPoolExecutor(max_workers=1) as executor:
+        contender = executor.submit(lambda: ArtifactRootLease(variant).__enter__())
+        with pytest.raises(AuthorizationError, match="artifact_lock_busy"):
+            contender.result()
+
+
+def test_v2_provider_snapshot_change_is_not_a_stable_provenance_commitment(tmp_path: Path) -> None:
+    intent, _, _ = _allocation_bundle(tmp_path)
+    fingerprints = {
+        reference.reference_sha256: _hash(reference.account)
+        for reference in intent.provider_references.all()
+    }
+
+    class Lease:
+        changed = False
+
+        def inspect(self, reference: ProviderReferenceV1) -> ProviderProvenance:
+            return ProviderProvenance(
+                provider=reference.provider,
+                service=reference.service,
+                account=reference.account,
+                version=reference.version,
+                reference_sha256=reference.reference_sha256,
+                fingerprint_sha256=fingerprints[reference.reference_sha256],
+            )
+
+        def recheck(self, reference: ProviderReferenceV1) -> ProviderProvenance:
+            fingerprint = fingerprints[reference.reference_sha256]
+            if not self.changed:
+                self.changed = True
+                fingerprint = _hash("changed-provider-fingerprint")
+            return ProviderProvenance(
+                provider=reference.provider,
+                service=reference.service,
+                account=reference.account,
+                version=reference.version,
+                reference_sha256=reference.reference_sha256,
+                fingerprint_sha256=fingerprint,
+            )
+
+    lease = Lease()
+    authorization._provider_commitment(
+        references=intent.provider_references.all(),
+        lease=lease,
+        fingerprints=fingerprints,
+        recheck=False,
+    )
+    with pytest.raises(AuthorizationError, match="provider_provenance"):
+        authorization._provider_commitment(
+            references=intent.provider_references.all(),
+            lease=lease,
+            fingerprints=fingerprints,
+            recheck=True,
+        )
+
+
+def test_v2_sidecar_swap_marker_tamper_and_noncanonical_signature_block() -> None:
+    signer, key = _trusted_signer()
+    artifact_name = "proposal.yaml"
+    artifact = b'{"field":"value"}'
+    signed_content_sha256 = hashlib.sha256(
+        authorization._canonical_signed_content(artifact_name, artifact)
+    ).hexdigest()
+    signature = key.sign(authorization._signature_message(artifact_name, signed_content_sha256))
+    sidecar = DetachedAuthorizationSignatureV1(
+        schema_version="rsd.authorization-signature.v3",
+        algorithm="ed25519",
+        artifact_name=artifact_name,
+        artifact_sha256=hashlib.sha256(artifact).hexdigest(),
+        signed_content_sha256=signed_content_sha256,
+        signer_key_id=signer.key_id,
+        signature_base64=base64.b64encode(signature).decode("ascii"),
+    )
+    assert (
+        authorization._verify_signature(
+            sidecar=sidecar, artifact_name=artifact_name, artifact=artifact, signer=signer
+        )
+        == signature
+    )
+    with pytest.raises(AuthorizationError, match="signature_binding"):
+        authorization._verify_signature(
+            sidecar=sidecar.model_copy(update={"artifact_name": "runtime-contract.yaml"}),
+            artifact_name=artifact_name,
+            artifact=artifact,
+            signer=signer,
+        )
+    alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    alias = bytearray(sidecar.signature_base64.encode("ascii"))
+    index = alphabet.index(alias[-3])
+    alias[-3] = alphabet[(index & 0b110000) | ((index + 1) & 0b001111)]
+    with pytest.raises(AuthorizationError, match="signature_verification"):
+        authorization._verify_signature(
+            sidecar=sidecar.model_copy(update={"signature_base64": alias.decode("ascii")}),
+            artifact_name=artifact_name,
+            artifact=artifact,
+            signer=signer,
+        )
+    marker = type(
+        "MarkedEvidence",
+        (),
+        {
+            "signature": DetachedSignatureV1(
+                algorithm="ed25519-detached-v1",
+                signer_key_id=signer.key_id,
+                signer_public_key_fingerprint_sha256=signer.public_key_fingerprint_sha256,
+                detached_signature_sha256=_hash("tampered-marker"),
+            )
+        },
+    )()
+    with pytest.raises(AuthorizationError, match="signature_marker"):
+        authorization._verify_embedded_marker(signature=signature, model=marker, signer=signer)
+
+
+def test_v2_owner_approval_and_historical_time_block_before_provisioning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
+        tmp_path
+    )
+    root = tmp_path / "artifacts"
+    paths = AuthorizationPaths(root=root)
+    authority = _AtomicReplayAuthority()
+    monkeypatch.setattr(authorization, "_system_utc_clock", lambda: _TEST_CLOCK)
+    with pytest.raises(AuthorizationError, match="allocation_intent_freshness"):
+        provision_allocation_journal(
+            paths,
+            signer=signer,
+            expected_disposal_owner="other-owner@example.test",
+            expected_approver_identity=_APPROVER,
+            journal=journal,
+            intent=intent,
+            executor_control_policy=executor,
+            postgres_control_policy=postgres,
+            replay_authority=authority,
+            replay_policy=policy,
+            replay_policy_artifact=artifact,
+        )
+    assert not root.exists()
+    assert authority.calls == 0
+    with pytest.raises(AuthorizationError, match="allocation_intent_freshness"):
+        provision_allocation_journal(
+            paths,
+            signer=signer,
+            expected_disposal_owner=_OWNER,
+            expected_approver_identity="other-approver@example.test",
+            journal=journal,
+            intent=intent,
+            executor_control_policy=executor,
+            postgres_control_policy=postgres,
+            replay_authority=authority,
+            replay_policy=policy,
+            replay_policy_artifact=artifact,
+        )
+    assert not root.exists()
+    assert authority.calls == 0
+    monkeypatch.setattr(
+        authorization, "_system_utc_clock", lambda: datetime(2030, 1, 1, tzinfo=UTC)
+    )
+    with pytest.raises(AuthorizationError, match="allocation_intent_freshness"):
+        provision_allocation_journal(
+            paths,
+            signer=signer,
+            expected_disposal_owner=_OWNER,
+            expected_approver_identity=_APPROVER,
+            journal=journal,
+            intent=intent,
+            executor_control_policy=executor,
+            postgres_control_policy=postgres,
+            replay_authority=authority,
+            replay_policy=policy,
+            replay_policy_artifact=artifact,
+        )
+    assert not root.exists()
+    assert authority.calls == 0
+
+
+def test_v2_missing_replay_authority_and_policy_substitution_block_before_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
+        tmp_path
+    )
+    root = tmp_path / "artifacts"
+    paths = AuthorizationPaths(root=root)
+    monkeypatch.setattr(authorization, "_system_utc_clock", lambda: _TEST_CLOCK)
+
+    with pytest.raises(AuthorizationError, match="replay_authority_failure"):
+        provision_allocation_journal(
+            paths,
+            signer=signer,
+            expected_disposal_owner=_OWNER,
+            expected_approver_identity=_APPROVER,
+            journal=journal,
+            intent=intent,
+            executor_control_policy=executor,
+            postgres_control_policy=postgres,
+            replay_authority=cast(Any, object()),
+            replay_policy=policy,
+            replay_policy_artifact=artifact,
+        )
+    assert not root.exists()
+
+    root.mkdir(mode=0o700)
+    (root / paths.replay_policy_name()).write_bytes(b"substituted-policy")
+    (root / paths.replay_policy_name()).chmod(0o600)
+    authority = _AtomicReplayAuthority()
+    with pytest.raises(AuthorizationError, match="replay_policy_artifact"):
+        provision_allocation_journal(
+            paths,
+            signer=signer,
+            expected_disposal_owner=_OWNER,
+            expected_approver_identity=_APPROVER,
+            journal=journal,
+            intent=intent,
+            executor_control_policy=executor,
+            postgres_control_policy=postgres,
+            replay_authority=authority,
+            replay_policy=policy,
+            replay_policy_artifact=artifact,
+        )
+    assert authority.calls == 0
+
+
+def test_v2_keychain_replay_authority_is_create_only_and_stores_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, intent, _, _, _, policy, _ = _signed_allocation_bundle(tmp_path)
+    verified = authorization._VerifiedAllocationIntent(
+        intent=intent,
+        intent_sha256=allocation_intent_sha256(intent),
+        capability=authorization._ALLOCATION_INTENT_CAPABILITY,
+    )
+    tombstone = authorization._allocation_genesis_tombstone(policy, verified)
+
+    class Store:
+        def __init__(self) -> None:
+            self.records: dict[tuple[str, str], bytes] = {}
+
+        def add_if_absent(self, service: str, account: str, value: bytes) -> bytes | None:
+            assert len(value) == 64
+            assert all(character in b"0123456789abcdef" for character in value)
+            key = (service, account)
+            existing = self.records.get(key)
+            if existing is None:
+                self.records[key] = value
+            return existing
+
+    store = Store()
+    authority = MacOSKeychainReplayAuthority(policy, _store=store)
+    assert authority.claim_once(tombstone) is ReplayAuthorityClaimResult.CREATED
+    assert authority.claim_once(tombstone) is ReplayAuthorityClaimResult.DUPLICATE_SAME
+    conflicting = tombstone.model_copy(
+        update={"journal_genesis_id": "123e4567-e89b-42d3-a456-426614174099"}
+    )
+    assert authority.claim_once(conflicting) is ReplayAuthorityClaimResult.DUPLICATE_CONFLICT
+    assert store.records == {(tombstone.service, tombstone.account): tombstone.value_bytes()}
+
+
+def test_v2_replay_authority_errors_are_redacted_and_block_the_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, intent, _, _, _, policy, _ = _signed_allocation_bundle(tmp_path)
+    verified = authorization._VerifiedAllocationIntent(
+        intent=intent,
+        intent_sha256=allocation_intent_sha256(intent),
+        capability=authorization._ALLOCATION_INTENT_CAPABILITY,
+    )
+
+    class FailingAuthority:
+        def claim_once(self, tombstone: ReplayTombstoneV1) -> ReplayAuthorityClaimResult:
+            del tombstone
+            raise RuntimeError("provider-secret-value-must-not-escape")
+
+    with pytest.raises(AuthorizationError, match="replay_authority_failure") as caught:
+        authorization._claim_replay_tombstone(
+            FailingAuthority(),
+            authorization._allocation_genesis_tombstone(policy, verified),
+            phase="allocation_journal_replayed",
+        )
+    assert "provider-secret-value-must-not-escape" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_v2_forged_allocation_grant_cannot_reach_the_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, intent, _, _, journal, _, _ = _provisioned_allocation(tmp_path, monkeypatch)
+    verified = _verified_allocation(intent, "forged-allocation-nonce")
+    forged = authorization._VerifiedAllocation(
+        context=verified.context,
+        nonce=verified.nonce,
+        authorized_at=verified.authorized_at,
+        capability=object(),
+    )
+
+    with pytest.raises(AuthorizationError, match="allocation_journal"):
+        journal._claim_verified(forged)
+    assert journal.operation_state(intent.allocation_operation_id) is None
+
+
+def test_v2_recovery_cannot_race_a_live_allocation_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, intent, _, _, journal, _, _ = _provisioned_allocation(tmp_path, monkeypatch)
+    verified = _verified_allocation(intent, "live-allocation-nonce")
+    journal._claim_verified(verified)
+    context = multiprocessing.get_context("spawn")
+    acquired = context.Event()
+    release = context.Event()
+    process = context.Process(
+        target=_hold_allocation_operation_lease,
+        args=(str(journal._path), intent.allocation_operation_id, acquired, release),
+    )
+    process.start()
+    try:
+        assert acquired.wait(timeout=10)
+        with pytest.raises(AuthorizationError, match="operation_live"):
+            journal.require_recovery(intent.allocation_operation_id)
+    finally:
+        release.set()
+        process.join(timeout=10)
+    assert process.exitcode == 0
+    assert journal.require_recovery(intent.allocation_operation_id) is (
+        AllocationOperationState.FAILED_RECOVERY_REQUIRED
+    )
+
+
+def test_v2_pinned_allocation_journal_identity_blocks_anchor_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, _, _, _, journal, _, _ = _provisioned_allocation(tmp_path, monkeypatch)
+    pin = journal._pin_execution_identity()
+    anchor = journal._anchor_path()
+    displaced = anchor.with_name(f"{anchor.name}.displaced")
+    anchor.rename(displaced)
+    anchor.write_bytes(displaced.read_bytes())
+    anchor.chmod(0o600)
+
+    with pytest.raises(AuthorizationError, match="allocation_journal_identity_pinned"):
+        journal._assert_pinned_execution_identity(pin)
+
+
+@pytest.mark.parametrize(
+    "profile",
+    (
+        DisposableTransportProfile.TLS_VERIFIED,
+        "tls_verified_v1",
+        _TLSProfileAlias("tls_verified_v1"),
+    ),
+)
+def test_v2_tls_type_drift_blocks_provisioning_before_root_or_tombstone(
+    profile: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
+        tmp_path
+    )
+    drift = intent.model_construct(
+        **{
+            **intent.model_dump(mode="python"),
+            "plan": intent.plan.model_construct(
+                **{
+                    **intent.plan.model_dump(mode="python"),
+                    "transport": intent.plan.transport.model_construct(
+                        **{
+                            **intent.plan.transport.model_dump(mode="python"),
+                            "profile": profile,
+                        }
+                    ),
+                }
+            ),
+        }
+    )
+    root = tmp_path / "absent-artifacts"
+    authority = _AtomicReplayAuthority()
+    monkeypatch.setattr(authorization, "_system_utc_clock", lambda: _TEST_CLOCK)
+    with pytest.raises(AuthorizationError, match="allocation_intent_artifact"):
+        provision_allocation_journal(
+            AuthorizationPaths(root=root),
+            signer=signer,
+            expected_disposal_owner=_OWNER,
+            expected_approver_identity=_APPROVER,
+            journal=journal,
+            intent=drift,
+            executor_control_policy=executor,
+            postgres_control_policy=postgres,
+            replay_authority=authority,
+            replay_policy=policy,
+            replay_policy_artifact=artifact,
+        )
+    assert not root.exists()
+    assert authority.calls == 0

@@ -60,6 +60,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
 
 _SHA256: Final = r"^[0-9a-f]{64}$"
 _IDENTIFIER: Final = r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$"
+_OWNER_IDENTITY: Final = r"^[A-Za-z0-9][A-Za-z0-9@._+-]{0,254}$"
 _UUID: Final = (
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-"
     r"[0-9a-f]{12}$"
@@ -316,8 +317,8 @@ class ProviderMaterialPolicyV1(_Model):
 
     schema_version: Literal["rsd.provider-crypto.material-policy.v1"]
     allocation_intent_sha256: str = Field(pattern=_SHA256)
-    disposal_owner: str = Field(pattern=_IDENTIFIER)
-    approver_identity: str = Field(pattern=_IDENTIFIER)
+    disposal_owner: str = Field(pattern=_OWNER_IDENTITY)
+    approver_identity: str = Field(pattern=_OWNER_IDENTITY)
     policy_id: str = Field(pattern=_UUID)
     signer_keychain_reference: KeychainItemReferenceV1
     signer_seed_fingerprint_sha256: str = Field(pattern=_SHA256)
