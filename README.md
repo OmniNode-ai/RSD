@@ -95,14 +95,61 @@ library.
 
 ## Phase-B authorization
 
-`omninode_rsd.lifecycle.authorize_and_execute()` is the single
+Phase-B has two non-interchangeable authorization stages. Phase-A remains a
+compiler only and never authorizes either stage.
+
+1. `InitialProvisioningIntentV1` is a signed pre-creation contract. It
+   contains planned stable names, host authority, database/schema/role intent,
+   immutable images, provider references, native transport policy, retention,
+   owner/approver, and governed evidence hashes. It deliberately has no
+   database OID, container ID, network ID, workload ID, volume ID, or runtime
+   fingerprint. `provision_initial_journal()` explicitly creates its separate
+   durable journal and external genesis tombstone. No authorization path
+   creates or recreates that journal implicitly.
+2. `authorize_initial_provisioning_and_execute()` accepts only the typed
+   `create_isolated_empty_resources_v1` scope. Its callback receives an
+   immutable `InitialProvisioningExecutionContext` containing the planned
+   intent and provider expectations, not an observed proposal or a journal.
+   The only accepted callback result is an
+   `InitialProvisioningEffectReceiptV1` with newly observed resource IDs.
+   Seed, backup, restore, reset, swap, and data-access operations are outside
+   that scope.
+3. A trusted signer must then issue `ObservedCandidateAttestationV1`. It binds
+   the exact intent hash and creation-receipt hash to the actual PostgreSQL
+   OID and service/network/workload/volume/container IDs. The existing
+   `ProposalV1` and `RuntimeContractV1` are post-observation contracts: their
+   actual identities, planned fields, and evidence must exactly match the
+   attestation before `authorize_and_execute()` can admit an observed
+   lifecycle effect.
+
+Both stages have distinct Ed25519 signature domains, SQLite operation kinds,
+journal state machines, idempotency domains, and external replay-tombstone
+kinds. A receipt from either stage is audit data, never a bearer grant.
+`InitialProvisioningJournalStatus` exposes only read-only diagnostics. An
+interrupted initial genesis remains blocked until a signed
+`InitialJournalGenesisReconciliationReceiptV1` either confirms the already
+durable database-and-anchor pair or records an abandonment; reconciliation
+never retries creation or clears the external tombstone.
+
+`DisposableTransportProfile` is the canonical public transport enum:
+`tls_verified_v1` and `unpublished_loopback_or_network_v1`. Planning inputs
+must map to these exact native values before constructing the public contract:
+
+| Planning profile | Native public value |
+| --- | --- |
+| verified TLS listener | `tls_verified_v1` |
+| unpublished loopback or isolated-network listener | `unpublished_loopback_or_network_v1` |
+
+Legacy spellings are not accepted.
+
+`omninode_rsd.lifecycle.authorize_and_execute()` is the observed-lifecycle
 mutation-admission boundary for a disposable acceptance workflow. It accepts
 an injected Ed25519 trust anchor, leased provider-provenance adapter, provider
-fingerprint policy, owner-only `SQLiteAuthorizationJournal`, mandatory
-`ProtocolReplayAuthority` plus typed `ReplayAuthorityPolicyV1`, and one effect
-callback. It requires actual detached-signature sidecars for the proposal,
-final contract, and evidence artifacts; Phase-A signature markers alone never
-authorize.
+fingerprint policy, owner-only `SQLiteAuthorizationJournal` and
+`SQLiteInitialProvisioningJournal`, mandatory `ProtocolReplayAuthority` plus
+typed `ReplayAuthorityPolicyV1`, and one effect callback. It requires actual
+detached-signature sidecars for the proposal, final contract, and evidence
+artifacts; Phase-A signature markers alone never authorize.
 
 The verifier uses its trusted UTC clock rather than a caller-provided time. It
 reads bounded owner-only artifact files through one open root-directory
@@ -117,14 +164,14 @@ replacement, rename, or lock replacement is checked before and after each
 boundary. Lock acquisition is bounded: a concurrent writer receives a typed
 busy error and a recursive lease receives a typed reentrant error.
 
-The callback receives only immutable `VerifiedExecutionContext`: parsed
+The observed callback receives only immutable `VerifiedExecutionContext`: parsed
 proposal/final-contract models, exact provider expectations, and a derived
 idempotency key. It receives no artifact path, nonce, or journal handle. It
 must return an `EffectReceiptV1` bound to that operation and idempotency key.
-Before any effect can be admitted, a separate caller must explicitly invoke
-`provision_journal()` once with a trusted Ed25519-signed
-`JournalGenesisReceiptV1`. That receipt commits to the operation/proposal/final
-hashes, expected owner and approver, canonical journal path, fresh journal ID,
+Before any observed effect can be admitted, a separate caller must explicitly
+complete the initial stage above and invoke `provision_journal()` once with a
+trusted Ed25519-signed `JournalGenesisReceiptV1`. That receipt commits to the
+operation/proposal/final hashes, expected owner and approver, canonical journal path, fresh journal ID,
 and journal schema digest, including the exact replay-policy digest.
 Provisioning writes an owner-only pending marker before it claims a
 create-once external genesis tombstone and creates the database. The
@@ -150,7 +197,13 @@ tombstone is the governed external record that survives local file rollback;
 deleting it is an explicit out-of-band governed destructive action, never an
 authorization recovery step.
 
-The SQLite journal requires an owner-only directory and database file, uses
+Tombstone accounts are derived from the typed replay policy, stage-specific
+operation kind, and operation ID rather than a mutable local journal path. The
+stored binding separately commits the journal identity and every applicable
+intent, proposal, contract, provider, and idempotency hash. Moving local files
+therefore cannot make a logical operation claimable again.
+
+The observed SQLite journal requires an owner-only directory and database file, uses
 `BEGIN IMMEDIATE`, `DELETE` journaling, and `FULL` synchronous durability. A
 one-time, `O_EXCL` anchor in that directory binds a random journal ID, canonical
 path digest, schema digests, and database device/inode/link-count to matching

@@ -9,6 +9,7 @@ import multiprocessing
 import os
 import shutil
 import sqlite3
+import time
 import traceback
 import uuid
 from collections.abc import Callable, Mapping
@@ -29,6 +30,10 @@ from omninode_rsd.lifecycle.authorization import (
     AuthorizationPaths,
     EffectReceiptV1,
     ExecutionReceiptV1,
+    InitialJournalGenesisReconciliationReceiptV1,
+    InitialProvisioningExecutionContext,
+    InitialProvisioningJournalStatus,
+    InitialProvisioningOperationState,
     JournalGenesisReceiptV1,
     JournalGenesisReconciliationReceiptV1,
     JournalMigrationStatus,
@@ -39,16 +44,25 @@ from omninode_rsd.lifecycle.authorization import (
     ReplayAuthorityPolicyV1,
     ReplayTombstoneV1,
     SQLiteAuthorizationJournal,
+    SQLiteInitialProvisioningJournal,
     TrustedEd25519SignerV1,
     VerifiedExecutionContext,
     _authorize_and_execute_for_test,
+    _authorize_initial_provisioning_and_execute_for_test,
     _canonical_signed_content,
+    _initial_intent_message,
+    _initial_journal_genesis_reconciliation_message,
     _journal_genesis_message,
     _journal_genesis_reconciliation_message,
+    _observed_candidate_attestation_message,
+    _provision_initial_journal_for_test,
     _provision_journal_for_test,
     _signature_message,
     authorize_and_execute,
+    authorize_initial_provisioning_and_execute,
+    provision_initial_journal,
     provision_journal,
+    reconcile_initial_journal_genesis,
     reconcile_journal_genesis,
 )
 from omninode_rsd.lifecycle.authorization import (
@@ -64,6 +78,17 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     GovernedBaselineV1,
     GovernedIdentityV1,
     ImageReferenceV1,
+    InitialPostgreSQLPlanV1,
+    InitialProvisioningEffectReceiptV1,
+    InitialProvisioningEvidenceBindingsV1,
+    InitialProvisioningIntentV1,
+    InitialProvisioningPlanV1,
+    InitialServicePlanV1,
+    InitialValkeyPlanV1,
+    ObservedCandidateAttestationV1,
+    ObservedResourceSetV1,
+    ObservedServiceResourcesV1,
+    ObservedValkeyResourcesV1,
     PostgreSQLAcceptanceOverlayV1,
     PostgreSQLContractV1,
     PreflightPaths,
@@ -82,8 +107,11 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     ValkeyIdentityV1,
     canonical_sha256,
     compile_preflight,
+    initial_provisioning_effect_receipt_sha256,
+    initial_provisioning_intent_sha256,
     main,
     proposal_sha256,
+    validate_observed_candidate_transition,
 )
 
 _NOW = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
@@ -152,13 +180,23 @@ class _FilesystemAtomicReplayAuthority:
         try:
             descriptor = os.open(path, flags, 0o600)
         except FileExistsError:
-            return (
-                ReplayAuthorityClaimResult.DUPLICATE_SAME
-                if path.read_bytes() == value
-                else ReplayAuthorityClaimResult.DUPLICATE_CONFLICT
-            )
+            deadline = time.monotonic() + 1.0
+            while True:
+                existing = path.read_bytes()
+                if len(existing) == len(value) or time.monotonic() >= deadline:
+                    return (
+                        ReplayAuthorityClaimResult.DUPLICATE_SAME
+                        if existing == value
+                        else ReplayAuthorityClaimResult.DUPLICATE_CONFLICT
+                    )
+                time.sleep(0.001)
         try:
-            os.write(descriptor, value)
+            remaining = memoryview(value)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    return ReplayAuthorityClaimResult.UNAVAILABLE
+                remaining = remaining[written:]
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
@@ -173,7 +211,8 @@ def _process_replay_authority_worker(root: str, queue: _StringQueue) -> None:
     )
     tombstone = ReplayTombstoneV1(
         schema_version="rsd.replay-tombstone.v1",
-        kind="operation",
+        kind="observed_operation",
+        operation_kind="observed_lifecycle_v1",
         service=policy.service,
         account=f"{policy.account_prefix}.o.process-claim",
         journal_genesis_id="00000000-0000-4000-8000-000000000001",
@@ -247,9 +286,11 @@ def _service(
         machine_id=f"machine-{number}",
         compose_project=project,
         service_name="infisical",
-        network_id=network,
+        network_name=network,
+        network_id=_digest(f"network:{network}".encode()),
         container_id=container_char * 64,
-        workload_id=f"workload-{number}",
+        workload_name=f"workload-{number}",
+        workload_id=_digest(f"workload:{number}".encode()),
         image=_IMAGE,
         listener_binding="isolated_network_only" if restore else "tls_lan",
         host_listener_port=None if restore else 443,
@@ -263,10 +304,13 @@ def _cache(
     return ValkeyIdentityV1(
         compose_project=project,
         service_name="valkey",
-        network_id=network,
-        volume_id=volume,
+        network_name=network,
+        network_id=_digest(f"network:{network}".encode()),
+        volume_name=volume,
+        volume_id=_digest(f"volume:{volume}".encode()),
         container_id=char * 64,
-        workload_id=f"workload-{namespace}",
+        workload_name=f"workload-{namespace}",
+        workload_id=_digest(f"workload:{namespace}".encode()),
         logical_namespace=namespace,
         credential_reference_sha256=reference,
         image=_CACHE_IMAGE,
@@ -288,7 +332,9 @@ def _proposal() -> ProposalV1:
             system_identifier="12345678",
             database_name="rsdacceptance",
             database_oid=101,
+            schema_name="rsdschema",
             owner_role="rsdowner",
+            role_names=("rsdowner", "rsdreader"),
             schema_fingerprint_sha256=_HASH,
             membership_fingerprint_sha256=_HASH,
             database_acl_sha256=_HASH,
@@ -332,6 +378,29 @@ def _proposal() -> ProposalV1:
         retention_expires_at="2030-01-01T00:00:00Z",
         disposal_owner="acceptance-owner",
         approval_reference_sha256="5" * 64,
+        initial_provisioning_evidence=InitialProvisioningEvidenceBindingsV1(
+            approval_sha256="0" * 64,
+            governed_deny_sha256="1" * 64,
+            governed_baseline_sha256="2" * 64,
+            collision_evidence_sha256="3" * 64,
+            registry_verification_sha256="4" * 64,
+            provider_declaration_sha256="5" * 64,
+        ),
+    )
+
+
+def _runtime_contract(proposal: ProposalV1) -> RuntimeContractV1:
+    return RuntimeContractV1(
+        **proposal.model_dump(mode="python"),
+        proposal_sha256=proposal_sha256(proposal),
+        evidence=EvidenceBindingsV1(
+            approval_sha256="0" * 64,
+            governed_baseline_sha256="1" * 64,
+            target_attestation_sha256="2" * 64,
+            provider_declaration_sha256="3" * 64,
+            registry_verification_sha256="4" * 64,
+            postgres_overlay_sha256="5" * 64,
+        ),
     )
 
 
@@ -600,7 +669,7 @@ def test_unpublished_network_transport_rejects_external_address_and_dns() -> Non
                 authority=authority,
                 authority_sha256=_digest(authority.encode()),
                 listener_binding="isolated_network_only",
-                isolated_network_id="isolated-network",
+                isolated_network_name="isolated-network",
                 isolated_network_alias="internal-service",
             )
 
@@ -632,7 +701,7 @@ def test_proposal_accepts_candidate_bound_internal_network_transport() -> None:
         authority=authority,
         authority_sha256=_digest(authority.encode()),
         listener_binding="isolated_network_only",
-        isolated_network_id="primary-network",
+        isolated_network_name="primary-network",
         isolated_network_alias="primary-internal",
     )
 
@@ -703,7 +772,7 @@ def test_transport_rejects_cleartext_published_lan() -> None:
             authority_sha256=_digest(authority.encode()),
             listener_binding="isolated_network_only",
             host_listener_port=8080,
-            isolated_network_id="isolated-network",
+            isolated_network_name="isolated-network",
         )
 
 
@@ -908,6 +977,278 @@ def _journal(tmp_path: Path) -> SQLiteAuthorizationJournal:
     return SQLiteAuthorizationJournal(root / "authorization.sqlite3")
 
 
+def _initial_journal(tmp_path: Path, paths: AuthorizationPaths) -> SQLiteInitialProvisioningJournal:
+    root = tmp_path / f"initial-journal-{_digest(os.fsencode(str(paths.root)))}"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root.chmod(0o700)
+    return SQLiteInitialProvisioningJournal(root / "initial-provisioning.sqlite3")
+
+
+def _planned_service(service: ServiceIdentityV1) -> InitialServicePlanV1:
+    return InitialServicePlanV1(
+        authority=service.authority,
+        authority_sha256=service.authority_sha256,
+        machine_id=service.machine_id,
+        compose_project=service.compose_project,
+        service_name=service.service_name,
+        network_name=service.network_name,
+        workload_name=service.workload_name,
+        image=service.image,
+        listener_binding=service.listener_binding,
+        host_listener_port=service.host_listener_port,
+        isolated_network_alias=service.isolated_network_alias,
+    )
+
+
+def _planned_postgres(postgres: PostgreSQLContractV1) -> InitialPostgreSQLPlanV1:
+    return InitialPostgreSQLPlanV1(
+        authority=postgres.authority,
+        database_name=postgres.database_name,
+        schema_name=postgres.schema_name,
+        owner_role=postgres.owner_role,
+        role_names=postgres.role_names,
+        stage_database_prefix=postgres.stage_database_prefix,
+        restore_database_prefix=postgres.restore_database_prefix,
+    )
+
+
+def _planned_valkey(cache: ValkeyIdentityV1) -> InitialValkeyPlanV1:
+    return InitialValkeyPlanV1(
+        compose_project=cache.compose_project,
+        service_name=cache.service_name,
+        network_name=cache.network_name,
+        volume_name=cache.volume_name,
+        workload_name=cache.workload_name,
+        logical_namespace=cache.logical_namespace,
+        credential_reference_sha256=cache.credential_reference_sha256,
+        image=cache.image,
+    )
+
+
+def _initial_intent(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    journal: SQLiteInitialProvisioningJournal,
+) -> InitialProvisioningIntentV1:
+    proposal = _proposal()
+    candidate = proposal.candidate
+    unsigned = InitialProvisioningIntentV1(
+        schema_version="rsd.initial-provisioning-intent.v1",
+        operation_kind="initial_provisioning_v1",
+        operation_scope="create_isolated_empty_resources_v1",
+        provisioning_operation_id="123e4567-e89b-42d3-a456-426614174001",
+        source_commit=proposal.source_commit,
+        plan=InitialProvisioningPlanV1(
+            transport=proposal.transport,
+            primary_service=_planned_service(candidate.primary_service),
+            restore_service=_planned_service(candidate.restore_service),
+            postgres=_planned_postgres(candidate.postgres),
+            primary_valkey=_planned_valkey(candidate.primary_valkey),
+            restore_valkey=_planned_valkey(candidate.restore_valkey),
+        ),
+        provider_references=proposal.provider_references,
+        evidence=proposal.initial_provisioning_evidence,
+        retention_expires_at=proposal.retention_expires_at,
+        disposal_owner=proposal.disposal_owner,
+        approver_identity="approval-owner",
+        approval_reference_sha256=proposal.approval_reference_sha256,
+        journal_path=str(journal._path),
+        journal_path_sha256=journal._path_sha256(),
+        journal_uuid="123e4567-e89b-42d3-a456-426614174002",
+        journal_schema_sha256=journal.journal_schema_sha256(),
+        replay_policy_sha256=_TEST_REPLAY_POLICY.sha256(),
+        created_at=_NOW.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        signer_key_id=signer.key_id,
+        signature_base64=base64.b64encode(b"0" * 64).decode(),
+    )
+    key = _TEST_SIGNING_KEYS[signer.public_key_fingerprint_sha256]
+    return unsigned.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                key.sign(_initial_intent_message(unsigned))
+            ).decode()
+        }
+    )
+
+
+def _observed_service_resources(service: ServiceIdentityV1) -> ObservedServiceResourcesV1:
+    return ObservedServiceResourcesV1(
+        network_name=service.network_name,
+        network_id=service.network_id,
+        container_id=service.container_id,
+        workload_name=service.workload_name,
+        workload_id=service.workload_id,
+    )
+
+
+def _observed_valkey_resources(cache: ValkeyIdentityV1) -> ObservedValkeyResourcesV1:
+    return ObservedValkeyResourcesV1(
+        **_observed_service_resources(cache).model_dump(mode="python"),
+        volume_name=cache.volume_name,
+        volume_id=cache.volume_id,
+    )
+
+
+def _observed_resources(proposal: ProposalV1) -> ObservedResourceSetV1:
+    candidate = proposal.candidate
+    return ObservedResourceSetV1(
+        postgres_system_identifier=candidate.postgres.system_identifier,
+        postgres_database_oid=candidate.postgres.database_oid,
+        primary_service=_observed_service_resources(candidate.primary_service),
+        restore_service=_observed_service_resources(candidate.restore_service),
+        primary_valkey=_observed_valkey_resources(candidate.primary_valkey),
+        restore_valkey=_observed_valkey_resources(candidate.restore_valkey),
+    )
+
+
+def _initial_effect(
+    context: InitialProvisioningExecutionContext,
+) -> InitialProvisioningEffectReceiptV1:
+    return InitialProvisioningEffectReceiptV1(
+        schema_version="rsd.initial-provisioning-effect-receipt.v1",
+        operation_kind="initial_provisioning_v1",
+        operation_scope="create_isolated_empty_resources_v1",
+        status="created_isolated_empty_resources",
+        provisioning_operation_id=context.provisioning_operation_id,
+        intent_sha256=context.intent_sha256,
+        journal_uuid=context.intent.journal_uuid,
+        idempotency_key=context.idempotency_key,
+        observed_resources=_observed_resources(_proposal()),
+        effect_receipt_sha256="e" * 64,
+        completed_at=_NOW.isoformat(timespec="seconds").replace("+00:00", "Z"),
+    )
+
+
+def _observed_attestation(
+    intent: InitialProvisioningIntentV1,
+    receipt: InitialProvisioningEffectReceiptV1,
+    *,
+    signer: TrustedEd25519SignerV1,
+    proposal: ProposalV1 | None = None,
+) -> ObservedCandidateAttestationV1:
+    proposal = _proposal() if proposal is None else proposal
+    unsigned = ObservedCandidateAttestationV1(
+        schema_version="rsd.observed-candidate-attestation.v1",
+        operation_kind="observed_lifecycle_v1",
+        provisioning_operation_id=intent.provisioning_operation_id,
+        observed_operation_id=proposal.operation_id,
+        initial_provisioning_intent_sha256=initial_provisioning_intent_sha256(intent),
+        provisioning_effect_receipt_sha256=initial_provisioning_effect_receipt_sha256(receipt),
+        proposal_sha256=proposal_sha256(proposal),
+        candidate=proposal.candidate,
+        candidate_composite_sha256=canonical_sha256(proposal.candidate),
+        observed_resources=receipt.observed_resources,
+        observed_at=_NOW.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        signer_key_id=signer.key_id,
+        signature_base64=base64.b64encode(b"0" * 64).decode(),
+    )
+    key = _TEST_SIGNING_KEYS[signer.public_key_fingerprint_sha256]
+    return unsigned.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                key.sign(_observed_candidate_attestation_message(unsigned))
+            ).decode()
+        }
+    )
+
+
+def _resign_initial_intent(
+    intent: InitialProvisioningIntentV1,
+    *,
+    signer: TrustedEd25519SignerV1,
+    updates: Mapping[str, object],
+) -> InitialProvisioningIntentV1:
+    raw = intent.model_dump(mode="python")
+    raw.update(updates)
+    raw["signature_base64"] = base64.b64encode(b"0" * 64).decode()
+    unsigned = InitialProvisioningIntentV1.model_validate(raw)
+    key = _TEST_SIGNING_KEYS[signer.public_key_fingerprint_sha256]
+    return unsigned.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                key.sign(_initial_intent_message(unsigned))
+            ).decode()
+        }
+    )
+
+
+def _initial_genesis_reconciliation(
+    intent: InitialProvisioningIntentV1,
+    *,
+    signer: TrustedEd25519SignerV1,
+    outcome: Literal["provisioning_completed", "provisioning_abandoned"],
+) -> InitialJournalGenesisReconciliationReceiptV1:
+    unsigned = InitialJournalGenesisReconciliationReceiptV1(
+        schema_version="rsd.initial-provisioning-journal-genesis-reconciliation.v1",
+        outcome=outcome,
+        journal_uuid=intent.journal_uuid,
+        journal_path_sha256=intent.journal_path_sha256,
+        intent_sha256=initial_provisioning_intent_sha256(intent),
+        created_at=_NOW.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        signer_key_id=signer.key_id,
+        signature_base64=base64.b64encode(b"0" * 64).decode(),
+    )
+    key = _TEST_SIGNING_KEYS[signer.public_key_fingerprint_sha256]
+    return unsigned.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                key.sign(_initial_journal_genesis_reconciliation_message(unsigned))
+            ).decode()
+        }
+    )
+
+
+def _ensure_test_initial_stage(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    provider: _Provider,
+    provider_fingerprints: Mapping[str, str],
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteInitialProvisioningJournal,
+    replay_authority: ProtocolReplayAuthority,
+) -> None:
+    with _TEST_PROVISION_LOCK:
+        if journal.migration_status() is InitialProvisioningJournalStatus.ABSENT:
+            intent = _initial_intent(paths, signer=signer, journal=journal)
+            _provision_initial_journal_for_test(
+                paths,
+                signer=signer,
+                expected_disposal_owner=expected_disposal_owner,
+                expected_approver_identity=expected_approver_identity,
+                journal=journal,
+                intent=intent,
+                replay_authority=replay_authority,
+                replay_policy=_TEST_REPLAY_POLICY,
+                _clock=lambda: _NOW,
+                _capability=_TEST_CLOCK_CAPABILITY,
+            )
+            _authorize_initial_provisioning_and_execute_for_test(
+                paths,
+                signer=signer,
+                provider=provider,
+                provider_fingerprints=provider_fingerprints,
+                expected_disposal_owner=expected_disposal_owner,
+                expected_approver_identity=expected_approver_identity,
+                journal=journal,
+                effect=_initial_effect,
+                replay_authority=replay_authority,
+                replay_policy=_TEST_REPLAY_POLICY,
+                _clock=lambda: _NOW,
+                _capability=_TEST_CLOCK_CAPABILITY,
+            )
+            # Read the committed immutable receipt rather than trusting the helper object.
+            raw = (paths.root / paths.initial_receipt_name()).read_bytes()
+            stored = InitialProvisioningEffectReceiptV1.model_validate(yaml.safe_load(raw))
+            _write(
+                paths.root,
+                paths.observed_attestation_name(),
+                _observed_attestation(intent, stored, signer=signer),
+            )
+
+
 def _root_lock_path(root: Path) -> Path:
     canonical = root.resolve(strict=True)
     parent_details = os.lstat(canonical.parent)
@@ -923,6 +1264,7 @@ def _effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
     assert not hasattr(context, "root")
     return EffectReceiptV1(
         schema_version="rsd.lifecycle-effect-receipt.v1",
+        operation_kind="observed_lifecycle_v1",
         operation_id=context.operation_id,
         idempotency_key=context.idempotency_key,
         effect_receipt_sha256="f" * 64,
@@ -942,7 +1284,8 @@ def _journal_genesis_receipt(
     compiled = compile_preflight(paths.preflight(), now=created)
     unsigned = JournalGenesisReceiptV1(
         schema_version="rsd.authorization-journal-genesis.v1",
-        operation_domain="rsd.disposable-acceptance-operation.v1",
+        operation_domain="rsd.observed-lifecycle-operation.v1",
+        operation_kind="observed_lifecycle_v1",
         operation_id=compiled.operation_id,
         proposal_sha256=compiled.proposal_sha256,
         contract_sha256=compiled.contract_sha256,
@@ -1046,6 +1389,7 @@ def _execute_for_test(
     replay_authority: ProtocolReplayAuthority | None = None,
 ) -> ExecutionReceiptV1:
     authority = _test_replay_authority(journal) if replay_authority is None else replay_authority
+    initial_journal = _initial_journal(paths.root.parent, paths)
     if provision:
         _ensure_test_journal_provisioned(
             paths,
@@ -1053,6 +1397,17 @@ def _execute_for_test(
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
             journal=journal,
+            replay_authority=authority,
+        )
+    if journal.migration_status() is JournalMigrationStatus.CURRENT:
+        _ensure_test_initial_stage(
+            paths,
+            signer=signer,
+            provider=provider,
+            provider_fingerprints=provider_fingerprints,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            journal=initial_journal,
             replay_authority=authority,
         )
     return _authorize_and_execute_for_test(
@@ -1063,6 +1418,7 @@ def _execute_for_test(
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
         journal=journal,
+        initial_journal=initial_journal,
         effect=effect,
         replay_authority=authority,
         replay_policy=_TEST_REPLAY_POLICY,
@@ -1091,13 +1447,313 @@ def test_phase_b_executes_only_after_durable_claim(tmp_path: Path) -> None:
     assert "nonce" not in receipt.model_dump()
 
 
+def test_initial_intent_is_name_only_and_transport_accepts_no_legacy_alias(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    signer, _, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    intent = _initial_intent(paths, signer=signer, journal=_initial_journal(tmp_path, paths))
+
+    assert "database_oid" not in intent.plan.postgres.model_dump()
+    assert "container_id" not in intent.plan.primary_service.model_dump()
+    assert "volume_id" not in intent.plan.primary_valkey.model_dump()
+
+    for section, field, value in (
+        ("postgres", "database_oid", 101),
+        ("primary_service", "container_id", "a" * 64),
+        ("primary_valkey", "volume_id", "b" * 64),
+    ):
+        raw = intent.model_dump(mode="python")
+        raw["plan"][section][field] = value
+        with pytest.raises(ValueError):
+            InitialProvisioningIntentV1.model_validate(raw)
+
+    transport = _proposal().transport.model_dump(mode="python")
+    transport["isolated_network_id"] = "old-network-spelling"
+    with pytest.raises(ValueError):
+        TransportContractV1.model_validate(transport)
+
+
+def test_transition_rejects_cross_intent_and_changed_planned_fields(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, _, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    intent = _initial_intent(paths, signer=signer, journal=_initial_journal(tmp_path, paths))
+    proposal = _proposal()
+    receipt = InitialProvisioningEffectReceiptV1(
+        schema_version="rsd.initial-provisioning-effect-receipt.v1",
+        operation_kind="initial_provisioning_v1",
+        operation_scope="create_isolated_empty_resources_v1",
+        status="created_isolated_empty_resources",
+        provisioning_operation_id=intent.provisioning_operation_id,
+        intent_sha256=initial_provisioning_intent_sha256(intent),
+        journal_uuid=intent.journal_uuid,
+        idempotency_key="a" * 64,
+        observed_resources=_observed_resources(proposal),
+        effect_receipt_sha256="b" * 64,
+        completed_at=_NOW.isoformat(timespec="seconds").replace("+00:00", "Z"),
+    )
+    attestation = _observed_attestation(intent, receipt, signer=signer, proposal=proposal)
+
+    validate_observed_candidate_transition(
+        intent,
+        receipt,
+        attestation,
+        proposal,
+        _runtime_contract(proposal),
+    )
+
+    cross_intent = _resign_initial_intent(
+        intent,
+        signer=signer,
+        updates={"provisioning_operation_id": "123e4567-e89b-42d3-a456-426614174099"},
+    )
+    with pytest.raises(ValueError, match="initial stage transition"):
+        validate_observed_candidate_transition(
+            cross_intent,
+            receipt,
+            attestation,
+            proposal,
+            _runtime_contract(proposal),
+        )
+
+    network_service = proposal.candidate.primary_service.model_copy(
+        update={"network_name": "changed-network"}
+    )
+    network_candidate = proposal.candidate.model_copy(update={"primary_service": network_service})
+    network_proposal = proposal.model_copy(update={"candidate": network_candidate})
+
+    changed_postgres = proposal.candidate.postgres.model_copy(
+        update={"database_name": "changed-database"}
+    )
+    database_candidate = proposal.candidate.model_copy(update={"postgres": changed_postgres})
+    database_proposal = proposal.model_copy(update={"candidate": database_candidate})
+
+    other_image = ImageReferenceV1(reference=f"registry.example.test/infisical@sha256:{'e' * 64}")
+    image_candidate = proposal.candidate.model_copy(
+        update={
+            "primary_service": proposal.candidate.primary_service.model_copy(
+                update={"image": other_image}
+            ),
+            "restore_service": proposal.candidate.restore_service.model_copy(
+                update={"image": other_image}
+            ),
+        }
+    )
+    image_proposal = proposal.model_copy(
+        update={
+            "candidate": image_candidate,
+            "primary_image": other_image,
+            "restore_image": other_image,
+        }
+    )
+
+    for changed in (network_proposal, database_proposal, image_proposal):
+        changed_receipt = receipt.model_copy(
+            update={"observed_resources": _observed_resources(changed)}
+        )
+        changed_attestation = _observed_attestation(
+            intent, changed_receipt, signer=signer, proposal=changed
+        )
+        with pytest.raises(ValueError, match="initial plan does not match"):
+            validate_observed_candidate_transition(
+                intent,
+                changed_receipt,
+                changed_attestation,
+                changed,
+                _runtime_contract(changed),
+            )
+
+    missing_oid = proposal.candidate.postgres.model_dump(mode="python")
+    del missing_oid["database_oid"]
+    with pytest.raises(ValueError):
+        PostgreSQLContractV1.model_validate(missing_oid)
+
+
+def test_initial_scope_cannot_be_used_as_observed_effect_authority(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    journal = _initial_journal(tmp_path, paths)
+    authority = _AtomicReplayAuthority()
+    intent = _initial_intent(paths, signer=signer, journal=journal)
+    _provision_initial_journal_for_test(
+        paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        intent=intent,
+        replay_authority=authority,
+        replay_policy=_TEST_REPLAY_POLICY,
+        _clock=lambda: _NOW,
+        _capability=_TEST_CLOCK_CAPABILITY,
+    )
+    seen: list[InitialProvisioningExecutionContext] = []
+
+    def overreaching_effect(context: InitialProvisioningExecutionContext) -> EffectReceiptV1:
+        seen.append(context)
+        return EffectReceiptV1(
+            schema_version="rsd.lifecycle-effect-receipt.v1",
+            operation_kind="observed_lifecycle_v1",
+            operation_id=_proposal().operation_id,
+            idempotency_key="a" * 64,
+            effect_receipt_sha256="b" * 64,
+        )
+
+    with pytest.raises(AuthorizationError, match="initial_effect_failed_recovery_required"):
+        _authorize_initial_provisioning_and_execute_for_test(
+            paths,
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            effect=overreaching_effect,  # type: ignore[arg-type]
+            replay_authority=authority,
+            replay_policy=_TEST_REPLAY_POLICY,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+
+    assert len(seen) == 1
+    context = seen[0]
+    assert context.operation_kind == "initial_provisioning_v1"
+    assert context.operation_scope == "create_isolated_empty_resources_v1"
+    assert not hasattr(context, "proposal")
+    assert "database_oid" not in context.intent.plan.postgres.model_dump()
+    assert (
+        journal.operation_state(intent.provisioning_operation_id)
+        is InitialProvisioningOperationState.FAILED_RECOVERY_REQUIRED
+    )
+
+
+def test_initial_genesis_reconciliation_never_retries_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "artifacts"
+    signer, _, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    journal = _initial_journal(tmp_path, paths)
+    authority = _AtomicReplayAuthority()
+    intent = _initial_intent(paths, signer=signer, journal=journal)
+    original = journal._set_marker_current
+
+    def interrupt(marker: object) -> None:
+        del marker
+        raise AuthorizationError("simulated_interrupt")
+
+    monkeypatch.setattr(journal, "_set_marker_current", interrupt)
+    with pytest.raises(AuthorizationError, match="simulated_interrupt"):
+        _provision_initial_journal_for_test(
+            paths,
+            signer=signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            intent=intent,
+            replay_authority=authority,
+            replay_policy=_TEST_REPLAY_POLICY,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+    monkeypatch.setattr(journal, "_set_marker_current", original)
+    assert journal.migration_status() is InitialProvisioningJournalStatus.PROVISIONING_INCOMPLETE
+
+    wrong_intent = _resign_initial_intent(
+        intent,
+        signer=signer,
+        updates={"journal_uuid": "123e4567-e89b-42d3-a456-426614174098"},
+    )
+    with pytest.raises(AuthorizationError, match="initial_journal_reconciliation"):
+        reconcile_initial_journal_genesis(
+            journal,
+            _initial_genesis_reconciliation(
+                wrong_intent, signer=signer, outcome="provisioning_completed"
+            ),
+            signer=signer,
+        )
+    assert (
+        reconcile_initial_journal_genesis(
+            journal,
+            _initial_genesis_reconciliation(
+                intent, signer=signer, outcome="provisioning_completed"
+            ),
+            signer=signer,
+        )
+        is InitialProvisioningJournalStatus.CURRENT
+    )
+    with pytest.raises(AuthorizationError, match="initial_journal_replayed"):
+        _provision_initial_journal_for_test(
+            paths,
+            signer=signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            intent=intent,
+            replay_authority=authority,
+            replay_policy=_TEST_REPLAY_POLICY,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+
+
+def test_external_initial_genesis_blocks_same_operation_at_a_new_path(tmp_path: Path) -> None:
+    first_root = tmp_path / "first-artifacts"
+    signer, _, _ = _authorize_materials(first_root)
+    first_paths = AuthorizationPaths(first_root)
+    authority = _AtomicReplayAuthority()
+    first_journal = _initial_journal(tmp_path, first_paths)
+    first_intent = _initial_intent(first_paths, signer=signer, journal=first_journal)
+    _provision_initial_journal_for_test(
+        first_paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=first_journal,
+        intent=first_intent,
+        replay_authority=authority,
+        replay_policy=_TEST_REPLAY_POLICY,
+        _clock=lambda: _NOW,
+        _capability=_TEST_CLOCK_CAPABILITY,
+    )
+
+    second_root = tmp_path / "second-artifacts"
+    _authorize_materials(second_root)
+    second_paths = AuthorizationPaths(second_root)
+    second_journal = _initial_journal(tmp_path, second_paths)
+    second_intent = _initial_intent(second_paths, signer=signer, journal=second_journal)
+    with pytest.raises(AuthorizationError, match="initial_journal_replayed"):
+        _provision_initial_journal_for_test(
+            second_paths,
+            signer=signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=second_journal,
+            intent=second_intent,
+            replay_authority=authority,
+            replay_policy=_TEST_REPLAY_POLICY,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+    assert (
+        second_journal.migration_status()
+        is InitialProvisioningJournalStatus.PROVISIONING_INCOMPLETE
+    )
+
+
 def test_public_execution_has_no_caller_controlled_clock(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     signer, fingerprints, _ = _authorize_materials(root)
     journal = _journal(tmp_path)
+    initial_journal = _initial_journal(tmp_path, AuthorizationPaths(root))
 
     assert "now" not in inspect.signature(authorize_and_execute).parameters
+    assert "now" not in inspect.signature(authorize_initial_provisioning_and_execute).parameters
     assert "now" not in inspect.signature(provision_journal).parameters
+    assert "now" not in inspect.signature(provision_initial_journal).parameters
     assert "_clock" not in inspect.signature(provision_journal).parameters
     assert (
         inspect.signature(authorize_and_execute).parameters["replay_authority"].default
@@ -1120,6 +1776,7 @@ def test_public_execution_has_no_caller_controlled_clock(tmp_path: Path) -> None
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=journal,
+            initial_journal=initial_journal,
             effect=_effect,
             replay_authority=_test_replay_authority(journal),
             replay_policy=_TEST_REPLAY_POLICY,
@@ -1134,6 +1791,7 @@ def test_public_execution_has_no_caller_controlled_clock(tmp_path: Path) -> None
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=journal,
+            initial_journal=initial_journal,
             effect=_effect,
             replay_authority=_test_replay_authority(journal),
             replay_policy=_TEST_REPLAY_POLICY,
@@ -1250,10 +1908,15 @@ def test_external_tombstone_blocks_local_rollback_and_deleted_operation_row(
         replay_authority=authority,
     )
     assert len(effects) == 1
-    genesis_claim, operation_claim = authority.tombstones
-    assert genesis_claim.kind == "genesis"
+    genesis_claim = next(
+        tombstone for tombstone in authority.tombstones if tombstone.kind == "observed_genesis"
+    )
+    operation_claim = next(
+        tombstone for tombstone in authority.tombstones if tombstone.kind == "observed_operation"
+    )
+    assert genesis_claim.kind == "observed_genesis"
     assert genesis_claim.journal_genesis_id == genesis.journal_uuid
-    assert operation_claim.kind == "operation"
+    assert operation_claim.kind == "observed_operation"
     assert operation_claim.journal_genesis_id == genesis.journal_uuid
     assert operation_claim.operation_id == effects[0].operation_id
     assert operation_claim.proposal_sha256 == effects[0].proposal_sha256
@@ -1834,6 +2497,16 @@ def test_phase_b_pins_journal_anchor_before_provider_and_effect(tmp_path: Path) 
         expected_approver_identity="approval-owner",
         journal=journal,
     )
+    _ensure_test_initial_stage(
+        AuthorizationPaths(root),
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=_initial_journal(tmp_path, AuthorizationPaths(root)),
+        replay_authority=_test_replay_authority(journal),
+    )
 
     class ReplacingProvider(_Provider):
         def inspect(self, reference: ProviderReferenceV1) -> ProviderProvenance | None:
@@ -1969,7 +2642,8 @@ def test_keychain_replay_authority_is_create_only_and_stores_hashes() -> None:
 
     tombstone = ReplayTombstoneV1(
         schema_version="rsd.replay-tombstone.v1",
-        kind="operation",
+        kind="observed_operation",
+        operation_kind="observed_lifecycle_v1",
         service=policy.service,
         account=f"{policy.account_prefix}.o.hash-only",
         journal_genesis_id="00000000-0000-4000-8000-000000000001",
@@ -2403,6 +3077,27 @@ def test_artifact_lock_rejects_relaxed_mode_and_symlink(tmp_path: Path) -> None:
 def test_phase_b_rejects_artifact_and_provider_mutation_before_effect(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     signer, fingerprints, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    journal = _journal(tmp_path)
+    authority = _test_replay_authority(journal)
+    _ensure_test_journal_provisioned(
+        paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        replay_authority=authority,
+    )
+    _ensure_test_initial_stage(
+        paths,
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=_initial_journal(tmp_path, paths),
+        replay_authority=authority,
+    )
     raced_sidecar = root / AuthorizationPaths.signature_name("proposal.yaml")
     called = False
 
@@ -2413,31 +3108,56 @@ def test_phase_b_rejects_artifact_and_provider_mutation_before_effect(tmp_path: 
 
     with pytest.raises(AuthorizationError, match="artifact_race"):
         _execute_for_test(
-            AuthorizationPaths(root),
+            paths,
             signer=signer,
             provider=_Provider(fingerprints, mutate_artifact=raced_sidecar),
             provider_fingerprints=fingerprints,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
-            journal=_journal(tmp_path),
+            journal=journal,
             effect=effect,
             now=_NOW,
+            provision=False,
+            replay_authority=authority,
         )
     assert not called
 
     provider_root = tmp_path / "provider-artifacts"
     signer, fingerprints, _ = _authorize_materials(provider_root)
+    provider_paths = AuthorizationPaths(provider_root)
+    provider_journal = _journal(tmp_path / "provider-journal")
+    provider_authority = _test_replay_authority(provider_journal)
+    _ensure_test_journal_provisioned(
+        provider_paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=provider_journal,
+        replay_authority=provider_authority,
+    )
+    _ensure_test_initial_stage(
+        provider_paths,
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=_initial_journal(provider_paths.root.parent, provider_paths),
+        replay_authority=provider_authority,
+    )
     with pytest.raises(AuthorizationError, match="provider_provenance"):
         _execute_for_test(
-            AuthorizationPaths(provider_root),
+            provider_paths,
             signer=signer,
             provider=_Provider(fingerprints, mutate_provider=True),
             provider_fingerprints=fingerprints,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
-            journal=_journal(tmp_path / "provider-journal"),
+            journal=provider_journal,
             effect=_effect,
             now=_NOW,
+            provision=False,
+            replay_authority=provider_authority,
         )
 
 
@@ -2485,6 +3205,7 @@ def test_external_execution_receipt_cannot_reach_internal_claim(tmp_path: Path) 
     receipt = ExecutionReceiptV1(
         schema_version="rsd.lifecycle-execution-receipt.v1",
         status="committed",
+        operation_kind="observed_lifecycle_v1",
         operation_id="forged-operation",
         idempotency_key="a" * 64,
         effect_receipt_sha256="b" * 64,

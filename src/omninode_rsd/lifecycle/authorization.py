@@ -29,7 +29,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from threading import Lock, get_ident
@@ -44,6 +44,9 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     ApprovalEvidenceV1,
     DisposablePreflightError,
     GovernedBaselineV1,
+    InitialProvisioningEffectReceiptV1,
+    InitialProvisioningIntentV1,
+    ObservedCandidateAttestationV1,
     PreflightPaths,
     PreflightReceiptV1,
     ProposalV1,
@@ -55,10 +58,15 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     _OwnerOnlyReader,
     _UniqueLoader,
     compile_preflight,
+    initial_provisioning_intent_sha256,
+    validate_observed_candidate_transition,
 )
 
 _SHA256: Final = r"^[0-9a-f]{64}$"
 _IDENTIFIER: Final = r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$"
+_UUID: Final = r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+_STAGE_ATTESTATION_FRESHNESS: Final = timedelta(minutes=15)
+_MAX_ARTIFACT_BYTES: Final = 131_072
 _ARTIFACT_NAMES: Final[tuple[str, ...]] = (
     "proposal.yaml",
     "runtime-contract.yaml",
@@ -70,13 +78,25 @@ _ARTIFACT_NAMES: Final[tuple[str, ...]] = (
     "postgres-overlay.yaml",
 )
 _JOURNAL_GENESIS_ARTIFACT_NAME: Final = "journal-genesis.yaml"
+_INITIAL_INTENT_ARTIFACT_NAME: Final = "initial-provisioning-intent.yaml"
+_INITIAL_RECEIPT_ARTIFACT_NAME: Final = "initial-provisioning-receipt.yaml"
+_OBSERVED_ATTESTATION_ARTIFACT_NAME: Final = "observed-candidate-attestation.yaml"
 _MARKED_EVIDENCE_NAMES: Final[frozenset[str]] = frozenset(_ARTIFACT_NAMES[2:-1])
 _SIGNATURE_DOMAIN: Final = b"omninode-rsd.authorization.ed25519.v3\x00"
+_INITIAL_INTENT_SIGNATURE_DOMAIN: Final = b"omninode-rsd.initial-provisioning-intent.ed25519.v1\x00"
+_OBSERVED_ATTESTATION_SIGNATURE_DOMAIN: Final = (
+    b"omninode-rsd.observed-candidate-attestation.ed25519.v1\x00"
+)
+_INITIAL_EFFECT_RECEIPT_DOMAIN: Final = b"omninode-rsd.initial-provisioning-effect-receipt.v1\x00"
 _IDEMPOTENCY_DOMAIN: Final = b"omninode-rsd.authorization.effect.v1\x00"
+_INITIAL_IDEMPOTENCY_DOMAIN: Final = b"omninode-rsd.initial-provisioning-effect.v1\x00"
 _RECONCILIATION_DOMAIN: Final = b"omninode-rsd.authorization.reconciliation.v1\x00"
 _JOURNAL_GENESIS_DOMAIN: Final = b"omninode-rsd.authorization.journal-genesis.v1\x00"
 _JOURNAL_GENESIS_RECONCILIATION_DOMAIN: Final = (
     b"omninode-rsd.authorization.journal-genesis-reconciliation.v1\x00"
+)
+_INITIAL_JOURNAL_GENESIS_RECONCILIATION_DOMAIN: Final = (
+    b"omninode-rsd.initial-provisioning-journal-genesis-reconciliation.v1\x00"
 )
 _REPLAY_TOMBSTONE_DOMAIN: Final = b"omninode-rsd.authorization.replay-tombstone.v1\x00"
 _REPLAY_ACCOUNT_DOMAIN: Final = b"omninode-rsd.authorization.replay-account.v1\x00"
@@ -85,22 +105,33 @@ _OPERATION_LEASE_PREFIX: Final = ".rsd-authorization-operation-"
 _JOURNAL_IDENTITY_LEASE_PREFIX: Final = ".rsd-authorization-journal-identity-"
 _JOURNAL_ANCHOR_PREFIX: Final = ".rsd-authorization-journal-anchor-"
 _JOURNAL_GENESIS_MARKER_PREFIX: Final = ".rsd-authorization-journal-genesis-"
+_INITIAL_JOURNAL_ANCHOR_PREFIX: Final = ".rsd-initial-provisioning-journal-anchor-"
+_INITIAL_JOURNAL_MARKER_PREFIX: Final = ".rsd-initial-provisioning-journal-marker-"
 _VERIFIED_CAPABILITY: Final = object()
 _GENESIS_CAPABILITY: Final = object()
+_INITIAL_VERIFIED_CAPABILITY: Final = object()
+_INITIAL_INTENT_CAPABILITY: Final = object()
 _JOURNAL_PIN_CAPABILITY: Final = object()
+_INITIAL_JOURNAL_PIN_CAPABILITY: Final = object()
 _TEST_CLOCK_CAPABILITY: Final = object()
 _SYSTEM_CLOCK_CAPABILITY: Final = object()
 _SAFE_CALL_FAILURE: Final = object()
 _OPERATION_TABLE: Final = "authorization_operation_journal"
 _JOURNAL_METADATA_TABLE: Final = "authorization_journal_metadata"
+_INITIAL_OPERATION_TABLE: Final = "initial_provisioning_operation_journal"
+_INITIAL_JOURNAL_METADATA_TABLE: Final = "initial_provisioning_journal_metadata"
 _LEGACY_OPERATION_TABLE: Final = "authorization_nonce_journal"
 _JOURNAL_SCHEMA_VERSION: Final = "rsd.authorization-journal.v1"
+_INITIAL_JOURNAL_SCHEMA_VERSION: Final = "rsd.initial-provisioning-journal.v1"
 _JOURNAL_ANCHOR_SCHEMA_VERSION: Final = "rsd.authorization-journal-anchor.v1"
 _JOURNAL_GENESIS_MARKER_SCHEMA_VERSION: Final = "rsd.authorization-journal-genesis-marker.v1"
-_JOURNAL_OPERATION_DOMAIN: Final = "rsd.disposable-acceptance-operation.v1"
+_JOURNAL_OPERATION_DOMAIN: Final = "rsd.observed-lifecycle-operation.v1"
+_OBSERVED_OPERATION_KIND: Final = "observed_lifecycle_v1"
+_INITIAL_OPERATION_KIND: Final = "initial_provisioning_v1"
 _OPERATION_SCHEMA: Final = f"""
 CREATE TABLE IF NOT EXISTS {_OPERATION_TABLE} (
     operation_id TEXT PRIMARY KEY NOT NULL,
+    operation_kind TEXT NOT NULL CHECK (operation_kind = '{_OBSERVED_OPERATION_KIND}'),
     nonce TEXT NOT NULL UNIQUE,
     proposal_sha256 TEXT NOT NULL,
     contract_sha256 TEXT NOT NULL,
@@ -122,6 +153,37 @@ CREATE TABLE IF NOT EXISTS {_JOURNAL_METADATA_TABLE} (
     operation_schema_sha256 TEXT NOT NULL,
     metadata_schema_sha256 TEXT NOT NULL,
     genesis_sha256 TEXT NOT NULL,
+    anchor_dev INTEGER NOT NULL,
+    anchor_ino INTEGER NOT NULL,
+    anchor_nlink INTEGER NOT NULL,
+    schema_version TEXT NOT NULL
+) WITHOUT ROWID
+"""
+_INITIAL_OPERATION_SCHEMA: Final = f"""
+CREATE TABLE IF NOT EXISTS {_INITIAL_OPERATION_TABLE} (
+    provisioning_operation_id TEXT PRIMARY KEY NOT NULL,
+    operation_kind TEXT NOT NULL CHECK (operation_kind = '{_INITIAL_OPERATION_KIND}'),
+    operation_scope TEXT NOT NULL CHECK (operation_scope = 'create_isolated_empty_resources_v1'),
+    intent_sha256 TEXT NOT NULL,
+    nonce TEXT NOT NULL UNIQUE,
+    provider_provenance_sha256 TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    state TEXT NOT NULL,
+    effect_receipt_sha256 TEXT,
+    observed_resources_sha256 TEXT,
+    failure_phase TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (state IN ('claimed', 'in_progress', 'provisioned_empty', 'failed_recovery_required'))
+) WITHOUT ROWID
+"""
+_INITIAL_JOURNAL_METADATA_SCHEMA: Final = f"""
+CREATE TABLE IF NOT EXISTS {_INITIAL_JOURNAL_METADATA_TABLE} (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+    journal_uuid TEXT NOT NULL,
+    journal_path_sha256 TEXT NOT NULL,
+    journal_schema_sha256 TEXT NOT NULL,
+    intent_sha256 TEXT NOT NULL,
     anchor_dev INTEGER NOT NULL,
     anchor_ino INTEGER NOT NULL,
     anchor_nlink INTEGER NOT NULL,
@@ -150,6 +212,22 @@ class AuthorizationOperationState(StrEnum):
     CLAIMED = "claimed"
     IN_PROGRESS = "in_progress"
     COMMITTED = "committed"
+    FAILED_RECOVERY_REQUIRED = "failed_recovery_required"
+
+
+class AuthorizationOperationKind(StrEnum):
+    """Journal scopes are explicit and never interchangeable."""
+
+    INITIAL_PROVISIONING = _INITIAL_OPERATION_KIND
+    OBSERVED_LIFECYCLE = _OBSERVED_OPERATION_KIND
+
+
+class InitialProvisioningOperationState(StrEnum):
+    """Durable states for a one-time empty-resource creation operation."""
+
+    CLAIMED = "claimed"
+    IN_PROGRESS = "in_progress"
+    PROVISIONED_EMPTY = "provisioned_empty"
     FAILED_RECOVERY_REQUIRED = "failed_recovery_required"
 
 
@@ -231,13 +309,20 @@ class ReplayTombstoneV1(_Model):
     """Value-free, immutable binding written once by an external authority."""
 
     schema_version: Literal["rsd.replay-tombstone.v1"]
-    kind: Literal["genesis", "operation"]
+    kind: Literal[
+        "initial_genesis",
+        "initial_operation",
+        "observed_genesis",
+        "observed_operation",
+    ]
+    operation_kind: Literal["initial_provisioning_v1", "observed_lifecycle_v1"]
     service: str = Field(pattern=_IDENTIFIER, min_length=1, max_length=128)
     account: str = Field(pattern=_IDENTIFIER, min_length=1, max_length=128)
-    journal_genesis_id: str = Field(min_length=36, max_length=36)
+    journal_genesis_id: str = Field(pattern=_UUID)
     operation_id: str = Field(min_length=1, max_length=256)
-    proposal_sha256: str = Field(pattern=_SHA256)
-    contract_sha256: str = Field(pattern=_SHA256)
+    proposal_sha256: str | None = Field(default=None, pattern=_SHA256)
+    contract_sha256: str | None = Field(default=None, pattern=_SHA256)
+    initial_provisioning_intent_sha256: str | None = Field(default=None, pattern=_SHA256)
     provider_provenance_sha256: str | None = None
     idempotency_key: str | None = None
 
@@ -249,16 +334,32 @@ class ReplayTombstoneV1(_Model):
             raise ValueError("replay tombstone binding is invalid") from None
         if str(parsed_uuid) != self.journal_genesis_id:
             raise ValueError("replay tombstone binding is invalid")
-        if self.kind == "genesis":
-            if self.provider_provenance_sha256 is not None or self.idempotency_key is not None:
+        observed = self.kind in {"observed_genesis", "observed_operation"}
+        operation = self.kind in {"initial_operation", "observed_operation"}
+        if observed != (self.operation_kind == _OBSERVED_OPERATION_KIND):
+            raise ValueError("replay tombstone binding is invalid")
+        if observed:
+            if (
+                type(self.proposal_sha256) is not str
+                or type(self.contract_sha256) is not str
+                or self.initial_provisioning_intent_sha256 is not None
+            ):
                 raise ValueError("replay tombstone binding is invalid")
-            return self
-        if (
-            type(self.provider_provenance_sha256) is not str
-            or re.fullmatch(_SHA256, self.provider_provenance_sha256) is None
-            or type(self.idempotency_key) is not str
-            or re.fullmatch(_SHA256, self.idempotency_key) is None
+        elif (
+            type(self.initial_provisioning_intent_sha256) is not str
+            or self.proposal_sha256 is not None
+            or self.contract_sha256 is not None
         ):
+            raise ValueError("replay tombstone binding is invalid")
+        if operation:
+            if (
+                type(self.provider_provenance_sha256) is not str
+                or re.fullmatch(_SHA256, self.provider_provenance_sha256) is None
+                or type(self.idempotency_key) is not str
+                or re.fullmatch(_SHA256, self.idempotency_key) is None
+            ):
+                raise ValueError("replay tombstone binding is invalid")
+        elif self.provider_provenance_sha256 is not None or self.idempotency_key is not None:
             raise ValueError("replay tombstone binding is invalid")
         return self
 
@@ -372,6 +473,7 @@ class ProviderExpectationV1(_Model):
 class VerifiedExecutionContext:
     """Immutable effect input with no artifact root, nonce, or journal handle."""
 
+    operation_kind: Literal["observed_lifecycle_v1"]
     operation_id: str
     idempotency_key: str
     proposal: ProposalV1
@@ -386,6 +488,7 @@ class EffectReceiptV1(_Model):
     """Effect-owned receipt explicitly bound to one execution context."""
 
     schema_version: Literal["rsd.lifecycle-effect-receipt.v1"]
+    operation_kind: Literal["observed_lifecycle_v1"]
     operation_id: str
     idempotency_key: str = Field(pattern=_SHA256)
     effect_receipt_sha256: str = Field(pattern=_SHA256)
@@ -413,7 +516,8 @@ class JournalGenesisReceiptV1(_Model):
     """Signed, one-time journal identity authorization for one artifact set."""
 
     schema_version: Literal["rsd.authorization-journal-genesis.v1"]
-    operation_domain: Literal["rsd.disposable-acceptance-operation.v1"]
+    operation_domain: Literal["rsd.observed-lifecycle-operation.v1"]
+    operation_kind: Literal["observed_lifecycle_v1"]
     operation_id: str = Field(min_length=1, max_length=256)
     proposal_sha256: str = Field(pattern=_SHA256)
     contract_sha256: str = Field(pattern=_SHA256)
@@ -478,6 +582,39 @@ class JournalGenesisReconciliationReceiptV1(_Model):
         return self
 
 
+class InitialJournalGenesisReconciliationReceiptV1(_Model):
+    """Signed resolution of an interrupted initial-journal genesis.
+
+    A completed reconciliation may only expose a database and anchor that were
+    already durably created before the interruption.  It never retries or
+    recreates those objects after an external genesis tombstone exists.
+    """
+
+    schema_version: Literal["rsd.initial-provisioning-journal-genesis-reconciliation.v1"]
+    outcome: Literal["provisioning_completed", "provisioning_abandoned"]
+    journal_uuid: str = Field(pattern=_UUID)
+    journal_path_sha256: str = Field(pattern=_SHA256)
+    intent_sha256: str = Field(pattern=_SHA256)
+    created_at: str = Field(min_length=20, max_length=40)
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @model_validator(mode="after")
+    def canonical_fields(self) -> InitialJournalGenesisReconciliationReceiptV1:
+        try:
+            created = datetime.fromisoformat(self.created_at.removesuffix("Z") + "+00:00")
+        except ValueError:
+            raise ValueError("initial journal reconciliation fields are invalid") from None
+        if (
+            not self.created_at.endswith("Z")
+            or created.tzinfo is None
+            or created.utcoffset() is None
+            or len(_canonical_base64(self.signature_base64)) != 64
+        ):
+            raise ValueError("initial journal reconciliation fields are invalid")
+        return self
+
+
 class JournalProvisioningReceiptV1(_Model):
     """Value-free result of explicit, one-time journal provisioning."""
 
@@ -493,12 +630,54 @@ class ExecutionReceiptV1(_Model):
 
     schema_version: Literal["rsd.lifecycle-execution-receipt.v1"]
     status: Literal["committed"]
+    operation_kind: Literal["observed_lifecycle_v1"]
     operation_id: str
     idempotency_key: str = Field(pattern=_SHA256)
     effect_receipt_sha256: str = Field(pattern=_SHA256)
     proposal_sha256: str = Field(pattern=_SHA256)
     contract_sha256: str = Field(pattern=_SHA256)
     provider_provenance_sha256: str = Field(pattern=_SHA256)
+    committed_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class InitialProvisioningExecutionContext:
+    """Opaque, bounded input for initial empty-resource creation only."""
+
+    operation_kind: Literal["initial_provisioning_v1"]
+    operation_scope: Literal["create_isolated_empty_resources_v1"]
+    provisioning_operation_id: str
+    intent: InitialProvisioningIntentV1
+    provider_expectations: tuple[ProviderExpectationV1, ...]
+    intent_sha256: str
+    idempotency_key: str
+    provider_provenance_sha256: str
+
+
+class InitialJournalProvisioningReceiptV1(_Model):
+    """Audit output for explicit pre-creation journal provisioning."""
+
+    schema_version: Literal["rsd.initial-provisioning-journal-provisioning-receipt.v1"]
+    status: Literal["provisioned"]
+    operation_kind: Literal["initial_provisioning_v1"]
+    provisioning_operation_id: str = Field(pattern=_UUID)
+    journal_uuid: str = Field(pattern=_UUID)
+    intent_sha256: str = Field(pattern=_SHA256)
+    provisioned_at: str
+
+
+class InitialProvisioningExecutionReceiptV1(_Model):
+    """Non-bearer audit result after the bounded initial effect commits."""
+
+    schema_version: Literal["rsd.initial-provisioning-execution-receipt.v1"]
+    status: Literal["provisioned_empty"]
+    operation_kind: Literal["initial_provisioning_v1"]
+    operation_scope: Literal["create_isolated_empty_resources_v1"]
+    provisioning_operation_id: str = Field(pattern=_UUID)
+    intent_sha256: str = Field(pattern=_SHA256)
+    idempotency_key: str = Field(pattern=_SHA256)
+    effect_receipt_sha256: str = Field(pattern=_SHA256)
+    observed_resources_sha256: str = Field(pattern=_SHA256)
     committed_at: str
 
 
@@ -519,12 +698,39 @@ class AuthorizationPaths:
     def journal_genesis_name() -> str:
         return _JOURNAL_GENESIS_ARTIFACT_NAME
 
+    @staticmethod
+    def initial_intent_name() -> str:
+        """Fixed artifact name for the signed pre-creation intent."""
+
+        return _INITIAL_INTENT_ARTIFACT_NAME
+
+    @staticmethod
+    def initial_receipt_name() -> str:
+        """Fixed artifact name for the bounded creation receipt."""
+
+        return _INITIAL_RECEIPT_ARTIFACT_NAME
+
+    @staticmethod
+    def observed_attestation_name() -> str:
+        """Fixed artifact name for the signed post-creation observation."""
+
+        return _OBSERVED_ATTESTATION_ARTIFACT_NAME
+
 
 @dataclass(frozen=True, slots=True)
 class _ArtifactVerification:
     receipt: PreflightReceiptV1
     proposal: ProposalV1
     final_contract: RuntimeContractV1
+
+
+@dataclass(frozen=True, slots=True)
+class _InitialStageArtifacts:
+    """Root-bound planned-to-observed material, never returned to callers."""
+
+    intent: InitialProvisioningIntentV1
+    receipt: InitialProvisioningEffectReceiptV1
+    attestation: ObservedCandidateAttestationV1
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,6 +749,25 @@ class _VerifiedGenesis:
 
     receipt: JournalGenesisReceiptV1
     artifact_sha256: str
+    capability: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedInitialIntent:
+    """Signature-verified intent admitted only to initial journal provisioning."""
+
+    intent: InitialProvisioningIntentV1
+    intent_sha256: str
+    capability: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedInitialProvisioning:
+    """Capability-bound local claim for the bounded pre-observation effect."""
+
+    context: InitialProvisioningExecutionContext
+    nonce: str
+    authorized_at: str
     capability: object = field(repr=False, compare=False)
 
 
@@ -568,25 +793,28 @@ def _replay_tombstone_sha256(tombstone: ReplayTombstoneV1) -> str:
 def _replay_account(
     policy: ReplayAuthorityPolicyV1,
     *,
-    kind: Literal["genesis", "operation"],
-    journal_path_sha256: str,
+    kind: Literal[
+        "initial_genesis",
+        "initial_operation",
+        "observed_genesis",
+        "observed_operation",
+    ],
     operation_id: str,
 ) -> str:
     if (
         type(policy) is not ReplayAuthorityPolicyV1
-        or re.fullmatch(_SHA256, journal_path_sha256) is None
         or type(operation_id) is not str
         or not operation_id
     ):
         raise AuthorizationError("replay_authority_binding")
     scope = {
-        "journal_path_sha256": journal_path_sha256,
         "kind": kind,
         "operation_id": operation_id,
         "policy_sha256": policy.sha256(),
     }
     account_digest = _digest(_REPLAY_ACCOUNT_DOMAIN + _canonical_json_bytes(scope))
-    return f"{policy.account_prefix}.{kind[0]}.{account_digest}"
+    stage = "i" if kind.startswith("initial_") else "o"
+    return f"{policy.account_prefix}.{stage}.{account_digest}"
 
 
 def _genesis_tombstone(
@@ -598,12 +826,12 @@ def _genesis_tombstone(
     receipt = verified.receipt
     return ReplayTombstoneV1(
         schema_version="rsd.replay-tombstone.v1",
-        kind="genesis",
+        kind="observed_genesis",
+        operation_kind=_OBSERVED_OPERATION_KIND,
         service=policy.service,
         account=_replay_account(
             policy,
-            kind="genesis",
-            journal_path_sha256=receipt.journal_path_sha256,
+            kind="observed_genesis",
             operation_id=receipt.operation_id,
         ),
         journal_genesis_id=receipt.journal_uuid,
@@ -627,18 +855,72 @@ def _operation_tombstone(
     receipt = genesis.receipt
     return ReplayTombstoneV1(
         schema_version="rsd.replay-tombstone.v1",
-        kind="operation",
+        kind="observed_operation",
+        operation_kind=_OBSERVED_OPERATION_KIND,
         service=policy.service,
         account=_replay_account(
             policy,
-            kind="operation",
-            journal_path_sha256=receipt.journal_path_sha256,
+            kind="observed_operation",
             operation_id=context.operation_id,
         ),
         journal_genesis_id=receipt.journal_uuid,
         operation_id=context.operation_id,
         proposal_sha256=context.proposal_sha256,
         contract_sha256=context.contract_sha256,
+        provider_provenance_sha256=context.provider_provenance_sha256,
+        idempotency_key=context.idempotency_key,
+    )
+
+
+def _initial_genesis_tombstone(
+    policy: ReplayAuthorityPolicyV1,
+    verified: _VerifiedInitialIntent,
+) -> ReplayTombstoneV1:
+    if (
+        type(verified) is not _VerifiedInitialIntent
+        or verified.capability is not _INITIAL_INTENT_CAPABILITY
+    ):
+        raise AuthorizationError("replay_authority_binding")
+    intent = verified.intent
+    return ReplayTombstoneV1(
+        schema_version="rsd.replay-tombstone.v1",
+        kind="initial_genesis",
+        operation_kind=_INITIAL_OPERATION_KIND,
+        service=policy.service,
+        account=_replay_account(
+            policy,
+            kind="initial_genesis",
+            operation_id=intent.provisioning_operation_id,
+        ),
+        journal_genesis_id=intent.journal_uuid,
+        operation_id=intent.provisioning_operation_id,
+        initial_provisioning_intent_sha256=verified.intent_sha256,
+    )
+
+
+def _initial_operation_tombstone(
+    policy: ReplayAuthorityPolicyV1,
+    verified: _VerifiedInitialProvisioning,
+) -> ReplayTombstoneV1:
+    if (
+        type(verified) is not _VerifiedInitialProvisioning
+        or verified.capability is not _INITIAL_VERIFIED_CAPABILITY
+    ):
+        raise AuthorizationError("replay_authority_binding")
+    context = verified.context
+    return ReplayTombstoneV1(
+        schema_version="rsd.replay-tombstone.v1",
+        kind="initial_operation",
+        operation_kind=_INITIAL_OPERATION_KIND,
+        service=policy.service,
+        account=_replay_account(
+            policy,
+            kind="initial_operation",
+            operation_id=context.provisioning_operation_id,
+        ),
+        journal_genesis_id=context.intent.journal_uuid,
+        operation_id=context.provisioning_operation_id,
+        initial_provisioning_intent_sha256=context.intent_sha256,
         provider_provenance_sha256=context.provider_provenance_sha256,
         idempotency_key=context.idempotency_key,
     )
@@ -903,6 +1185,79 @@ def _verify_journal_genesis_signature(
         raise AuthorizationError("journal_genesis_signature") from None
 
 
+def _direct_signature_message(domain: bytes, model: BaseModel) -> bytes:
+    """Canonical domain-separated bytes for an embedded Ed25519 signature."""
+
+    try:
+        material = model.model_dump(mode="json", exclude={"signature_base64"})
+        return domain + json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError):
+        raise AuthorizationError("initial_stage_signature") from None
+
+
+def _initial_intent_message(intent: InitialProvisioningIntentV1) -> bytes:
+    if type(intent) is not InitialProvisioningIntentV1:
+        raise AuthorizationError("initial_intent_signature")
+    return _direct_signature_message(_INITIAL_INTENT_SIGNATURE_DOMAIN, intent)
+
+
+def _observed_candidate_attestation_message(attestation: ObservedCandidateAttestationV1) -> bytes:
+    if type(attestation) is not ObservedCandidateAttestationV1:
+        raise AuthorizationError("observed_attestation_signature")
+    return _direct_signature_message(_OBSERVED_ATTESTATION_SIGNATURE_DOMAIN, attestation)
+
+
+def _verify_initial_intent_signature(
+    intent: InitialProvisioningIntentV1, *, signer: TrustedEd25519SignerV1
+) -> None:
+    if (
+        type(intent) is not InitialProvisioningIntentV1
+        or type(signer) is not TrustedEd25519SignerV1
+        or intent.signer_key_id != signer.key_id
+    ):
+        raise AuthorizationError("initial_intent_signature")
+    try:
+        signer.key().verify(
+            _canonical_base64(intent.signature_base64), _initial_intent_message(intent)
+        )
+    except (InvalidSignature, ValueError, binascii.Error):
+        raise AuthorizationError("initial_intent_signature") from None
+
+
+def _verify_observed_candidate_attestation_signature(
+    attestation: ObservedCandidateAttestationV1,
+    *,
+    signer: TrustedEd25519SignerV1,
+) -> None:
+    if (
+        type(attestation) is not ObservedCandidateAttestationV1
+        or type(signer) is not TrustedEd25519SignerV1
+        or attestation.signer_key_id != signer.key_id
+    ):
+        raise AuthorizationError("observed_attestation_signature")
+    try:
+        signer.key().verify(
+            _canonical_base64(attestation.signature_base64),
+            _observed_candidate_attestation_message(attestation),
+        )
+    except (InvalidSignature, ValueError, binascii.Error):
+        raise AuthorizationError("observed_attestation_signature") from None
+
+
+def _initial_intent_artifact_bytes(intent: InitialProvisioningIntentV1) -> bytes:
+    try:
+        return yaml.safe_dump(intent.model_dump(mode="json"), sort_keys=True).encode("utf-8")
+    except (TypeError, ValueError, yaml.YAMLError):
+        raise AuthorizationError("initial_intent_artifact") from None
+
+
+def _initial_receipt_artifact_bytes(receipt: InitialProvisioningEffectReceiptV1) -> bytes:
+    try:
+        return yaml.safe_dump(receipt.model_dump(mode="json"), sort_keys=True).encode("utf-8")
+    except (TypeError, ValueError, yaml.YAMLError):
+        raise AuthorizationError("initial_receipt_artifact") from None
+
+
 def _journal_genesis_artifact_bytes(receipt: JournalGenesisReceiptV1) -> bytes:
     try:
         return yaml.safe_dump(receipt.model_dump(mode="json"), sort_keys=True).encode("utf-8")
@@ -1149,6 +1504,109 @@ def _verify_authorization_artifact_snapshot(
     return artifacts, genesis, snapshot
 
 
+def _read_initial_stage_artifacts(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    now: datetime,
+    reader: _OwnerOnlyReader,
+) -> tuple[_InitialStageArtifacts, dict[str, bytes]]:
+    """Read and verify the signed stage hand-off through the locked root fd."""
+
+    names = (
+        paths.initial_intent_name(),
+        paths.initial_receipt_name(),
+        paths.observed_attestation_name(),
+    )
+    try:
+        raw = {name: reader.read(name) for name in names}
+        intent = InitialProvisioningIntentV1.model_validate(
+            _parse_document(raw[paths.initial_intent_name()], phase="initial_intent_artifact")
+        )
+        receipt = InitialProvisioningEffectReceiptV1.model_validate(
+            _parse_document(raw[paths.initial_receipt_name()], phase="initial_receipt_artifact")
+        )
+        attestation = ObservedCandidateAttestationV1.model_validate(
+            _parse_document(
+                raw[paths.observed_attestation_name()], phase="observed_attestation_artifact"
+            )
+        )
+    except (AuthorizationError, DisposablePreflightError, ValidationError, ValueError):
+        raise AuthorizationError("initial_stage_artifact") from None
+    _verify_initial_intent_signature(intent, signer=signer)
+    _verify_observed_candidate_attestation_signature(attestation, signer=signer)
+    try:
+        created = datetime.fromisoformat(intent.created_at.removesuffix("Z") + "+00:00")
+        completed = datetime.fromisoformat(receipt.completed_at.removesuffix("Z") + "+00:00")
+        observed = datetime.fromisoformat(attestation.observed_at.removesuffix("Z") + "+00:00")
+        retained = datetime.fromisoformat(intent.retention_expires_at.removesuffix("Z") + "+00:00")
+    except ValueError:
+        raise AuthorizationError("initial_stage_freshness") from None
+    if (
+        created.tzinfo is None
+        or completed.tzinfo is None
+        or observed.tzinfo is None
+        or retained.tzinfo is None
+        or created.astimezone(UTC) > now
+        or completed.astimezone(UTC) > now
+        or observed.astimezone(UTC) > now
+        or completed.astimezone(UTC) < created.astimezone(UTC)
+        or observed.astimezone(UTC) < completed.astimezone(UTC)
+        or now - observed.astimezone(UTC) > _STAGE_ATTESTATION_FRESHNESS
+        or retained.astimezone(UTC) <= now
+        or intent.disposal_owner != expected_disposal_owner
+        or intent.approver_identity != expected_approver_identity
+    ):
+        raise AuthorizationError("initial_stage_freshness")
+    return _InitialStageArtifacts(intent, receipt, attestation), raw
+
+
+def _read_verified_initial_intent(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    now: datetime,
+    reader: _OwnerOnlyReader,
+) -> tuple[_VerifiedInitialIntent, bytes]:
+    """Read the root-bound signed intent without constructing any journal."""
+
+    try:
+        raw = reader.read(paths.initial_intent_name())
+        intent = InitialProvisioningIntentV1.model_validate(
+            _parse_document(raw, phase="initial_intent_artifact")
+        )
+    except (AuthorizationError, DisposablePreflightError, ValidationError, ValueError):
+        raise AuthorizationError("initial_intent_artifact") from None
+    _verify_initial_intent_signature(intent, signer=signer)
+    try:
+        created = datetime.fromisoformat(intent.created_at.removesuffix("Z") + "+00:00")
+        retention = datetime.fromisoformat(intent.retention_expires_at.removesuffix("Z") + "+00:00")
+    except ValueError:
+        raise AuthorizationError("initial_intent_freshness") from None
+    if (
+        created.tzinfo is None
+        or retention.tzinfo is None
+        or created.astimezone(UTC) > now
+        or now - created.astimezone(UTC) > _STAGE_ATTESTATION_FRESHNESS
+        or retention.astimezone(UTC) <= now
+        or intent.disposal_owner != expected_disposal_owner
+        or intent.approver_identity != expected_approver_identity
+    ):
+        raise AuthorizationError("initial_intent_freshness")
+    return (
+        _VerifiedInitialIntent(
+            intent=intent,
+            intent_sha256=initial_provisioning_intent_sha256(intent),
+            capability=_INITIAL_INTENT_CAPABILITY,
+        ),
+        raw,
+    )
+
+
 def _safe_call(call: Callable[[], object]) -> object:
     """Discard arbitrary adapter or callback failures before they escape a boundary."""
 
@@ -1262,6 +1720,15 @@ def _idempotency_key(
         (operation_id, proposal_sha256, contract_sha256, provider_sha256)
     ).encode("ascii")
     return _digest(_IDEMPOTENCY_DOMAIN + material)
+
+
+def _initial_idempotency_key(
+    *, provisioning_operation_id: str, intent_sha256: str, provider_sha256: str
+) -> str:
+    material = "\x00".join((provisioning_operation_id, intent_sha256, provider_sha256)).encode(
+        "ascii"
+    )
+    return _digest(_INITIAL_IDEMPOTENCY_DOMAIN + material)
 
 
 class ArtifactRootLease:
@@ -1581,7 +2048,12 @@ class ArtifactRootLease:
     def write_once(self, name: str, payload: bytes, *, phase: str) -> None:
         """Create one bounded, owner-only artifact through the locked root fd."""
 
-        if "/" in name or name.startswith(".") or type(payload) is not bytes or len(payload) > 4096:
+        if (
+            "/" in name
+            or name.startswith(".")
+            or type(payload) is not bytes
+            or len(payload) > _MAX_ARTIFACT_BYTES
+        ):
             raise AuthorizationError(phase)
         self.assert_stable()
         assert self._root_descriptor is not None
@@ -2904,16 +3376,17 @@ class SQLiteAuthorizationJournal:
         rows = connection.execute(f"PRAGMA table_info({_OPERATION_TABLE})").fetchall()
         expected = [
             (0, "operation_id", "TEXT", 1, None, 1),
-            (1, "nonce", "TEXT", 1, None, 0),
-            (2, "proposal_sha256", "TEXT", 1, None, 0),
-            (3, "contract_sha256", "TEXT", 1, None, 0),
-            (4, "provider_provenance_sha256", "TEXT", 1, None, 0),
-            (5, "idempotency_key", "TEXT", 1, None, 0),
-            (6, "state", "TEXT", 1, None, 0),
-            (7, "effect_receipt_sha256", "TEXT", 0, None, 0),
-            (8, "failure_phase", "TEXT", 0, None, 0),
-            (9, "created_at", "TEXT", 1, None, 0),
-            (10, "updated_at", "TEXT", 1, None, 0),
+            (1, "operation_kind", "TEXT", 1, None, 0),
+            (2, "nonce", "TEXT", 1, None, 0),
+            (3, "proposal_sha256", "TEXT", 1, None, 0),
+            (4, "contract_sha256", "TEXT", 1, None, 0),
+            (5, "provider_provenance_sha256", "TEXT", 1, None, 0),
+            (6, "idempotency_key", "TEXT", 1, None, 0),
+            (7, "state", "TEXT", 1, None, 0),
+            (8, "effect_receipt_sha256", "TEXT", 0, None, 0),
+            (9, "failure_phase", "TEXT", 0, None, 0),
+            (10, "created_at", "TEXT", 1, None, 0),
+            (11, "updated_at", "TEXT", 1, None, 0),
         ]
         if rows != expected:
             raise AuthorizationError("journal_schema")
@@ -3037,13 +3510,14 @@ class SQLiteAuthorizationJournal:
             connection.execute(
                 f"""
                 INSERT INTO {_OPERATION_TABLE} (
-                    operation_id, nonce, proposal_sha256, contract_sha256,
+                    operation_id, operation_kind, nonce, proposal_sha256, contract_sha256,
                     provider_provenance_sha256, idempotency_key, state,
                     effect_receipt_sha256, failure_phase, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
                 """,
                 (
                     verified.context.operation_id,
+                    verified.context.operation_kind,
                     verified.nonce,
                     proposal_sha256,
                     contract_sha256,
@@ -3272,15 +3746,974 @@ class SQLiteAuthorizationJournal:
         return AuthorizationOperationState(result)
 
 
+class InitialProvisioningJournalStatus(StrEnum):
+    """Read-only state for the separate pre-creation durable journal."""
+
+    ABSENT = "absent"
+    CURRENT = "current"
+    PROVISIONING_INCOMPLETE = "provisioning_incomplete"
+    ABANDONED = "abandoned"
+    JOURNAL_MISSING = "journal_missing"
+    IDENTITY_MISMATCH = "identity_mismatch"
+    UNKNOWN = "unknown"
+
+
+class _InitialJournalAnchorV1(_Model):
+    schema_version: Literal["rsd.initial-provisioning-journal-anchor.v1"]
+    journal_uuid: str = Field(pattern=_UUID)
+    journal_path_sha256: str = Field(pattern=_SHA256)
+    journal_schema_sha256: str = Field(pattern=_SHA256)
+    intent_sha256: str = Field(pattern=_SHA256)
+    database_dev: int = Field(ge=0)
+    database_ino: int = Field(ge=1)
+    database_nlink: Literal[1]
+
+
+class _InitialJournalMarkerV1(_Model):
+    schema_version: Literal["rsd.initial-provisioning-journal-marker.v1"]
+    state: Literal["pending", "current", "abandoned"]
+    journal_uuid: str = Field(pattern=_UUID)
+    journal_path_sha256: str = Field(pattern=_SHA256)
+    journal_schema_sha256: str = Field(pattern=_SHA256)
+    intent_sha256: str = Field(pattern=_SHA256)
+
+
+@dataclass(frozen=True, slots=True)
+class _InitialJournalIdentity:
+    journal_uuid: str
+    journal_path_sha256: str
+    journal_schema_sha256: str
+    intent_sha256: str
+    database_details: tuple[int, int, int]
+    anchor_details: tuple[int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _InitialJournalExecutionPin:
+    """Exact initial-journal objects observed before a live creation effect."""
+
+    identity: _InitialJournalIdentity
+    database_details: tuple[int, int, int]
+    anchor_details: tuple[int, int, int]
+    marker_details: tuple[int, int, int]
+    capability: object = field(repr=False, compare=False)
+
+
+class SQLiteInitialProvisioningJournal:
+    """Durable owner-only state for the one bounded pre-observation operation.
+
+    It has a deliberately separate schema and identity from the observed
+    lifecycle journal.  Neither its constructor nor its authorization methods
+    create files; only the explicit signed intent provisioning boundary does.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._requested_path = path
+        self._path = Path(os.path.realpath(path))
+
+    def _validate_path(self) -> None:
+        requested = self._requested_path
+        if not requested.is_absolute() or not requested.name or requested.name in {".", ".."}:
+            raise AuthorizationError("initial_journal_path")
+        SQLiteAuthorizationJournal._validate_owner_directory(requested.parent)
+        try:
+            details = os.lstat(requested)
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise AuthorizationError("initial_journal_path") from None
+        if stat.S_ISLNK(details.st_mode):
+            raise AuthorizationError("initial_journal_path")
+
+    def _path_sha256(self) -> str:
+        return _digest(os.fsencode(str(self._path)))
+
+    def _anchor_path(self) -> Path:
+        self._validate_path()
+        return self._path.parent / f"{_INITIAL_JOURNAL_ANCHOR_PREFIX}{self._path_sha256()}.json"
+
+    def _marker_path(self) -> Path:
+        self._validate_path()
+        return self._path.parent / f"{_INITIAL_JOURNAL_MARKER_PREFIX}{self._path_sha256()}.json"
+
+    @classmethod
+    def _operation_schema_sha256(cls) -> str:
+        return SQLiteAuthorizationJournal._schema_sha256(_INITIAL_OPERATION_SCHEMA)
+
+    @classmethod
+    def _metadata_schema_sha256(cls) -> str:
+        return SQLiteAuthorizationJournal._schema_sha256(_INITIAL_JOURNAL_METADATA_SCHEMA)
+
+    @classmethod
+    def journal_schema_sha256(cls) -> str:
+        material = {
+            "metadata_schema_sha256": cls._metadata_schema_sha256(),
+            "operation_schema_sha256": cls._operation_schema_sha256(),
+            "schema_version": _INITIAL_JOURNAL_SCHEMA_VERSION,
+        }
+        return _digest(json.dumps(material, sort_keys=True, separators=(",", ":")).encode())
+
+    def _identity_lease(self) -> _OperationLease:
+        self._validate_path()
+        return _OperationLease(
+            cast(SQLiteAuthorizationJournal, self),
+            self._path_sha256(),
+            nonblocking=False,
+            prefix=f"{_INITIAL_JOURNAL_MARKER_PREFIX}lease-",
+        )
+
+    def _operation_lease(self, operation_id: str, *, nonblocking: bool = False) -> _OperationLease:
+        if type(operation_id) is not str or not operation_id:
+            raise AuthorizationError("initial_operation_id")
+        return _OperationLease(
+            cast(SQLiteAuthorizationJournal, self),
+            operation_id,
+            nonblocking=nonblocking,
+            prefix=f"{_INITIAL_JOURNAL_MARKER_PREFIX}operation-",
+        )
+
+    @staticmethod
+    def _file_details(path: Path, phase: str) -> tuple[int, int, int]:
+        return SQLiteAuthorizationJournal._owner_file_details(path, phase)
+
+    @staticmethod
+    def _file_details_or_none(path: Path, phase: str) -> tuple[int, int, int] | None:
+        return SQLiteAuthorizationJournal._owner_file_details_or_none(path, phase)
+
+    @staticmethod
+    def _fsync_parent(path: Path) -> None:
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+            os.fsync(descriptor)
+        except OSError:
+            raise AuthorizationError("initial_journal_durability") from None
+        finally:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+
+    @staticmethod
+    def _write_exclusive(path: Path, payload: bytes, *, phase: str) -> tuple[int, int, int]:
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            details = SQLiteAuthorizationJournal._validate_owner_file_details(
+                os.fstat(descriptor), phase
+            )
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise AuthorizationError(phase)
+                view = view[written:]
+            os.fsync(descriptor)
+            return details
+        except AuthorizationError:
+            raise
+        except FileExistsError:
+            raise AuthorizationError(phase) from None
+        except OSError:
+            raise AuthorizationError(phase) from None
+        finally:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+
+    @staticmethod
+    def _rewrite_current(path: Path, payload: bytes, *, phase: str) -> None:
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY
+                | os.O_TRUNC
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            SQLiteAuthorizationJournal._validate_owner_file_details(os.fstat(descriptor), phase)
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise AuthorizationError(phase)
+                view = view[written:]
+            os.fsync(descriptor)
+        except AuthorizationError:
+            raise
+        except OSError:
+            raise AuthorizationError(phase) from None
+        finally:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+
+    @staticmethod
+    def _model_bytes(model: BaseModel, *, phase: str) -> bytes:
+        try:
+            return json.dumps(
+                model.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            raise AuthorizationError(phase) from None
+
+    @staticmethod
+    def _read_model(path: Path, model: type[_Model], *, phase: str) -> _Model:
+        SQLiteInitialProvisioningJournal._file_details(path, phase)
+        try:
+            raw = path.read_bytes()
+            return model.model_validate(_parse_document(raw, phase=phase))
+        except (AuthorizationError, OSError, ValidationError, ValueError):
+            raise AuthorizationError(phase) from None
+
+    def _read_marker(self) -> _InitialJournalMarkerV1:
+        model = self._read_model(
+            self._marker_path(), _InitialJournalMarkerV1, phase="initial_journal_marker"
+        )
+        if type(model) is not _InitialJournalMarkerV1:
+            raise AuthorizationError("initial_journal_marker")
+        return model
+
+    def _read_anchor(self) -> _InitialJournalAnchorV1:
+        model = self._read_model(
+            self._anchor_path(), _InitialJournalAnchorV1, phase="initial_journal_anchor"
+        )
+        if type(model) is not _InitialJournalAnchorV1:
+            raise AuthorizationError("initial_journal_anchor")
+        return model
+
+    def _write_marker(self, marker: _InitialJournalMarkerV1) -> tuple[int, int, int]:
+        details = self._write_exclusive(
+            self._marker_path(),
+            self._model_bytes(marker, phase="initial_journal_marker"),
+            phase="initial_journal_marker",
+        )
+        self._fsync_parent(self._marker_path())
+        return details
+
+    def _write_anchor(self, anchor: _InitialJournalAnchorV1) -> tuple[int, int, int]:
+        details = self._write_exclusive(
+            self._anchor_path(),
+            self._model_bytes(anchor, phase="initial_journal_anchor"),
+            phase="initial_journal_anchor",
+        )
+        self._fsync_parent(self._anchor_path())
+        return details
+
+    def _set_marker_state(
+        self, marker: _InitialJournalMarkerV1, state: Literal["current", "abandoned"]
+    ) -> None:
+        current = marker.model_copy(update={"state": state})
+        self._rewrite_current(
+            self._marker_path(),
+            self._model_bytes(current, phase="initial_journal_marker"),
+            phase="initial_journal_marker",
+        )
+        self._fsync_parent(self._marker_path())
+
+    def _set_marker_current(self, marker: _InitialJournalMarkerV1) -> None:
+        self._set_marker_state(marker, "current")
+
+    def _create_database(self) -> tuple[int, int, int]:
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                self._path,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            details = SQLiteAuthorizationJournal._validate_owner_file_details(
+                os.fstat(descriptor), "initial_journal_path"
+            )
+            os.fsync(descriptor)
+            self._fsync_parent(self._path)
+            return details
+        except AuthorizationError:
+            raise
+        except FileExistsError:
+            raise AuthorizationError("initial_journal_replayed") from None
+        except OSError:
+            raise AuthorizationError("initial_journal_path") from None
+        finally:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+
+    def _validate_companions(self) -> None:
+        for suffix in ("-journal", "-wal", "-shm"):
+            if self._file_details_or_none(
+                Path(f"{self._path}{suffix}"), "initial_journal_companion"
+            ):
+                raise AuthorizationError("initial_journal_companion")
+
+    @staticmethod
+    def _normalized_schema(schema: str) -> str:
+        return re.sub(r"\s+", "", schema.replace("IF NOT EXISTS ", "").lower())
+
+    @classmethod
+    def _validate_schema(cls, connection: sqlite3.Connection) -> None:
+        SQLiteAuthorizationJournal._reject_executable_schema_objects(connection)
+        names = SQLiteAuthorizationJournal._table_names(connection)
+        if names != {_INITIAL_OPERATION_TABLE, _INITIAL_JOURNAL_METADATA_TABLE}:
+            raise AuthorizationError("initial_journal_schema")
+        expected_tables = (
+            (_INITIAL_OPERATION_TABLE, _INITIAL_OPERATION_SCHEMA),
+            (_INITIAL_JOURNAL_METADATA_TABLE, _INITIAL_JOURNAL_METADATA_SCHEMA),
+        )
+        for name, expected in expected_tables:
+            row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+            ).fetchone()
+            if (
+                row is None
+                or type(row[0]) is not str
+                or cls._normalized_schema(row[0]) != cls._normalized_schema(expected)
+            ):
+                raise AuthorizationError("initial_journal_schema")
+
+    def _metadata_identity(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        database_details: tuple[int, int, int],
+        anchor_details: tuple[int, int, int],
+    ) -> _InitialJournalIdentity:
+        self._validate_schema(connection)
+        rows = connection.execute(
+            f"""
+            SELECT journal_uuid, journal_path_sha256, journal_schema_sha256, intent_sha256,
+                   anchor_dev, anchor_ino, anchor_nlink, schema_version
+            FROM {_INITIAL_JOURNAL_METADATA_TABLE}
+            """
+        ).fetchall()
+        if len(rows) != 1:
+            raise AuthorizationError("initial_journal_identity")
+        row = rows[0]
+        if (
+            len(row) != 8
+            or any(type(value) is not str for value in row[:4])
+            or any(type(value) is not int for value in row[4:7])
+            or row[7] != _INITIAL_JOURNAL_SCHEMA_VERSION
+            or row[4:7] != anchor_details
+        ):
+            raise AuthorizationError("initial_journal_identity")
+        return _InitialJournalIdentity(
+            journal_uuid=cast(str, row[0]),
+            journal_path_sha256=cast(str, row[1]),
+            journal_schema_sha256=cast(str, row[2]),
+            intent_sha256=cast(str, row[3]),
+            database_details=database_details,
+            anchor_details=anchor_details,
+        )
+
+    def _established_identity(self) -> _InitialJournalIdentity:
+        self._validate_path()
+        with self._identity_lease() as lease:
+            lease.assert_stable()
+            database_details = self._file_details_or_none(self._path, "initial_journal_path")
+            anchor_details = self._file_details_or_none(
+                self._anchor_path(), "initial_journal_anchor"
+            )
+            marker_details = self._file_details_or_none(
+                self._marker_path(), "initial_journal_marker"
+            )
+            if marker_details is None:
+                if database_details is None and anchor_details is None:
+                    raise AuthorizationError("initial_journal_absent")
+                raise AuthorizationError("initial_journal_marker")
+            marker = self._read_marker()
+            if marker.state != "current":
+                raise AuthorizationError("initial_provisioning_incomplete")
+            if database_details is None or anchor_details is None:
+                raise AuthorizationError("initial_journal_missing")
+            self._validate_companions()
+            try:
+                connection = sqlite3.connect(
+                    f"{self._path.as_uri()}?mode=ro", uri=True, isolation_level=None, timeout=5.0
+                )
+            except sqlite3.Error:
+                raise AuthorizationError("initial_journal_open") from None
+            try:
+                connection.execute("PRAGMA trusted_schema = OFF")
+                anchor = self._read_anchor()
+                identity = self._metadata_identity(
+                    connection,
+                    database_details=database_details,
+                    anchor_details=anchor_details,
+                )
+                if (
+                    anchor.journal_uuid != identity.journal_uuid
+                    or anchor.journal_path_sha256 != identity.journal_path_sha256
+                    or anchor.journal_schema_sha256 != identity.journal_schema_sha256
+                    or anchor.intent_sha256 != identity.intent_sha256
+                    or (anchor.database_dev, anchor.database_ino, anchor.database_nlink)
+                    != database_details
+                    or marker.journal_uuid != identity.journal_uuid
+                    or marker.journal_path_sha256 != identity.journal_path_sha256
+                    or marker.journal_schema_sha256 != identity.journal_schema_sha256
+                    or marker.intent_sha256 != identity.intent_sha256
+                ):
+                    raise AuthorizationError("initial_journal_identity")
+                lease.assert_stable()
+                return identity
+            finally:
+                connection.close()
+
+    def _pin_execution_identity(self) -> _InitialJournalExecutionPin:
+        """Capture the local identity that must survive one initial effect."""
+
+        identity = self._established_identity()
+        database_details = self._file_details(self._path, "initial_journal_identity_pinned")
+        anchor_details = self._file_details(self._anchor_path(), "initial_journal_identity_pinned")
+        marker_details = self._file_details(self._marker_path(), "initial_journal_identity_pinned")
+        if (
+            database_details != identity.database_details
+            or anchor_details != identity.anchor_details
+            or self._established_identity() != identity
+            or self._file_details(self._path, "initial_journal_identity_pinned") != database_details
+            or self._file_details(self._anchor_path(), "initial_journal_identity_pinned")
+            != anchor_details
+            or self._file_details(self._marker_path(), "initial_journal_identity_pinned")
+            != marker_details
+        ):
+            raise AuthorizationError("initial_journal_identity_pinned")
+        return _InitialJournalExecutionPin(
+            identity=identity,
+            database_details=database_details,
+            anchor_details=anchor_details,
+            marker_details=marker_details,
+            capability=_INITIAL_JOURNAL_PIN_CAPABILITY,
+        )
+
+    def _assert_pinned_execution_identity(self, pin: _InitialJournalExecutionPin) -> None:
+        """Reject database, anchor, or marker replacement after first snapshot."""
+
+        if (
+            type(pin) is not _InitialJournalExecutionPin
+            or pin.capability is not _INITIAL_JOURNAL_PIN_CAPABILITY
+        ):
+            raise AuthorizationError("initial_journal_identity_pinned")
+        try:
+            identity = self._established_identity()
+            database_details = self._file_details(self._path, "initial_journal_identity_pinned")
+            anchor_details = self._file_details(
+                self._anchor_path(), "initial_journal_identity_pinned"
+            )
+            marker_details = self._file_details(
+                self._marker_path(), "initial_journal_identity_pinned"
+            )
+        except AuthorizationError:
+            raise AuthorizationError("initial_journal_identity_pinned") from None
+        if (
+            identity != pin.identity
+            or database_details != pin.database_details
+            or anchor_details != pin.anchor_details
+            or marker_details != pin.marker_details
+        ):
+            raise AuthorizationError("initial_journal_identity_pinned")
+
+    def migration_status(self) -> InitialProvisioningJournalStatus:
+        """Classify local state without creating, rotating, or repairing it."""
+
+        self._validate_path()
+        database_details = self._file_details_or_none(self._path, "initial_journal_path")
+        anchor_details = self._file_details_or_none(self._anchor_path(), "initial_journal_anchor")
+        marker_details = self._file_details_or_none(self._marker_path(), "initial_journal_marker")
+        if database_details is None and anchor_details is None and marker_details is None:
+            return InitialProvisioningJournalStatus.ABSENT
+        if marker_details is not None:
+            try:
+                marker = self._read_marker()
+            except AuthorizationError:
+                return InitialProvisioningJournalStatus.IDENTITY_MISMATCH
+            if marker.state != "current":
+                if marker.state == "abandoned":
+                    return InitialProvisioningJournalStatus.ABANDONED
+                return InitialProvisioningJournalStatus.PROVISIONING_INCOMPLETE
+        if database_details is None or anchor_details is None or marker_details is None:
+            return InitialProvisioningJournalStatus.JOURNAL_MISSING
+        try:
+            self._established_identity()
+        except AuthorizationError:
+            return InitialProvisioningJournalStatus.IDENTITY_MISMATCH
+        return InitialProvisioningJournalStatus.CURRENT
+
+    @staticmethod
+    def _require_verified_intent(verified: _VerifiedInitialIntent) -> None:
+        if (
+            type(verified) is not _VerifiedInitialIntent
+            or verified.capability is not _INITIAL_INTENT_CAPABILITY
+        ):
+            raise AuthorizationError("initial_journal")
+
+    def _begin_verified_intent(self, verified: _VerifiedInitialIntent) -> None:
+        """Persist a pending local marker before the external genesis claim."""
+
+        self._require_verified_intent(verified)
+        intent = verified.intent
+        with self._identity_lease() as lease:
+            lease.assert_stable()
+            if self.migration_status() is not InitialProvisioningJournalStatus.ABSENT:
+                raise AuthorizationError("initial_journal_replayed")
+            marker = _InitialJournalMarkerV1(
+                schema_version="rsd.initial-provisioning-journal-marker.v1",
+                state="pending",
+                journal_uuid=intent.journal_uuid,
+                journal_path_sha256=intent.journal_path_sha256,
+                journal_schema_sha256=intent.journal_schema_sha256,
+                intent_sha256=verified.intent_sha256,
+            )
+            self._write_marker(marker)
+            lease.assert_stable()
+
+    def _complete_verified_intent(self, verified: _VerifiedInitialIntent) -> None:
+        """Create exactly one journal/anchor pair after a pending marker exists."""
+
+        self._require_verified_intent(verified)
+        intent = verified.intent
+        with self._identity_lease() as lease:
+            lease.assert_stable()
+            marker = self._read_marker()
+            if (
+                marker.state != "pending"
+                or marker.journal_uuid != intent.journal_uuid
+                or marker.intent_sha256 != verified.intent_sha256
+                or marker.journal_path_sha256 != self._path_sha256()
+                or marker.journal_schema_sha256 != self.journal_schema_sha256()
+            ):
+                raise AuthorizationError("initial_provisioning_incomplete")
+            if (
+                self._file_details_or_none(self._path, "initial_journal_path") is not None
+                or self._file_details_or_none(self._anchor_path(), "initial_journal_anchor")
+                is not None
+            ):
+                raise AuthorizationError("initial_provisioning_incomplete")
+            database_details = self._create_database()
+            try:
+                connection = sqlite3.connect(
+                    f"{self._path.as_uri()}?mode=rw", uri=True, isolation_level=None, timeout=5.0
+                )
+            except sqlite3.Error:
+                raise AuthorizationError("initial_journal_open") from None
+            try:
+                connection.execute("PRAGMA trusted_schema = OFF")
+                if connection.execute("PRAGMA journal_mode = DELETE").fetchone() != ("delete",):
+                    raise AuthorizationError("initial_journal_durability")
+                connection.execute("PRAGMA synchronous = FULL")
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(_INITIAL_OPERATION_SCHEMA)
+                connection.execute(_INITIAL_JOURNAL_METADATA_SCHEMA)
+                connection.execute("COMMIT")
+                anchor = _InitialJournalAnchorV1(
+                    schema_version="rsd.initial-provisioning-journal-anchor.v1",
+                    journal_uuid=intent.journal_uuid,
+                    journal_path_sha256=intent.journal_path_sha256,
+                    journal_schema_sha256=intent.journal_schema_sha256,
+                    intent_sha256=verified.intent_sha256,
+                    database_dev=database_details[0],
+                    database_ino=database_details[1],
+                    database_nlink=1,
+                )
+                anchor_details = self._write_anchor(anchor)
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    f"""
+                    INSERT INTO {_INITIAL_JOURNAL_METADATA_TABLE} (
+                        singleton, journal_uuid, journal_path_sha256, journal_schema_sha256,
+                        intent_sha256, anchor_dev, anchor_ino, anchor_nlink, schema_version
+                    ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        intent.journal_uuid,
+                        intent.journal_path_sha256,
+                        intent.journal_schema_sha256,
+                        verified.intent_sha256,
+                        anchor_details[0],
+                        anchor_details[1],
+                        anchor_details[2],
+                        _INITIAL_JOURNAL_SCHEMA_VERSION,
+                    ),
+                )
+                connection.execute("COMMIT")
+                self._set_marker_current(marker)
+                lease.assert_stable()
+            except AuthorizationError:
+                with suppress(sqlite3.Error):
+                    connection.execute("ROLLBACK")
+                raise
+            except sqlite3.Error:
+                with suppress(sqlite3.Error):
+                    connection.execute("ROLLBACK")
+                raise AuthorizationError("initial_journal_transaction") from None
+            finally:
+                connection.close()
+
+    def reconcile_genesis(
+        self, receipt: InitialJournalGenesisReconciliationReceiptV1
+    ) -> InitialProvisioningJournalStatus:
+        """Resolve a pending genesis without recreating any local object.
+
+        Completion is permitted only after the database and anchor already
+        exist and validate against the pending marker.  Earlier crash windows
+        can only be explicitly abandoned, preserving the external tombstone.
+        """
+
+        if type(receipt) is not InitialJournalGenesisReconciliationReceiptV1:
+            raise AuthorizationError("initial_journal_reconciliation")
+        with self._identity_lease() as lease:
+            lease.assert_stable()
+            marker = self._read_marker()
+            if (
+                marker.state != "pending"
+                or marker.journal_uuid != receipt.journal_uuid
+                or marker.journal_path_sha256 != receipt.journal_path_sha256
+                or marker.intent_sha256 != receipt.intent_sha256
+            ):
+                raise AuthorizationError("initial_journal_reconciliation")
+            if receipt.outcome == "provisioning_abandoned":
+                self._set_marker_state(marker, "abandoned")
+                lease.assert_stable()
+                return InitialProvisioningJournalStatus.ABANDONED
+
+            database_details = self._file_details_or_none(
+                self._path, "initial_journal_reconciliation"
+            )
+            anchor_details = self._file_details_or_none(
+                self._anchor_path(), "initial_journal_reconciliation"
+            )
+            if database_details is None or anchor_details is None:
+                raise AuthorizationError("initial_journal_reconciliation")
+            self._validate_companions()
+            try:
+                connection = sqlite3.connect(
+                    f"{self._path.as_uri()}?mode=ro", uri=True, isolation_level=None, timeout=5.0
+                )
+            except sqlite3.Error:
+                raise AuthorizationError("initial_journal_reconciliation") from None
+            try:
+                connection.execute("PRAGMA trusted_schema = OFF")
+                anchor = self._read_anchor()
+                identity = self._metadata_identity(
+                    connection,
+                    database_details=database_details,
+                    anchor_details=anchor_details,
+                )
+                if (
+                    anchor.journal_uuid != marker.journal_uuid
+                    or anchor.journal_path_sha256 != marker.journal_path_sha256
+                    or anchor.journal_schema_sha256 != marker.journal_schema_sha256
+                    or anchor.intent_sha256 != marker.intent_sha256
+                    or (anchor.database_dev, anchor.database_ino, anchor.database_nlink)
+                    != database_details
+                    or identity.journal_uuid != marker.journal_uuid
+                    or identity.journal_path_sha256 != marker.journal_path_sha256
+                    or identity.journal_schema_sha256 != marker.journal_schema_sha256
+                    or identity.intent_sha256 != marker.intent_sha256
+                ):
+                    raise AuthorizationError("initial_journal_reconciliation")
+            except AuthorizationError:
+                raise
+            except sqlite3.Error:
+                raise AuthorizationError("initial_journal_reconciliation") from None
+            finally:
+                connection.close()
+            self._set_marker_current(marker)
+            lease.assert_stable()
+        return InitialProvisioningJournalStatus.CURRENT
+
+    def assert_intent(self, verified: _VerifiedInitialIntent) -> None:
+        self._require_verified_intent(verified)
+        identity = self._established_identity()
+        intent = verified.intent
+        if (
+            identity.journal_uuid != intent.journal_uuid
+            or identity.journal_path_sha256 != intent.journal_path_sha256
+            or identity.journal_schema_sha256 != intent.journal_schema_sha256
+            or identity.intent_sha256 != verified.intent_sha256
+        ):
+            raise AuthorizationError("initial_journal_intent_mismatch")
+
+    def _connect(self) -> tuple[sqlite3.Connection, _InitialJournalIdentity]:
+        identity = self._established_identity()
+        self._validate_companions()
+        try:
+            connection = sqlite3.connect(
+                f"{self._path.as_uri()}?mode=rw", uri=True, isolation_level=None, timeout=5.0
+            )
+        except sqlite3.Error:
+            raise AuthorizationError("initial_journal_open") from None
+        try:
+            connection.execute("PRAGMA trusted_schema = OFF")
+            if connection.execute("PRAGMA journal_mode = DELETE").fetchone() != ("delete",):
+                raise AuthorizationError("initial_journal_durability")
+            connection.execute("PRAGMA synchronous = FULL")
+            return connection, identity
+        except AuthorizationError:
+            connection.close()
+            raise
+        except sqlite3.Error:
+            connection.close()
+            raise AuthorizationError("initial_journal_open") from None
+
+    def _transaction(self, action: Callable[[sqlite3.Connection], None]) -> None:
+        connection, identity = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if self._established_identity() != identity:
+                raise AuthorizationError("initial_journal_identity")
+            action(connection)
+            connection.execute("COMMIT")
+            if self._established_identity() != identity:
+                raise AuthorizationError("initial_journal_identity")
+        except AuthorizationError:
+            with suppress(sqlite3.Error):
+                connection.execute("ROLLBACK")
+            raise
+        except sqlite3.Error:
+            with suppress(sqlite3.Error):
+                connection.execute("ROLLBACK")
+            raise AuthorizationError("initial_journal_transaction") from None
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _require_verified_operation(verified: _VerifiedInitialProvisioning) -> None:
+        if (
+            type(verified) is not _VerifiedInitialProvisioning
+            or verified.capability is not _INITIAL_VERIFIED_CAPABILITY
+        ):
+            raise AuthorizationError("initial_journal")
+
+    def _claim_verified(self, verified: _VerifiedInitialProvisioning) -> None:
+        self._require_verified_operation(verified)
+        context = verified.context
+
+        def claim(connection: sqlite3.Connection) -> None:
+            existing = connection.execute(
+                f"SELECT 1 FROM {_INITIAL_OPERATION_TABLE} WHERE provisioning_operation_id = ?",
+                (context.provisioning_operation_id,),
+            ).fetchone()
+            nonce = connection.execute(
+                f"SELECT 1 FROM {_INITIAL_OPERATION_TABLE} WHERE nonce = ?", (verified.nonce,)
+            ).fetchone()
+            if existing is not None:
+                raise AuthorizationError("initial_operation_replayed")
+            if nonce is not None:
+                raise AuthorizationError("initial_nonce_replayed")
+            connection.execute(
+                f"""
+                INSERT INTO {_INITIAL_OPERATION_TABLE} (
+                    provisioning_operation_id, operation_kind, operation_scope, intent_sha256,
+                    nonce,
+                    provider_provenance_sha256, idempotency_key, state, effect_receipt_sha256,
+                    observed_resources_sha256, failure_phase, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    context.provisioning_operation_id,
+                    context.operation_kind,
+                    context.operation_scope,
+                    context.intent_sha256,
+                    verified.nonce,
+                    context.provider_provenance_sha256,
+                    context.idempotency_key,
+                    InitialProvisioningOperationState.CLAIMED.value,
+                    verified.authorized_at,
+                    verified.authorized_at,
+                ),
+            )
+
+        self._transaction(claim)
+
+    def _begin_effect(self, verified: _VerifiedInitialProvisioning) -> None:
+        self._require_verified_operation(verified)
+        context = verified.context
+
+        def begin(connection: sqlite3.Connection) -> None:
+            result = connection.execute(
+                f"""
+                UPDATE {_INITIAL_OPERATION_TABLE}
+                SET state = ?, updated_at = ?
+                WHERE provisioning_operation_id = ? AND intent_sha256 = ? AND nonce = ?
+                  AND idempotency_key = ? AND state = ?
+                """,
+                (
+                    InitialProvisioningOperationState.IN_PROGRESS.value,
+                    verified.authorized_at,
+                    context.provisioning_operation_id,
+                    context.intent_sha256,
+                    verified.nonce,
+                    context.idempotency_key,
+                    InitialProvisioningOperationState.CLAIMED.value,
+                ),
+            )
+            if result.rowcount != 1:
+                raise AuthorizationError("initial_operation_state")
+
+        self._transaction(begin)
+
+    def _commit_effect(
+        self, verified: _VerifiedInitialProvisioning, receipt: InitialProvisioningEffectReceiptV1
+    ) -> None:
+        self._require_verified_operation(verified)
+        context = verified.context
+        resources_sha256 = _digest(
+            _INITIAL_EFFECT_RECEIPT_DOMAIN
+            + json.dumps(
+                receipt.observed_resources.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        )
+
+        def commit(connection: sqlite3.Connection) -> None:
+            result = connection.execute(
+                f"""
+                UPDATE {_INITIAL_OPERATION_TABLE}
+                SET state = ?, effect_receipt_sha256 = ?, observed_resources_sha256 = ?,
+                    failure_phase = NULL, updated_at = ?
+                WHERE provisioning_operation_id = ? AND intent_sha256 = ? AND nonce = ?
+                  AND idempotency_key = ? AND state = ?
+                """,
+                (
+                    InitialProvisioningOperationState.PROVISIONED_EMPTY.value,
+                    receipt.effect_receipt_sha256,
+                    resources_sha256,
+                    verified.authorized_at,
+                    context.provisioning_operation_id,
+                    context.intent_sha256,
+                    verified.nonce,
+                    context.idempotency_key,
+                    InitialProvisioningOperationState.IN_PROGRESS.value,
+                ),
+            )
+            if result.rowcount != 1:
+                raise AuthorizationError("initial_operation_state")
+
+        self._transaction(commit)
+
+    def _fail_effect(self, verified: _VerifiedInitialProvisioning) -> None:
+        self._require_verified_operation(verified)
+        context = verified.context
+
+        def fail(connection: sqlite3.Connection) -> None:
+            result = connection.execute(
+                f"""
+                UPDATE {_INITIAL_OPERATION_TABLE}
+                SET state = ?, failure_phase = ?, updated_at = ?
+                WHERE provisioning_operation_id = ? AND nonce = ? AND state IN (?, ?)
+                """,
+                (
+                    InitialProvisioningOperationState.FAILED_RECOVERY_REQUIRED.value,
+                    "effect_failed_recovery_required",
+                    verified.authorized_at,
+                    context.provisioning_operation_id,
+                    verified.nonce,
+                    InitialProvisioningOperationState.CLAIMED.value,
+                    InitialProvisioningOperationState.IN_PROGRESS.value,
+                ),
+            )
+            if result.rowcount != 1:
+                raise AuthorizationError("initial_operation_state")
+
+        self._transaction(fail)
+
+    def operation_state(
+        self, provisioning_operation_id: str
+    ) -> InitialProvisioningOperationState | None:
+        if type(provisioning_operation_id) is not str or not provisioning_operation_id:
+            raise AuthorizationError("initial_operation_id")
+        connection, _ = self._connect()
+        try:
+            row = connection.execute(
+                f"SELECT state FROM {_INITIAL_OPERATION_TABLE} WHERE provisioning_operation_id = ?",
+                (provisioning_operation_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            raise AuthorizationError("initial_journal_transaction") from None
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        try:
+            return InitialProvisioningOperationState(row[0])
+        except (TypeError, ValueError):
+            raise AuthorizationError("initial_journal_schema") from None
+
+    def require_recovery(self, provisioning_operation_id: str) -> InitialProvisioningOperationState:
+        """Mark an ambiguous initial effect terminal without retrying it."""
+
+        if type(provisioning_operation_id) is not str or not provisioning_operation_id:
+            raise AuthorizationError("initial_operation_id")
+
+        def recover(connection: sqlite3.Connection) -> None:
+            result = connection.execute(
+                f"""
+                UPDATE {_INITIAL_OPERATION_TABLE}
+                SET state = ?, failure_phase = ?, updated_at = ?
+                WHERE provisioning_operation_id = ? AND state IN (?, ?)
+                """,
+                (
+                    InitialProvisioningOperationState.FAILED_RECOVERY_REQUIRED.value,
+                    "explicit_recovery",
+                    datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                    provisioning_operation_id,
+                    InitialProvisioningOperationState.CLAIMED.value,
+                    InitialProvisioningOperationState.IN_PROGRESS.value,
+                ),
+            )
+            if result.rowcount != 1:
+                raise AuthorizationError("initial_operation_state")
+
+        with self._operation_lease(provisioning_operation_id, nonblocking=True) as lease:
+            lease.assert_stable()
+            self._transaction(recover)
+            lease.assert_stable()
+        return InitialProvisioningOperationState.FAILED_RECOVERY_REQUIRED
+
+
 def _validate_effect_receipt(context: VerifiedExecutionContext, value: object) -> EffectReceiptV1:
     if type(value) is not EffectReceiptV1:
         raise AuthorizationError("effect_receipt")
     receipt = value
     if (
-        receipt.operation_id != context.operation_id
+        receipt.operation_kind != context.operation_kind
+        or receipt.operation_id != context.operation_id
         or receipt.idempotency_key != context.idempotency_key
     ):
         raise AuthorizationError("effect_receipt")
+    return receipt
+
+
+def _validate_initial_effect_receipt(
+    context: InitialProvisioningExecutionContext, value: object
+) -> InitialProvisioningEffectReceiptV1:
+    """Reject every effect output outside the one empty-resource scope."""
+
+    if type(value) is not InitialProvisioningEffectReceiptV1:
+        raise AuthorizationError("initial_effect_receipt")
+    receipt = value
+    if (
+        receipt.operation_kind != context.operation_kind
+        or receipt.operation_scope != context.operation_scope
+        or receipt.provisioning_operation_id != context.provisioning_operation_id
+        or receipt.intent_sha256 != context.intent_sha256
+        or receipt.journal_uuid != context.intent.journal_uuid
+        or receipt.idempotency_key != context.idempotency_key
+    ):
+        raise AuthorizationError("initial_effect_receipt")
     return receipt
 
 
@@ -3323,6 +4756,33 @@ def _verify_journal_genesis_reconciliation_receipt(
         signer.key().verify(signature, _journal_genesis_reconciliation_message(receipt))
     except (InvalidSignature, ValueError, binascii.Error):
         raise AuthorizationError("journal_genesis_reconciliation_signature") from None
+
+
+def _initial_journal_genesis_reconciliation_message(
+    receipt: InitialJournalGenesisReconciliationReceiptV1,
+) -> bytes:
+    material = receipt.model_dump(mode="json", exclude={"signature_base64"})
+    return _INITIAL_JOURNAL_GENESIS_RECONCILIATION_DOMAIN + json.dumps(
+        material, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _verify_initial_journal_genesis_reconciliation_receipt(
+    receipt: InitialJournalGenesisReconciliationReceiptV1,
+    *,
+    signer: TrustedEd25519SignerV1,
+) -> None:
+    if (
+        type(receipt) is not InitialJournalGenesisReconciliationReceiptV1
+        or type(signer) is not TrustedEd25519SignerV1
+        or receipt.signer_key_id != signer.key_id
+    ):
+        raise AuthorizationError("initial_journal_reconciliation_signature")
+    try:
+        signature = _canonical_base64(receipt.signature_base64)
+        signer.key().verify(signature, _initial_journal_genesis_reconciliation_message(receipt))
+    except (InvalidSignature, ValueError, binascii.Error):
+        raise AuthorizationError("initial_journal_reconciliation_signature") from None
 
 
 def _verify_reconciliation_receipt(
@@ -3409,6 +4869,475 @@ def _check_execution_stability(
     artifact_lease.assert_stable()
     operation_lease.assert_stable()
     journal._assert_pinned_execution_identity(journal_pin)
+
+
+def _check_initial_execution_stability(
+    journal: SQLiteInitialProvisioningJournal,
+    journal_pin: _InitialJournalExecutionPin,
+    intent: _VerifiedInitialIntent,
+    artifact_lease: ArtifactRootLease,
+    operation_lease: _OperationLease,
+) -> None:
+    artifact_lease.assert_stable()
+    operation_lease.assert_stable()
+    journal._assert_pinned_execution_identity(journal_pin)
+    journal.assert_intent(intent)
+
+
+def _check_observed_stage_stability(
+    journal: SQLiteInitialProvisioningJournal,
+    journal_pin: _InitialJournalExecutionPin,
+    intent: _VerifiedInitialIntent,
+) -> None:
+    """Keep the completed initial stage pinned through an observed effect."""
+
+    journal._assert_pinned_execution_identity(journal_pin)
+    journal.assert_intent(intent)
+    if (
+        journal.operation_state(intent.intent.provisioning_operation_id)
+        is not InitialProvisioningOperationState.PROVISIONED_EMPTY
+    ):
+        raise AuthorizationError("initial_operation_state")
+
+
+def _require_current_initial_journal(status: InitialProvisioningJournalStatus) -> None:
+    if status is InitialProvisioningJournalStatus.CURRENT:
+        return
+    phases = {
+        InitialProvisioningJournalStatus.ABSENT: "initial_journal_absent",
+        InitialProvisioningJournalStatus.PROVISIONING_INCOMPLETE: "initial_provisioning_incomplete",
+        InitialProvisioningJournalStatus.ABANDONED: "initial_journal_abandoned",
+        InitialProvisioningJournalStatus.JOURNAL_MISSING: "initial_journal_missing",
+        InitialProvisioningJournalStatus.IDENTITY_MISMATCH: "initial_journal_identity_mismatch",
+        InitialProvisioningJournalStatus.UNKNOWN: "initial_journal_schema",
+    }
+    raise AuthorizationError(phases[status])
+
+
+def _verify_initial_intent_binding(
+    verified: _VerifiedInitialIntent,
+    *,
+    journal: SQLiteInitialProvisioningJournal,
+    replay_policy: ReplayAuthorityPolicyV1,
+) -> None:
+    if (
+        type(verified) is not _VerifiedInitialIntent
+        or verified.capability is not _INITIAL_INTENT_CAPABILITY
+        or type(journal) is not SQLiteInitialProvisioningJournal
+        or type(replay_policy) is not ReplayAuthorityPolicyV1
+    ):
+        raise AuthorizationError("initial_intent_binding")
+    intent = verified.intent
+    if (
+        intent.journal_path != str(journal._path)
+        or intent.journal_path_sha256 != journal._path_sha256()
+        or intent.journal_schema_sha256 != journal.journal_schema_sha256()
+        or intent.replay_policy_sha256 != replay_policy.sha256()
+    ):
+        raise AuthorizationError("initial_intent_binding")
+
+
+def _provision_initial_journal_with_clock(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteInitialProvisioningJournal,
+    intent: InitialProvisioningIntentV1,
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
+    clock: Callable[[], datetime],
+    _capability: object,
+) -> InitialJournalProvisioningReceiptV1:
+    """Explicit create-once initial journal provisioning from a signed intent."""
+
+    if _capability not in {_TEST_CLOCK_CAPABILITY, _SYSTEM_CLOCK_CAPABILITY}:
+        raise AuthorizationError("test_clock")
+    if (
+        type(paths) is not AuthorizationPaths
+        or type(signer) is not TrustedEd25519SignerV1
+        or type(journal) is not SQLiteInitialProvisioningJournal
+        or type(intent) is not InitialProvisioningIntentV1
+        or type(replay_policy) is not ReplayAuthorityPolicyV1
+    ):
+        raise AuthorizationError("initial_journal_genesis")
+    _replay_claim_method(replay_authority)
+    now = _read_clock(clock)
+    _verify_initial_intent_signature(intent, signer=signer)
+    try:
+        created = datetime.fromisoformat(intent.created_at.removesuffix("Z") + "+00:00")
+        retained = datetime.fromisoformat(intent.retention_expires_at.removesuffix("Z") + "+00:00")
+    except ValueError:
+        raise AuthorizationError("initial_intent_freshness") from None
+    if (
+        created.tzinfo is None
+        or retained.tzinfo is None
+        or created.astimezone(UTC) > now
+        or now - created.astimezone(UTC) > _STAGE_ATTESTATION_FRESHNESS
+        or retained.astimezone(UTC) <= now
+        or intent.disposal_owner != expected_disposal_owner
+        or intent.approver_identity != expected_approver_identity
+    ):
+        raise AuthorizationError("initial_intent_freshness")
+    verified = _VerifiedInitialIntent(
+        intent=intent,
+        intent_sha256=initial_provisioning_intent_sha256(intent),
+        capability=_INITIAL_INTENT_CAPABILITY,
+    )
+    _verify_initial_intent_binding(verified, journal=journal, replay_policy=replay_policy)
+    with ArtifactRootLease(paths.root) as artifact_lease:
+        artifact_lease.assert_stable()
+        if journal.migration_status() is not InitialProvisioningJournalStatus.ABSENT:
+            raise AuthorizationError("initial_journal_replayed")
+        artifact_lease.assert_absent(paths.initial_intent_name(), phase="initial_journal_replayed")
+        artifact_lease.assert_absent(paths.initial_receipt_name(), phase="initial_journal_replayed")
+        journal._begin_verified_intent(verified)
+        _claim_replay_tombstone(
+            replay_authority,
+            _initial_genesis_tombstone(replay_policy, verified),
+            phase="initial_journal_replayed",
+        )
+        artifact_lease.assert_stable()
+        artifact_lease.write_once(
+            paths.initial_intent_name(),
+            _initial_intent_artifact_bytes(intent),
+            phase="initial_journal_replayed",
+        )
+        journal._complete_verified_intent(verified)
+        journal.assert_intent(verified)
+        artifact_lease.assert_stable()
+    return InitialJournalProvisioningReceiptV1(
+        schema_version="rsd.initial-provisioning-journal-provisioning-receipt.v1",
+        status="provisioned",
+        operation_kind=_INITIAL_OPERATION_KIND,
+        provisioning_operation_id=intent.provisioning_operation_id,
+        journal_uuid=intent.journal_uuid,
+        intent_sha256=verified.intent_sha256,
+        provisioned_at=now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+    )
+
+
+def provision_initial_journal(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteInitialProvisioningJournal,
+    intent: InitialProvisioningIntentV1,
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
+) -> InitialJournalProvisioningReceiptV1:
+    """Provision the separate pre-creation journal exactly once."""
+
+    return _provision_initial_journal_with_clock(
+        paths,
+        signer=signer,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        journal=journal,
+        intent=intent,
+        replay_authority=replay_authority,
+        replay_policy=replay_policy,
+        clock=_system_utc_clock,
+        _capability=_SYSTEM_CLOCK_CAPABILITY,
+    )
+
+
+def _provision_initial_journal_for_test(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteInitialProvisioningJournal,
+    intent: InitialProvisioningIntentV1,
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
+    _clock: Callable[[], datetime],
+    _capability: object,
+) -> InitialJournalProvisioningReceiptV1:
+    """Module-restricted test clock seam for initial journal provisioning."""
+
+    if _capability is not _TEST_CLOCK_CAPABILITY:
+        raise AuthorizationError("test_clock")
+    return _provision_initial_journal_with_clock(
+        paths,
+        signer=signer,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        journal=journal,
+        intent=intent,
+        replay_authority=replay_authority,
+        replay_policy=replay_policy,
+        clock=_clock,
+        _capability=_TEST_CLOCK_CAPABILITY,
+    )
+
+
+def _mark_initial_effect_ambiguous(
+    journal: SQLiteInitialProvisioningJournal, verified: _VerifiedInitialProvisioning
+) -> None:
+    if _safe_call(lambda: journal._fail_effect(verified)) is _SAFE_CALL_FAILURE:
+        raise AuthorizationError("initial_effect_failed_recovery_required")
+
+
+def _authorize_initial_provisioning_and_execute_with_clock(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    provider: ProviderProvenanceAdapter,
+    provider_fingerprints: Mapping[str, str],
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteInitialProvisioningJournal,
+    effect: Callable[[InitialProvisioningExecutionContext], InitialProvisioningEffectReceiptV1],
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
+    clock: Callable[[], datetime],
+) -> InitialProvisioningExecutionReceiptV1:
+    """Authorize only the typed isolated-empty pre-observation effect scope."""
+
+    if (
+        type(paths) is not AuthorizationPaths
+        or type(signer) is not TrustedEd25519SignerV1
+        or type(journal) is not SQLiteInitialProvisioningJournal
+        or type(replay_policy) is not ReplayAuthorityPolicyV1
+        or not callable(effect)
+    ):
+        raise AuthorizationError("initial_journal_effect")
+    _replay_claim_method(replay_authority)
+    fingerprints = _normalized_fingerprints(provider_fingerprints)
+    with ArtifactRootLease(paths.root) as artifact_lease:
+        artifact_lease.assert_stable()
+        _require_current_initial_journal(journal.migration_status())
+        verified_intent, initial_raw = _read_verified_initial_intent(
+            paths,
+            signer=signer,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            now=_read_clock(clock),
+            reader=artifact_lease.reader(),
+        )
+        _verify_initial_intent_binding(
+            verified_intent, journal=journal, replay_policy=replay_policy
+        )
+        journal.assert_intent(verified_intent)
+        journal_pin = journal._pin_execution_identity()
+        artifact_lease.assert_absent(
+            paths.initial_receipt_name(), phase="initial_operation_replayed"
+        )
+        references = verified_intent.intent.provider_references.all()
+        manager, provider_lease = _acquire_provider_lease(provider, references)
+        released = True
+        execution_receipt: InitialProvisioningExecutionReceiptV1 | None = None
+        try:
+            initial_provider_sha256, expectations = _provider_commitment(
+                references=references,
+                lease=provider_lease,
+                fingerprints=fingerprints,
+                recheck=False,
+            )
+            artifact_lease.assert_stable()
+            journal._assert_pinned_execution_identity(journal_pin)
+            repeated_intent, repeated_raw = _read_verified_initial_intent(
+                paths,
+                signer=signer,
+                expected_disposal_owner=expected_disposal_owner,
+                expected_approver_identity=expected_approver_identity,
+                now=_read_clock(clock),
+                reader=artifact_lease.reader(),
+            )
+            if repeated_intent != verified_intent or repeated_raw != initial_raw:
+                raise AuthorizationError("initial_artifact_race")
+            final_provider_sha256, final_expectations = _provider_commitment(
+                references=references,
+                lease=provider_lease,
+                fingerprints=fingerprints,
+                recheck=True,
+            )
+            artifact_lease.assert_stable()
+            journal._assert_pinned_execution_identity(journal_pin)
+            if (
+                initial_provider_sha256 != final_provider_sha256
+                or expectations != final_expectations
+            ):
+                raise AuthorizationError("initial_provider_race")
+            authorized_at = _read_clock(clock).isoformat(timespec="seconds").replace("+00:00", "Z")
+            context = InitialProvisioningExecutionContext(
+                operation_kind=_INITIAL_OPERATION_KIND,
+                operation_scope="create_isolated_empty_resources_v1",
+                provisioning_operation_id=verified_intent.intent.provisioning_operation_id,
+                intent=verified_intent.intent,
+                provider_expectations=final_expectations,
+                intent_sha256=verified_intent.intent_sha256,
+                idempotency_key=_initial_idempotency_key(
+                    provisioning_operation_id=verified_intent.intent.provisioning_operation_id,
+                    intent_sha256=verified_intent.intent_sha256,
+                    provider_sha256=final_provider_sha256,
+                ),
+                provider_provenance_sha256=final_provider_sha256,
+            )
+            verified = _VerifiedInitialProvisioning(
+                context=context,
+                nonce=secrets.token_hex(16),
+                authorized_at=authorized_at,
+                capability=_INITIAL_VERIFIED_CAPABILITY,
+            )
+            with journal._operation_lease(context.provisioning_operation_id) as operation_lease:
+                _check_initial_execution_stability(
+                    journal, journal_pin, verified_intent, artifact_lease, operation_lease
+                )
+                _claim_replay_tombstone(
+                    replay_authority,
+                    _initial_operation_tombstone(replay_policy, verified),
+                    phase="initial_replay_authority_replayed",
+                )
+                _check_initial_execution_stability(
+                    journal, journal_pin, verified_intent, artifact_lease, operation_lease
+                )
+                journal._claim_verified(verified)
+                journal._begin_effect(verified)
+                _check_initial_execution_stability(
+                    journal, journal_pin, verified_intent, artifact_lease, operation_lease
+                )
+                outcome = _safe_call(lambda: effect(context))
+                if outcome is _SAFE_CALL_FAILURE:
+                    _mark_initial_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("initial_effect_failed_recovery_required")
+                effect_receipt = _safe_call(
+                    lambda: _validate_initial_effect_receipt(context, outcome)
+                )
+                if type(effect_receipt) is not InitialProvisioningEffectReceiptV1:
+                    _mark_initial_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("initial_effect_failed_recovery_required")
+                stable = _safe_call(
+                    lambda: _check_initial_execution_stability(
+                        journal, journal_pin, verified_intent, artifact_lease, operation_lease
+                    )
+                )
+                if stable is _SAFE_CALL_FAILURE:
+                    _mark_initial_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("initial_effect_failed_recovery_required")
+                receipt_written = _safe_call(
+                    lambda: artifact_lease.write_once(
+                        paths.initial_receipt_name(),
+                        _initial_receipt_artifact_bytes(effect_receipt),
+                        phase="initial_effect_failed_recovery_required",
+                    )
+                )
+                if receipt_written is _SAFE_CALL_FAILURE:
+                    _mark_initial_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("initial_effect_failed_recovery_required")
+                stable_before_commit = _safe_call(
+                    lambda: _check_initial_execution_stability(
+                        journal, journal_pin, verified_intent, artifact_lease, operation_lease
+                    )
+                )
+                if stable_before_commit is _SAFE_CALL_FAILURE:
+                    _mark_initial_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("initial_effect_failed_recovery_required")
+                committed = _safe_call(lambda: journal._commit_effect(verified, effect_receipt))
+                if committed is _SAFE_CALL_FAILURE:
+                    _mark_initial_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("initial_effect_failed_recovery_required")
+                terminal_stable = _safe_call(
+                    lambda: _check_initial_execution_stability(
+                        journal, journal_pin, verified_intent, artifact_lease, operation_lease
+                    )
+                )
+                if terminal_stable is _SAFE_CALL_FAILURE:
+                    raise AuthorizationError("initial_terminal_stability")
+                execution_receipt = InitialProvisioningExecutionReceiptV1(
+                    schema_version="rsd.initial-provisioning-execution-receipt.v1",
+                    status="provisioned_empty",
+                    operation_kind=_INITIAL_OPERATION_KIND,
+                    operation_scope="create_isolated_empty_resources_v1",
+                    provisioning_operation_id=context.provisioning_operation_id,
+                    intent_sha256=context.intent_sha256,
+                    idempotency_key=context.idempotency_key,
+                    effect_receipt_sha256=effect_receipt.effect_receipt_sha256,
+                    observed_resources_sha256=_digest(
+                        _INITIAL_EFFECT_RECEIPT_DOMAIN
+                        + json.dumps(
+                            effect_receipt.observed_resources.model_dump(mode="json"),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ),
+                    committed_at=authorized_at,
+                )
+        finally:
+            released = _release_provider_lease(manager)
+        if not released:
+            raise AuthorizationError("provider_release")
+        assert execution_receipt is not None
+        return execution_receipt
+
+
+def authorize_initial_provisioning_and_execute(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    provider: ProviderProvenanceAdapter,
+    provider_fingerprints: Mapping[str, str],
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteInitialProvisioningJournal,
+    effect: Callable[[InitialProvisioningExecutionContext], InitialProvisioningEffectReceiptV1],
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
+) -> InitialProvisioningExecutionReceiptV1:
+    """Use the trusted system clock for the sole initial creation boundary."""
+
+    return _authorize_initial_provisioning_and_execute_with_clock(
+        paths,
+        signer=signer,
+        provider=provider,
+        provider_fingerprints=provider_fingerprints,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        journal=journal,
+        effect=effect,
+        replay_authority=replay_authority,
+        replay_policy=replay_policy,
+        clock=_system_utc_clock,
+    )
+
+
+def _authorize_initial_provisioning_and_execute_for_test(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    provider: ProviderProvenanceAdapter,
+    provider_fingerprints: Mapping[str, str],
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteInitialProvisioningJournal,
+    effect: Callable[[InitialProvisioningExecutionContext], InitialProvisioningEffectReceiptV1],
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
+    _clock: Callable[[], datetime],
+    _capability: object,
+) -> InitialProvisioningExecutionReceiptV1:
+    """Module-restricted clock seam for adversarial initial-stage tests."""
+
+    if _capability is not _TEST_CLOCK_CAPABILITY:
+        raise AuthorizationError("test_clock")
+    return _authorize_initial_provisioning_and_execute_with_clock(
+        paths,
+        signer=signer,
+        provider=provider,
+        provider_fingerprints=provider_fingerprints,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        journal=journal,
+        effect=effect,
+        replay_authority=replay_authority,
+        replay_policy=replay_policy,
+        clock=_clock,
+    )
 
 
 def _provision_journal_with_clock(
@@ -3565,6 +5494,24 @@ def reconcile_journal_genesis(
     return journal.reconcile_genesis(receipt, signer=signer)
 
 
+def reconcile_initial_journal_genesis(
+    journal: SQLiteInitialProvisioningJournal,
+    receipt: InitialJournalGenesisReconciliationReceiptV1,
+    *,
+    signer: TrustedEd25519SignerV1,
+) -> InitialProvisioningJournalStatus:
+    """Apply signed, non-retrying recovery evidence to initial genesis only."""
+
+    if (
+        type(journal) is not SQLiteInitialProvisioningJournal
+        or type(receipt) is not InitialJournalGenesisReconciliationReceiptV1
+        or type(signer) is not TrustedEd25519SignerV1
+    ):
+        raise AuthorizationError("initial_journal_reconciliation")
+    _verify_initial_journal_genesis_reconciliation_receipt(receipt, signer=signer)
+    return journal.reconcile_genesis(receipt)
+
+
 def _require_current_journal(status: JournalMigrationStatus) -> None:
     if status is JournalMigrationStatus.CURRENT:
         return
@@ -3591,6 +5538,7 @@ def _authorize_and_execute_with_clock(
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
+    initial_journal: SQLiteInitialProvisioningJournal,
     effect: Callable[[VerifiedExecutionContext], EffectReceiptV1],
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
@@ -3607,6 +5555,7 @@ def _authorize_and_execute_with_clock(
         type(paths) is not AuthorizationPaths
         or type(signer) is not TrustedEd25519SignerV1
         or type(journal) is not SQLiteAuthorizationJournal
+        or type(initial_journal) is not SQLiteInitialProvisioningJournal
         or type(replay_policy) is not ReplayAuthorityPolicyV1
         or not callable(effect)
     ):
@@ -3616,6 +5565,7 @@ def _authorize_and_execute_with_clock(
     with ArtifactRootLease(paths.root) as artifact_lease:
         artifact_lease.assert_stable()
         _require_current_journal(journal.migration_status())
+        _require_current_initial_journal(initial_journal.migration_status())
         journal_pin = journal._pin_execution_identity()
         artifacts, genesis, snapshot = _verify_authorization_artifact_snapshot(
             paths,
@@ -3627,9 +5577,45 @@ def _authorize_and_execute_with_clock(
             now=_read_clock(clock),
             reader=artifact_lease.reader(),
         )
+        initial_stage, initial_stage_snapshot = _read_initial_stage_artifacts(
+            paths,
+            signer=signer,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            now=_read_clock(clock),
+            reader=artifact_lease.reader(),
+        )
+        verified_initial_intent = _VerifiedInitialIntent(
+            intent=initial_stage.intent,
+            intent_sha256=initial_provisioning_intent_sha256(initial_stage.intent),
+            capability=_INITIAL_INTENT_CAPABILITY,
+        )
+        _verify_initial_intent_binding(
+            verified_initial_intent, journal=initial_journal, replay_policy=replay_policy
+        )
+        initial_journal.assert_intent(verified_initial_intent)
+        if (
+            initial_journal.operation_state(initial_stage.intent.provisioning_operation_id)
+            is not InitialProvisioningOperationState.PROVISIONED_EMPTY
+        ):
+            raise AuthorizationError("initial_operation_state")
+        initial_journal_pin = initial_journal._pin_execution_identity()
+        try:
+            validate_observed_candidate_transition(
+                initial_stage.intent,
+                initial_stage.receipt,
+                initial_stage.attestation,
+                artifacts.proposal,
+                artifacts.final_contract,
+            )
+        except ValueError:
+            raise AuthorizationError("initial_stage_transition") from None
         artifact_lease.assert_stable()
         journal.assert_genesis(genesis)
         journal._assert_pinned_execution_identity(journal_pin)
+        _check_observed_stage_stability(
+            initial_journal, initial_journal_pin, verified_initial_intent
+        )
         artifact_lease.assert_stable()
         references = artifacts.proposal.provider_references.all()
         manager, provider_lease = _acquire_provider_lease(provider, references)
@@ -3643,6 +5629,10 @@ def _authorize_and_execute_with_clock(
                 recheck=False,
             )
             artifact_lease.assert_stable()
+            journal._assert_pinned_execution_identity(journal_pin)
+            _check_observed_stage_stability(
+                initial_journal, initial_journal_pin, verified_initial_intent
+            )
             repeated_artifacts, repeated_genesis, repeated_snapshot = (
                 _verify_authorization_artifact_snapshot(
                     paths,
@@ -3655,11 +5645,33 @@ def _authorize_and_execute_with_clock(
                     reader=artifact_lease.reader(),
                 )
             )
+            repeated_stage, repeated_stage_snapshot = _read_initial_stage_artifacts(
+                paths,
+                signer=signer,
+                expected_disposal_owner=expected_disposal_owner,
+                expected_approver_identity=expected_approver_identity,
+                now=_read_clock(clock),
+                reader=artifact_lease.reader(),
+            )
+            try:
+                validate_observed_candidate_transition(
+                    repeated_stage.intent,
+                    repeated_stage.receipt,
+                    repeated_stage.attestation,
+                    repeated_artifacts.proposal,
+                    repeated_artifacts.final_contract,
+                )
+            except ValueError:
+                raise AuthorizationError("initial_stage_transition") from None
+            _check_observed_stage_stability(
+                initial_journal, initial_journal_pin, verified_initial_intent
+            )
             artifact_lease.assert_stable()
             if (
                 not _same_artifact_receipt(artifacts.receipt, repeated_artifacts.receipt)
                 or genesis != repeated_genesis
                 or snapshot != repeated_snapshot
+                or initial_stage_snapshot != repeated_stage_snapshot
             ):
                 raise AuthorizationError("artifact_race")
             final_provider_sha256, final_expectations = _provider_commitment(
@@ -3669,6 +5681,10 @@ def _authorize_and_execute_with_clock(
                 recheck=True,
             )
             artifact_lease.assert_stable()
+            journal._assert_pinned_execution_identity(journal_pin)
+            _check_observed_stage_stability(
+                initial_journal, initial_journal_pin, verified_initial_intent
+            )
             if (
                 initial_provider_sha256 != final_provider_sha256
                 or expectations != final_expectations
@@ -3687,6 +5703,27 @@ def _authorize_and_execute_with_clock(
                     reader=artifact_lease.reader(),
                 )
             )
+            terminal_stage, terminal_stage_snapshot = _read_initial_stage_artifacts(
+                paths,
+                signer=signer,
+                expected_disposal_owner=expected_disposal_owner,
+                expected_approver_identity=expected_approver_identity,
+                now=authorization_clock,
+                reader=artifact_lease.reader(),
+            )
+            try:
+                validate_observed_candidate_transition(
+                    terminal_stage.intent,
+                    terminal_stage.receipt,
+                    terminal_stage.attestation,
+                    terminal_artifacts.proposal,
+                    terminal_artifacts.final_contract,
+                )
+            except ValueError:
+                raise AuthorizationError("initial_stage_transition") from None
+            _check_observed_stage_stability(
+                initial_journal, initial_journal_pin, verified_initial_intent
+            )
             artifact_lease.assert_stable()
             if (
                 not _same_artifact_receipt(artifacts.receipt, repeated_artifacts.receipt)
@@ -3695,6 +5732,7 @@ def _authorize_and_execute_with_clock(
                 or genesis != terminal_genesis
                 or snapshot != repeated_snapshot
                 or snapshot != terminal_snapshot
+                or initial_stage_snapshot != terminal_stage_snapshot
             ):
                 raise AuthorizationError("artifact_race")
             idempotency_key = _idempotency_key(
@@ -3704,6 +5742,7 @@ def _authorize_and_execute_with_clock(
                 provider_sha256=final_provider_sha256,
             )
             context = VerifiedExecutionContext(
+                operation_kind=_OBSERVED_OPERATION_KIND,
                 operation_id=artifacts.receipt.operation_id,
                 idempotency_key=idempotency_key,
                 proposal=artifacts.proposal,
@@ -3722,15 +5761,24 @@ def _authorize_and_execute_with_clock(
             )
             with journal._operation_lease(context.operation_id) as operation_lease:
                 _check_execution_stability(journal, journal_pin, artifact_lease, operation_lease)
+                _check_observed_stage_stability(
+                    initial_journal, initial_journal_pin, verified_initial_intent
+                )
                 _claim_replay_tombstone(
                     replay_authority,
                     _operation_tombstone(replay_policy, genesis, context),
                     phase="replay_authority_replayed",
                 )
                 _check_execution_stability(journal, journal_pin, artifact_lease, operation_lease)
+                _check_observed_stage_stability(
+                    initial_journal, initial_journal_pin, verified_initial_intent
+                )
                 journal._claim_verified(verified)
                 journal._begin_effect(verified)
                 _check_execution_stability(journal, journal_pin, artifact_lease, operation_lease)
+                _check_observed_stage_stability(
+                    initial_journal, initial_journal_pin, verified_initial_intent
+                )
                 outcome = _safe_call(lambda: effect(context))
                 if outcome is _SAFE_CALL_FAILURE:
                     _mark_effect_ambiguous(journal, verified)
@@ -3744,7 +5792,15 @@ def _authorize_and_execute_with_clock(
                         journal, journal_pin, artifact_lease, operation_lease
                     )
                 )
-                if post_effect_stable is _SAFE_CALL_FAILURE:
+                initial_post_effect_stable = _safe_call(
+                    lambda: _check_observed_stage_stability(
+                        initial_journal, initial_journal_pin, verified_initial_intent
+                    )
+                )
+                if (
+                    post_effect_stable is _SAFE_CALL_FAILURE
+                    or initial_post_effect_stable is _SAFE_CALL_FAILURE
+                ):
                     _mark_effect_ambiguous(journal, verified)
                     raise AuthorizationError("effect_failed_recovery_required")
                 committed = _safe_call(lambda: journal._commit_effect(verified, effect_receipt))
@@ -3756,11 +5812,20 @@ def _authorize_and_execute_with_clock(
                         journal, journal_pin, artifact_lease, operation_lease
                     )
                 )
-                if terminal_stable is _SAFE_CALL_FAILURE:
+                initial_terminal_stable = _safe_call(
+                    lambda: _check_observed_stage_stability(
+                        initial_journal, initial_journal_pin, verified_initial_intent
+                    )
+                )
+                if (
+                    terminal_stable is _SAFE_CALL_FAILURE
+                    or initial_terminal_stable is _SAFE_CALL_FAILURE
+                ):
                     raise AuthorizationError("terminal_stability")
                 execution_receipt = ExecutionReceiptV1(
                     schema_version="rsd.lifecycle-execution-receipt.v1",
                     status="committed",
+                    operation_kind=_OBSERVED_OPERATION_KIND,
                     operation_id=context.operation_id,
                     idempotency_key=context.idempotency_key,
                     effect_receipt_sha256=effect_receipt.effect_receipt_sha256,
@@ -3786,6 +5851,7 @@ def _authorize_and_execute_for_test(
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
+    initial_journal: SQLiteInitialProvisioningJournal,
     effect: Callable[[VerifiedExecutionContext], EffectReceiptV1],
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
@@ -3804,6 +5870,7 @@ def _authorize_and_execute_for_test(
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
         journal=journal,
+        initial_journal=initial_journal,
         effect=effect,
         replay_authority=replay_authority,
         replay_policy=replay_policy,
@@ -3820,6 +5887,7 @@ def authorize_and_execute(
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
+    initial_journal: SQLiteInitialProvisioningJournal,
     effect: Callable[[VerifiedExecutionContext], EffectReceiptV1],
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
@@ -3834,6 +5902,7 @@ def authorize_and_execute(
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
         journal=journal,
+        initial_journal=initial_journal,
         effect=effect,
         replay_authority=replay_authority,
         replay_policy=replay_policy,

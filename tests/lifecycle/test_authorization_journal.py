@@ -47,6 +47,7 @@ class _ResultQueue(Protocol):
 
 def _verified(nonce: str, operation_id: str = "operation-one") -> _VerifiedExecution:
     context = VerifiedExecutionContext(
+        operation_kind="observed_lifecycle_v1",
         operation_id=operation_id,
         idempotency_key="a" * 64,
         proposal=ProposalV1.model_construct(),
@@ -76,7 +77,8 @@ def _seed_current_journal(journal: SQLiteAuthorizationJournal) -> None:
     )
     unsigned = JournalGenesisReceiptV1(
         schema_version="rsd.authorization-journal-genesis.v1",
-        operation_domain="rsd.disposable-acceptance-operation.v1",
+        operation_domain="rsd.observed-lifecycle-operation.v1",
+        operation_kind="observed_lifecycle_v1",
         operation_id="operation-one",
         proposal_sha256="b" * 64,
         contract_sha256="c" * 64,

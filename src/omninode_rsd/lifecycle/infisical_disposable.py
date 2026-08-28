@@ -9,6 +9,8 @@ provenance before it can perform any action.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import ipaddress
 import json
@@ -231,7 +233,9 @@ class PostgreSQLContractV1(_Model):
     system_identifier: str = Field(pattern=r"^[0-9]{8,32}$")
     database_name: str = Field(pattern=_IDENTIFIER)
     database_oid: int = Field(ge=1)
+    schema_name: str = Field(pattern=_IDENTIFIER)
     owner_role: str = Field(pattern=_IDENTIFIER)
+    role_names: tuple[str, ...] = Field(min_length=1, max_length=16)
     schema_fingerprint_sha256: str = Field(pattern=_SHA256)
     membership_fingerprint_sha256: str = Field(pattern=_SHA256)
     database_acl_sha256: str = Field(pattern=_SHA256)
@@ -247,7 +251,21 @@ class PostgreSQLContractV1(_Model):
     def names_differ(self) -> Self:
         if len({self.database_name, self.stage_database_prefix, self.restore_database_prefix}) != 3:
             raise ValueError("database name and prefixes must differ")
+        if self.owner_role not in self.role_names or len(set(self.role_names)) != len(
+            self.role_names
+        ):
+            raise ValueError("PostgreSQL roles must be distinct and include the owner")
         return self
+
+    @field_validator("role_names", mode="before")
+    @classmethod
+    def declared_roles(cls, value: object) -> tuple[object, ...]:
+        roles = _items(value, field="role_names")
+        if not all(
+            type(role) is str and re.fullmatch(_IDENTIFIER, role) is not None for role in roles
+        ):
+            raise ValueError("PostgreSQL roles must be declared identifiers")
+        return roles
 
 
 class TransportContractV1(_Model):
@@ -256,7 +274,7 @@ class TransportContractV1(_Model):
     authority_sha256: str = Field(pattern=_SHA256)
     listener_binding: Literal["tls_lan", "loopback_only", "isolated_network_only"]
     host_listener_port: int | None = Field(default=None, ge=1, le=65535)
-    isolated_network_id: str | None = Field(default=None, pattern=_IDENTIFIER)
+    isolated_network_name: str | None = Field(default=None, pattern=_IDENTIFIER)
     isolated_network_alias: str | None = Field(default=None, pattern=_IDENTIFIER)
     tls_trust_anchor_reference_sha256: str | None = Field(default=None, pattern=_SHA256)
     minimum_tls_version: Literal["TLSv1.3"] | None = None
@@ -290,7 +308,7 @@ class TransportContractV1(_Model):
                 parsed.scheme == "https"
                 and self.listener_binding == "tls_lan"
                 and self.host_listener_port == parsed.port
-                and self.isolated_network_id is None
+                and self.isolated_network_name is None
                 and self.isolated_network_alias is None
                 and self.tls_trust_anchor_reference_sha256 is not None
                 and self.minimum_tls_version == "TLSv1.3"
@@ -305,7 +323,7 @@ class TransportContractV1(_Model):
                         address.is_loopback
                         and self.listener_binding == "loopback_only"
                         and self.host_listener_port == parsed.port
-                        and self.isolated_network_id is None
+                        and self.isolated_network_name is None
                         and self.isolated_network_alias is None
                     )
                     or (
@@ -316,7 +334,7 @@ class TransportContractV1(_Model):
                         and not address.is_link_local
                         and self.listener_binding == "isolated_network_only"
                         and self.host_listener_port is None
-                        and self.isolated_network_id is not None
+                        and self.isolated_network_name is not None
                         and self.isolated_network_alias is not None
                     )
                 )
@@ -349,9 +367,11 @@ class ServiceIdentityV1(_Model):
     machine_id: str = Field(pattern=_IDENTIFIER)
     compose_project: str = Field(pattern=_IDENTIFIER)
     service_name: str = Field(pattern=_IDENTIFIER)
-    network_id: str = Field(pattern=_IDENTIFIER)
+    network_name: str = Field(pattern=_IDENTIFIER)
+    network_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
-    workload_id: str = Field(pattern=_IDENTIFIER)
+    workload_name: str = Field(pattern=_IDENTIFIER)
+    workload_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     image: ImageReferenceV1
     listener_binding: Literal["tls_lan", "loopback_only", "isolated_network_only"]
     host_listener_port: int | None = Field(default=None, ge=1, le=65535)
@@ -436,10 +456,13 @@ class ServiceIdentityV1(_Model):
 class ValkeyIdentityV1(_Model):
     compose_project: str = Field(pattern=_IDENTIFIER)
     service_name: str = Field(pattern=_IDENTIFIER)
-    network_id: str = Field(pattern=_IDENTIFIER)
-    volume_id: str = Field(pattern=_IDENTIFIER)
+    network_name: str = Field(pattern=_IDENTIFIER)
+    network_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    volume_name: str = Field(pattern=_IDENTIFIER)
+    volume_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
-    workload_id: str = Field(pattern=_IDENTIFIER)
+    workload_name: str = Field(pattern=_IDENTIFIER)
+    workload_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     logical_namespace: str = Field(pattern=_IDENTIFIER)
     credential_reference_sha256: str = Field(pattern=_SHA256)
     image: ImageReferenceV1
@@ -505,8 +528,13 @@ class CandidateCompositeV1(_Model):
             raise ValueError("all component network identities must be distinct")
         if len({item.workload_id for item in components}) != 4:
             raise ValueError("all component workload identities must be distinct")
+        if len({item.network_name for item in components}) != 4:
+            raise ValueError("all component network names must be distinct")
+        if len({item.workload_name for item in components}) != 4:
+            raise ValueError("all component workload names must be distinct")
         if (
             len({item.volume_id for item in caches}) != 2
+            or len({item.volume_name for item in caches}) != 2
             or len({item.logical_namespace for item in caches}) != 2
         ):
             raise ValueError("primary and restore Valkey storage must be distinct")
@@ -554,6 +582,7 @@ class ProposalV1(_Model):
     retention_expires_at: str
     disposal_owner: str = Field(pattern=_OWNER_IDENTITY)
     approval_reference_sha256: str = Field(pattern=_SHA256)
+    initial_provisioning_evidence: InitialProvisioningEvidenceBindingsV1
 
     @field_validator("retention_expires_at")
     @classmethod
@@ -575,7 +604,7 @@ class ProposalV1(_Model):
         ):
             raise ValueError("transport must bind primary candidate service")
         if self.transport.listener_binding == "isolated_network_only" and (
-            primary.network_id != self.transport.isolated_network_id
+            primary.network_name != self.transport.isolated_network_name
             or primary.isolated_network_alias != self.transport.isolated_network_alias
         ):
             raise ValueError("isolated transport must bind primary network alias")
@@ -628,6 +657,542 @@ class RuntimeContractV1(ProposalV1):
         if self.proposal_sha256 != proposal_sha256(self):
             raise ValueError("runtime contract does not bind proposal")
         return self
+
+
+class InitialProvisioningOperationKind(StrEnum):
+    """The only operation kind admitted before runtime identities exist."""
+
+    INITIAL_PROVISIONING = "initial_provisioning_v1"
+
+
+class InitialProvisioningScope(StrEnum):
+    """The bounded pre-observation effect scope."""
+
+    CREATE_ISOLATED_EMPTY_RESOURCES = "create_isolated_empty_resources_v1"
+
+
+class ObservedLifecycleOperationKind(StrEnum):
+    """The post-observation lifecycle operation kind."""
+
+    OBSERVED_LIFECYCLE = "observed_lifecycle_v1"
+
+
+def _canonical_base64_bytes(value: str) -> bytes:
+    """Accept only uniquely spelled standard base64 signatures."""
+
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError("signature base64 is invalid") from None
+    if base64.b64encode(decoded).decode("ascii") != value:
+        raise ValueError("signature base64 is not canonical")
+    return decoded
+
+
+class InitialProvisioningEvidenceBindingsV1(_Model):
+    """Signed commitments to the governed evidence required before creation."""
+
+    approval_sha256: str = Field(pattern=_SHA256)
+    governed_deny_sha256: str = Field(pattern=_SHA256)
+    governed_baseline_sha256: str = Field(pattern=_SHA256)
+    collision_evidence_sha256: str = Field(pattern=_SHA256)
+    registry_verification_sha256: str = Field(pattern=_SHA256)
+    provider_declaration_sha256: str = Field(pattern=_SHA256)
+
+    @model_validator(mode="after")
+    def distinct_bindings(self) -> Self:
+        values = tuple(self.model_dump(mode="python").values())
+        if len(set(values)) != len(values):
+            raise ValueError("initial evidence commitments must be distinct")
+        return self
+
+
+class InitialServicePlanV1(_Model):
+    """A planned service identity deliberately excluding runtime identifiers."""
+
+    authority: str | None = None
+    authority_sha256: str | None = Field(default=None, pattern=_SHA256)
+    machine_id: str = Field(pattern=_IDENTIFIER)
+    compose_project: str = Field(pattern=_IDENTIFIER)
+    service_name: str = Field(pattern=_IDENTIFIER)
+    network_name: str = Field(pattern=_IDENTIFIER)
+    workload_name: str = Field(pattern=_IDENTIFIER)
+    image: ImageReferenceV1
+    listener_binding: Literal["tls_lan", "loopback_only", "isolated_network_only"]
+    host_listener_port: int | None = Field(default=None, ge=1, le=65535)
+    isolated_network_alias: str | None = Field(default=None, pattern=_IDENTIFIER)
+
+    @field_validator("authority")
+    @classmethod
+    def canonical_service(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return _authority(value, schemes=frozenset({"http", "https"}))
+
+    @model_validator(mode="after")
+    def binds_listener(self) -> Self:
+        if self.authority is None:
+            if self.authority_sha256 is not None:
+                raise ValueError("missing planned authority cannot have a hash")
+            parsed = None
+        else:
+            parsed = urlsplit(self.authority)
+            assert parsed.port is not None and parsed.hostname is not None
+            if self.authority_sha256 != _digest(self.authority.encode()):
+                raise ValueError("planned authority hash does not bind authority")
+        if self.listener_binding == "isolated_network_only":
+            if self.host_listener_port is not None or self.isolated_network_alias is None:
+                raise ValueError("isolated planned service cannot publish a port")
+            if self.authority is not None:
+                assert parsed is not None and parsed.hostname is not None
+                address = ipaddress.ip_address(parsed.hostname)
+                if (
+                    parsed.scheme != "http"
+                    or address.is_loopback
+                    or not address.is_private
+                    or address.is_unspecified
+                    or address.is_multicast
+                    or address.is_link_local
+                ):
+                    raise ValueError("isolated planned authority must be internal HTTP")
+        elif self.authority is None or self.authority_sha256 is None:
+            raise ValueError("planned listener port must bind authority")
+        else:
+            assert parsed is not None and parsed.port is not None
+            if self.isolated_network_alias is not None or self.host_listener_port != parsed.port:
+                raise ValueError("planned listener port must bind authority")
+        return self
+
+
+class InitialPostgreSQLPlanV1(_Model):
+    """Target database names and roles, without an OID or live fingerprints."""
+
+    authority: str
+    database_name: str = Field(pattern=_IDENTIFIER)
+    schema_name: str = Field(pattern=_IDENTIFIER)
+    owner_role: str = Field(pattern=_IDENTIFIER)
+    role_names: tuple[str, ...] = Field(min_length=1, max_length=16)
+    stage_database_prefix: str = Field(pattern=_IDENTIFIER)
+    restore_database_prefix: str = Field(pattern=_IDENTIFIER)
+
+    @field_validator("authority")
+    @classmethod
+    def canonical_postgres(cls, value: str) -> str:
+        return _authority(value, schemes=frozenset({"postgresql"}))
+
+    @field_validator("role_names", mode="before")
+    @classmethod
+    def declared_roles(cls, value: object) -> tuple[object, ...]:
+        roles = _items(value, field="role_names")
+        if not all(
+            type(role) is str and re.fullmatch(_IDENTIFIER, role) is not None for role in roles
+        ):
+            raise ValueError("planned PostgreSQL roles must be declared identifiers")
+        return roles
+
+    @model_validator(mode="after")
+    def names_differ(self) -> Self:
+        if len({self.database_name, self.stage_database_prefix, self.restore_database_prefix}) != 3:
+            raise ValueError("planned database name and prefixes must differ")
+        if self.owner_role not in self.role_names or len(set(self.role_names)) != len(
+            self.role_names
+        ):
+            raise ValueError("planned PostgreSQL roles must be distinct and include the owner")
+        return self
+
+
+class InitialValkeyPlanV1(_Model):
+    """Planned cache names, image, and provider reference without object IDs."""
+
+    compose_project: str = Field(pattern=_IDENTIFIER)
+    service_name: str = Field(pattern=_IDENTIFIER)
+    network_name: str = Field(pattern=_IDENTIFIER)
+    volume_name: str = Field(pattern=_IDENTIFIER)
+    workload_name: str = Field(pattern=_IDENTIFIER)
+    logical_namespace: str = Field(pattern=_IDENTIFIER)
+    credential_reference_sha256: str = Field(pattern=_SHA256)
+    image: ImageReferenceV1
+
+
+class InitialProvisioningPlanV1(_Model):
+    """Complete, name-only pre-creation plan for an isolated empty candidate."""
+
+    transport: TransportContractV1
+    primary_service: InitialServicePlanV1
+    restore_service: InitialServicePlanV1
+    postgres: InitialPostgreSQLPlanV1
+    primary_valkey: InitialValkeyPlanV1
+    restore_valkey: InitialValkeyPlanV1
+
+    @model_validator(mode="after")
+    def isolated_pairs(self) -> Self:
+        primary = self.primary_service
+        restore = self.restore_service
+        if (
+            primary.authority != self.transport.authority
+            or primary.authority_sha256 != self.transport.authority_sha256
+            or primary.listener_binding != self.transport.listener_binding
+            or primary.host_listener_port != self.transport.host_listener_port
+        ):
+            raise ValueError("planned transport must bind primary service")
+        if self.transport.listener_binding == "isolated_network_only" and (
+            primary.network_name != self.transport.isolated_network_name
+            or primary.isolated_network_alias != self.transport.isolated_network_alias
+        ):
+            raise ValueError("planned isolated transport must bind primary network alias")
+        if (
+            restore.listener_binding != "isolated_network_only"
+            or restore.host_listener_port is not None
+            or restore.authority is not None
+            or restore.authority_sha256 is not None
+            or restore.isolated_network_alias is None
+        ):
+            raise ValueError("planned restore service must be unpublished and isolated")
+        services = (primary, restore)
+        caches = (self.primary_valkey, self.restore_valkey)
+        components = (*services, *caches)
+        if len({item.network_name for item in components}) != 4:
+            raise ValueError("planned component networks must be distinct")
+        if len({item.workload_name for item in components}) != 4:
+            raise ValueError("planned component workloads must be distinct")
+        if len({(item.compose_project, item.service_name) for item in components}) != 4:
+            raise ValueError("planned compose identities must be distinct")
+        if (
+            len({item.volume_name for item in caches}) != 2
+            or len({item.logical_namespace for item in caches}) != 2
+        ):
+            raise ValueError("planned Valkey storage must be distinct")
+        if primary.image != restore.image:
+            raise ValueError("planned primary and restore images must share one digest")
+        return self
+
+
+class InitialProvisioningIntentV1(_Model):
+    """Signed pre-creation authority limited to isolated empty resource creation."""
+
+    schema_version: Literal["rsd.initial-provisioning-intent.v1"]
+    operation_kind: Literal["initial_provisioning_v1"]
+    operation_scope: Literal["create_isolated_empty_resources_v1"]
+    provisioning_operation_id: str = Field(pattern=_UUID)
+    source_commit: str = Field(pattern=_COMMIT)
+    plan: InitialProvisioningPlanV1
+    provider_references: ProviderReferencesV1
+    evidence: InitialProvisioningEvidenceBindingsV1
+    retention_expires_at: str
+    disposal_owner: str = Field(pattern=_OWNER_IDENTITY)
+    approver_identity: str = Field(pattern=_OWNER_IDENTITY)
+    approval_reference_sha256: str = Field(pattern=_SHA256)
+    journal_path: str = Field(min_length=1, max_length=4096)
+    journal_path_sha256: str = Field(pattern=_SHA256)
+    journal_uuid: str = Field(pattern=_UUID)
+    journal_schema_sha256: str = Field(pattern=_SHA256)
+    replay_policy_sha256: str = Field(pattern=_SHA256)
+    created_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("retention_expires_at", "created_at")
+    @classmethod
+    def canonical_time(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def binds_precreation_plan(self) -> Self:
+        if (
+            not Path(self.journal_path).is_absolute()
+            or os.path.normpath(self.journal_path) != self.journal_path
+            or self.journal_path_sha256 != _digest(os.fsencode(self.journal_path))
+            or _timestamp(self.retention_expires_at) <= _timestamp(self.created_at)
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("initial provisioning intent fields are invalid")
+        if (
+            self.plan.primary_valkey.credential_reference_sha256
+            != self.provider_references.primary_valkey_password.reference_sha256
+            or self.plan.restore_valkey.credential_reference_sha256
+            != self.provider_references.restore_valkey_password.reference_sha256
+        ):
+            raise ValueError("initial plan provider references do not bind caches")
+        anchor = self.provider_references.tls_trust_anchor
+        if self.plan.transport.profile is DisposableTransportProfile.TLS_VERIFIED:
+            if (
+                anchor is None
+                or anchor.reference_sha256 != self.plan.transport.tls_trust_anchor_reference_sha256
+            ):
+                raise ValueError("initial TLS plan must bind trust reference")
+        elif anchor is not None:
+            raise ValueError("initial unpublished plan cannot carry TLS trust reference")
+        return self
+
+
+class ObservedServiceResourcesV1(_Model):
+    """Runtime identifiers observed only after the bounded creation effect."""
+
+    network_name: str = Field(pattern=_IDENTIFIER)
+    network_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    workload_name: str = Field(pattern=_IDENTIFIER)
+    workload_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ObservedValkeyResourcesV1(ObservedServiceResourcesV1):
+    """Observed cache identity including its concrete volume ID."""
+
+    volume_name: str = Field(pattern=_IDENTIFIER)
+    volume_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ObservedResourceSetV1(_Model):
+    """The IDs emitted by initial creation, before any data-bearing action."""
+
+    postgres_system_identifier: str = Field(pattern=r"^[0-9]{8,32}$")
+    postgres_database_oid: int = Field(ge=1)
+    primary_service: ObservedServiceResourcesV1
+    restore_service: ObservedServiceResourcesV1
+    primary_valkey: ObservedValkeyResourcesV1
+    restore_valkey: ObservedValkeyResourcesV1
+
+    @model_validator(mode="after")
+    def distinct_resources(self) -> Self:
+        services = (self.primary_service, self.restore_service)
+        caches = (self.primary_valkey, self.restore_valkey)
+        components = (*services, *caches)
+        if (
+            len({item.network_name for item in components}) != 4
+            or len({item.network_id for item in components}) != 4
+            or len({item.container_id for item in components}) != 4
+            or len({item.workload_name for item in components}) != 4
+            or len({item.workload_id for item in components}) != 4
+            or len({item.volume_name for item in caches}) != 2
+            or len({item.volume_id for item in caches}) != 2
+        ):
+            raise ValueError("observed resources must be distinct")
+        return self
+
+
+class InitialProvisioningEffectReceiptV1(_Model):
+    """Effect output for the sole pre-observation creation scope."""
+
+    schema_version: Literal["rsd.initial-provisioning-effect-receipt.v1"]
+    operation_kind: Literal["initial_provisioning_v1"]
+    operation_scope: Literal["create_isolated_empty_resources_v1"]
+    status: Literal["created_isolated_empty_resources"]
+    provisioning_operation_id: str = Field(pattern=_UUID)
+    intent_sha256: str = Field(pattern=_SHA256)
+    journal_uuid: str = Field(pattern=_UUID)
+    idempotency_key: str = Field(pattern=_SHA256)
+    observed_resources: ObservedResourceSetV1
+    effect_receipt_sha256: str = Field(pattern=_SHA256)
+    completed_at: str
+
+    @field_validator("completed_at")
+    @classmethod
+    def completed_time(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+
+def initial_provisioning_intent_sha256(intent: InitialProvisioningIntentV1) -> str:
+    """Commit the complete signed pre-creation intent for stage hand-off."""
+
+    if type(intent) is not InitialProvisioningIntentV1:
+        raise ValueError("initial provisioning intent is invalid")
+    return canonical_sha256(intent)
+
+
+def initial_provisioning_effect_receipt_sha256(
+    receipt: InitialProvisioningEffectReceiptV1,
+) -> str:
+    """Commit the bounded-effect receipt later signed by the observer."""
+
+    if type(receipt) is not InitialProvisioningEffectReceiptV1:
+        raise ValueError("initial provisioning effect receipt is invalid")
+    return canonical_sha256(receipt)
+
+
+class ObservedCandidateAttestationV1(_Model):
+    """Signed post-creation attestation adding real IDs to the planned intent."""
+
+    schema_version: Literal["rsd.observed-candidate-attestation.v1"]
+    operation_kind: Literal["observed_lifecycle_v1"]
+    provisioning_operation_id: str = Field(pattern=_UUID)
+    observed_operation_id: str = Field(pattern=_UUID)
+    initial_provisioning_intent_sha256: str = Field(pattern=_SHA256)
+    provisioning_effect_receipt_sha256: str = Field(pattern=_SHA256)
+    proposal_sha256: str = Field(pattern=_SHA256)
+    candidate: CandidateCompositeV1
+    candidate_composite_sha256: str = Field(pattern=_SHA256)
+    observed_resources: ObservedResourceSetV1
+    observed_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("observed_at")
+    @classmethod
+    def observation_time(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def binds_observed_candidate(self) -> Self:
+        if (
+            self.candidate_composite_sha256 != canonical_sha256(self.candidate)
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("observed candidate attestation is invalid")
+        resources = self.observed_resources
+        candidate = self.candidate
+        if (
+            resources.postgres_system_identifier != candidate.postgres.system_identifier
+            or resources.postgres_database_oid != candidate.postgres.database_oid
+            or not _matches_observed_service(resources.primary_service, candidate.primary_service)
+            or not _matches_observed_service(resources.restore_service, candidate.restore_service)
+            or not _matches_observed_valkey(resources.primary_valkey, candidate.primary_valkey)
+            or not _matches_observed_valkey(resources.restore_valkey, candidate.restore_valkey)
+        ):
+            raise ValueError("observed resources do not bind candidate")
+        return self
+
+
+def _matches_observed_service(
+    observed: ObservedServiceResourcesV1, candidate: ServiceIdentityV1 | ValkeyIdentityV1
+) -> bool:
+    return (
+        observed.network_name == candidate.network_name
+        and observed.network_id == candidate.network_id
+        and observed.container_id == candidate.container_id
+        and observed.workload_name == candidate.workload_name
+        and observed.workload_id == candidate.workload_id
+    )
+
+
+def _matches_observed_valkey(
+    observed: ObservedValkeyResourcesV1, candidate: ValkeyIdentityV1
+) -> bool:
+    return (
+        _matches_observed_service(observed, candidate)
+        and observed.volume_name == candidate.volume_name
+        and observed.volume_id == candidate.volume_id
+    )
+
+
+def observed_candidate_attestation_sha256(attestation: ObservedCandidateAttestationV1) -> str:
+    """Return the full signed observation commitment."""
+
+    if type(attestation) is not ObservedCandidateAttestationV1:
+        raise ValueError("observed candidate attestation is invalid")
+    return canonical_sha256(attestation)
+
+
+def validate_observed_candidate_transition(
+    intent: InitialProvisioningIntentV1,
+    receipt: InitialProvisioningEffectReceiptV1,
+    attestation: ObservedCandidateAttestationV1,
+    proposal: ProposalV1,
+    contract: RuntimeContractV1,
+) -> None:
+    """Require a signed planned-to-observed transition before lifecycle effects.
+
+    The intent contains names and policies only.  The effect receipt introduces
+    IDs, and the signed attestation must bind those IDs to the exact final
+    candidate/proposal before the observed lifecycle boundary can proceed.
+    """
+
+    if (
+        type(intent) is not InitialProvisioningIntentV1
+        or type(receipt) is not InitialProvisioningEffectReceiptV1
+        or type(attestation) is not ObservedCandidateAttestationV1
+        or type(proposal) is not ProposalV1
+        or type(contract) is not RuntimeContractV1
+    ):
+        raise ValueError("initial stage transition is invalid")
+    intent_hash = initial_provisioning_intent_sha256(intent)
+    receipt_hash = initial_provisioning_effect_receipt_sha256(receipt)
+    if (
+        receipt.provisioning_operation_id != intent.provisioning_operation_id
+        or receipt.intent_sha256 != intent_hash
+        or receipt.journal_uuid != intent.journal_uuid
+        or attestation.provisioning_operation_id != intent.provisioning_operation_id
+        or attestation.observed_operation_id != proposal.operation_id
+        or attestation.initial_provisioning_intent_sha256 != intent_hash
+        or attestation.provisioning_effect_receipt_sha256 != receipt_hash
+        or attestation.observed_resources != receipt.observed_resources
+        or attestation.proposal_sha256 != proposal_sha256(proposal)
+        or attestation.candidate != proposal.candidate
+        or contract.model_dump(mode="json", include=set(ProposalV1.model_fields))
+        != proposal.model_dump(mode="json")
+    ):
+        raise ValueError("initial stage transition is invalid")
+    if (
+        intent.source_commit != proposal.source_commit
+        or intent.retention_expires_at != proposal.retention_expires_at
+        or intent.disposal_owner != proposal.disposal_owner
+        or intent.approval_reference_sha256 != proposal.approval_reference_sha256
+        or intent.provider_references != proposal.provider_references
+        or intent.plan.transport != proposal.transport
+    ):
+        raise ValueError("initial plan does not match observed proposal")
+    plan = intent.plan
+    candidate = proposal.candidate
+    if (
+        not _planned_service_matches(plan.primary_service, candidate.primary_service)
+        or not _planned_service_matches(plan.restore_service, candidate.restore_service)
+        or not _planned_postgres_matches(plan.postgres, candidate.postgres)
+        or not _planned_valkey_matches(plan.primary_valkey, candidate.primary_valkey)
+        or not _planned_valkey_matches(plan.restore_valkey, candidate.restore_valkey)
+        or intent.evidence != proposal.initial_provisioning_evidence
+    ):
+        raise ValueError("initial plan does not match observed proposal")
+
+
+def _planned_service_matches(plan: InitialServicePlanV1, observed: ServiceIdentityV1) -> bool:
+    return (
+        plan.authority == observed.authority
+        and plan.authority_sha256 == observed.authority_sha256
+        and plan.machine_id == observed.machine_id
+        and plan.compose_project == observed.compose_project
+        and plan.service_name == observed.service_name
+        and plan.network_name == observed.network_name
+        and plan.workload_name == observed.workload_name
+        and plan.image == observed.image
+        and plan.listener_binding == observed.listener_binding
+        and plan.host_listener_port == observed.host_listener_port
+        and plan.isolated_network_alias == observed.isolated_network_alias
+    )
+
+
+def _planned_postgres_matches(
+    plan: InitialPostgreSQLPlanV1, observed: PostgreSQLContractV1
+) -> bool:
+    return (
+        plan.authority == observed.authority
+        and plan.database_name == observed.database_name
+        and plan.schema_name == observed.schema_name
+        and plan.owner_role == observed.owner_role
+        and plan.role_names == observed.role_names
+        and plan.stage_database_prefix == observed.stage_database_prefix
+        and plan.restore_database_prefix == observed.restore_database_prefix
+    )
+
+
+def _planned_valkey_matches(plan: InitialValkeyPlanV1, observed: ValkeyIdentityV1) -> bool:
+    return (
+        plan.compose_project == observed.compose_project
+        and plan.service_name == observed.service_name
+        and plan.network_name == observed.network_name
+        and plan.volume_name == observed.volume_name
+        and plan.workload_name == observed.workload_name
+        and plan.logical_namespace == observed.logical_namespace
+        and plan.credential_reference_sha256 == observed.credential_reference_sha256
+        and plan.image == observed.image
+    )
+
+
+# ``ProposalV1`` intentionally refers forward to the pre-creation evidence
+# model so its observed artifact commits the original governed plan too.
+ProposalV1.model_rebuild()
+RuntimeContractV1.model_rebuild()
 
 
 class GovernedIdentityV1(_Model):
