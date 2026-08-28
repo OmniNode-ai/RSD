@@ -57,8 +57,10 @@ class StableIdentifierKind(StrEnum):
     COMPOSE_SERVICE = "compose_service"
     IMAGE_REPO_DIGEST = "image_repo_digest"
     NETWORK = "network"
+    NETWORK_ALIAS = "network_alias"
     VOLUME = "volume"
     POSTGRES_SYSTEM_DATABASE = "postgres_system_database"
+    POSTGRES_SYSTEM_DATABASE_OID = "postgres_system_database_oid"
     POSTGRES_OWNER = "postgres_owner"
     VALKEY_NAMESPACE_WORKLOAD = "valkey_namespace_workload"
     PROVIDER_REFERENCE = "provider_reference"
@@ -215,6 +217,7 @@ class PostgreSQLAcceptanceOverlayV1(_Model):
 
     schema_version: Literal["rsd.postgres-acceptance-overlay.v1"]
     database_name: str = Field(pattern=_IDENTIFIER)
+    database_oid: int = Field(ge=1)
     owner_role: str = Field(pattern=_IDENTIFIER)
     secret_provider_kind: Literal["infisical"]
     secret_project: str = Field(pattern=_IDENTIFIER)
@@ -226,6 +229,7 @@ class PostgreSQLContractV1(_Model):
     authority: str
     system_identifier: str = Field(pattern=r"^[0-9]{8,32}$")
     database_name: str = Field(pattern=_IDENTIFIER)
+    database_oid: int = Field(ge=1)
     owner_role: str = Field(pattern=_IDENTIFIER)
     schema_fingerprint_sha256: str = Field(pattern=_SHA256)
     membership_fingerprint_sha256: str = Field(pattern=_SHA256)
@@ -252,6 +256,7 @@ class TransportContractV1(_Model):
     listener_binding: Literal["tls_lan", "loopback_only", "isolated_network_only"]
     host_listener_port: int | None = Field(default=None, ge=1, le=65535)
     isolated_network_id: str | None = Field(default=None, pattern=_IDENTIFIER)
+    isolated_network_alias: str | None = Field(default=None, pattern=_IDENTIFIER)
     tls_trust_anchor_reference_sha256: str | None = Field(default=None, pattern=_SHA256)
     minimum_tls_version: Literal["TLSv1.3"] | None = None
 
@@ -285,6 +290,7 @@ class TransportContractV1(_Model):
                 and self.listener_binding == "tls_lan"
                 and self.host_listener_port == parsed.port
                 and self.isolated_network_id is None
+                and self.isolated_network_alias is None
                 and self.tls_trust_anchor_reference_sha256 is not None
                 and self.minimum_tls_version == "TLSv1.3"
             )
@@ -299,12 +305,18 @@ class TransportContractV1(_Model):
                         and self.listener_binding == "loopback_only"
                         and self.host_listener_port == parsed.port
                         and self.isolated_network_id is None
+                        and self.isolated_network_alias is None
                     )
                     or (
                         not address.is_loopback
+                        and address.is_private
+                        and not address.is_unspecified
+                        and not address.is_multicast
+                        and not address.is_link_local
                         and self.listener_binding == "isolated_network_only"
                         and self.host_listener_port is None
                         and self.isolated_network_id is not None
+                        and self.isolated_network_alias is not None
                     )
                 )
             )
@@ -331,8 +343,8 @@ class StableIdentifierV1(_Model):
 
 
 class ServiceIdentityV1(_Model):
-    authority: str
-    authority_sha256: str = Field(pattern=_SHA256)
+    authority: str | None = None
+    authority_sha256: str | None = Field(default=None, pattern=_SHA256)
     machine_id: str = Field(pattern=_IDENTIFIER)
     compose_project: str = Field(pattern=_IDENTIFIER)
     service_name: str = Field(pattern=_IDENTIFIER)
@@ -342,30 +354,51 @@ class ServiceIdentityV1(_Model):
     image: ImageReferenceV1
     listener_binding: Literal["tls_lan", "loopback_only", "isolated_network_only"]
     host_listener_port: int | None = Field(default=None, ge=1, le=65535)
+    isolated_network_alias: str | None = Field(default=None, pattern=_IDENTIFIER)
 
     @field_validator("authority")
     @classmethod
-    def canonical_service(cls, value: str) -> str:
+    def canonical_service(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
         return _authority(value, schemes=frozenset({"http", "https"}))
 
     @model_validator(mode="after")
     def binds_listener(self) -> Self:
-        parsed = urlsplit(self.authority)
-        assert parsed.port is not None
-        if self.authority_sha256 != _digest(self.authority.encode()):
-            raise ValueError("service authority hash does not bind authority")
+        if self.authority is None:
+            if self.authority_sha256 is not None:
+                raise ValueError("missing service authority cannot have a hash")
+            parsed = None
+        else:
+            parsed = urlsplit(self.authority)
+            assert parsed.port is not None and parsed.hostname is not None
+            if self.authority_sha256 != _digest(self.authority.encode()):
+                raise ValueError("service authority hash does not bind authority")
         if self.listener_binding == "isolated_network_only":
-            if self.host_listener_port is not None:
+            if self.host_listener_port is not None or self.isolated_network_alias is None:
                 raise ValueError("isolated service cannot publish a port")
-        elif self.host_listener_port != parsed.port:
+            if self.authority is not None:
+                assert parsed is not None and parsed.hostname is not None
+                address = ipaddress.ip_address(parsed.hostname)
+                if (
+                    parsed.scheme != "http"
+                    or address.is_loopback
+                    or not address.is_private
+                    or address.is_unspecified
+                    or address.is_multicast
+                    or address.is_link_local
+                ):
+                    raise ValueError("isolated service authority must be internal HTTP")
+        elif self.authority is None or self.authority_sha256 is None:
             raise ValueError("listener port must bind authority")
+        else:
+            assert parsed is not None and parsed.port is not None
+            if self.isolated_network_alias is not None or self.host_listener_port != parsed.port:
+                raise ValueError("listener port must bind authority")
         return self
 
     def stable(self) -> tuple[StableIdentifierV1, ...]:
         output = [
-            StableIdentifierV1(
-                kind=StableIdentifierKind.AUTHORITY_HASH, value=self.authority_sha256
-            ),
             StableIdentifierV1(
                 kind=StableIdentifierKind.COMPOSE_SERVICE,
                 value=f"{self.compose_project}/{self.service_name}",
@@ -376,6 +409,19 @@ class ServiceIdentityV1(_Model):
             ),
             StableIdentifierV1(kind=StableIdentifierKind.WORKLOAD, value=self.workload_id),
         ]
+        if self.authority_sha256 is not None:
+            output.append(
+                StableIdentifierV1(
+                    kind=StableIdentifierKind.AUTHORITY_HASH, value=self.authority_sha256
+                )
+            )
+        if self.isolated_network_alias is not None:
+            output.append(
+                StableIdentifierV1(
+                    kind=StableIdentifierKind.NETWORK_ALIAS,
+                    value=f"{self.network_id}/{self.isolated_network_alias}",
+                )
+            )
         if self.host_listener_port is not None:
             output.append(
                 StableIdentifierV1(
@@ -436,20 +482,28 @@ class CandidateCompositeV1(_Model):
     def isolated_pairs(self) -> Self:
         if self.authority_sha256 != _digest(self.authority.encode()):
             raise ValueError("candidate authority hash does not bind authority")
-        if self.primary_service.authority != self.authority:
+        if (
+            self.primary_service.authority != self.authority
+            or self.primary_service.authority_sha256 != self.authority_sha256
+        ):
             raise ValueError("primary service must bind candidate authority")
+        if (
+            self.restore_service.listener_binding != "isolated_network_only"
+            or self.restore_service.host_listener_port is not None
+            or self.restore_service.authority is not None
+            or self.restore_service.authority_sha256 is not None
+            or self.restore_service.isolated_network_alias is None
+        ):
+            raise ValueError("restore service must be unpublished and isolated")
         services = (self.primary_service, self.restore_service)
         caches = (self.primary_valkey, self.restore_valkey)
-        if (
-            len({item.container_id for item in services}) != 2
-            or len({item.network_id for item in services}) != 2
-        ):
-            raise ValueError("primary and restore services must be distinct")
-        if (
-            len({item.container_id for item in caches}) != 2
-            or len({item.network_id for item in caches}) != 2
-        ):
-            raise ValueError("primary and restore Valkey must be distinct")
+        components = (*services, *caches)
+        if len({item.container_id for item in components}) != 4:
+            raise ValueError("all component container identities must be distinct")
+        if len({item.network_id for item in components}) != 4:
+            raise ValueError("all component network identities must be distinct")
+        if len({item.workload_id for item in components}) != 4:
+            raise ValueError("all component workload identities must be distinct")
         if (
             len({item.volume_id for item in caches}) != 2
             or len({item.logical_namespace for item in caches}) != 2
@@ -466,6 +520,10 @@ class CandidateCompositeV1(_Model):
             StableIdentifierV1(
                 kind=StableIdentifierKind.POSTGRES_SYSTEM_DATABASE,
                 value=f"{self.postgres.system_identifier}/{self.postgres.database_name}",
+            ),
+            StableIdentifierV1(
+                kind=StableIdentifierKind.POSTGRES_SYSTEM_DATABASE_OID,
+                value=f"{self.postgres.system_identifier}/{self.postgres.database_oid}",
             ),
             StableIdentifierV1(
                 kind=StableIdentifierKind.POSTGRES_OWNER,
@@ -505,6 +563,21 @@ class ProposalV1(_Model):
 
     @model_validator(mode="after")
     def binds_candidate(self) -> Self:
+        primary = self.candidate.primary_service
+        if (
+            self.transport.authority != self.candidate.authority
+            or self.transport.authority_sha256 != self.candidate.authority_sha256
+            or primary.authority != self.transport.authority
+            or primary.authority_sha256 != self.transport.authority_sha256
+            or primary.listener_binding != self.transport.listener_binding
+            or primary.host_listener_port != self.transport.host_listener_port
+        ):
+            raise ValueError("transport must bind primary candidate service")
+        if self.transport.listener_binding == "isolated_network_only" and (
+            primary.network_id != self.transport.isolated_network_id
+            or primary.isolated_network_alias != self.transport.isolated_network_alias
+        ):
+            raise ValueError("isolated transport must bind primary network alias")
         if self.primary_image != self.restore_image:
             raise ValueError("primary and restore images must share one digest")
         if (
@@ -585,6 +658,7 @@ class TargetAttestationV1(_Model):
     snapshot_epoch_id: str = Field(pattern=_IDENTIFIER)
     observed_at: str
     candidate_composite_sha256: str = Field(pattern=_SHA256)
+    postgres_database_oid: int = Field(ge=1)
     signature: DetachedSignatureV1
 
     @field_validator("observed_at")
@@ -893,6 +967,7 @@ def compile_preflight(paths: PreflightPaths, *, now: datetime | None = None) -> 
     if (
         target.authorization_subject_sha256 != subject
         or target.candidate_composite_sha256 != canonical_sha256(proposal.candidate)
+        or target.postgres_database_oid != proposal.candidate.postgres.database_oid
     ):
         raise DisposablePreflightError("target_attestation")
     _fresh(target.observed_at, now=clock, phase="target_attestation")
@@ -913,6 +988,7 @@ def compile_preflight(paths: PreflightPaths, *, now: datetime | None = None) -> 
     _fresh(registry.observed_at, now=clock, phase="registry_verification")
     if (
         overlay.database_name != proposal.candidate.postgres.database_name
+        or overlay.database_oid != proposal.candidate.postgres.database_oid
         or overlay.owner_role != proposal.candidate.postgres.owner_role
     ):
         raise DisposablePreflightError("postgres_overlay")

@@ -88,12 +88,16 @@ def _provider_references() -> ProviderReferencesV1:
     )
 
 
-def _service(*, number: int, project: str, network: str) -> ServiceIdentityV1:
-    authority = "https://" + ".".join(("198", "51", "100", str(number))) + ":443"
+def _service(
+    *, number: int, project: str, network: str, restore: bool = False
+) -> ServiceIdentityV1:
+    authority = None
+    if not restore:
+        authority = "https://" + ".".join(("198", "51", "100", str(number))) + ":443"
     container_char = "a" if number == 31 else "b"
     return ServiceIdentityV1(
         authority=authority,
-        authority_sha256=_digest(authority.encode()),
+        authority_sha256=None if authority is None else _digest(authority.encode()),
         machine_id=f"machine-{number}",
         compose_project=project,
         service_name="infisical",
@@ -101,8 +105,9 @@ def _service(*, number: int, project: str, network: str) -> ServiceIdentityV1:
         container_id=container_char * 64,
         workload_id=f"workload-{number}",
         image=_IMAGE,
-        listener_binding="tls_lan",
-        host_listener_port=443,
+        listener_binding="isolated_network_only" if restore else "tls_lan",
+        host_listener_port=None if restore else 443,
+        isolated_network_alias="restore-infisical" if restore else None,
     )
 
 
@@ -129,11 +134,14 @@ def _proposal() -> ProposalV1:
         authority=authority,
         authority_sha256=_digest(authority.encode()),
         primary_service=_service(number=31, project="primary-project", network="primary-network"),
-        restore_service=_service(number=32, project="restore-project", network="restore-network"),
+        restore_service=_service(
+            number=32, project="restore-project", network="restore-network", restore=True
+        ),
         postgres=PostgreSQLContractV1(
             authority="postgresql://192.0.2.40:5432",
             system_identifier="12345678",
             database_name="rsdacceptance",
+            database_oid=101,
             owner_role="rsdowner",
             schema_fingerprint_sha256=_HASH,
             membership_fingerprint_sha256=_HASH,
@@ -188,7 +196,14 @@ def _write(path: Path, name: str, model: object) -> str:
     return _digest(raw)
 
 
-def _materials(root: Path, *, governed_collision: bool = False) -> None:
+def _materials(
+    root: Path,
+    *,
+    governed_collision: bool = False,
+    target_database_oid: int | None = None,
+    overlay_database_oid: int | None = None,
+    provider_epoch: str = "snapshot-1",
+) -> None:
     root.mkdir(mode=0o700)
     proposal = _proposal()
     subject = proposal_sha256(proposal)
@@ -225,12 +240,17 @@ def _materials(root: Path, *, governed_collision: bool = False) -> None:
         snapshot_epoch_id="snapshot-1",
         observed_at="2026-08-27T11:59:00Z",
         candidate_composite_sha256=canonical_sha256(proposal.candidate),
+        postgres_database_oid=(
+            proposal.candidate.postgres.database_oid
+            if target_database_oid is None
+            else target_database_oid
+        ),
         signature=_signature(),
     )
     provider = ProviderDeclarationV1(
         schema_version="rsd.disposable-provider-declaration.v1",
         authorization_subject_sha256=subject,
-        snapshot_epoch_id="snapshot-1",
+        snapshot_epoch_id=provider_epoch,
         observed_at="2026-08-27T11:59:00Z",
         proof_source="offline-provider-reference-declaration-v1",
         signature=_signature(),
@@ -260,6 +280,7 @@ def _materials(root: Path, *, governed_collision: bool = False) -> None:
     overlay = PostgreSQLAcceptanceOverlayV1(
         schema_version="rsd.postgres-acceptance-overlay.v1",
         database_name="rsdacceptance",
+        database_oid=101 if overlay_database_oid is None else overlay_database_oid,
         owner_role="rsdowner",
         secret_provider_kind="infisical",
         secret_project="acceptance-project",
@@ -351,8 +372,179 @@ def test_candidate_rejects_shared_restore_valkey_volume() -> None:
     raw = candidate.model_dump(mode="python")
     raw["restore_valkey"] = candidate.primary_valkey
 
-    with pytest.raises(ValueError, match="primary and restore Valkey"):
+    with pytest.raises(ValueError, match="all component container identities"):
         CandidateCompositeV1.model_validate(raw)
+
+
+@pytest.mark.parametrize("field", ("container_id", "network_id", "workload_id"))
+def test_candidate_rejects_service_to_valkey_identity_collision(field: str) -> None:
+    candidate = _proposal().candidate
+    raw = candidate.model_dump(mode="python")
+    colliding_valkey = candidate.primary_valkey.model_dump(mode="python")
+    colliding_valkey[field] = getattr(candidate.primary_service, field)
+    raw["primary_valkey"] = colliding_valkey
+
+    with pytest.raises(ValueError, match=f"all component {field.removesuffix('_id')} identities"):
+        CandidateCompositeV1.model_validate(raw)
+
+
+def test_candidate_rejects_restore_service_published_authority() -> None:
+    candidate = _proposal().candidate
+    raw = candidate.model_dump(mode="python")
+    published_restore = candidate.restore_service.model_dump(mode="python")
+    published_restore.update(
+        {
+            "authority": candidate.authority,
+            "authority_sha256": candidate.authority_sha256,
+            "listener_binding": "tls_lan",
+            "host_listener_port": 443,
+            "isolated_network_alias": None,
+        }
+    )
+    raw["restore_service"] = published_restore
+
+    with pytest.raises(ValueError, match="restore service must be unpublished and isolated"):
+        CandidateCompositeV1.model_validate(raw)
+
+
+def test_proposal_rejects_transport_authority_mismatch_with_primary_candidate() -> None:
+    proposal = _proposal()
+    authority = "https://" + ".".join(("198", "51", "100", "39")) + ":443"
+    raw = proposal.model_dump(mode="python")
+    raw["transport"] = TransportContractV1(
+        profile=DisposableTransportProfile.TLS_VERIFIED,
+        authority=authority,
+        authority_sha256=_digest(authority.encode()),
+        listener_binding="tls_lan",
+        host_listener_port=443,
+        tls_trust_anchor_reference_sha256=(
+            proposal.provider_references.tls_trust_anchor.reference_sha256
+        ),
+        minimum_tls_version="TLSv1.3",
+    )
+
+    with pytest.raises(ValueError, match="transport must bind primary candidate service"):
+        ProposalV1.model_validate(raw)
+
+
+def test_proposal_rejects_claimed_loopback_when_candidate_is_tls_lan() -> None:
+    proposal = _proposal()
+    references = proposal.provider_references.model_dump(mode="python")
+    references["tls_trust_anchor"] = None
+    raw = proposal.model_dump(mode="python")
+    raw["provider_references"] = ProviderReferencesV1.model_validate(references)
+    raw["transport"] = TransportContractV1(
+        profile=DisposableTransportProfile.UNPUBLISHED_LOOPBACK_OR_NETWORK,
+        authority="http://127.0.0.1:8080",
+        authority_sha256=_digest(b"http://127.0.0.1:8080"),
+        listener_binding="loopback_only",
+        host_listener_port=8080,
+    )
+
+    with pytest.raises(ValueError, match="transport must bind primary candidate service"):
+        ProposalV1.model_validate(raw)
+
+
+def test_unpublished_network_transport_rejects_external_address_and_dns() -> None:
+    external_authority = "http://" + ".".join(("8", "8", "8", "8")) + ":8080"
+    for authority in (external_authority, "http://service.example.test:8080"):
+        with pytest.raises(ValueError):
+            TransportContractV1(
+                profile=DisposableTransportProfile.UNPUBLISHED_LOOPBACK_OR_NETWORK,
+                authority=authority,
+                authority_sha256=_digest(authority.encode()),
+                listener_binding="isolated_network_only",
+                isolated_network_id="isolated-network",
+                isolated_network_alias="internal-service",
+            )
+
+
+def test_proposal_accepts_candidate_bound_internal_network_transport() -> None:
+    proposal = _proposal()
+    authority = "http://" + ".".join(("198", "51", "100", "41")) + ":8080"
+    candidate_raw = proposal.candidate.model_dump(mode="python")
+    primary_raw = proposal.candidate.primary_service.model_dump(mode="python")
+    primary_raw.update(
+        {
+            "authority": authority,
+            "authority_sha256": _digest(authority.encode()),
+            "listener_binding": "isolated_network_only",
+            "host_listener_port": None,
+            "isolated_network_alias": "primary-internal",
+        }
+    )
+    candidate_raw["authority"] = authority
+    candidate_raw["authority_sha256"] = _digest(authority.encode())
+    candidate_raw["primary_service"] = primary_raw
+    references_raw = proposal.provider_references.model_dump(mode="python")
+    references_raw["tls_trust_anchor"] = None
+    raw = proposal.model_dump(mode="python")
+    raw["candidate"] = CandidateCompositeV1.model_validate(candidate_raw)
+    raw["provider_references"] = ProviderReferencesV1.model_validate(references_raw)
+    raw["transport"] = TransportContractV1(
+        profile=DisposableTransportProfile.UNPUBLISHED_LOOPBACK_OR_NETWORK,
+        authority=authority,
+        authority_sha256=_digest(authority.encode()),
+        listener_binding="isolated_network_only",
+        isolated_network_id="primary-network",
+        isolated_network_alias="primary-internal",
+    )
+
+    assert ProposalV1.model_validate(raw).transport.isolated_network_alias == "primary-internal"
+
+
+def test_postgres_identity_requires_positive_oid() -> None:
+    raw = _proposal().candidate.postgres.model_dump(mode="python")
+    raw["database_oid"] = 0
+
+    with pytest.raises(ValueError, match="database_oid"):
+        PostgreSQLContractV1.model_validate(raw)
+
+
+def test_final_contract_rejects_postgres_oid_replay_tampering() -> None:
+    proposal = _proposal()
+    candidate_raw = proposal.candidate.model_dump(mode="python")
+    postgres_raw = proposal.candidate.postgres.model_dump(mode="python")
+    postgres_raw["database_oid"] = 102
+    candidate_raw["postgres"] = postgres_raw
+    raw = proposal.model_dump(mode="python")
+    raw["candidate"] = CandidateCompositeV1.model_validate(candidate_raw)
+
+    with pytest.raises(ValueError, match="runtime contract does not bind proposal"):
+        RuntimeContractV1(
+            **raw,
+            proposal_sha256=proposal_sha256(proposal),
+            evidence=EvidenceBindingsV1(
+                approval_sha256="0" * 64,
+                governed_baseline_sha256="1" * 64,
+                target_attestation_sha256="2" * 64,
+                provider_declaration_sha256="3" * 64,
+                registry_verification_sha256="4" * 64,
+                postgres_overlay_sha256="5" * 64,
+            ),
+        )
+
+
+def test_target_database_oid_and_overlay_oid_are_revalidated(tmp_path: Path) -> None:
+    target_root = tmp_path / "target-oid"
+    _materials(target_root, target_database_oid=102)
+
+    with pytest.raises(DisposablePreflightError, match="target_attestation"):
+        compile_preflight(PreflightPaths(root=target_root), now=_NOW)
+
+    overlay_root = tmp_path / "overlay-oid"
+    _materials(overlay_root, overlay_database_oid=102)
+
+    with pytest.raises(DisposablePreflightError, match="postgres_overlay"):
+        compile_preflight(PreflightPaths(root=overlay_root), now=_NOW)
+
+
+def test_provider_snapshot_replay_is_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "replayed-provider"
+    _materials(root, provider_epoch="snapshot-replayed")
+
+    with pytest.raises(DisposablePreflightError, match="provider_declaration"):
+        compile_preflight(PreflightPaths(root=root), now=_NOW)
 
 
 def test_transport_rejects_cleartext_published_lan() -> None:
