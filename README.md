@@ -142,10 +142,17 @@ must map to these exact native values before constructing the public contract:
 
 Legacy spellings are not accepted.
 
+`tls_verified_v1` remains a canonical schema value, but it is not provisionable
+by this release. Until a separately signed TLS-termination amendment defines
+server certificate and server signing-key custody, every Phase-B journal and effect
+boundary rejects that profile with
+`tls_termination_amendment_required` before a provider lease, local create,
+external tombstone, or callback can run.
+
 `omninode_rsd.lifecycle.authorize_and_execute()` is the observed-lifecycle
 mutation-admission boundary for a disposable acceptance workflow. It accepts
-an injected Ed25519 trust anchor, leased provider-provenance adapter, provider
-fingerprint policy, owner-only `SQLiteAuthorizationJournal` and
+an injected Ed25519 trust anchor, leased provider-provenance adapter, owner-only
+`SQLiteAuthorizationJournal` and
 `SQLiteInitialProvisioningJournal`, mandatory `ProtocolReplayAuthority` plus
 typed `ReplayAuthorityPolicyV1`, and one effect callback. It requires actual
 detached-signature sidecars for the proposal, final contract, and evidence
@@ -227,10 +234,26 @@ attestation is written only after all create-once rows succeed. Any duplicate,
 partial, missing, changed, malformed, or interrupted state is diagnostic-only
 and blocks automatic retry or replacement.
 
+Authorization never accepts material policy, genesis, or fingerprint models
+from its caller. Under the held artifact-root descriptor it loads the persisted
+issuer-signed `SignerGenesisV1`, policy, pending genesis, and terminal
+attestation; verifies their canonical hashes, Ed25519 domains, intent/owner/
+approver/reference bindings, distinct fingerprints, and declared formats; and
+rechecks that exact four-file snapshot before an effect and before commit. A
+manually populated Keychain item without this verified terminal artifact set
+cannot reach an effect. `provider_material_genesis_status()` is deliberately a
+structural diagnostic only: its `structurally_complete_unverified` result is
+never an authorization signal.
+
 For macOS Keychain material, the immutable account name carries its declared
 version as a `.v<version>` suffix, in addition to the signed reference hash.
 This makes a version transition a distinct create-once item rather than an
 interpretation of an older row.
+
+The material policy also carries the signer Keychain reference and seed
+fingerprint. That signer item, every material purpose/reference, and every
+material fingerprint must be pairwise distinct, so an Ed25519 seed cannot be
+reused as HMAC, AEAD, or application material.
 
 The public material policy has fixed purpose-to-format bindings: commitment
 HMAC and backup AES-256-GCM keys are each 32 raw bytes; the normal Infisical
@@ -252,7 +275,8 @@ are surfaced only as generic value-redacted errors.
 This boundary intentionally represents a CA trust anchor only. TLS server
 certificate and associated signing-key generation, custody, installation, and
 runtime termination are not defined or authorized here; they require a separate
-signed intent and policy amendment before any provisioning work.
+signed intent and policy amendment. Consequently, a TLS-profile intent is
+blocked before any provisioning work in this release.
 
 The observed SQLite journal requires an owner-only directory and database file, uses
 `BEGIN IMMEDIATE`, `DELETE` journaling, and `FULL` synchronous durability. A

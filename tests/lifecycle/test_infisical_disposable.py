@@ -118,6 +118,9 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     validate_observed_candidate_transition,
 )
 from omninode_rsd.lifecycle.provider_crypto import (
+    _TEST_CLOCK_CAPABILITY as _PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
+)
+from omninode_rsd.lifecycle.provider_crypto import (
     KeychainEd25519Signer,
     KeychainItemReferenceV1,
     ProviderCryptoError,
@@ -131,10 +134,12 @@ from omninode_rsd.lifecycle.provider_crypto import (
     ProviderMaterialSpecV1,
     ReplayAuthorityPolicyArtifactV1,
     SignerGenesisV1,
+    _load_verified_provider_material_bundle_for_test,
+    _persist_provider_material_genesis_for_test,
+    _persist_provider_material_policy_for_test,
+    _provision_keychain_materials_for_test,
     load_keychain_ed25519_signer,
-    load_verified_provider_material_bundle,
     load_verified_signer_genesis,
-    persist_provider_material_genesis,
     persist_provider_material_policy,
     persist_signer_genesis,
     provider_fingerprint_attestation_message,
@@ -142,7 +147,6 @@ from omninode_rsd.lifecycle.provider_crypto import (
     provider_material_genesis_status,
     provider_material_policy_message,
     provision_keychain_ed25519_signer,
-    provision_keychain_materials,
     replay_authority_policy_message,
     signer_genesis_message,
 )
@@ -153,6 +157,7 @@ _HASH = "b" * 64
 _IMAGE = ImageReferenceV1(reference=f"registry.example.test/infisical@sha256:{'c' * 64}")
 _CACHE_IMAGE = ImageReferenceV1(reference=f"registry.example.test/valkey@sha256:{'d' * 64}")
 _TEST_SIGNING_KEYS: dict[str, Ed25519PrivateKey] = {}
+_TEST_PROVIDER_SIGNERS: dict[tuple[str, str], tuple[TrustedEd25519SignerV1, SignerGenesisV1]] = {}
 _TEST_PROVISION_LOCK = Lock()
 _TEST_REPLAY_POLICY = ReplayAuthorityPolicyV1(
     schema_version="rsd.replay-authority-policy.v1",
@@ -298,7 +303,9 @@ def _reference(
     )
 
 
-def _provider_references(*, provider: str = "metadata-provider") -> ProviderReferencesV1:
+def _provider_references(
+    *, provider: str = "metadata-provider", tls: bool = False
+) -> ProviderReferencesV1:
     return ProviderReferencesV1(
         commitment_hmac=_reference("commitment", 1, provider=provider),
         backup_encryption=_reference("backup", 1, provider=provider),
@@ -306,16 +313,20 @@ def _provider_references(*, provider: str = "metadata-provider") -> ProviderRefe
         auth_secret=_reference("auth", 1, provider=provider),
         primary_valkey_password=_reference("primary-cache", 1, provider=provider),
         restore_valkey_password=_reference("restore-cache", 1, provider=provider),
-        tls_trust_anchor=_reference("trust", 1, provider=provider),
+        tls_trust_anchor=_reference("trust", 1, provider=provider) if tls else None,
     )
 
 
 def _service(
-    *, number: int, project: str, network: str, restore: bool = False
+    *, number: int, project: str, network: str, restore: bool = False, tls: bool = False
 ) -> ServiceIdentityV1:
     authority = None
     if not restore:
-        authority = "https://" + ".".join(("198", "51", "100", str(number))) + ":443"
+        authority = (
+            "https://" + ".".join(("198", "51", "100", str(number))) + ":443"
+            if tls
+            else "http://127.0.0.1:8080"
+        )
     container_char = "a" if number == 31 else "b"
     return ServiceIdentityV1(
         authority=authority,
@@ -329,8 +340,10 @@ def _service(
         workload_name=f"workload-{number}",
         workload_id=_digest(f"workload:{number}".encode()),
         image=_IMAGE,
-        listener_binding="isolated_network_only" if restore else "tls_lan",
-        host_listener_port=None if restore else 443,
+        listener_binding="isolated_network_only"
+        if restore
+        else ("tls_lan" if tls else "loopback_only"),
+        host_listener_port=None if restore else (443 if tls else 8080),
         isolated_network_alias="restore-infisical" if restore else None,
     )
 
@@ -354,15 +367,24 @@ def _cache(
     )
 
 
-def _proposal(*, provider: str = "metadata-provider") -> ProposalV1:
-    references = _provider_references(provider=provider)
-    authority = "https://198.51.100.31:443"
+def _proposal(*, provider: str = "metadata-provider", tls: bool = False) -> ProposalV1:
+    references = _provider_references(provider=provider, tls=tls)
+    authority = "https://198.51.100.31:443" if tls else "http://127.0.0.1:8080"
     candidate = CandidateCompositeV1(
         authority=authority,
         authority_sha256=_digest(authority.encode()),
-        primary_service=_service(number=31, project="primary-project", network="primary-network"),
+        primary_service=_service(
+            number=31,
+            project="primary-project",
+            network="primary-network",
+            tls=tls,
+        ),
         restore_service=_service(
-            number=32, project="restore-project", network="restore-network", restore=True
+            number=32,
+            project="restore-project",
+            network="restore-network",
+            restore=True,
+            tls=tls,
         ),
         postgres=PostgreSQLContractV1(
             authority="postgresql://192.0.2.40:5432",
@@ -400,13 +422,19 @@ def _proposal(*, provider: str = "metadata-provider") -> ProposalV1:
         operation_id="123e4567-e89b-42d3-a456-426614174000",
         source_commit=_COMMIT,
         transport=TransportContractV1(
-            profile=DisposableTransportProfile.TLS_VERIFIED,
+            profile=(
+                DisposableTransportProfile.TLS_VERIFIED
+                if tls
+                else DisposableTransportProfile.UNPUBLISHED_LOOPBACK_OR_NETWORK
+            ),
             authority=authority,
             authority_sha256=_digest(authority.encode()),
-            listener_binding="tls_lan",
-            host_listener_port=443,
-            tls_trust_anchor_reference_sha256=references.tls_trust_anchor.reference_sha256,
-            minimum_tls_version="TLSv1.3",
+            listener_binding="tls_lan" if tls else "loopback_only",
+            host_listener_port=443 if tls else 8080,
+            tls_trust_anchor_reference_sha256=(
+                references.tls_trust_anchor.reference_sha256 if tls else None
+            ),
+            minimum_tls_version="TLSv1.3" if tls else None,
         ),
         candidate=candidate,
         primary_image=_IMAGE,
@@ -641,7 +669,7 @@ def test_candidate_rejects_service_to_valkey_identity_collision(field: str) -> N
 
 
 def test_candidate_rejects_restore_service_published_authority() -> None:
-    candidate = _proposal().candidate
+    candidate = _proposal(tls=True).candidate
     raw = candidate.model_dump(mode="python")
     published_restore = candidate.restore_service.model_dump(mode="python")
     published_restore.update(
@@ -660,7 +688,7 @@ def test_candidate_rejects_restore_service_published_authority() -> None:
 
 
 def test_proposal_rejects_transport_authority_mismatch_with_primary_candidate() -> None:
-    proposal = _proposal()
+    proposal = _proposal(tls=True)
     authority = "https://" + ".".join(("198", "51", "100", "39")) + ":443"
     raw = proposal.model_dump(mode="python")
     raw["transport"] = TransportContractV1(
@@ -680,7 +708,7 @@ def test_proposal_rejects_transport_authority_mismatch_with_primary_candidate() 
 
 
 def test_proposal_rejects_claimed_loopback_when_candidate_is_tls_lan() -> None:
-    proposal = _proposal()
+    proposal = _proposal(tls=True)
     references = proposal.provider_references.model_dump(mode="python")
     references["tls_trust_anchor"] = None
     raw = proposal.model_dump(mode="python")
@@ -1135,12 +1163,78 @@ def _replay_policy_artifact(
     )
 
 
+def _provider_signer_for_intent(
+    intent: InitialProvisioningIntentV1,
+    *,
+    issuer: TrustedEd25519SignerV1,
+) -> tuple[TrustedEd25519SignerV1, SignerGenesisV1]:
+    """Create one test-only child signer bound to this exact signed intent."""
+
+    intent_sha256 = initial_provisioning_intent_sha256(intent)
+    cache_key = (issuer.public_key_fingerprint_sha256, intent_sha256)
+    cached = _TEST_PROVIDER_SIGNERS.get(cache_key)
+    if cached is not None:
+        return cached
+    issuer_key = _TEST_SIGNING_KEYS[issuer.public_key_fingerprint_sha256]
+    private_key = Ed25519PrivateKey.generate()
+    seed = private_key.private_bytes(
+        serialization.Encoding.Raw,
+        serialization.PrivateFormat.Raw,
+        serialization.NoEncryption(),
+    )
+    public = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    suffix = intent_sha256[:16]
+    fields = {
+        "account": f"provider-signer-{suffix}.v1",
+        "provider": "macos_keychain",
+        "service": "provider-material-signer",
+        "version": 1,
+    }
+    provider_signer = TrustedEd25519SignerV1(
+        key_id=f"provider-material-{suffix}",
+        public_key_base64=base64.b64encode(public).decode(),
+        public_key_fingerprint_sha256=_digest(public),
+    )
+    unsigned = SignerGenesisV1(
+        schema_version="rsd.provider-crypto.signer-genesis.v1",
+        initial_intent_sha256=intent_sha256,
+        issuer_key_id=issuer.key_id,
+        key_id=provider_signer.key_id,
+        public_key_base64=provider_signer.public_key_base64,
+        public_key_fingerprint_sha256=provider_signer.public_key_fingerprint_sha256,
+        seed_fingerprint_sha256=_digest(seed),
+        keychain_reference=KeychainItemReferenceV1(
+            **fields,
+            reference_sha256=_digest(
+                json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
+            ),
+        ),
+        created_at=_NOW.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        signature_base64=base64.b64encode(b"0" * 64).decode(),
+    )
+    genesis = unsigned.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                issuer_key.sign(signer_genesis_message(unsigned))
+            ).decode()
+        }
+    )
+    _TEST_SIGNING_KEYS[provider_signer.public_key_fingerprint_sha256] = private_key
+    result = (provider_signer, genesis)
+    _TEST_PROVIDER_SIGNERS[cache_key] = result
+    return result
+
+
 def _provider_material_bundle(
     intent: InitialProvisioningIntentV1,
     *,
     signer: TrustedEd25519SignerV1,
     fingerprints: Mapping[str, str],
 ) -> tuple[ProviderMaterialPolicyV1, ProviderFingerprintAttestationV1, ProviderMaterialGenesisV1]:
+    provider_signer, signer_genesis = _provider_signer_for_intent(intent, issuer=signer)
     references = intent.provider_references
     definitions: tuple[
         tuple[ProviderMaterialPurpose, ProviderMaterialFormat, int, int, ProviderReferenceV1], ...
@@ -1205,6 +1299,8 @@ def _provider_material_bundle(
         disposal_owner="acceptance-owner",
         approver_identity="approval-owner",
         policy_id="123e4567-e89b-42d3-a456-426614174003",
+        signer_keychain_reference=signer_genesis.keychain_reference,
+        signer_seed_fingerprint_sha256=signer_genesis.seed_fingerprint_sha256,
         created_at=_NOW.isoformat(timespec="seconds").replace("+00:00", "Z"),
         retention_expires_at=intent.retention_expires_at,
         materials=tuple(
@@ -1217,10 +1313,10 @@ def _provider_material_bundle(
             )
             for purpose, material_format, minimum, maximum, reference in definitions
         ),
-        signer_key_id=signer.key_id,
+        signer_key_id=provider_signer.key_id,
         signature_base64=base64.b64encode(b"0" * 64).decode(),
     )
-    key = _TEST_SIGNING_KEYS[signer.public_key_fingerprint_sha256]
+    key = _TEST_SIGNING_KEYS[provider_signer.public_key_fingerprint_sha256]
     policy = unsigned_policy.model_copy(
         update={
             "signature_base64": base64.b64encode(
@@ -1242,7 +1338,7 @@ def _provider_material_bundle(
             )
             for purpose, _format, _minimum, _maximum, reference in definitions
         ),
-        signer_key_id=signer.key_id,
+        signer_key_id=provider_signer.key_id,
         signature_base64=base64.b64encode(b"0" * 64).decode(),
     )
     attestation = unsigned_attestation.model_copy(
@@ -1264,7 +1360,7 @@ def _provider_material_bundle(
             ).encode()
         ),
         created_at=_NOW.isoformat(timespec="seconds").replace("+00:00", "Z"),
-        signer_key_id=signer.key_id,
+        signer_key_id=provider_signer.key_id,
         signature_base64=base64.b64encode(b"0" * 64).decode(),
     )
     genesis = unsigned_genesis.model_copy(
@@ -1277,7 +1373,54 @@ def _provider_material_bundle(
     return policy, attestation, genesis
 
 
-def _provider_material_values() -> dict[ProviderMaterialPurpose, bytearray]:
+def _persist_completed_provider_material_bundle_for_test(
+    paths: AuthorizationPaths,
+    *,
+    intent: InitialProvisioningIntentV1,
+    signer: TrustedEd25519SignerV1,
+    fingerprints: Mapping[str, str],
+) -> tuple[ProviderMaterialPolicyV1, ProviderFingerprintAttestationV1, ProviderMaterialGenesisV1]:
+    """Install a complete signed non-secret fixture before authorization tests.
+
+    Production authorization never accepts these models from a caller.  This
+    setup helper writes the same immutable artifact set a completed create-only
+    bootstrap would leave, so the authorization test exercises the descriptor
+    relative persisted-artifact path rather than an in-memory bypass.
+    """
+
+    _provider_signer, signer_genesis = _provider_signer_for_intent(intent, issuer=signer)
+    policy, attestation, material_genesis = _provider_material_bundle(
+        intent,
+        signer=signer,
+        fingerprints=fingerprints,
+    )
+    artifact_paths = ProviderMaterialArtifactPaths(paths.root)
+    _write(paths.root, artifact_paths.signer_genesis_name(), signer_genesis)
+    _write(paths.root, artifact_paths.policy_name(), policy)
+    _write(paths.root, artifact_paths.genesis_name(), material_genesis)
+    _write(paths.root, artifact_paths.attestation_name(), attestation)
+    return policy, attestation, material_genesis
+
+
+def _provider_material_values(
+    *, include_tls_trust_anchor: bool = False
+) -> dict[ProviderMaterialPurpose, bytearray]:
+    values = {
+        ProviderMaterialPurpose.COMMITMENT_HMAC: bytearray(b"c" * 32),
+        ProviderMaterialPurpose.BACKUP_ENCRYPTION: bytearray(b"b" * 32),
+        ProviderMaterialPurpose.INFISICAL_ENCRYPTION_KEY: bytearray(
+            b"0123456789abcdef0123456789abcdef"
+        ),
+        ProviderMaterialPurpose.INFISICAL_AUTH_SECRET: bytearray(base64.b64encode(b"a" * 32)),
+        ProviderMaterialPurpose.PRIMARY_VALKEY_PASSWORD: bytearray(
+            base64.urlsafe_b64encode(b"p" * 32).rstrip(b"=")
+        ),
+        ProviderMaterialPurpose.RESTORE_VALKEY_PASSWORD: bytearray(
+            base64.urlsafe_b64encode(b"r" * 32).rstrip(b"=")
+        ),
+    }
+    if not include_tls_trust_anchor:
+        return values
     certificate_key = Ed25519PrivateKey.generate()
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "provider-test-ca")])
     certificate = (
@@ -1291,23 +1434,10 @@ def _provider_material_values() -> dict[ProviderMaterialPurpose, bytearray]:
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .sign(certificate_key, algorithm=None)
     )
-    return {
-        ProviderMaterialPurpose.COMMITMENT_HMAC: bytearray(b"c" * 32),
-        ProviderMaterialPurpose.BACKUP_ENCRYPTION: bytearray(b"b" * 32),
-        ProviderMaterialPurpose.INFISICAL_ENCRYPTION_KEY: bytearray(
-            b"0123456789abcdef0123456789abcdef"
-        ),
-        ProviderMaterialPurpose.INFISICAL_AUTH_SECRET: bytearray(base64.b64encode(b"a" * 32)),
-        ProviderMaterialPurpose.PRIMARY_VALKEY_PASSWORD: bytearray(
-            base64.urlsafe_b64encode(b"p" * 32).rstrip(b"=")
-        ),
-        ProviderMaterialPurpose.RESTORE_VALKEY_PASSWORD: bytearray(
-            base64.urlsafe_b64encode(b"r" * 32).rstrip(b"=")
-        ),
-        ProviderMaterialPurpose.TLS_TRUST_ANCHOR: bytearray(
-            certificate.public_bytes(serialization.Encoding.PEM)
-        ),
-    }
+    values[ProviderMaterialPurpose.TLS_TRUST_ANCHOR] = bytearray(
+        certificate.public_bytes(serialization.Encoding.PEM)
+    )
+    return values
 
 
 def _material_fingerprints(
@@ -1496,8 +1626,11 @@ def _ensure_test_initial_stage(
     with _TEST_PROVISION_LOCK:
         if journal.migration_status() is InitialProvisioningJournalStatus.ABSENT:
             intent = _initial_intent(paths, signer=signer, journal=journal)
-            policy, attestation, material_genesis = _provider_material_bundle(
-                intent, signer=signer, fingerprints=provider_fingerprints
+            _persist_completed_provider_material_bundle_for_test(
+                paths,
+                intent=intent,
+                signer=signer,
+                fingerprints=provider_fingerprints,
             )
             _provision_initial_journal_for_test(
                 paths,
@@ -1516,9 +1649,6 @@ def _ensure_test_initial_stage(
                 paths,
                 signer=signer,
                 provider=provider,
-                provider_material_policy=policy,
-                provider_fingerprint_attestation=attestation,
-                provider_material_genesis=material_genesis,
                 expected_disposal_owner=expected_disposal_owner,
                 expected_approver_identity=expected_approver_identity,
                 journal=journal,
@@ -1699,22 +1829,10 @@ def _execute_for_test(
             journal=initial_journal,
             replay_authority=authority,
         )
-    try:
-        stored_intent = InitialProvisioningIntentV1.model_validate(
-            yaml.safe_load((paths.root / paths.initial_intent_name()).read_bytes())
-        )
-    except FileNotFoundError:
-        stored_intent = _initial_intent(paths, signer=signer, journal=initial_journal)
-    policy, attestation, material_genesis = _provider_material_bundle(
-        stored_intent, signer=signer, fingerprints=provider_fingerprints
-    )
     return _authorize_and_execute_for_test(
         paths,
         signer=signer,
         provider=provider,
-        provider_material_policy=policy,
-        provider_fingerprint_attestation=attestation,
-        provider_material_genesis=material_genesis,
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
         journal=journal,
@@ -1878,6 +1996,12 @@ def test_initial_scope_cannot_be_used_as_observed_effect_authority(tmp_path: Pat
     journal = _initial_journal(tmp_path, paths)
     authority = _AtomicReplayAuthority()
     intent = _initial_intent(paths, signer=signer, journal=journal)
+    _persist_completed_provider_material_bundle_for_test(
+        paths,
+        intent=intent,
+        signer=signer,
+        fingerprints=fingerprints,
+    )
     _provision_initial_journal_for_test(
         paths,
         signer=signer,
@@ -1903,17 +2027,11 @@ def test_initial_scope_cannot_be_used_as_observed_effect_authority(tmp_path: Pat
             effect_receipt_sha256="b" * 64,
         )
 
-    policy, attestation, material_genesis = _provider_material_bundle(
-        intent, signer=signer, fingerprints=fingerprints
-    )
     with pytest.raises(AuthorizationError, match="initial_effect_failed_recovery_required"):
         _authorize_initial_provisioning_and_execute_for_test(
             paths,
             signer=signer,
             provider=_Provider(fingerprints),
-            provider_material_policy=policy,
-            provider_fingerprint_attestation=attestation,
-            provider_material_genesis=material_genesis,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=journal,
@@ -2059,16 +2177,18 @@ def test_public_execution_has_no_caller_controlled_clock(tmp_path: Path) -> None
     signer, fingerprints, _ = _authorize_materials(root)
     journal = _journal(tmp_path)
     initial_journal = _initial_journal(tmp_path, AuthorizationPaths(root))
-    intent = _initial_intent(AuthorizationPaths(root), signer=signer, journal=initial_journal)
-    policy, attestation, material_genesis = _provider_material_bundle(
-        intent, signer=signer, fingerprints=fingerprints
-    )
 
     assert "now" not in inspect.signature(authorize_and_execute).parameters
     assert "now" not in inspect.signature(authorize_initial_provisioning_and_execute).parameters
     assert "now" not in inspect.signature(provision_journal).parameters
     assert "now" not in inspect.signature(provision_initial_journal).parameters
     assert "provider_fingerprints" not in inspect.signature(authorize_and_execute).parameters
+    assert "provider_material_policy" not in inspect.signature(authorize_and_execute).parameters
+    assert (
+        "provider_fingerprint_attestation"
+        not in inspect.signature(authorize_and_execute).parameters
+    )
+    assert "provider_material_genesis" not in inspect.signature(authorize_and_execute).parameters
     assert (
         "provider_fingerprints"
         not in inspect.signature(authorize_initial_provisioning_and_execute).parameters
@@ -2091,9 +2211,6 @@ def test_public_execution_has_no_caller_controlled_clock(tmp_path: Path) -> None
             AuthorizationPaths(root),
             signer=signer,
             provider=_Provider(fingerprints),
-            provider_material_policy=policy,
-            provider_fingerprint_attestation=attestation,
-            provider_material_genesis=material_genesis,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=journal,
@@ -2108,9 +2225,6 @@ def test_public_execution_has_no_caller_controlled_clock(tmp_path: Path) -> None
             AuthorizationPaths(root),
             signer=signer,
             provider=_Provider(fingerprints),
-            provider_material_policy=policy,
-            provider_fingerprint_attestation=attestation,
-            provider_material_genesis=material_genesis,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=journal,
@@ -2183,6 +2297,97 @@ def test_missing_replay_authority_fails_before_journal_provisioning(tmp_path: Pa
         )
     assert journal.migration_status() is JournalMigrationStatus.ABSENT
     assert not (root / AuthorizationPaths.journal_genesis_name()).exists()
+
+
+def test_initial_replay_policy_is_durable_before_tombstone_and_allows_exact_recovery(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    signer, _fingerprints, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    journal = _initial_journal(tmp_path, paths)
+    intent = _initial_intent(paths, signer=signer, journal=journal)
+    policy_artifact = _replay_policy_artifact(intent, signer=signer)
+    expected = yaml.safe_dump(policy_artifact.model_dump(mode="json"), sort_keys=True).encode()
+    policy_path = root / paths.replay_policy_name()
+    observed: list[tuple[bool, InitialProvisioningJournalStatus]] = []
+
+    class _PolicyVisibleAuthority(_AtomicReplayAuthority):
+        def claim_once(self, tombstone: ReplayTombstoneV1) -> ReplayAuthorityClaimResult:
+            observed.append((policy_path.read_bytes() == expected, journal.migration_status()))
+            return super().claim_once(tombstone)
+
+    _provision_initial_journal_for_test(
+        paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        intent=intent,
+        replay_authority=_PolicyVisibleAuthority(),
+        replay_policy=_TEST_REPLAY_POLICY,
+        replay_policy_artifact=policy_artifact,
+        _clock=lambda: _NOW,
+        _capability=_TEST_CLOCK_CAPABILITY,
+    )
+    assert observed == [(True, InitialProvisioningJournalStatus.PROVISIONING_INCOMPLETE)]
+
+    recovery_root = tmp_path / "recovery-artifacts"
+    recovery_signer, _recovery_fingerprints, _ = _authorize_materials(recovery_root)
+    recovery_paths = AuthorizationPaths(recovery_root)
+    recovery_journal = _initial_journal(tmp_path, recovery_paths)
+    recovery_intent = _initial_intent(
+        recovery_paths,
+        signer=recovery_signer,
+        journal=recovery_journal,
+    )
+    recovery_artifact = _replay_policy_artifact(recovery_intent, signer=recovery_signer)
+    _write(recovery_root, recovery_paths.replay_policy_name(), recovery_artifact)
+    _provision_initial_journal_for_test(
+        recovery_paths,
+        signer=recovery_signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=recovery_journal,
+        intent=recovery_intent,
+        replay_authority=_AtomicReplayAuthority(),
+        replay_policy=_TEST_REPLAY_POLICY,
+        replay_policy_artifact=recovery_artifact,
+        _clock=lambda: _NOW,
+        _capability=_TEST_CLOCK_CAPABILITY,
+    )
+    assert recovery_journal.migration_status() is InitialProvisioningJournalStatus.CURRENT
+
+
+def test_initial_replay_policy_substitution_blocks_before_external_claim(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, _fingerprints, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    journal = _initial_journal(tmp_path, paths)
+    intent = _initial_intent(paths, signer=signer, journal=journal)
+    policy_artifact = _replay_policy_artifact(intent, signer=signer)
+    replacement = policy_artifact.model_copy(
+        update={"signature_base64": base64.b64encode(b"r" * 64).decode()}
+    )
+    _write(root, paths.replay_policy_name(), replacement)
+    authority = _AtomicReplayAuthority()
+
+    with pytest.raises(AuthorizationError, match="replay_policy_artifact"):
+        _provision_initial_journal_for_test(
+            paths,
+            signer=signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            intent=intent,
+            replay_authority=authority,
+            replay_policy=_TEST_REPLAY_POLICY,
+            replay_policy_artifact=policy_artifact,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+    assert not authority.tombstones
+    assert journal.migration_status() is InitialProvisioningJournalStatus.ABSENT
 
 
 def test_external_tombstone_blocks_local_rollback_and_deleted_operation_row(
@@ -3641,67 +3846,95 @@ def test_provider_material_genesis_is_create_only_and_partial_state_blocks_retry
         intent, signer=signer, fingerprints=fingerprints
     )
     artifact_paths = ProviderMaterialArtifactPaths(root)
-    persist_provider_material_policy(
+    provider_signer, signer_genesis = _provider_signer_for_intent(intent, issuer=signer)
+    persist_signer_genesis(
+        artifact_paths,
+        signer_genesis,
+        issuer=signer,
+        initial_intent=intent,
+    )
+    _persist_provider_material_policy_for_test(
         artifact_paths,
         policy,
-        signer=signer,
+        signer=provider_signer,
+        signer_genesis=signer_genesis,
+        issuer=signer,
         initial_intent=intent,
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
-        now=_NOW,
+        _clock=lambda: _NOW,
+        _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
     )
-    persist_provider_material_genesis(
+    _persist_provider_material_genesis_for_test(
         artifact_paths,
         genesis,
         policy=policy,
         attestation=attestation,
-        signer=signer,
+        signer=provider_signer,
+        signer_genesis=signer_genesis,
+        issuer=signer,
         initial_intent=intent,
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
-        now=_NOW,
+        _clock=lambda: _NOW,
+        _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
     )
     store = _CreateOnlyMaterialStore()
-    provision_keychain_materials(
+    _provision_keychain_materials_for_test(
         artifact_paths,
         policy=policy,
         genesis=genesis,
         attestation=attestation,
-        signer=signer,
+        signer=provider_signer,
+        signer_genesis=signer_genesis,
+        issuer=signer,
         initial_intent=intent,
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
-        now=_NOW,
         materials=values,
         _store=store,
+        _clock=lambda: _NOW,
+        _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
     )
     assert all(not any(value) for value in values.values())
-    assert provider_material_genesis_status(artifact_paths, _store=store).value == "complete"
-    loaded_policy, loaded_attestation = load_verified_provider_material_bundle(
-        artifact_paths,
-        signer=signer,
-        initial_intent=intent,
-        expected_disposal_owner="acceptance-owner",
-        expected_approver_identity="approval-owner",
-        now=_NOW,
+    assert (
+        provider_material_genesis_status(artifact_paths, _store=store).value
+        == "structurally_complete_unverified"
+    )
+    loaded_policy, loaded_genesis, loaded_attestation = (
+        _load_verified_provider_material_bundle_for_test(
+            artifact_paths,
+            signer=provider_signer,
+            signer_genesis=signer_genesis,
+            issuer=signer,
+            initial_intent=intent,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            _clock=lambda: _NOW,
+            _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
+        )
     )
     assert loaded_policy == policy
+    assert loaded_genesis == genesis
     assert loaded_attestation == attestation
 
     retry_values = _provider_material_values()
     with pytest.raises(ProviderCryptoError, match="material_genesis_state"):
-        provision_keychain_materials(
+        _provision_keychain_materials_for_test(
             artifact_paths,
             policy=policy,
             genesis=genesis,
             attestation=attestation,
-            signer=signer,
+            signer=provider_signer,
+            signer_genesis=signer_genesis,
+            issuer=signer,
             initial_intent=intent,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
-            now=_NOW,
             materials=retry_values,
             _store=store,
+            _clock=lambda: _NOW,
+            _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
         )
     assert all(not any(value) for value in retry_values.values())
 
@@ -3720,41 +3953,60 @@ def test_provider_material_genesis_is_create_only_and_partial_state_blocks_retry
         partial_intent, signer=partial_signer, fingerprints=partial_fingerprints
     )
     partial_artifact_paths = ProviderMaterialArtifactPaths(partial_root)
-    persist_provider_material_policy(
+    partial_provider_signer, partial_signer_genesis = _provider_signer_for_intent(
+        partial_intent,
+        issuer=partial_signer,
+    )
+    persist_signer_genesis(
+        partial_artifact_paths,
+        partial_signer_genesis,
+        issuer=partial_signer,
+        initial_intent=partial_intent,
+    )
+    _persist_provider_material_policy_for_test(
         partial_artifact_paths,
         partial_policy,
-        signer=partial_signer,
+        signer=partial_provider_signer,
+        signer_genesis=partial_signer_genesis,
+        issuer=partial_signer,
         initial_intent=partial_intent,
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
-        now=_NOW,
+        _clock=lambda: _NOW,
+        _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
     )
-    persist_provider_material_genesis(
+    _persist_provider_material_genesis_for_test(
         partial_artifact_paths,
         partial_genesis,
         policy=partial_policy,
         attestation=partial_attestation,
-        signer=partial_signer,
+        signer=partial_provider_signer,
+        signer_genesis=partial_signer_genesis,
+        issuer=partial_signer,
         initial_intent=partial_intent,
         expected_disposal_owner="acceptance-owner",
         expected_approver_identity="approval-owner",
-        now=_NOW,
+        _clock=lambda: _NOW,
+        _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
     )
     provider_secret = "secret-bearing-provider-error"
     partial_store = _CreateOnlyMaterialStore(fail_after=1, failure_message=provider_secret)
     with pytest.raises(ProviderCryptoError, match="material_provider") as caught:
-        provision_keychain_materials(
+        _provision_keychain_materials_for_test(
             partial_artifact_paths,
             policy=partial_policy,
             genesis=partial_genesis,
             attestation=partial_attestation,
-            signer=partial_signer,
+            signer=partial_provider_signer,
+            signer_genesis=partial_signer_genesis,
+            issuer=partial_signer,
             initial_intent=partial_intent,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
-            now=_NOW,
             materials=partial_values,
             _store=partial_store,
+            _clock=lambda: _NOW,
+            _capability=_PROVIDER_CRYPTO_TEST_CLOCK_CAPABILITY,
         )
     assert provider_secret not in "".join(traceback.format_exception(caught.value))
     assert caught.value.__cause__ is None
@@ -3764,6 +4016,56 @@ def test_provider_material_genesis_is_create_only_and_partial_state_blocks_retry
         provider_material_genesis_status(partial_artifact_paths, _store=partial_store).value
         == "partial_or_reconciliation_required"
     )
+
+
+def test_public_material_persistence_cannot_use_a_historical_clock(tmp_path: Path) -> None:
+    root = tmp_path / "expired-provider-artifacts"
+    issuer, _fingerprints, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    intent = _initial_intent(
+        paths,
+        signer=issuer,
+        journal=_initial_journal(tmp_path, paths),
+        proposal=_proposal(provider="macos_keychain"),
+    )
+    values = _provider_material_values()
+    fingerprints = _material_fingerprints(intent, values)
+    policy, _attestation, _genesis = _provider_material_bundle(
+        intent,
+        signer=issuer,
+        fingerprints=fingerprints,
+    )
+    provider_signer, signer_genesis = _provider_signer_for_intent(intent, issuer=issuer)
+    unsigned = policy.model_copy(
+        update={
+            "created_at": "1999-01-01T00:00:00Z",
+            "retention_expires_at": "2000-01-01T00:00:00Z",
+            "signature_base64": base64.b64encode(b"0" * 64).decode(),
+        }
+    )
+    policy_key = _TEST_SIGNING_KEYS[provider_signer.public_key_fingerprint_sha256]
+    expired_policy = unsigned.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                policy_key.sign(provider_material_policy_message(unsigned))
+            ).decode()
+        }
+    )
+    artifact_paths = ProviderMaterialArtifactPaths(root)
+
+    assert "now" not in inspect.signature(persist_provider_material_policy).parameters
+    with pytest.raises(ProviderCryptoError, match="material_policy"):
+        persist_provider_material_policy(
+            artifact_paths,
+            expired_policy,
+            signer=provider_signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            initial_intent=intent,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+        )
+    assert not (root / artifact_paths.policy_name()).exists()
 
 
 def test_signer_genesis_binds_keychain_seed_and_refuses_duplicate_creation(tmp_path: Path) -> None:
@@ -3827,19 +4129,44 @@ def test_signer_genesis_binds_keychain_seed_and_refuses_duplicate_creation(tmp_p
     )
     assert isinstance(signer, KeychainEd25519Signer)
     assert not any(seed)
-    message = b"public-domain-message"
-    signer.key().verify(signer.sign(message), message)
+    artifact = ReplayAuthorityPolicyArtifactV1(
+        schema_version="rsd.provider-crypto.replay-authority-policy.v1",
+        initial_intent_sha256=initial_provisioning_intent_sha256(intent),
+        service=_TEST_REPLAY_POLICY.service,
+        account_prefix=_TEST_REPLAY_POLICY.account_prefix,
+        replay_policy_sha256=_TEST_REPLAY_POLICY.sha256(),
+        created_at=_NOW.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        signer_key_id=genesis.key_id,
+        signature_base64=base64.b64encode(b"0" * 64).decode(),
+    )
+    assert not hasattr(signer, "sign")
+    signer.key().verify(signer.sign_artifact(artifact), replay_authority_policy_message(artifact))
+    wrong_intent_artifact = artifact.model_copy(update={"initial_intent_sha256": "f" * 64})
+    with pytest.raises(ProviderCryptoError, match="keychain_signer_scope"):
+        signer.sign_artifact(wrong_intent_artifact)
     loaded_signer = load_keychain_ed25519_signer(
         artifact_paths,
         issuer=issuer,
         initial_intent=intent,
         _store=store,
     )
-    loaded_signer.key().verify(loaded_signer.sign(message), message)
+    loaded_signer.key().verify(
+        loaded_signer.sign_artifact(artifact), replay_authority_policy_message(artifact)
+    )
+
+    forged_intent = intent.model_copy(
+        update={"signature_base64": base64.b64encode(b"f" * 64).decode()}
+    )
+    with pytest.raises(ProviderCryptoError, match="initial_intent_signature"):
+        load_verified_signer_genesis(
+            artifact_paths,
+            issuer=issuer,
+            initial_intent=forged_intent,
+        )
 
     store.records[(reference.service, reference.account)] = b"x" * 32
     with pytest.raises(ProviderCryptoError, match="keychain_signer") as caught:
-        signer.sign(message)
+        signer.sign_artifact(artifact)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
 
@@ -3880,15 +4207,12 @@ def test_phase_b_rejects_forged_provider_attestation_before_effect(tmp_path: Pat
         journal=initial_journal,
         replay_authority=authority,
     )
-    intent = InitialProvisioningIntentV1.model_validate(
-        yaml.safe_load((root / paths.initial_intent_name()).read_bytes())
-    )
-    policy, attestation, genesis = _provider_material_bundle(
-        intent, signer=signer, fingerprints=fingerprints
-    )
-    forged_attestation = attestation.model_copy(
-        update={"signature_base64": base64.b64encode(b"f" * 64).decode()}
-    )
+    attestation_path = root / ProviderMaterialArtifactPaths.attestation_name()
+    forged_attestation = yaml.safe_load(attestation_path.read_bytes())
+    assert type(forged_attestation) is dict
+    forged_attestation["signature_base64"] = base64.b64encode(b"f" * 64).decode()
+    attestation_path.write_bytes(yaml.safe_dump(forged_attestation, sort_keys=True).encode())
+    attestation_path.chmod(0o600)
     called = False
 
     def effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
@@ -3901,9 +4225,6 @@ def test_phase_b_rejects_forged_provider_attestation_before_effect(tmp_path: Pat
             paths,
             signer=signer,
             provider=_Provider(fingerprints),
-            provider_material_policy=policy,
-            provider_fingerprint_attestation=forged_attestation,
-            provider_material_genesis=genesis,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
             journal=journal,
@@ -3917,3 +4238,88 @@ def test_phase_b_rejects_forged_provider_attestation_before_effect(tmp_path: Pat
     assert not called
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+def test_phase_b_rejects_manual_provider_without_terminal_material_artifacts(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    journal = _journal(tmp_path)
+    authority = _test_replay_authority(journal)
+    initial_journal = _initial_journal(tmp_path, paths)
+    _ensure_test_journal_provisioned(
+        paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        replay_authority=authority,
+    )
+    _ensure_test_initial_stage(
+        paths,
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=initial_journal,
+        replay_authority=authority,
+    )
+    terminal_marker = root / ProviderMaterialArtifactPaths.attestation_name()
+    terminal_marker.unlink()
+    called = False
+
+    def effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
+        nonlocal called
+        called = True
+        return _effect(context)
+
+    with pytest.raises(AuthorizationError, match="provider_material_attestation"):
+        _authorize_and_execute_for_test(
+            paths,
+            signer=signer,
+            provider=_Provider(fingerprints),
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            initial_journal=initial_journal,
+            effect=effect,
+            replay_authority=authority,
+            replay_policy=_TEST_REPLAY_POLICY,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+    assert not called
+
+
+def test_tls_initial_intent_never_claims_or_reaches_an_effect(tmp_path: Path) -> None:
+    root = tmp_path / "tls-artifacts"
+    signer, _fingerprints, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    journal = _initial_journal(tmp_path, paths)
+    intent = _initial_intent(
+        paths,
+        signer=signer,
+        journal=journal,
+        proposal=_proposal(tls=True),
+    )
+    authority = _AtomicReplayAuthority()
+
+    with pytest.raises(AuthorizationError, match="tls_termination_amendment_required"):
+        _provision_initial_journal_for_test(
+            paths,
+            signer=signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            intent=intent,
+            replay_authority=authority,
+            replay_policy=_TEST_REPLAY_POLICY,
+            replay_policy_artifact=_replay_policy_artifact(intent, signer=signer),
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+    assert not authority.tombstones
+    assert journal.migration_status() is InitialProvisioningJournalStatus.ABSENT

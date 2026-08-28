@@ -23,7 +23,7 @@ import os
 import re
 import stat
 import sys
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -48,6 +48,7 @@ from pydantic import (
 )
 
 from omninode_rsd.lifecycle.infisical_disposable import (
+    DisposableTransportProfile,
     InitialProvisioningIntentV1,
     ProviderReferenceV1,
     _UniqueLoader,
@@ -69,12 +70,15 @@ _FINGERPRINT_ATTESTATION_DOMAIN: Final = (
     b"omninode-rsd.provider-crypto.fingerprint-attestation.v1\x00"
 )
 _MATERIAL_GENESIS_DOMAIN: Final = b"omninode-rsd.provider-crypto.material-genesis.v1\x00"
+_INITIAL_INTENT_SIGNATURE_DOMAIN: Final = b"omninode-rsd.initial-provisioning-intent.ed25519.v1\x00"
 _MATERIAL_POLICY_NAME: Final = "provider-material-policy.yaml"
 _MATERIAL_GENESIS_NAME: Final = "provider-material-genesis.yaml"
 _FINGERPRINT_ATTESTATION_NAME: Final = "provider-fingerprint-attestation.yaml"
 _REPLAY_POLICY_NAME: Final = "replay-authority-policy.yaml"
 _SIGNER_GENESIS_NAME: Final = "signer-genesis.yaml"
 _TRANSPORT_FAILURE: Final = object()
+_SYSTEM_CLOCK_CAPABILITY: Final = object()
+_TEST_CLOCK_CAPABILITY: Final = object()
 
 
 class ProviderCryptoError(RuntimeError):
@@ -90,8 +94,11 @@ class _Model(BaseModel):
 
 
 class _TrustedSigner(Protocol):
-    key_id: str
-    public_key_fingerprint_sha256: str
+    @property
+    def key_id(self) -> str: ...
+
+    @property
+    def public_key_fingerprint_sha256(self) -> str: ...
 
     def key(self) -> Ed25519PublicKey: ...
 
@@ -306,6 +313,8 @@ class ProviderMaterialPolicyV1(_Model):
     disposal_owner: str = Field(pattern=_IDENTIFIER)
     approver_identity: str = Field(pattern=_IDENTIFIER)
     policy_id: str = Field(pattern=_UUID)
+    signer_keychain_reference: KeychainItemReferenceV1
+    signer_seed_fingerprint_sha256: str = Field(pattern=_SHA256)
     created_at: str = Field(min_length=20, max_length=40)
     retention_expires_at: str = Field(min_length=20, max_length=40)
     materials: tuple[ProviderMaterialSpecV1, ...] = Field(min_length=6, max_length=7)
@@ -329,6 +338,11 @@ class ProviderMaterialPolicyV1(_Model):
         purposes = tuple(item.purpose for item in self.materials)
         identities = tuple(item.reference.identity for item in self.materials)
         references = tuple(item.reference.reference_sha256 for item in self.materials)
+        signer_identity = (
+            self.signer_keychain_reference.provider,
+            self.signer_keychain_reference.service,
+            self.signer_keychain_reference.account,
+        )
         if (
             created is None
             or expires is None
@@ -336,6 +350,8 @@ class ProviderMaterialPolicyV1(_Model):
             or len(set(purposes)) != len(purposes)
             or len(set(identities)) != len(identities)
             or len(set(references)) != len(references)
+            or signer_identity in identities
+            or self.signer_keychain_reference.reference_sha256 in references
             or set(purposes)
             not in (
                 set(ProviderMaterialPurpose),
@@ -439,11 +455,11 @@ class ProviderMaterialGenesisV1(_Model):
 
 
 class ProviderMaterialGenesisStatus(StrEnum):
-    """Read-only status; no status authorizes an automatic retry."""
+    """Structural read-only status; it never proves authorization completeness."""
 
     ABSENT = "absent"
     PENDING = "pending"
-    COMPLETE = "complete"
+    STRUCTURALLY_COMPLETE_UNVERIFIED = "structurally_complete_unverified"
     PARTIAL_OR_RECONCILIATION_REQUIRED = "partial_or_reconciliation_required"
     INVALID = "invalid"
 
@@ -466,6 +482,12 @@ class _KeychainTransport(Protocol):
     def add_if_absent(self, service: str, account: str, value: bytearray) -> bool: ...
 
     def read_if_present(self, service: str, account: str) -> bytearray | None: ...
+
+
+class _ArtifactReader(Protocol):
+    """Already-pinned descriptor-relative artifact reader used by authorization."""
+
+    def read(self, name: str) -> bytes: ...
 
 
 def _sha256(value: bytes | bytearray) -> str:
@@ -525,12 +547,78 @@ def _parse_timestamp(value: str) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
+def _system_utc_clock() -> datetime:
+    """Return the only production clock accepted by bootstrap mutations."""
+
+    return datetime.now(UTC)
+
+
+def _read_clock(clock: Callable[[], datetime]) -> datetime:
+    """Read and normalize a capability-provided test clock."""
+
+    try:
+        value = clock()
+    except Exception:
+        raise ProviderCryptoError("clock") from None
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+        raise ProviderCryptoError("clock")
+    return value.astimezone(UTC)
+
+
+def _require_mutation_clock_capability(capability: object) -> None:
+    """Keep historical clocks unavailable to installed bootstrap callers."""
+
+    if capability not in {_SYSTEM_CLOCK_CAPABILITY, _TEST_CLOCK_CAPABILITY}:
+        raise ProviderCryptoError("clock")
+
+
+def _reject_unsupported_tls_termination(intent: InitialProvisioningIntentV1) -> None:
+    """Block every bootstrap write for TLS until its full material amendment exists."""
+
+    if (
+        type(intent) is not InitialProvisioningIntentV1
+        or intent.plan.transport.profile is DisposableTransportProfile.TLS_VERIFIED
+    ):
+        raise ProviderCryptoError("tls_termination_amendment_required")
+
+
 def _signature_message(domain: bytes, model: BaseModel) -> bytes:
     try:
         payload = model.model_dump(mode="json", exclude={"signature_base64"})
     except (TypeError, ValueError):
         raise ProviderCryptoError("artifact_signature") from None
     return domain + _canonical_json(payload)
+
+
+def _initial_intent_message(intent: InitialProvisioningIntentV1) -> bytes:
+    if type(intent) is not InitialProvisioningIntentV1:
+        raise ProviderCryptoError("initial_intent_signature")
+    return _INITIAL_INTENT_SIGNATURE_DOMAIN + _canonical_json(
+        intent.model_dump(mode="json", exclude={"signature_base64"})
+    )
+
+
+def _verify_initial_intent_signature(
+    intent: InitialProvisioningIntentV1, *, issuer: _TrustedSigner
+) -> None:
+    """Require the original intent signature before any bootstrap artifact use."""
+
+    valid = False
+    try:
+        if (
+            type(intent) is not InitialProvisioningIntentV1
+            or type(issuer.key_id) is not str
+            or intent.signer_key_id != issuer.key_id
+        ):
+            raise ValueError("initial intent signer is invalid")
+        issuer.key().verify(
+            _canonical_base64(intent.signature_base64), _initial_intent_message(intent)
+        )
+        valid = True
+    except Exception:
+        valid = False
+    if not valid:
+        raise ProviderCryptoError("initial_intent_signature")
 
 
 def _verify_signed(
@@ -643,6 +731,7 @@ def verify_signer_genesis(
         or type(initial_intent) is not InitialProvisioningIntentV1
     ):
         raise ProviderCryptoError("signer_genesis")
+    _verify_initial_intent_signature(initial_intent, issuer=issuer)
     _verify_signed(genesis, domain=_SIGNER_GENESIS_DOMAIN, signer=issuer)
     if genesis.initial_intent_sha256 != initial_provisioning_intent_sha256(initial_intent):
         raise ProviderCryptoError("signer_genesis_binding")
@@ -681,6 +770,7 @@ def verify_replay_authority_policy_artifact(
         or type(expected_policy_sha256) is not str
     ):
         raise ProviderCryptoError("replay_policy")
+    _verify_initial_intent_signature(initial_intent, issuer=signer)
     _verify_signed(artifact, domain=_REPLAY_POLICY_DOMAIN, signer=signer)
     intent_sha256 = initial_provisioning_intent_sha256(initial_intent)
     if (
@@ -708,10 +798,44 @@ def _reference_map(
     return result
 
 
-def verify_provider_material_policy(
+def _verify_material_signer(
+    *,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+) -> None:
+    """Bind every material signature to one issuer-approved intent signer."""
+
+    verify_signer_genesis(signer_genesis, issuer=issuer, initial_intent=initial_intent)
+    valid = False
+    try:
+        if (
+            type(signer.key_id) is not str
+            or type(signer.public_key_fingerprint_sha256) is not str
+            or signer.key_id != signer_genesis.key_id
+            or signer.public_key_fingerprint_sha256 != signer_genesis.public_key_fingerprint_sha256
+        ):
+            raise ValueError("material signer is invalid")
+        public_key = signer.key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+        if not hmac.compare_digest(public_key, _canonical_base64(signer_genesis.public_key_base64)):
+            raise ValueError("material signer is invalid")
+        valid = True
+    except Exception:
+        valid = False
+    if not valid:
+        raise ProviderCryptoError("material_signer")
+
+
+def _verify_provider_material_policy_at(
     policy: ProviderMaterialPolicyV1,
     *,
     signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
     initial_intent: InitialProvisioningIntentV1,
     expected_disposal_owner: str,
     expected_approver_identity: str,
@@ -729,6 +853,12 @@ def verify_provider_material_policy(
         or now.utcoffset() is None
     ):
         raise ProviderCryptoError("material_policy")
+    _verify_material_signer(
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+    )
     _verify_signed(policy, domain=_MATERIAL_POLICY_DOMAIN, signer=signer)
     expected_references = _reference_map(initial_intent)
     policy_references = {item.purpose: item.reference for item in policy.materials}
@@ -747,15 +877,43 @@ def verify_provider_material_policy(
         or policy.disposal_owner != expected_disposal_owner
         or policy.approver_identity != expected_approver_identity
         or policy_references != expected_references
+        or policy.signer_keychain_reference != signer_genesis.keychain_reference
+        or policy.signer_seed_fingerprint_sha256 != signer_genesis.seed_fingerprint_sha256
     ):
         raise ProviderCryptoError("material_policy_binding")
 
 
-def verify_provider_fingerprint_attestation(
+def verify_provider_material_policy(
+    policy: ProviderMaterialPolicyV1,
+    *,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+) -> None:
+    """Verify a material policy against the trusted production UTC clock."""
+
+    _verify_provider_material_policy_at(
+        policy,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        now=_system_utc_clock(),
+    )
+
+
+def _verify_provider_fingerprint_attestation_at(
     attestation: ProviderFingerprintAttestationV1,
     *,
     policy: ProviderMaterialPolicyV1,
     signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
     initial_intent: InitialProvisioningIntentV1,
     now: datetime,
 ) -> dict[str, str]:
@@ -770,6 +928,12 @@ def verify_provider_fingerprint_attestation(
         or now.utcoffset() is None
     ):
         raise ProviderCryptoError("fingerprint_attestation")
+    _verify_material_signer(
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+    )
     _verify_signed(attestation, domain=_FINGERPRINT_ATTESTATION_DOMAIN, signer=signer)
     observed_at = _parse_timestamp(attestation.observed_at)
     normalized_now = now.astimezone(UTC)
@@ -788,18 +952,44 @@ def verify_provider_fingerprint_attestation(
     ):
         raise ProviderCryptoError("fingerprint_attestation_binding")
     fingerprints = attestation.fingerprint_by_reference()
-    if len(fingerprints) != len(policy.materials) or len(set(fingerprints.values())) != len(
-        fingerprints
+    if (
+        len(fingerprints) != len(policy.materials)
+        or len(set(fingerprints.values())) != len(fingerprints)
+        or policy.signer_seed_fingerprint_sha256 in fingerprints.values()
     ):
         raise ProviderCryptoError("fingerprint_attestation_binding")
     return fingerprints
 
 
-def verify_provider_material_bundle(
+def verify_provider_fingerprint_attestation(
+    attestation: ProviderFingerprintAttestationV1,
+    *,
+    policy: ProviderMaterialPolicyV1,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+) -> dict[str, str]:
+    """Verify a fingerprint attestation against the production UTC clock."""
+
+    return _verify_provider_fingerprint_attestation_at(
+        attestation,
+        policy=policy,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+        now=_system_utc_clock(),
+    )
+
+
+def _verify_provider_material_bundle_at(
     policy: ProviderMaterialPolicyV1,
     attestation: ProviderFingerprintAttestationV1,
     *,
     signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
     initial_intent: InitialProvisioningIntentV1,
     expected_disposal_owner: str,
     expected_approver_identity: str,
@@ -807,20 +997,50 @@ def verify_provider_material_bundle(
 ) -> dict[str, str]:
     """Verify a signed policy and its signed fingerprint attestation together."""
 
-    verify_provider_material_policy(
+    _verify_provider_material_policy_at(
         policy,
         signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
         initial_intent=initial_intent,
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
         now=now,
     )
-    return verify_provider_fingerprint_attestation(
+    return _verify_provider_fingerprint_attestation_at(
         attestation,
         policy=policy,
         signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
         initial_intent=initial_intent,
         now=now,
+    )
+
+
+def verify_provider_material_bundle(
+    policy: ProviderMaterialPolicyV1,
+    attestation: ProviderFingerprintAttestationV1,
+    *,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+) -> dict[str, str]:
+    """Verify a material bundle against the trusted production UTC clock."""
+
+    return _verify_provider_material_bundle_at(
+        policy,
+        attestation,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        now=_system_utc_clock(),
     )
 
 
@@ -830,6 +1050,8 @@ def verify_provider_material_genesis(
     policy: ProviderMaterialPolicyV1,
     attestation: ProviderFingerprintAttestationV1,
     signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
     initial_intent: InitialProvisioningIntentV1,
 ) -> None:
     """Verify the pending manifest binds the exact policy and attestation.
@@ -846,6 +1068,12 @@ def verify_provider_material_genesis(
         or type(initial_intent) is not InitialProvisioningIntentV1
     ):
         raise ProviderCryptoError("material_genesis")
+    _verify_material_signer(
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+    )
     _verify_signed(genesis, domain=_MATERIAL_GENESIS_DOMAIN, signer=signer)
     if (
         genesis.initial_intent_sha256 != initial_provisioning_intent_sha256(initial_intent)
@@ -863,6 +1091,53 @@ def _zeroize(value: bytearray) -> None:
         value[index] = 0
 
 
+_STANDARD_BASE64_ALPHABET: Final = (
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+)
+_URLSAFE_BASE64_ALPHABET: Final = (
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
+
+
+def _alphabet_index(value: int, alphabet: bytes) -> int:
+    """Find one encoded byte without allocating a secret-bearing copy."""
+
+    for index, candidate in enumerate(alphabet):
+        if value == candidate:
+            return index
+    return -1
+
+
+def _is_lower_hex_16(raw: bytearray) -> bool:
+    return len(raw) == 32 and all(48 <= value <= 57 or 97 <= value <= 102 for value in raw)
+
+
+def _is_canonical_standard_base64_32(raw: bytearray) -> bool:
+    """Recognize the only canonical 44-char Base64 representation of 32 bytes."""
+
+    if len(raw) != 44 or raw[-1] != ord("="):
+        return False
+    last_index = -1
+    for index in range(len(raw) - 1):
+        last_index = _alphabet_index(raw[index], _STANDARD_BASE64_ALPHABET)
+        if last_index < 0:
+            return False
+    return last_index & 0b11 == 0
+
+
+def _is_canonical_base64url_32(raw: bytearray) -> bool:
+    """Recognize the only canonical unpadded Base64URL spelling of 32 bytes."""
+
+    if len(raw) != 43:
+        return False
+    last_index = -1
+    for value in raw:
+        last_index = _alphabet_index(value, _URLSAFE_BASE64_ALPHABET)
+        if last_index < 0:
+            return False
+    return last_index & 0b11 == 0
+
+
 def _validate_value(spec: ProviderMaterialSpecV1, value: bytearray) -> None:
     """Validate format without returning or serializing the material value."""
 
@@ -877,39 +1152,22 @@ def _validate_value(spec: ProviderMaterialSpecV1, value: bytearray) -> None:
     }:
         return
     if spec.format is ProviderMaterialFormat.INFISICAL_HEX_16_V1:
-        if re.fullmatch(rb"[0-9a-f]{32}", raw) is None:
-            raise ProviderCryptoError("material_format")
-        try:
-            decoded = bytes.fromhex(raw.decode("ascii"))
-        except (UnicodeDecodeError, ValueError):
-            raise ProviderCryptoError("material_format") from None
-        if len(decoded) != 16:
+        if not _is_lower_hex_16(raw):
             raise ProviderCryptoError("material_format")
         return
     if spec.format is ProviderMaterialFormat.INFISICAL_AUTH_SECRET_BASE64_32_V1:
-        try:
-            decoded = _canonical_base64(raw.decode("ascii"))
-        except (UnicodeDecodeError, ValueError):
-            raise ProviderCryptoError("material_format") from None
-        if len(decoded) != 32:
+        if not _is_canonical_standard_base64_32(raw):
             raise ProviderCryptoError("material_format")
         return
     if spec.format is ProviderMaterialFormat.VALKEY_PASSWORD_BASE64URL_32_V1:
-        if re.fullmatch(rb"[A-Za-z0-9_-]{43}", raw) is None:
-            raise ProviderCryptoError("material_format")
-        padded = raw + b"="
-        try:
-            decoded = base64.urlsafe_b64decode(padded)
-        except (binascii.Error, ValueError):
-            raise ProviderCryptoError("material_format") from None
-        if len(decoded) != 32 or base64.urlsafe_b64encode(decoded).rstrip(b"=") != raw:
+        if not _is_canonical_base64url_32(raw):
             raise ProviderCryptoError("material_format")
         return
     if spec.format is ProviderMaterialFormat.X509_CA_PEM_V1:
         try:
-            # The crypto parser accepts immutable input, so this narrow branch
-            # must make one transient copy; all other format checks stay on the
-            # caller-owned mutable buffer.
+            # cryptography accepts immutable input here. This isolated parser
+            # boundary therefore makes one unavoidable transient copy; the
+            # encoded secret formats above never decode or copy their buffers.
             certificate = x509.load_pem_x509_certificate(bytes(raw))
             canonical = certificate.public_bytes(serialization.Encoding.PEM)
             basic_constraints = certificate.extensions.get_extension_for_class(
@@ -1144,9 +1402,44 @@ class KeychainEd25519Signer:
             raise ProviderCryptoError("keychain_signer")
         return seed
 
-    def sign(self, message: bytes) -> bytes:
-        if type(message) is not bytes:
-            raise ProviderCryptoError("keychain_signer")
+    def sign_artifact(
+        self,
+        artifact: (
+            ReplayAuthorityPolicyArtifactV1
+            | ProviderMaterialPolicyV1
+            | ProviderFingerprintAttestationV1
+            | ProviderMaterialGenesisV1
+        ),
+    ) -> bytes:
+        """Sign only one exact, intent-bound provider bootstrap artifact.
+
+        This intentionally does not offer a generic ``sign(bytes)`` method.
+        The Keychain seed may not become an ambient signing oracle for another
+        intent or an unrelated Ed25519 domain.
+        """
+
+        messages: tuple[tuple[type[BaseModel], Callable[[Any], bytes]], ...] = (
+            (ReplayAuthorityPolicyArtifactV1, replay_authority_policy_message),
+            (ProviderMaterialPolicyV1, provider_material_policy_message),
+            (ProviderFingerprintAttestationV1, provider_fingerprint_attestation_message),
+            (ProviderMaterialGenesisV1, provider_material_genesis_message),
+        )
+        message: bytes | None = None
+        for model_type, build_message in messages:
+            if type(artifact) is model_type:
+                candidate_intent = getattr(artifact, "initial_intent_sha256", None)
+                candidate_key_id = getattr(artifact, "signer_key_id", None)
+                if (
+                    type(candidate_intent) is not str
+                    or type(candidate_key_id) is not str
+                    or candidate_intent != self._genesis.initial_intent_sha256
+                    or candidate_key_id != self._genesis.key_id
+                ):
+                    raise ProviderCryptoError("keychain_signer_scope")
+                message = build_message(artifact)
+                break
+        if message is None:
+            raise ProviderCryptoError("keychain_signer_scope")
         seed = self._seed()
         try:
             return Ed25519PrivateKey.from_private_bytes(seed).sign(message)
@@ -1174,6 +1467,7 @@ def provision_keychain_ed25519_signer(
     if type(seed) is not bytearray:
         raise ProviderCryptoError("keychain_signer")
     try:
+        _reject_unsupported_tls_termination(initial_intent)
         verify_signer_genesis(genesis, issuer=issuer, initial_intent=initial_intent)
         try:
             derived = (
@@ -1519,6 +1813,7 @@ def persist_replay_authority_policy_artifact(
 ) -> None:
     """Explicitly persist one signed replay-policy preimage before use."""
 
+    _reject_unsupported_tls_termination(initial_intent)
     verify_replay_authority_policy_artifact(
         artifact,
         signer=signer,
@@ -1538,6 +1833,7 @@ def persist_signer_genesis(
 ) -> None:
     """Persist one issuer-signed Keychain signer trust anchor without mutation."""
 
+    _reject_unsupported_tls_termination(initial_intent)
     verify_signer_genesis(genesis, issuer=issuer, initial_intent=initial_intent)
     with _OwnerOnlyArtifactDirectory(paths.root) as directory:
         directory.write_once(paths.signer_genesis_name(), _yaml_bytes(genesis))
@@ -1564,21 +1860,46 @@ def load_verified_signer_genesis(
     return genesis
 
 
-def persist_provider_material_policy(
+def _load_verified_signer_genesis_from_reader(
+    reader: _ArtifactReader,
+    *,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+) -> tuple[SignerGenesisV1, str]:
+    """Load the trust anchor from an authorization-pinned root descriptor."""
+
+    try:
+        raw = reader.read(_SIGNER_GENESIS_NAME)
+    except Exception:
+        raise ProviderCryptoError("signer_genesis") from None
+    genesis = cast(
+        SignerGenesisV1,
+        _load_model(raw, SignerGenesisV1, phase="signer_genesis"),
+    )
+    verify_signer_genesis(genesis, issuer=issuer, initial_intent=initial_intent)
+    return genesis, _sha256(raw)
+
+
+def _persist_provider_material_policy_at(
     paths: ProviderMaterialArtifactPaths,
     policy: ProviderMaterialPolicyV1,
     *,
     signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
     initial_intent: InitialProvisioningIntentV1,
     expected_disposal_owner: str,
     expected_approver_identity: str,
     now: datetime,
+    _capability: object,
 ) -> None:
-    """Explicitly persist a signed, value-free material policy once."""
-
-    verify_provider_material_policy(
+    _require_mutation_clock_capability(_capability)
+    _reject_unsupported_tls_termination(initial_intent)
+    _verify_provider_material_policy_at(
         policy,
         signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
         initial_intent=initial_intent,
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
@@ -1588,24 +1909,85 @@ def persist_provider_material_policy(
         directory.write_once(paths.policy_name(), _yaml_bytes(policy))
 
 
-def persist_provider_material_genesis(
+def persist_provider_material_policy(
+    paths: ProviderMaterialArtifactPaths,
+    policy: ProviderMaterialPolicyV1,
+    *,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+) -> None:
+    """Persist a signed material policy once using the trusted UTC clock."""
+
+    _persist_provider_material_policy_at(
+        paths,
+        policy,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        now=_system_utc_clock(),
+        _capability=_SYSTEM_CLOCK_CAPABILITY,
+    )
+
+
+def _persist_provider_material_policy_for_test(
+    paths: ProviderMaterialArtifactPaths,
+    policy: ProviderMaterialPolicyV1,
+    *,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    _clock: Callable[[], datetime],
+    _capability: object,
+) -> None:
+    if _capability is not _TEST_CLOCK_CAPABILITY:
+        raise ProviderCryptoError("test_clock")
+    _persist_provider_material_policy_at(
+        paths,
+        policy,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        now=_read_clock(_clock),
+        _capability=_TEST_CLOCK_CAPABILITY,
+    )
+
+
+def _persist_provider_material_genesis_at(
     paths: ProviderMaterialArtifactPaths,
     genesis: ProviderMaterialGenesisV1,
     *,
     policy: ProviderMaterialPolicyV1,
     attestation: ProviderFingerprintAttestationV1,
     signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
     initial_intent: InitialProvisioningIntentV1,
     expected_disposal_owner: str,
     expected_approver_identity: str,
     now: datetime,
+    _capability: object,
 ) -> None:
-    """Persist the signed pending manifest before any Keychain material write."""
-
-    verify_provider_material_bundle(
+    _require_mutation_clock_capability(_capability)
+    _reject_unsupported_tls_termination(initial_intent)
+    _verify_provider_material_bundle_at(
         policy,
         attestation,
         signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
         initial_intent=initial_intent,
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
@@ -1616,6 +1998,8 @@ def persist_provider_material_genesis(
         policy=policy,
         attestation=attestation,
         signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
         initial_intent=initial_intent,
     )
     with _OwnerOnlyArtifactDirectory(paths.root) as directory:
@@ -1633,6 +2017,70 @@ def persist_provider_material_genesis(
         ):
             raise ProviderCryptoError("material_genesis_state")
         directory.write_once(paths.genesis_name(), _yaml_bytes(genesis))
+
+
+def persist_provider_material_genesis(
+    paths: ProviderMaterialArtifactPaths,
+    genesis: ProviderMaterialGenesisV1,
+    *,
+    policy: ProviderMaterialPolicyV1,
+    attestation: ProviderFingerprintAttestationV1,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+) -> None:
+    """Persist a signed pending manifest using the trusted UTC clock."""
+
+    _persist_provider_material_genesis_at(
+        paths,
+        genesis,
+        policy=policy,
+        attestation=attestation,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        now=_system_utc_clock(),
+        _capability=_SYSTEM_CLOCK_CAPABILITY,
+    )
+
+
+def _persist_provider_material_genesis_for_test(
+    paths: ProviderMaterialArtifactPaths,
+    genesis: ProviderMaterialGenesisV1,
+    *,
+    policy: ProviderMaterialPolicyV1,
+    attestation: ProviderFingerprintAttestationV1,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    _clock: Callable[[], datetime],
+    _capability: object,
+) -> None:
+    if _capability is not _TEST_CLOCK_CAPABILITY:
+        raise ProviderCryptoError("test_clock")
+    _persist_provider_material_genesis_at(
+        paths,
+        genesis,
+        policy=policy,
+        attestation=attestation,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        now=_read_clock(_clock),
+        _capability=_TEST_CLOCK_CAPABILITY,
+    )
 
 
 def _read_material_artifacts(
@@ -1724,7 +2172,7 @@ def provider_material_genesis_status(
         return ProviderMaterialGenesisStatus.INVALID
     if attestation is not None:
         return (
-            ProviderMaterialGenesisStatus.COMPLETE
+            ProviderMaterialGenesisStatus.STRUCTURALLY_COMPLETE_UNVERIFIED
             if all(existing)
             else ProviderMaterialGenesisStatus.PARTIAL_OR_RECONCILIATION_REQUIRED
         )
@@ -1733,17 +2181,20 @@ def provider_material_genesis_status(
     return ProviderMaterialGenesisStatus.PARTIAL_OR_RECONCILIATION_REQUIRED
 
 
-def provision_keychain_materials(
+def _provision_keychain_materials_at(
     paths: ProviderMaterialArtifactPaths,
     *,
     policy: ProviderMaterialPolicyV1,
     genesis: ProviderMaterialGenesisV1,
     attestation: ProviderFingerprintAttestationV1,
     signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
     initial_intent: InitialProvisioningIntentV1,
     expected_disposal_owner: str,
     expected_approver_identity: str,
     now: datetime,
+    _capability: object,
     materials: Mapping[ProviderMaterialPurpose, bytearray],
     _store: _KeychainTransport | None = None,
 ) -> None:
@@ -1757,6 +2208,7 @@ def provision_keychain_materials(
 
     supplied: dict[ProviderMaterialPurpose, bytearray] = {}
     material_mapping_failed = False
+    _require_mutation_clock_capability(_capability)
     try:
         supplied = dict(materials)
     except Exception:
@@ -1766,10 +2218,13 @@ def provision_keychain_materials(
             type(value) is bytearray for value in supplied.values()
         ):
             raise ProviderCryptoError("material_values")
-        verify_provider_material_bundle(
+        _reject_unsupported_tls_termination(initial_intent)
+        _verify_provider_material_bundle_at(
             policy,
             attestation,
             signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
             initial_intent=initial_intent,
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
@@ -1780,6 +2235,8 @@ def provision_keychain_materials(
             policy=policy,
             attestation=attestation,
             signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
             initial_intent=initial_intent,
         )
         if set(supplied) != {spec.purpose for spec in policy.materials}:
@@ -1825,24 +2282,100 @@ def provision_keychain_materials(
             _zeroize(value)
 
 
-def load_verified_provider_material_bundle(
+def provision_keychain_materials(
+    paths: ProviderMaterialArtifactPaths,
+    *,
+    policy: ProviderMaterialPolicyV1,
+    genesis: ProviderMaterialGenesisV1,
+    attestation: ProviderFingerprintAttestationV1,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    materials: Mapping[ProviderMaterialPurpose, bytearray],
+    _store: _KeychainTransport | None = None,
+) -> None:
+    """Create material rows only once using the trusted production UTC clock."""
+
+    _provision_keychain_materials_at(
+        paths,
+        policy=policy,
+        genesis=genesis,
+        attestation=attestation,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        now=_system_utc_clock(),
+        _capability=_SYSTEM_CLOCK_CAPABILITY,
+        materials=materials,
+        _store=_store,
+    )
+
+
+def _provision_keychain_materials_for_test(
+    paths: ProviderMaterialArtifactPaths,
+    *,
+    policy: ProviderMaterialPolicyV1,
+    genesis: ProviderMaterialGenesisV1,
+    attestation: ProviderFingerprintAttestationV1,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    materials: Mapping[ProviderMaterialPurpose, bytearray],
+    _store: _KeychainTransport | None,
+    _clock: Callable[[], datetime],
+    _capability: object,
+) -> None:
+    if _capability is not _TEST_CLOCK_CAPABILITY:
+        raise ProviderCryptoError("test_clock")
+    _provision_keychain_materials_at(
+        paths,
+        policy=policy,
+        genesis=genesis,
+        attestation=attestation,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        now=_read_clock(_clock),
+        _capability=_TEST_CLOCK_CAPABILITY,
+        materials=materials,
+        _store=_store,
+    )
+
+
+def _load_verified_provider_material_bundle_at(
     paths: ProviderMaterialArtifactPaths,
     *,
     signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
     initial_intent: InitialProvisioningIntentV1,
     expected_disposal_owner: str,
     expected_approver_identity: str,
     now: datetime,
-) -> tuple[ProviderMaterialPolicyV1, ProviderFingerprintAttestationV1]:
+) -> tuple[ProviderMaterialPolicyV1, ProviderMaterialGenesisV1, ProviderFingerprintAttestationV1]:
     """Load and verify only completed material artifacts through one root fd."""
 
     policy, genesis, attestation = _read_material_artifacts(paths)
     if attestation is None:
         raise ProviderCryptoError("material_genesis_pending")
-    verify_provider_material_bundle(
+    _verify_provider_material_bundle_at(
         policy,
         attestation,
         signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
         initial_intent=initial_intent,
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
@@ -1853,9 +2386,140 @@ def load_verified_provider_material_bundle(
         policy=policy,
         attestation=attestation,
         signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
         initial_intent=initial_intent,
     )
-    return policy, attestation
+    return policy, genesis, attestation
+
+
+def load_verified_provider_material_bundle(
+    paths: ProviderMaterialArtifactPaths,
+    *,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+) -> tuple[ProviderMaterialPolicyV1, ProviderMaterialGenesisV1, ProviderFingerprintAttestationV1]:
+    """Load only a cryptographically verified terminal material state."""
+
+    return _load_verified_provider_material_bundle_at(
+        paths,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        now=_system_utc_clock(),
+    )
+
+
+def _load_verified_provider_material_bundle_for_test(
+    paths: ProviderMaterialArtifactPaths,
+    *,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    _clock: Callable[[], datetime],
+    _capability: object,
+) -> tuple[ProviderMaterialPolicyV1, ProviderMaterialGenesisV1, ProviderFingerprintAttestationV1]:
+    if _capability is not _TEST_CLOCK_CAPABILITY:
+        raise ProviderCryptoError("test_clock")
+    return _load_verified_provider_material_bundle_at(
+        paths,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        now=_read_clock(_clock),
+    )
+
+
+def _load_verified_provider_material_bundle_from_reader_at(
+    reader: _ArtifactReader,
+    *,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    now: datetime,
+) -> tuple[
+    ProviderMaterialPolicyV1,
+    ProviderMaterialGenesisV1,
+    ProviderFingerprintAttestationV1,
+    tuple[str, str, str],
+]:
+    """Verify terminal artifacts from an authorization-pinned directory FD.
+
+    Authorization uses this internal helper rather than reopening the root by
+    path, then compares the returned raw-file hashes at each snapshot. The
+    terminal fingerprint-attestation artifact is the durable completion marker;
+    a manually populated provider without these three artifacts cannot enter an
+    effect path.
+    """
+
+    try:
+        raw_policy = reader.read(_MATERIAL_POLICY_NAME)
+        raw_genesis = reader.read(_MATERIAL_GENESIS_NAME)
+        raw_attestation = reader.read(_FINGERPRINT_ATTESTATION_NAME)
+    except Exception:
+        raise ProviderCryptoError("material_artifact") from None
+    policy = cast(
+        ProviderMaterialPolicyV1,
+        _load_model(raw_policy, ProviderMaterialPolicyV1, phase="material_policy"),
+    )
+    genesis = cast(
+        ProviderMaterialGenesisV1,
+        _load_model(raw_genesis, ProviderMaterialGenesisV1, phase="material_genesis"),
+    )
+    attestation = cast(
+        ProviderFingerprintAttestationV1,
+        _load_model(
+            raw_attestation,
+            ProviderFingerprintAttestationV1,
+            phase="fingerprint_attestation",
+        ),
+    )
+    _verify_provider_material_bundle_at(
+        policy,
+        attestation,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        now=now,
+    )
+    verify_provider_material_genesis(
+        genesis,
+        policy=policy,
+        attestation=attestation,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        initial_intent=initial_intent,
+    )
+    return (
+        policy,
+        genesis,
+        attestation,
+        (
+            _sha256(raw_policy),
+            _sha256(raw_genesis),
+            _sha256(raw_attestation),
+        ),
+    )
 
 
 __all__: Sequence[str] = (

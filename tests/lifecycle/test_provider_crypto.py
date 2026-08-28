@@ -86,12 +86,25 @@ def _policy() -> ProviderMaterialPolicyV1:
             _reference("restore"),
         ),
     )
+    signer_fields = {
+        "account": "account-provider-signer.v1",
+        "provider": "macos_keychain",
+        "service": "service-provider-signer",
+        "version": 1,
+    }
     return ProviderMaterialPolicyV1(
         schema_version="rsd.provider-crypto.material-policy.v1",
         initial_intent_sha256="a" * 64,
         disposal_owner="owner",
         approver_identity="approver",
         policy_id="123e4567-e89b-42d3-a456-426614174011",
+        signer_keychain_reference=KeychainItemReferenceV1(
+            **signer_fields,
+            reference_sha256=_sha256(
+                json.dumps(signer_fields, sort_keys=True, separators=(",", ":")).encode()
+            ),
+        ),
+        signer_seed_fingerprint_sha256="f" * 64,
         created_at="2026-08-27T12:00:00Z",
         retention_expires_at="2026-08-27T12:10:00Z",
         materials=tuple(
@@ -196,6 +209,60 @@ def test_material_policy_rejects_duplicate_purpose_and_reference() -> None:
 
     with pytest.raises(ValueError, match="provider material policy fields"):
         ProviderMaterialPolicyV1.model_validate(raw)
+
+
+def test_material_policy_rejects_reusing_the_signer_keychain_item() -> None:
+    policy = _policy()
+    raw = policy.model_dump(mode="python")
+    materials = list(raw["materials"])
+    materials[0] = {
+        **materials[0],
+        "reference": raw["signer_keychain_reference"],
+    }
+    raw["materials"] = tuple(materials)
+
+    with pytest.raises(ValueError, match="provider material policy fields"):
+        ProviderMaterialPolicyV1.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    ("purpose", "alphabet", "last_offset"),
+    (
+        (
+            ProviderMaterialPurpose.INFISICAL_AUTH_SECRET,
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
+            -2,
+        ),
+        (
+            ProviderMaterialPurpose.PRIMARY_VALKEY_PASSWORD,
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_",
+            -1,
+        ),
+    ),
+)
+def test_keychain_provenance_rejects_noncanonical_trailing_bit_aliases(
+    purpose: ProviderMaterialPurpose,
+    alphabet: bytes,
+    last_offset: int,
+) -> None:
+    policy = _policy()
+    values = _values(policy)
+    target = next(spec for spec in policy.materials if spec.purpose is purpose)
+    alias = bytearray(values[target.reference.reference_sha256])
+    position = len(alias) + last_offset
+    index = alphabet.index(alias[position])
+    alias[position] = alphabet[(index & ~0b11) | ((index + 1) & 0b11)]
+    store = _Store()
+    for spec in policy.materials:
+        value = alias if spec is target else values[spec.reference.reference_sha256]
+        store.records[(spec.reference.service, spec.reference.account)] = bytes(value)
+
+    adapter = MacOSKeychainProviderProvenanceAdapter(policy, _store=store)
+    with (
+        pytest.raises(ProviderCryptoError, match="material_format"),
+        adapter.acquire(tuple(spec.reference for spec in policy.materials)) as lease,
+    ):
+        lease.inspect(target.reference)
 
 
 def test_keychain_reference_requires_an_immutable_versioned_account_name() -> None:
