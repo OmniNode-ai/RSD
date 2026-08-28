@@ -11,7 +11,9 @@ import base64
 import hashlib
 import io
 import json
+import sqlite3
 import stat
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +26,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import omninode_rsd.lifecycle.executor_daemon as daemon
 import omninode_rsd.lifecycle.executor_transport as transport
 from omninode_rsd.lifecycle.executor_daemon import (
+    AllocationExecutorBackendContextV1,
+    ExecutorAllocationBackendEvidenceV1,
+    ExecutorBackendContextV2,
     ExecutorBackendReceiptV2,
     ExecutorDaemonError,
     ExecutorDaemonSessionEngine,
@@ -34,20 +39,41 @@ from omninode_rsd.lifecycle.executor_daemon import (
     MemorySafetyLease,
 )
 from omninode_rsd.lifecycle.executor_transport import (
+    ExecutorAllocationTransportReceiptV1,
+    ExecutorAllocationTransportRequestV1,
     ExecutorClientHelloV2,
+    ExecutorHelloV2,
     ExecutorTransportPolicyV2,
+    ExecutorTransportReceiptV2,
     ExecutorTransportRequestV2,
+    RemoteEffectAuthorizationWitnessV1,
     SecureShellIdentityReferenceV1,
 )
 from omninode_rsd.lifecycle.infisical_disposable import (
+    AllocationExecutorReceiptV1,
+    ContainerBootstrapInspectionV1,
+    ContainerSecretSinkV1,
+    DockerEngineFilteredProjectionV1,
+    DockerImagePolicyV1,
+    DockerNamedVolumeMountV1,
+    EngineIdentityObservationV1,
+    ExecutorContainerInspectionV1,
     ExecutorIdentityV1,
     ExecutorInstallationPolicyV1,
     ExecutorInstallationReceiptV1,
+    ImageReferenceV1,
+    MaterializationExecutorReceiptV1,
     SecretDeliverySinkV1,
     SecretDeliverySlotV1,
     SSHConnectionPolicyV1,
+    StartRuntimeExecutorReceiptV2,
+    canonical_sha256,
+    docker_engine_fingerprint_sha256,
 )
-from omninode_rsd.lifecycle.provider_crypto import SignerGenesisV1
+from omninode_rsd.lifecycle.provider_crypto import (
+    SignerGenesisV1,
+    executor_allocation_metadata_message,
+)
 from omninode_rsd.lifecycle.transport import CanonicalFrameWriter, read_raw_transport
 
 _NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
@@ -76,6 +102,16 @@ def _hash(label: str) -> str:
 
 def _reference(label: str) -> str:
     return _hash(label)
+
+
+def _allocation_engine_fingerprint() -> str:
+    projection = DockerEngineFilteredProjectionV1(
+        daemon_id="daemon-identity.v1",
+        api_version="1.47",
+        operating_system="linux",
+        architecture="amd64",
+    )
+    return docker_engine_fingerprint_sha256(projection)
 
 
 def _slot(purpose: str) -> SecretDeliverySlotV1:
@@ -224,6 +260,41 @@ def _policy() -> tuple[ExecutorTransportPolicyV2, ExecutorIdentityV1]:
 def _request(
     policy: ExecutorTransportPolicyV2, signer: Ed25519PrivateKey
 ) -> ExecutorTransportRequestV2:
+    witness = RemoteEffectAuthorizationWitnessV1(
+        schema_version="rsd.remote-effect-authorization-witness.v1",
+        operation_scope="materialize_and_start_runtime_v1",
+        operation_id=_UUIDS[1],
+        allocation_intent_sha256=_ALLOCATION,
+        external_replay_tombstone_sha256=_hash("runtime-external-tombstone"),
+        replay_policy_sha256=_hash("runtime-replay-policy"),
+        executor_policy_sha256=policy.policy_sha256(),
+        journal_uuid=_UUIDS[0],
+        idempotency_key=_hash("runtime-idempotency"),
+        effect_intent_sha256=_hash("materialization-intent"),
+        predecessor_attestation_sha256=_hash("observed-allocation"),
+        predecessor_operation_id=None,
+        docker_engine_control_policy_sha256=_hash("docker-control"),
+        postgres_prepared_control_policy_sha256=_hash("postgres-control"),
+        host_fingerprint_sha256=_hash("executor-host"),
+        engine_fingerprint_sha256=_hash("engine"),
+        effect_plan_sha256=_hash("runtime-effect-plan"),
+        engine_operation_plan_sha256=transport.executor_engine_operation_plan_sha256(
+            operation_scope="materialize_and_start_runtime_v1",
+            operation_id=_UUIDS[1],
+        ),
+        artifact_chain_sha256=_hash("runtime-artifact-chain"),
+        issued_at="2026-08-28T11:59:00Z",
+        expires_at="2026-08-28T12:00:30Z",
+        signer_key_id="client-signer",
+        signature_base64=base64.b64encode(b"0" * 64).decode("ascii"),
+    )
+    witness = witness.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                signer.sign(transport.remote_effect_authorization_witness_message(witness))
+            ).decode("ascii")
+        }
+    )
     unsigned = ExecutorTransportRequestV2(
         schema_version="rsd.executor-transport-request.v2",
         message_kind="materialize",
@@ -232,6 +303,16 @@ def _request(
         operation_id=_UUIDS[1],
         predecessor_materialization_operation_id=None,
         journal_uuid=_UUIDS[0],
+        idempotency_key=witness.idempotency_key,
+        effect_intent_sha256=cast(str, witness.effect_intent_sha256),
+        predecessor_attestation_sha256=cast(str, witness.predecessor_attestation_sha256),
+        docker_engine_control_policy_sha256=witness.docker_engine_control_policy_sha256,
+        postgres_prepared_control_policy_sha256=(witness.postgres_prepared_control_policy_sha256),
+        host_fingerprint_sha256=witness.host_fingerprint_sha256,
+        engine_fingerprint_sha256=witness.engine_fingerprint_sha256,
+        effect_plan_sha256=witness.effect_plan_sha256,
+        artifact_chain_sha256=witness.artifact_chain_sha256,
+        authorization_witness=witness,
         request_id=_UUIDS[2],
         client_nonce=_UUIDS[3],
         server_nonce=_UUIDS[4],
@@ -269,6 +350,88 @@ def _request(
             allocation_intent_sha256=unsigned.allocation_intent_sha256,
             operation_scope=unsigned.operation_scope,
             operation_id=unsigned.operation_id,
+            metadata_sha256=unsigned.metadata_sha256(),
+        )
+    )
+    return unsigned.model_copy(
+        update={"signature_base64": base64.b64encode(signature).decode("ascii")}
+    )
+
+
+def _allocation_request(
+    policy: ExecutorTransportPolicyV2, signer: Ed25519PrivateKey
+) -> ExecutorAllocationTransportRequestV1:
+    """Build one fully signed, no-secret allocation request for the daemon."""
+
+    witness = RemoteEffectAuthorizationWitnessV1(
+        schema_version="rsd.remote-effect-authorization-witness.v1",
+        operation_scope="allocate_isolated_empty_resources_v2",
+        operation_id=_UUIDS[1],
+        allocation_intent_sha256=_ALLOCATION,
+        external_replay_tombstone_sha256=_hash("external-allocation-tombstone"),
+        replay_policy_sha256=_hash("replay-policy"),
+        executor_policy_sha256=policy.policy_sha256(),
+        journal_uuid=_UUIDS[0],
+        idempotency_key=_hash("allocation-idempotency"),
+        docker_engine_control_policy_sha256=_hash("docker-control-policy"),
+        postgres_prepared_control_policy_sha256=_hash("postgres-prepared-policy"),
+        host_fingerprint_sha256=_hash("executor-host"),
+        engine_fingerprint_sha256=_allocation_engine_fingerprint(),
+        effect_plan_sha256=_hash("allocation-plan"),
+        engine_operation_plan_sha256=transport.executor_engine_operation_plan_sha256(
+            operation_scope="allocate_isolated_empty_resources_v2",
+            operation_id=_UUIDS[1],
+        ),
+        artifact_chain_sha256=_hash("allocation-artifact-chain"),
+        issued_at="2026-08-28T11:59:00Z",
+        expires_at="2026-08-28T12:00:30Z",
+        signer_key_id="client-signer",
+        signature_base64=base64.b64encode(b"0" * 64).decode("ascii"),
+    )
+    witness = witness.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                signer.sign(transport.remote_effect_authorization_witness_message(witness))
+            ).decode("ascii")
+        }
+    )
+    unsigned = ExecutorAllocationTransportRequestV1(
+        schema_version="rsd.executor-allocation-request.v1",
+        message_kind="allocation",
+        operation_scope="allocate_isolated_empty_resources_v2",
+        allocation_intent_sha256=_ALLOCATION,
+        allocation_operation_id=_UUIDS[1],
+        idempotency_key=witness.idempotency_key,
+        journal_uuid=_UUIDS[0],
+        request_id=_UUIDS[2],
+        client_nonce=_UUIDS[3],
+        server_nonce=_UUIDS[4],
+        session_id=_UUIDS[0],
+        request_nonce_sha256=_hash("allocation-request-nonce"),
+        channel_binding_sha256=_hash("allocation-channel"),
+        session_binding_sha256=_hash("allocation-session"),
+        host_key_fingerprint_sha256=policy.host_key_fingerprint_sha256,
+        executor_id=policy.executor_id,
+        executor_policy_sha256=policy.policy_sha256(),
+        package_sha256=policy.package_sha256,
+        template_bundle_sha256=policy.template_bundle_sha256,
+        installation_receipt_sha256=policy.executor_installation_receipt_sha256,
+        docker_engine_control_policy_sha256=witness.docker_engine_control_policy_sha256,
+        postgres_prepared_control_policy_sha256=(witness.postgres_prepared_control_policy_sha256),
+        host_fingerprint_sha256=witness.host_fingerprint_sha256,
+        engine_fingerprint_sha256=witness.engine_fingerprint_sha256,
+        allocation_plan_sha256=witness.effect_plan_sha256,
+        artifact_chain_sha256=witness.artifact_chain_sha256,
+        authorization_witness=witness,
+        expires_at="2026-08-28T12:00:30Z",
+        chunk_count=0,
+        signer_key_id="client-signer",
+        signature_base64=base64.b64encode(b"0" * 64).decode("ascii"),
+    )
+    signature = signer.sign(
+        executor_allocation_metadata_message(
+            allocation_intent_sha256=unsigned.allocation_intent_sha256,
+            allocation_operation_id=unsigned.allocation_operation_id,
             metadata_sha256=unsigned.metadata_sha256(),
         )
     )
@@ -333,6 +496,87 @@ class _Attestation:
         del receipt
         return base64.b64encode(b"r" * 64).decode("ascii")
 
+    def sign_allocation_executor_receipt(self, receipt: object) -> str:
+        del receipt
+        return base64.b64encode(b"a" * 64).decode("ascii")
+
+    def sign_allocation_transport_receipt(self, receipt: object) -> str:
+        del receipt
+        return base64.b64encode(b"t" * 64).decode("ascii")
+
+    def sign_materialization_executor_receipt(self, receipt: object) -> str:
+        del receipt
+        return base64.b64encode(b"m" * 64).decode("ascii")
+
+    def sign_start_runtime_executor_receipt(self, receipt: object) -> str:
+        del receipt
+        return base64.b64encode(b"s" * 64).decode("ascii")
+
+
+class _AllocationAttestation:
+    """Real deterministic attestation signatures for allocation receipt tests."""
+
+    key_id = "executor-attestation"
+
+    def __init__(self) -> None:
+        self._key = Ed25519PrivateKey.from_private_bytes(b"e" * 32)
+
+    def sign_hello(self, hello: object) -> str:
+        return base64.b64encode(
+            self._key.sign(transport.executor_hello_message(cast(ExecutorHelloV2, hello)))
+        ).decode("ascii")
+
+    def sign_receipt(self, receipt: object) -> str:
+        return base64.b64encode(
+            self._key.sign(
+                transport.executor_transport_receipt_message(
+                    cast(ExecutorTransportReceiptV2, receipt)
+                )
+            )
+        ).decode("ascii")
+
+    def sign_allocation_executor_receipt(self, receipt: object) -> str:
+        from omninode_rsd.lifecycle.infisical_disposable import allocation_executor_receipt_message
+
+        return base64.b64encode(
+            self._key.sign(
+                allocation_executor_receipt_message(cast(AllocationExecutorReceiptV1, receipt))
+            )
+        ).decode("ascii")
+
+    def sign_allocation_transport_receipt(self, receipt: object) -> str:
+        return base64.b64encode(
+            self._key.sign(
+                transport.executor_allocation_transport_receipt_message(
+                    cast(ExecutorAllocationTransportReceiptV1, receipt)
+                )
+            )
+        ).decode("ascii")
+
+    def sign_materialization_executor_receipt(self, receipt: object) -> str:
+        from omninode_rsd.lifecycle.infisical_disposable import (
+            materialization_executor_receipt_message,
+        )
+
+        return base64.b64encode(
+            self._key.sign(
+                materialization_executor_receipt_message(
+                    cast(MaterializationExecutorReceiptV1, receipt)
+                )
+            )
+        ).decode("ascii")
+
+    def sign_start_runtime_executor_receipt(self, receipt: object) -> str:
+        from omninode_rsd.lifecycle.infisical_disposable import (
+            start_runtime_executor_receipt_message,
+        )
+
+        return base64.b64encode(
+            self._key.sign(
+                start_runtime_executor_receipt_message(cast(StartRuntimeExecutorReceiptV2, receipt))
+            )
+        ).decode("ascii")
+
 
 class _Sink(ExecutorSecretSink):
     def __init__(self) -> None:
@@ -343,6 +587,181 @@ class _Sink(ExecutorSecretSink):
         self.values.append(bytes(value))
 
 
+def _runtime_inspections() -> tuple[
+    ExecutorContainerInspectionV1,
+    ExecutorContainerInspectionV1,
+    ExecutorContainerInspectionV1,
+    ExecutorContainerInspectionV1,
+]:
+    """Build canonical, value-free inspection evidence for the fake backend."""
+
+    components = (
+        ("primary_infisical", "a", "192.0.2.2"),
+        ("primary_valkey", "b", "192.0.2.3"),
+        ("restore_infisical", "c", "198.51.100.2"),
+        ("restore_valkey", "d", "198.51.100.3"),
+    )
+    values: list[ExecutorContainerInspectionV1] = []
+    for component, marker, address in components:
+        image = ImageReferenceV1(
+            reference=f"registry.example.test/{component}@sha256:{marker * 64}"
+        )
+        policy = DockerImagePolicyV1(
+            image=image,
+            registry_index_digest_sha256=marker * 64,
+            linux_amd64_manifest_digest_sha256=_hash(component + "-manifest"),
+            config_digest_sha256=_hash(component + "-config"),
+        )
+        entrypoint = ("/bootstrap",)
+        entrypoint_sha256 = hashlib.sha256(
+            json.dumps(entrypoint, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        is_valkey = component.endswith("valkey")
+        mounts = (
+            (
+                DockerNamedVolumeMountV1(
+                    mount_type="volume",
+                    source_volume_name=f"{component}-volume",
+                    target_path="/data",
+                    read_only=False,
+                    bind_allowed=False,
+                    tmpfs_allowed=False,
+                    propagation="none",
+                ),
+            )
+            if is_valkey
+            else ()
+        )
+        inspection = ContainerBootstrapInspectionV1(
+            image_policy=policy,
+            entrypoint=entrypoint,
+            command=(),
+            entrypoint_sha256=entrypoint_sha256,
+            template_sha256=_hash(component + "-template"),
+            bootstrap_wrapper_sha256=_hash(component + "-wrapper"),
+            ingress_protocol_sha256=_hash(component + "-ingress"),
+            create_request_sha256=_hash(component + "-create"),
+            numeric_user="1001:1001",
+            working_directory="/work",
+            open_stdin=True,
+            stdin_once=True,
+            attach_stdin=True,
+            tty=False,
+            run_as_non_root=True,
+            read_only_root_filesystem=True,
+            cap_drop_all=True,
+            cap_add=(),
+            no_new_privileges=True,
+            security_options=("no-new-privileges:true",),
+            private_pid=True,
+            pid_mode="isolated_pid_namespace_v1",
+            log_driver="none",
+            restart_policy="no",
+            mounts=mounts,
+            docker_socket_mounted=False,
+            host_network=False,
+            network_mode="exact_isolated_network_v1",
+            publish_all_ports=False,
+            port_bindings=(),
+            labels=(),
+            network_name=(
+                "primary-network" if component.startswith("primary") else "restore-network"
+            ),
+            network_alias=component.replace("_", "-"),
+            static_ipv4=address,
+            accepted_secret_sink=(
+                ContainerSecretSinkV1.VALKEY_STDIN_CONFIGURATION
+                if is_valkey
+                else ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT
+            ),
+            running=True,
+        )
+        values.append(
+            ExecutorContainerInspectionV1(
+                component=component,
+                container_id=_hash(component + "-container"),
+                inspection=inspection,
+            )
+        )
+    return cast(
+        tuple[
+            ExecutorContainerInspectionV1,
+            ExecutorContainerInspectionV1,
+            ExecutorContainerInspectionV1,
+            ExecutorContainerInspectionV1,
+        ],
+        tuple(values),
+    )
+
+
+def _runtime_executor_receipt(
+    context: ExecutorBackendContextV2,
+) -> MaterializationExecutorReceiptV1 | StartRuntimeExecutorReceiptV2:
+    """Return backend evidence with all session bindings supplied by the daemon."""
+
+    _complete_engine_operation_plan(context.engine_operations, label="runtime")
+    engine_journal_sha256 = context.engine_operations.completed_projection_sha256()
+    containers = _runtime_inspections()
+    if context.operation_scope == "materialize_and_start_runtime_v1":
+        return MaterializationExecutorReceiptV1(
+            schema_version="rsd.materialization-executor-receipt.v1",
+            executor_id=context.executor_id,
+            installation_receipt_sha256=context.installation_receipt_sha256,
+            operation_scope=context.operation_scope,
+            operation_id=context.operation_id,
+            idempotency_key=context.idempotency_key,
+            materialization_intent_sha256=context.effect_intent_sha256,
+            observed_allocation_attestation_sha256=context.predecessor_attestation_sha256,
+            docker_engine_control_policy_sha256=(context.docker_engine_control_policy_sha256),
+            secret_delivery_receipt_sha256=_hash("delivery-receipt"),
+            channel_binding_sha256=context.channel_binding_sha256,
+            session_binding_sha256=context.session_binding_sha256,
+            host_fingerprint_sha256=context.host_fingerprint_sha256,
+            engine_fingerprint_sha256=context.engine_fingerprint_sha256,
+            engine_operation_journal_sha256=engine_journal_sha256,
+            containers=containers,
+            completed_at=_NOW_TEXT,
+            signer_key_id="backend-placeholder",
+            signature_base64=base64.b64encode(b"0" * 64).decode("ascii"),
+        )
+    return StartRuntimeExecutorReceiptV2(
+        schema_version="rsd.start-runtime-executor-receipt.v2",
+        operation_kind="start_runtime_v2",
+        operation_scope=context.operation_scope,
+        start_operation_id=context.operation_id,
+        start_runtime_intent_sha256=context.effect_intent_sha256,
+        idempotency_key=context.idempotency_key,
+        secret_delivery_receipt_sha256=_hash("delivery-receipt"),
+        request_nonce_sha256=context.request_nonce_sha256,
+        channel_binding_sha256=context.channel_binding_sha256,
+        session_binding_sha256=context.session_binding_sha256,
+        installation_receipt_sha256=context.installation_receipt_sha256,
+        executor_id=context.executor_id,
+        host_fingerprint_sha256=context.host_fingerprint_sha256,
+        engine_fingerprint_sha256=context.engine_fingerprint_sha256,
+        engine_operation_journal_sha256=engine_journal_sha256,
+        containers=containers,
+        completed_at=_NOW_TEXT,
+        signer_key_id="backend-placeholder",
+        signature_base64=base64.b64encode(b"0" * 64).decode("ascii"),
+    )
+
+
+def _complete_engine_operation_plan(
+    recorder: daemon.ExecutorEngineOperationRecorder,
+    *,
+    label: str,
+) -> None:
+    """Drive the daemon-selected immutable plan without selecting a step."""
+
+    while recorder.remaining_operations() > 0:
+        operation = recorder.claim_next()
+        recorder.complete(
+            operation,
+            filtered_projection_sha256=_hash(f"{label}-{operation.sequence}"),
+        )
+
+
 class _Backend:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
@@ -350,15 +769,97 @@ class _Backend:
         self.calls = 0
 
     def materialize_and_start(self, context: object, delivery: object) -> ExecutorBackendReceiptV2:
-        del context
         self.calls += 1
         if self.fail:
             raise ExecutorDaemonError("backend_effect")
         cast(object, delivery).consume_into(self.sink)
-        return ExecutorBackendReceiptV2(backend_receipt_sha256=_hash("backend-receipt"))
+        return ExecutorBackendReceiptV2(
+            executor_receipt=_runtime_executor_receipt(cast(ExecutorBackendContextV2, context))
+        )
 
     def start(self, context: object, delivery: object) -> ExecutorBackendReceiptV2:
         return self.materialize_and_start(context, delivery)
+
+
+class _CheckpointGapBackend(_Backend):
+    """Fake a crash between a claimed Engine step and its filtered receipt."""
+
+    def materialize_and_start(self, context: object, delivery: object) -> ExecutorBackendReceiptV2:
+        self.calls += 1
+        checked_context = cast(ExecutorBackendContextV2, context)
+        checked_delivery = cast(daemon.BoundedExecutorDelivery, delivery)
+        checked_delivery.consume_into(self.sink)
+        checked_context.engine_operations.claim_next()
+        # The shared fake tries to generate terminal evidence after the
+        # missing checkpoint.  The journal must reject the gap rather than
+        # treating a later completed row as proof of this effect.
+        return ExecutorBackendReceiptV2(executor_receipt=_runtime_executor_receipt(checked_context))
+
+
+class _FutureRuntimeReceiptBackend(_Backend):
+    """Return a structurally valid receipt whose inner completion is future-dated."""
+
+    def materialize_and_start(self, context: object, delivery: object) -> ExecutorBackendReceiptV2:
+        result = super().materialize_and_start(context, delivery)
+        return ExecutorBackendReceiptV2(
+            executor_receipt=result.executor_receipt.model_copy(
+                update={"completed_at": "2026-08-28T12:00:01Z"}
+            )
+        )
+
+
+class _SecretBearingRuntimeFailureBackend(_Backend):
+    """Raise a fake backend error containing a value sentinel after delivery."""
+
+    sentinel = "transport-backend-value-sentinel"
+
+    def materialize_and_start(self, context: object, delivery: object) -> ExecutorBackendReceiptV2:
+        self.calls += 1
+        cast(daemon.BoundedExecutorDelivery, delivery).consume_into(self.sink)
+        raise ExecutorDaemonError(self.sentinel)
+
+
+class _AllocationBackend:
+    def __init__(self, *, fail: bool = False, events: list[str] | None = None) -> None:
+        self.fail = fail
+        self.events = [] if events is None else events
+        self.calls = 0
+
+    def allocate_empty_resources(
+        self, context: AllocationExecutorBackendContextV1
+    ) -> ExecutorAllocationBackendEvidenceV1:
+        self.calls += 1
+        self.events.append("backend")
+        if self.fail:
+            raise RuntimeError("allocation backend sentinel must not escape")
+        projection = DockerEngineFilteredProjectionV1(
+            daemon_id="daemon-identity.v1",
+            api_version="1.47",
+            operating_system="linux",
+            architecture="amd64",
+        )
+        engine = EngineIdentityObservationV1(
+            projection=projection,
+            engine_fingerprint_sha256=docker_engine_fingerprint_sha256(projection),
+        )
+        assert context.allocation_operation_id == _UUIDS[1]
+        _complete_engine_operation_plan(context.engine_operations, label="allocation")
+        return ExecutorAllocationBackendEvidenceV1(
+            engine=engine,
+            allocated_resources_projection_sha256=_hash("allocated-resources"),
+            engine_operation_journal_sha256=(
+                context.engine_operations.completed_projection_sha256()
+            ),
+            completed_at=_NOW_TEXT,
+        )
+
+    def materialize_and_start(self, context: object, delivery: object) -> ExecutorBackendReceiptV2:
+        del context, delivery
+        raise AssertionError("allocation test selected a delivery backend")
+
+    def start(self, context: object, delivery: object) -> ExecutorBackendReceiptV2:
+        del context, delivery
+        raise AssertionError("allocation test selected a delivery backend")
 
 
 def _engine(
@@ -377,7 +878,10 @@ def _engine(
         daemon._executor_daemon_session_engine_for_test(
             policy=policy,
             signer_genesis=genesis,
-            attestation_signer=_Attestation(),
+            # Use a deterministic real attestation key for runtime evidence
+            # too.  The client-side verifier tests therefore exercise both
+            # the outer daemon signature and the typed inner receipt domain.
+            attestation_signer=_AllocationAttestation(),
             journal=journal,
             backend=backend,
             memory_safety=_Memory(),
@@ -447,6 +951,401 @@ def _session_bytes(request: ExecutorTransportRequestV2) -> bytes:
         for index, slot in enumerate(request.slots)
     )
     return _frame(client) + _frame(request, count=5, chunks=secrets)
+
+
+def _allocation_session_bytes(request: ExecutorAllocationTransportRequestV1) -> bytes:
+    client = ExecutorClientHelloV2(
+        schema_version="rsd.executor-client-hello.v2",
+        allocation_intent_sha256=_ALLOCATION,
+        client_nonce=request.client_nonce,
+        session_id=request.session_id,
+        request_id=request.request_id,
+        executor_id=request.executor_id,
+        executor_policy_sha256=request.executor_policy_sha256,
+        chunk_count=0,
+    )
+    return _frame(client) + _frame(request)
+
+
+def _allocation_engine(
+    tmp_path: Path, backend: _AllocationBackend
+) -> tuple[
+    ExecutorDaemonSessionEngine,
+    ExecutorAllocationTransportRequestV1,
+    ExecutorTransportPolicyV2,
+]:
+    policy, _ = _policy()
+    signer = Ed25519PrivateKey.from_private_bytes(b"c" * 32)
+    journal = ExecutorSessionJournal.provision(tmp_path / "journal.sqlite3", journal_id=_UUIDS[0])
+    return (
+        daemon._executor_daemon_session_engine_for_test(
+            policy=policy,
+            signer_genesis=_genesis(signer),
+            attestation_signer=_AllocationAttestation(),
+            journal=journal,
+            backend=backend,
+            memory_safety=_Memory(),
+        ),
+        _allocation_request(policy, signer),
+        policy,
+    )
+
+
+def test_zero_chunk_allocation_claims_before_effect_and_returns_typed_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Allocation admits no secret chunks and is claimed before backend work."""
+
+    monkeypatch.setattr(daemon, "_system_utc_clock", lambda: _NOW)
+    events: list[str] = []
+    original = ExecutorSessionJournal.claim_allocation
+
+    def claim(self: ExecutorSessionJournal, request: ExecutorAllocationTransportRequestV1) -> None:
+        events.append("claim")
+        original(self, request)
+
+    monkeypatch.setattr(ExecutorSessionJournal, "claim_allocation", claim)
+    backend = _AllocationBackend(events=events)
+    engine, request, policy = _allocation_engine(tmp_path, backend)
+    result = engine._serve_for_test(
+        _Source(_allocation_session_bytes(request)), io.BytesIO(), peer_uid=1001
+    )
+    assert type(result) is transport.ExecutorAllocationTransportReceiptV1
+    _, identity = _policy()
+    verified = transport.verify_executor_allocation_transport_receipt(
+        result,
+        request=request,
+        policy=policy,
+        attestation_public_key_base64=identity.attestation_public_key_base64,
+        attestation_key_id=identity.attestation_key_id,
+    )
+    assert verified.allocation_executor_receipt.idempotency_key == request.idempotency_key
+    assert events == ["claim", "backend"]
+    assert backend.calls == 1
+    assert (
+        engine._journal.state(request.allocation_operation_id) is ExecutorSessionStateV2.ALLOCATED
+    )
+
+
+def test_allocation_witness_policy_substitution_blocks_before_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A client cannot substitute an unsigned Docker/psql policy commitment."""
+
+    monkeypatch.setattr(daemon, "_system_utc_clock", lambda: _NOW)
+    backend = _AllocationBackend()
+    engine, request, _ = _allocation_engine(tmp_path, backend)
+    forged = request.model_copy(
+        update={"docker_engine_control_policy_sha256": _hash("substituted-docker-policy")}
+    )
+    with pytest.raises(ExecutorDaemonError, match="allocation_request"):
+        engine._serve_for_test(
+            _Source(_allocation_session_bytes(forged)), io.BytesIO(), peer_uid=1001
+        )
+    assert backend.calls == 0
+    assert engine._journal.state(request.allocation_operation_id) is None
+
+
+def test_allocation_transport_receipt_rejects_a_re_signed_inner_signature_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid outer envelope cannot authenticate a substituted inner receipt."""
+
+    monkeypatch.setattr(daemon, "_system_utc_clock", lambda: _NOW)
+    backend = _AllocationBackend()
+    engine, request, policy = _allocation_engine(tmp_path, backend)
+    result = engine._serve_for_test(
+        _Source(_allocation_session_bytes(request)), io.BytesIO(), peer_uid=1001
+    )
+    assert type(result) is ExecutorAllocationTransportReceiptV1
+    swapped_inner = result.allocation_executor_receipt.model_copy(
+        update={"signature_base64": base64.b64encode(b"x" * 64).decode("ascii")}
+    )
+    unsigned = result.model_copy(
+        update={
+            "allocation_executor_receipt": swapped_inner,
+            "allocation_executor_receipt_sha256": canonical_sha256(swapped_inner),
+            "signature_base64": base64.b64encode(b"0" * 64).decode("ascii"),
+        }
+    )
+    tampered = unsigned.model_copy(
+        update={
+            "signature_base64": _AllocationAttestation().sign_allocation_transport_receipt(unsigned)
+        }
+    )
+    _, identity = _policy()
+    with pytest.raises(transport.ExecutorTransportError, match="allocation_receipt"):
+        transport.verify_executor_allocation_transport_receipt(
+            tampered,
+            request=request,
+            policy=policy,
+            attestation_public_key_base64=identity.attestation_public_key_base64,
+            attestation_key_id=identity.attestation_key_id,
+        )
+
+
+def test_allocation_transport_receipt_rejects_a_re_signed_host_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Allocation receipt host evidence is bound to the signed request, not its signature alone."""
+
+    monkeypatch.setattr(daemon, "_system_utc_clock", lambda: _NOW)
+    engine, request, policy = _allocation_engine(tmp_path, _AllocationBackend())
+    result = engine._serve_for_test(
+        _Source(_allocation_session_bytes(request)), io.BytesIO(), peer_uid=1001
+    )
+    assert type(result) is ExecutorAllocationTransportReceiptV1
+    signer = _AllocationAttestation()
+    unsigned_inner = result.allocation_executor_receipt.model_copy(
+        update={
+            "host_fingerprint_sha256": _hash("other-executor-host"),
+            "signature_base64": base64.b64encode(b"0" * 64).decode("ascii"),
+        }
+    )
+    forged_inner = unsigned_inner.model_copy(
+        update={"signature_base64": signer.sign_allocation_executor_receipt(unsigned_inner)}
+    )
+    unsigned_outer = result.model_copy(
+        update={
+            "allocation_executor_receipt": forged_inner,
+            "allocation_executor_receipt_sha256": canonical_sha256(forged_inner),
+            "signature_base64": base64.b64encode(b"0" * 64).decode("ascii"),
+        }
+    )
+    forged = unsigned_outer.model_copy(
+        update={"signature_base64": signer.sign_allocation_transport_receipt(unsigned_outer)}
+    )
+    _, identity = _policy()
+    with pytest.raises(transport.ExecutorTransportError, match="allocation_receipt"):
+        transport.verify_executor_allocation_transport_receipt(
+            forged,
+            request=request,
+            policy=policy,
+            attestation_public_key_base64=identity.attestation_public_key_base64,
+            attestation_key_id=identity.attestation_key_id,
+        )
+
+
+def test_signed_engine_checkpoint_plan_rejects_a_backend_selected_sequence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The witness commits the full immutable plan before a backend can run."""
+
+    monkeypatch.setattr(daemon, "_system_utc_clock", lambda: _NOW)
+    backend = _Backend()
+    engine, request, _, _ = _engine(tmp_path, backend)
+    plan = transport.executor_engine_operation_plan_v1(
+        operation_scope=request.operation_scope,
+        operation_id=request.operation_id,
+    )
+    assert tuple((item.operation_kind.value, item.target.value) for item in plan.operations) == (
+        ("postgres_scram_verifier_install", "application_postgres"),
+        ("container_create", "primary_infisical"),
+        ("container_inspect", "primary_infisical"),
+        ("container_start", "primary_infisical"),
+        ("container_inspect", "primary_infisical"),
+        ("container_attach", "primary_infisical"),
+        ("container_inspect", "primary_infisical"),
+        *(
+            (kind, component)
+            for component in ("primary_valkey", "restore_infisical", "restore_valkey")
+            for kind in (
+                "container_create",
+                "container_inspect",
+                "container_start",
+                "container_inspect",
+                "container_attach",
+                "container_inspect",
+            )
+        ),
+    )
+    unsigned_witness = request.authorization_witness.model_copy(
+        update={
+            "engine_operation_plan_sha256": _hash("backend-selected-short-plan"),
+            "signature_base64": base64.b64encode(b"0" * 64).decode("ascii"),
+        }
+    )
+    with pytest.raises(transport.ExecutorTransportError, match="remote_effect_witness"):
+        transport.remote_effect_authorization_witness_message(unsigned_witness)
+    forged_request = request.model_copy(update={"authorization_witness": unsigned_witness})
+    with pytest.raises(ExecutorDaemonError):
+        engine._serve_for_test(_Source(_session_bytes(forged_request)), io.BytesIO(), peer_uid=1001)
+    assert backend.calls == 0
+    assert engine._journal.state(request.operation_id) is None
+
+
+def test_runtime_witness_substitution_blocks_before_claim_or_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request cannot replace a witness-bound host identity before secret I/O."""
+
+    monkeypatch.setattr(daemon, "_system_utc_clock", lambda: _NOW)
+    backend = _Backend()
+    engine, request, _, _ = _engine(tmp_path, backend)
+    forged = request.model_copy(update={"host_fingerprint_sha256": _hash("other-host")})
+    with pytest.raises(ExecutorDaemonError):
+        engine._serve_for_test(_Source(_session_bytes(forged)), io.BytesIO(), peer_uid=1001)
+    assert backend.calls == 0
+    assert engine._journal.state(request.operation_id) is None
+
+
+def test_runtime_typed_receipt_binds_host_and_engine_to_the_signed_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-signed outer receipt cannot substitute filtered host/Engine evidence."""
+
+    monkeypatch.setattr(daemon, "_system_utc_clock", lambda: _NOW)
+    backend = _Backend()
+    engine, request, _, policy = _engine(tmp_path, backend)
+    result = engine._serve_for_test(_Source(_session_bytes(request)), io.BytesIO(), peer_uid=1001)
+    assert type(result) is ExecutorTransportReceiptV2
+    inner = result.executor_receipt.model_copy(
+        update={"engine_fingerprint_sha256": _hash("substituted-engine")}
+    )
+    unsigned = result.model_copy(
+        update={
+            "executor_receipt": inner,
+            "executor_receipt_sha256": canonical_sha256(inner),
+            "signature_base64": base64.b64encode(b"0" * 64).decode("ascii"),
+        }
+    )
+    tampered = unsigned.model_copy(
+        update={"signature_base64": _AllocationAttestation().sign_receipt(unsigned)}
+    )
+    _, identity = _policy()
+    with pytest.raises(transport.ExecutorTransportError, match="transport_receipt"):
+        transport.verify_executor_transport_receipt(
+            tampered,
+            request=request,
+            policy=policy,
+            attestation_public_key_base64=identity.attestation_public_key_base64,
+            attestation_key_id=identity.attestation_key_id,
+        )
+
+
+def test_runtime_transport_receipt_carries_a_verifiable_typed_executor_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Terminal transport evidence contains signed projections, not a lone hash."""
+
+    monkeypatch.setattr(daemon, "_system_utc_clock", lambda: _NOW)
+    backend = _Backend()
+    engine, request, _, policy = _engine(tmp_path, backend)
+    result = engine._serve_for_test(_Source(_session_bytes(request)), io.BytesIO(), peer_uid=1001)
+    assert type(result) is ExecutorTransportReceiptV2
+    _, identity = _policy()
+    verified = transport.verify_executor_transport_receipt(
+        result,
+        request=request,
+        policy=policy,
+        attestation_public_key_base64=identity.attestation_public_key_base64,
+        attestation_key_id=identity.attestation_key_id,
+    )
+    assert type(verified.executor_receipt) is MaterializationExecutorReceiptV1
+    assert verified.executor_receipt.engine_operation_journal_sha256 != _hash("backend")
+
+
+def test_runtime_transport_receipt_rejects_a_re_signed_future_inner_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid outer envelope cannot make a future inner completion acceptable."""
+
+    monkeypatch.setattr(daemon, "_system_utc_clock", lambda: _NOW)
+    engine, request, _, policy = _engine(tmp_path, _Backend())
+    result = engine._serve_for_test(_Source(_session_bytes(request)), io.BytesIO(), peer_uid=1001)
+    assert type(result) is ExecutorTransportReceiptV2
+    signer = _AllocationAttestation()
+    unsigned_inner = result.executor_receipt.model_copy(
+        update={
+            "completed_at": "2026-08-28T12:00:01Z",
+            "signature_base64": base64.b64encode(b"0" * 64).decode("ascii"),
+        }
+    )
+    assert type(unsigned_inner) is MaterializationExecutorReceiptV1
+    future_inner = unsigned_inner.model_copy(
+        update={"signature_base64": signer.sign_materialization_executor_receipt(unsigned_inner)}
+    )
+    unsigned_outer = result.model_copy(
+        update={
+            "executor_receipt": future_inner,
+            "executor_receipt_sha256": canonical_sha256(future_inner),
+            "signature_base64": base64.b64encode(b"0" * 64).decode("ascii"),
+        }
+    )
+    future_outer = unsigned_outer.model_copy(
+        update={"signature_base64": signer.sign_receipt(unsigned_outer)}
+    )
+    _, identity = _policy()
+    with pytest.raises(transport.ExecutorTransportError, match="transport_receipt"):
+        transport.verify_executor_transport_receipt(
+            future_outer,
+            request=request,
+            policy=policy,
+            attestation_public_key_base64=identity.attestation_public_key_base64,
+            attestation_key_id=identity.attestation_key_id,
+        )
+
+
+def test_allocation_backend_failure_is_ambiguous_and_value_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A claimed allocation never retries after an injected backend failure."""
+
+    monkeypatch.setattr(daemon, "_system_utc_clock", lambda: _NOW)
+    backend = _AllocationBackend(fail=True)
+    engine, request, _ = _allocation_engine(tmp_path, backend)
+    with pytest.raises(ExecutorDaemonError) as caught:
+        engine._serve_for_test(
+            _Source(_allocation_session_bytes(request)), io.BytesIO(), peer_uid=1001
+        )
+    rendered = "".join(traceback.format_exception(caught.type, caught.value, caught.tb, chain=True))
+    assert "allocation backend sentinel" not in rendered
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert backend.calls == 1
+    assert (
+        engine._journal.state(request.allocation_operation_id)
+        is ExecutorSessionStateV2.ALLOCATION_AMBIGUOUS
+    )
+    with pytest.raises(ExecutorDaemonError, match="session_replayed"):
+        engine._serve_for_test(
+            _Source(_allocation_session_bytes(request)), io.BytesIO(), peer_uid=1001
+        )
+
+
+def test_allocation_rejects_nonzero_chunk_frame_before_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Raw framing cannot turn an allocation request into a secret carrier."""
+
+    monkeypatch.setattr(daemon, "_system_utc_clock", lambda: _NOW)
+    backend = _AllocationBackend()
+    engine, request, _ = _allocation_engine(tmp_path, backend)
+    raw = request.model_dump(mode="json")
+    raw["chunk_count"] = 1
+    stream = _frame(
+        ExecutorClientHelloV2(
+            schema_version="rsd.executor-client-hello.v2",
+            allocation_intent_sha256=_ALLOCATION,
+            client_nonce=request.client_nonce,
+            session_id=request.session_id,
+            request_id=request.request_id,
+            executor_id=request.executor_id,
+            executor_policy_sha256=request.executor_policy_sha256,
+            chunk_count=0,
+        )
+    )
+    sink = io.BytesIO()
+    writer = CanonicalFrameWriter(sink)
+    writer.begin(
+        json.dumps(raw, sort_keys=True, separators=(",", ":")).encode("ascii"), chunk_count=1
+    )
+    writer.write_chunk(memoryview(b"not-authorized"))
+    writer.finish()
+    with pytest.raises(ExecutorDaemonError):
+        engine._serve_for_test(_Source(stream + sink.getvalue()), io.BytesIO(), peer_uid=1001)
+    assert backend.calls == 0
+    assert engine._journal.state(request.allocation_operation_id) is None
 
 
 def test_claim_is_durable_before_first_secret_read(
@@ -591,6 +1490,30 @@ def test_systemd_activated_session_refuses_default_backend_before_accepting_mate
     assert calls == []
 
 
+def test_session_journal_rejects_a_schema_text_substitution_before_a_session(
+    tmp_path: Path,
+) -> None:
+    """Metadata version alone cannot bless a journal with changed SQL semantics."""
+
+    path = tmp_path / "journal.sqlite3"
+    journal = ExecutorSessionJournal.provision(path, journal_id=_UUIDS[0])
+    with sqlite3.connect(path) as connection:
+        schema_version = connection.execute("PRAGMA schema_version").fetchone()
+        assert schema_version is not None
+        connection.execute("PRAGMA writable_schema = ON")
+        result = connection.execute(
+            "UPDATE sqlite_master "
+            "SET sql = REPLACE(sql, 'executor_receipt_sha256 TEXT,', "
+            "'executor_receipt_sha256 TEXT DEFAULT NULL,') "
+            "WHERE type = 'table' AND name = 'sessions'"
+        )
+        assert result.rowcount == 1
+        connection.execute("PRAGMA writable_schema = OFF")
+        connection.execute(f"PRAGMA schema_version = {schema_version[0] + 1}")
+    with pytest.raises(ExecutorDaemonError, match="session_journal"):
+        journal.state(_UUIDS[1])
+
+
 def test_live_daemon_constructor_rejects_caller_model_bundle(tmp_path: Path) -> None:
     """The daemon production factory must load verified artifacts itself."""
 
@@ -679,6 +1602,53 @@ def test_backend_failure_is_persisted_as_ambiguous_and_redacts_material(
     assert secret.decode("ascii") not in str(caught.value)
     journal = engine._journal
     assert journal.state(request.operation_id) is ExecutorSessionStateV2.START_AMBIGUOUS
+
+
+def test_backend_exception_chain_is_sanitized_after_secret_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backend exception cannot preserve a value through error-chain fields."""
+
+    monkeypatch.setattr(daemon, "_system_utc_clock", lambda: _NOW)
+    backend = _SecretBearingRuntimeFailureBackend()
+    engine, request, _, _ = _engine(tmp_path, backend)
+    with pytest.raises(ExecutorDaemonError, match="backend_effect") as caught:
+        engine._serve_for_test(_Source(_session_bytes(request)), io.BytesIO(), peer_uid=1001)
+    rendered = "".join(traceback.format_exception(caught.type, caught.value, caught.tb, chain=True))
+    assert backend.sentinel not in rendered
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert engine._journal.state(request.operation_id) is ExecutorSessionStateV2.START_AMBIGUOUS
+
+
+def test_future_inner_runtime_receipt_is_ambiguous_before_daemon_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon must not sign a backend receipt dated after its trusted clock."""
+
+    monkeypatch.setattr(daemon, "_system_utc_clock", lambda: _NOW)
+    backend = _FutureRuntimeReceiptBackend()
+    engine, request, _, _ = _engine(tmp_path, backend)
+    with pytest.raises(ExecutorDaemonError, match="backend_receipt"):
+        engine._serve_for_test(_Source(_session_bytes(request)), io.BytesIO(), peer_uid=1001)
+    assert backend.calls == 1
+    assert engine._journal.state(request.operation_id) is ExecutorSessionStateV2.START_AMBIGUOUS
+
+
+def test_unfinished_engine_checkpoint_is_ambiguous_and_cannot_be_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash before a per-step projection receipt never permits auto-adoption."""
+
+    monkeypatch.setattr(daemon, "_system_utc_clock", lambda: _NOW)
+    backend = _CheckpointGapBackend()
+    engine, request, _, _ = _engine(tmp_path, backend)
+    with pytest.raises(ExecutorDaemonError, match="backend_effect"):
+        engine._serve_for_test(_Source(_session_bytes(request)), io.BytesIO(), peer_uid=1001)
+    assert backend.calls == 1
+    assert engine._journal.state(request.operation_id) is ExecutorSessionStateV2.START_AMBIGUOUS
+    with pytest.raises(ExecutorDaemonError, match="session_replayed"):
+        engine._serve_for_test(_Source(_session_bytes(request)), io.BytesIO(), peer_uid=1001)
 
 
 def test_recovery_requires_the_verified_signer_and_exact_journal_session_binding(

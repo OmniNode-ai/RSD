@@ -302,11 +302,12 @@ def _signed_provider_allocation_intent(
         ),
         executor=ExecutorPlacementV1(
             executor_id="provider-local-executor",
-            placement="inside_disposable_networks_v1",
-            attached_network_names=(primary.name, restore.name),
+            placement="host_control_plane_v1",
         ),
     )
     postgres_policy_sha256 = _sha256(b"provider-postgres-policy")
+    postgres_prepared_policy_sha256 = _sha256(b"provider-postgres-prepared-policy")
+    docker_engine_control_policy_sha256 = _sha256(b"provider-docker-engine-policy")
     plan = AllocationPlanV2(
         transport=TransportContractV1(
             profile=DisposableTransportProfile.UNPUBLISHED_LOOPBACK_OR_NETWORK,
@@ -355,7 +356,9 @@ def _signed_provider_allocation_intent(
             stage_database_prefix="provider-stage",
             restore_database_prefix="provider-restore",
             control_policy_sha256=postgres_policy_sha256,
+            prepared_control_policy_sha256=postgres_prepared_policy_sha256,
         ),
+        docker_engine_control_policy_sha256=docker_engine_control_policy_sha256,
     )
     journal_path = tmp_path / "provider-allocation-journal.sqlite3"
     evidence = AllocationEvidenceBindingsV1(
@@ -366,7 +369,9 @@ def _signed_provider_allocation_intent(
         registry_verification_sha256=_sha256(b"provider-registry"),
         provider_declaration_sha256=_sha256(b"provider-declaration"),
         executor_control_policy_sha256=_sha256(b"provider-executor-policy"),
+        docker_engine_control_policy_sha256=docker_engine_control_policy_sha256,
         postgres_control_policy_sha256=postgres_policy_sha256,
+        postgres_prepared_control_policy_sha256=postgres_prepared_policy_sha256,
     )
     unsigned = AllocationIntentV2(
         schema_version="rsd.allocation-intent.v2",

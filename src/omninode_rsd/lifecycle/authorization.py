@@ -42,25 +42,28 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from omninode_rsd.lifecycle.infisical_disposable import (
     AllocationEffectReceiptV2,
+    AllocationExecutorReceiptV1,
     AllocationIntentV2,
     ApprovalEvidenceV1,
     ContainerBootstrapInspectionV1,
     ContainerBootstrapTemplateV1,
     DisposablePreflightError,
     DisposableTransportProfile,
+    DockerEngineControlPolicyV1,
     EphemeralPostgreSQLConnectionPolicyV1,
     ExecutorControlPolicyV1,
     ExecutorInstallationIntentV1,
     ExecutorInstallationPolicyV1,
     ExecutorInstallationReceiptV1,
-    ExecutorOperationReceiptV1,
     GovernedBaselineV1,
     MaterializationEffectReceiptV1,
+    MaterializationExecutorReceiptV1,
     MaterializationIntentV1,
     ObservedAllocationAttestationV1,
     ObservedRuntimeAttestationV1,
     PostgreSQLControlPolicyV1,
     PostgreSQLLoginTransitionIntentV1,
+    PostgreSQLPreparedControlPolicyV2,
     PreflightPaths,
     PreflightReceiptV1,
     ProposalV1,
@@ -80,14 +83,17 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     _strict_canonical_model,
     _UniqueLoader,
     allocation_effect_receipt_sha256,
+    allocation_executor_receipt_message,
     allocation_intent_sha256,
     canonical_sha256,
     compile_preflight,
     materialization_effect_receipt_sha256,
+    materialization_executor_receipt_message,
     materialization_intent_sha256,
     observed_allocation_attestation_sha256,
     observed_runtime_attestation_sha256,
     start_runtime_effect_receipt_sha256,
+    start_runtime_executor_receipt_message,
     start_runtime_intent_sha256,
     strict_canonical_allocation_intent,
     strict_canonical_materialization_intent,
@@ -126,7 +132,9 @@ _MATERIALIZATION_INTENT_ARTIFACT_NAME: Final = "materialization-intent.yaml"
 _MATERIALIZATION_RECEIPT_ARTIFACT_NAME: Final = "materialization-receipt.yaml"
 _OBSERVED_RUNTIME_ATTESTATION_ARTIFACT_NAME: Final = "observed-runtime-attestation.yaml"
 _EXECUTOR_CONTROL_POLICY_ARTIFACT_NAME: Final = "executor-control-policy.yaml"
+_DOCKER_ENGINE_CONTROL_POLICY_ARTIFACT_NAME: Final = "docker-engine-control-policy.yaml"
 _POSTGRES_CONTROL_POLICY_ARTIFACT_NAME: Final = "postgres-control-policy.yaml"
+_POSTGRES_PREPARED_CONTROL_POLICY_ARTIFACT_NAME: Final = "postgres-prepared-control-policy.yaml"
 _SECRET_CAPABILITY_POLICY_ARTIFACT_NAME: Final = "secret-capability-policy.yaml"
 _SECRET_HANDLING_POLICY_ARTIFACT_NAME: Final = "secret-handling-policy.yaml"
 _EXECUTOR_INSTALLATION_POLICY_ARTIFACT_NAME: Final = "executor-installation-policy.yaml"
@@ -150,8 +158,14 @@ _OBSERVED_RUNTIME_ATTESTATION_SIGNATURE_DOMAIN: Final = (
 _EXECUTOR_CONTROL_POLICY_SIGNATURE_DOMAIN: Final = (
     b"omninode-rsd.executor-control-policy.ed25519.v1\x00"
 )
+_DOCKER_ENGINE_CONTROL_POLICY_SIGNATURE_DOMAIN: Final = (
+    b"omninode-rsd.docker-engine-control-policy.ed25519.v1\x00"
+)
 _POSTGRES_CONTROL_POLICY_SIGNATURE_DOMAIN: Final = (
     b"omninode-rsd.postgresql-control-policy.ed25519.v1\x00"
+)
+_POSTGRES_PREPARED_CONTROL_POLICY_SIGNATURE_DOMAIN: Final = (
+    b"omninode-rsd.postgresql-prepared-control-policy.ed25519.v2\x00"
 )
 _SECRET_CAPABILITY_POLICY_SIGNATURE_DOMAIN: Final = (
     b"omninode-rsd.secret-capability-policy.ed25519.v1\x00"
@@ -168,8 +182,11 @@ _EXECUTOR_INSTALLATION_INTENT_SIGNATURE_DOMAIN: Final = (
 _EXECUTOR_INSTALLATION_RECEIPT_SIGNATURE_DOMAIN: Final = (
     b"omninode-rsd.executor-installation-receipt.ed25519.v1\x00"
 )
-_EXECUTOR_OPERATION_RECEIPT_SIGNATURE_DOMAIN: Final = (
-    b"omninode-rsd.executor-operation-receipt.ed25519.v1\x00"
+_MATERIALIZATION_EXECUTOR_RECEIPT_SIGNATURE_DOMAIN: Final = (
+    b"omninode-rsd.materialization-executor-receipt.ed25519.v1\x00"
+)
+_ALLOCATION_EXECUTOR_RECEIPT_SIGNATURE_DOMAIN: Final = (
+    b"omninode-rsd.allocation-executor-receipt.ed25519.v1\x00"
 )
 _START_RUNTIME_INTENT_SIGNATURE_DOMAIN: Final = b"omninode-rsd.start-runtime-intent.ed25519.v2\x00"
 _START_RUNTIME_EXECUTOR_RECEIPT_SIGNATURE_DOMAIN: Final = (
@@ -760,12 +777,33 @@ class PostgreSQLControlProvenance:
     capability_fingerprint_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class PostgreSQLPreparedOperationProvenance:
+    """Value-free result of one pre-authorized psql stdin template.
+
+    It carries only the signed template/result commitments.  Plaintext,
+    verifier text, SQL, psql stderr/stdout, and control-container paths are
+    intentionally not representable.
+    """
+
+    operation_id: str
+    result_projection_sha256: str
+    control_container_id: str
+    capability_fingerprint_sha256: str
+
+
 class PostgreSQLControlLease(Protocol):
     """Future typed capability for empty schema/role/ACL work only."""
 
     def inspect(self, policy: PostgreSQLControlPolicyV1) -> PostgreSQLControlProvenance | None: ...
 
     def recheck(self, policy: PostgreSQLControlPolicyV1) -> PostgreSQLControlProvenance | None: ...
+
+    def execute_allocation(
+        self,
+        policy: PostgreSQLControlPolicyV1,
+        prepared: PostgreSQLPreparedControlPolicyV2,
+    ) -> PostgreSQLPreparedOperationProvenance | None: ...
 
 
 class PostgreSQLControlCapability(Protocol):
@@ -806,6 +844,14 @@ class PostgreSQLLoginTransitionLease(Protocol):
         transition: PostgreSQLLoginTransitionIntentV1,
         connection: EphemeralPostgreSQLConnectionPolicyV1,
     ) -> PostgreSQLLoginTransitionProvenance | None: ...
+
+    def install_scram_verifier(
+        self,
+        policy: PostgreSQLControlPolicyV1,
+        prepared: PostgreSQLPreparedControlPolicyV2,
+        transition: PostgreSQLLoginTransitionIntentV1,
+        connection: EphemeralPostgreSQLConnectionPolicyV1,
+    ) -> PostgreSQLPreparedOperationProvenance | None: ...
 
 
 class PostgreSQLLoginTransitionCapability(Protocol):
@@ -1123,7 +1169,14 @@ class AllocationExecutionContext:
     intent: AllocationIntentV2
     provider_expectations: tuple[ProviderExpectationV1, ...]
     executor_expectation: ExecutorControlExpectationV1
+    executor_attestation_key_id: str
+    executor_attestation_public_key_base64: str
+    executor_attestation_public_key_fingerprint_sha256: str
+    docker_engine_control_policy_sha256: str
     postgres_control_expectation: PostgreSQLControlExpectationV1
+    postgres_prepared_control_policy_sha256: str
+    postgres_allocation_prepared_operation_id: str
+    postgres_allocation_result_projection_sha256: str
     allocation_intent_sha256: str
     idempotency_key: str
     provider_provenance_sha256: str
@@ -1157,7 +1210,10 @@ class MaterializationExecutionContext:
     executor_attestation_key_id: str
     executor_attestation_public_key_base64: str
     executor_attestation_public_key_fingerprint_sha256: str
+    docker_engine_control_policy_sha256: str
     postgres_login_expectation: PostgreSQLLoginTransitionExpectationV1
+    postgres_prepared_control_policy_sha256: str
+    postgres_verifier_result_projection_sha256: str
     secret_material_expectation: SecretMaterialExpectationV1
     secret_handling_policy_sha256: str
     secret_delivery_request: SecretDeliveryRequestV1
@@ -1345,8 +1401,16 @@ class AuthorizationPaths:
         return _EXECUTOR_CONTROL_POLICY_ARTIFACT_NAME
 
     @staticmethod
+    def docker_engine_control_policy_name() -> str:
+        return _DOCKER_ENGINE_CONTROL_POLICY_ARTIFACT_NAME
+
+    @staticmethod
     def postgres_control_policy_name() -> str:
         return _POSTGRES_CONTROL_POLICY_ARTIFACT_NAME
+
+    @staticmethod
+    def postgres_prepared_control_policy_name() -> str:
+        return _POSTGRES_PREPARED_CONTROL_POLICY_ARTIFACT_NAME
 
     @staticmethod
     def secret_capability_policy_name() -> str:
@@ -1417,7 +1481,9 @@ class _AllocationControlPolicies:
     """Signed control policy preimages re-opened from the artifact root."""
 
     executor: ExecutorControlPolicyV1
+    docker: DockerEngineControlPolicyV1
     postgres: PostgreSQLControlPolicyV1
+    postgres_prepared: PostgreSQLPreparedControlPolicyV2
 
 
 @dataclass(frozen=True, slots=True)
@@ -1425,7 +1491,9 @@ class _MaterializationControlPolicies:
     """Signed secret-use constraints re-opened before a runtime effect."""
 
     executor: ExecutorControlPolicyV1
+    docker: DockerEngineControlPolicyV1
     postgres: PostgreSQLControlPolicyV1
+    postgres_prepared: PostgreSQLPreparedControlPolicyV2
     installation_policy: ExecutorInstallationPolicyV1
     installation_intent: ExecutorInstallationIntentV1
     installation_receipt: ExecutorInstallationReceiptV1
@@ -2075,10 +2143,22 @@ def _executor_control_policy_message(policy: ExecutorControlPolicyV1) -> bytes:
     return _direct_signature_message(_EXECUTOR_CONTROL_POLICY_SIGNATURE_DOMAIN, policy)
 
 
+def _docker_engine_control_policy_message(policy: DockerEngineControlPolicyV1) -> bytes:
+    if type(policy) is not DockerEngineControlPolicyV1:
+        raise AuthorizationError("docker_engine_control_policy_signature")
+    return _direct_signature_message(_DOCKER_ENGINE_CONTROL_POLICY_SIGNATURE_DOMAIN, policy)
+
+
 def _postgres_control_policy_message(policy: PostgreSQLControlPolicyV1) -> bytes:
     if type(policy) is not PostgreSQLControlPolicyV1:
         raise AuthorizationError("postgres_control_policy_signature")
     return _direct_signature_message(_POSTGRES_CONTROL_POLICY_SIGNATURE_DOMAIN, policy)
+
+
+def _postgres_prepared_control_policy_message(policy: PostgreSQLPreparedControlPolicyV2) -> bytes:
+    if type(policy) is not PostgreSQLPreparedControlPolicyV2:
+        raise AuthorizationError("postgres_prepared_control_policy_signature")
+    return _direct_signature_message(_POSTGRES_PREPARED_CONTROL_POLICY_SIGNATURE_DOMAIN, policy)
 
 
 def _secret_capability_policy_message(policy: SecretCapabilityPolicyV1) -> bytes:
@@ -2111,10 +2191,22 @@ def _executor_installation_receipt_message(receipt: ExecutorInstallationReceiptV
     return _direct_signature_message(_EXECUTOR_INSTALLATION_RECEIPT_SIGNATURE_DOMAIN, receipt)
 
 
-def _executor_operation_receipt_message(receipt: ExecutorOperationReceiptV1) -> bytes:
-    if type(receipt) is not ExecutorOperationReceiptV1:
-        raise AuthorizationError("executor_operation_receipt_signature")
-    return _direct_signature_message(_EXECUTOR_OPERATION_RECEIPT_SIGNATURE_DOMAIN, receipt)
+def _materialization_executor_receipt_message(receipt: MaterializationExecutorReceiptV1) -> bytes:
+    if type(receipt) is not MaterializationExecutorReceiptV1:
+        raise AuthorizationError("materialization_executor_receipt_signature")
+    try:
+        return materialization_executor_receipt_message(receipt)
+    except ValueError:
+        raise AuthorizationError("materialization_executor_receipt_signature") from None
+
+
+def _allocation_executor_receipt_message(receipt: AllocationExecutorReceiptV1) -> bytes:
+    if type(receipt) is not AllocationExecutorReceiptV1:
+        raise AuthorizationError("allocation_executor_receipt_signature")
+    try:
+        return allocation_executor_receipt_message(receipt)
+    except ValueError:
+        raise AuthorizationError("allocation_executor_receipt_signature") from None
 
 
 def _start_runtime_intent_message(intent: StartRuntimeIntentV2) -> bytes:
@@ -2126,7 +2218,10 @@ def _start_runtime_intent_message(intent: StartRuntimeIntentV2) -> bytes:
 def _start_runtime_executor_receipt_message(receipt: StartRuntimeExecutorReceiptV2) -> bytes:
     if type(receipt) is not StartRuntimeExecutorReceiptV2:
         raise AuthorizationError("start_runtime_executor_receipt_signature")
-    return _direct_signature_message(_START_RUNTIME_EXECUTOR_RECEIPT_SIGNATURE_DOMAIN, receipt)
+    try:
+        return start_runtime_executor_receipt_message(receipt)
+    except ValueError:
+        raise AuthorizationError("start_runtime_executor_receipt_signature") from None
 
 
 def _verify_direct_signature(
@@ -2225,6 +2320,25 @@ def _verify_executor_control_policy_signature(
     )
 
 
+def _verify_docker_engine_control_policy_signature(
+    policy: DockerEngineControlPolicyV1, *, signer: TrustedEd25519SignerV1
+) -> None:
+    policy = cast(
+        DockerEngineControlPolicyV1,
+        _canonical_artifact_model(
+            policy, DockerEngineControlPolicyV1, phase="docker_engine_control_policy_signature"
+        ),
+    )
+    _verify_direct_signature(
+        policy,
+        signer=signer,
+        message=lambda model: _docker_engine_control_policy_message(
+            cast(DockerEngineControlPolicyV1, model)
+        ),
+        phase="docker_engine_control_policy_signature",
+    )
+
+
 def _verify_postgres_control_policy_signature(
     policy: PostgreSQLControlPolicyV1, *, signer: TrustedEd25519SignerV1
 ) -> None:
@@ -2241,6 +2355,27 @@ def _verify_postgres_control_policy_signature(
             cast(PostgreSQLControlPolicyV1, model)
         ),
         phase="postgres_control_policy_signature",
+    )
+
+
+def _verify_postgres_prepared_control_policy_signature(
+    policy: PostgreSQLPreparedControlPolicyV2, *, signer: TrustedEd25519SignerV1
+) -> None:
+    policy = cast(
+        PostgreSQLPreparedControlPolicyV2,
+        _canonical_artifact_model(
+            policy,
+            PostgreSQLPreparedControlPolicyV2,
+            phase="postgres_prepared_control_policy_signature",
+        ),
+    )
+    _verify_direct_signature(
+        policy,
+        signer=signer,
+        message=lambda model: _postgres_prepared_control_policy_message(
+            cast(PostgreSQLPreparedControlPolicyV2, model)
+        ),
+        phase="postgres_prepared_control_policy_signature",
     )
 
 
@@ -2319,15 +2454,17 @@ def _verify_executor_installation_intent_signature(
 
 
 def _verify_executor_attestation_signature(
-    receipt: ExecutorInstallationReceiptV1
-    | ExecutorOperationReceiptV1
+    receipt: AllocationExecutorReceiptV1
+    | ExecutorInstallationReceiptV1
+    | MaterializationExecutorReceiptV1
     | StartRuntimeExecutorReceiptV2,
     *,
     executor: ExecutorControlPolicyV1,
     message: Callable[
         [
-            ExecutorInstallationReceiptV1
-            | ExecutorOperationReceiptV1
+            AllocationExecutorReceiptV1
+            | ExecutorInstallationReceiptV1
+            | MaterializationExecutorReceiptV1
             | StartRuntimeExecutorReceiptV2
         ],
         bytes,
@@ -2342,8 +2479,9 @@ def _verify_executor_attestation_signature(
             type(executor) is not ExecutorControlPolicyV1
             or type(receipt)
             not in {
+                AllocationExecutorReceiptV1,
                 ExecutorInstallationReceiptV1,
-                ExecutorOperationReceiptV1,
+                MaterializationExecutorReceiptV1,
                 StartRuntimeExecutorReceiptV2,
             }
             or receipt.signer_key_id != executor.executor.attestation_key_id
@@ -2950,18 +3088,26 @@ def _verify_allocation_control_policy_bindings(
     *,
     intent: AllocationIntentV2,
     executor: ExecutorControlPolicyV1,
+    docker: DockerEngineControlPolicyV1,
     postgres: PostgreSQLControlPolicyV1,
+    postgres_prepared: PostgreSQLPreparedControlPolicyV2,
     signer: TrustedEd25519SignerV1,
 ) -> None:
     """Bind allocation-only capabilities to the exact signed resource plan."""
 
     _verify_executor_control_policy_signature(executor, signer=signer)
+    _verify_docker_engine_control_policy_signature(docker, signer=signer)
     _verify_postgres_control_policy_signature(postgres, signer=signer)
+    _verify_postgres_prepared_control_policy_signature(postgres_prepared, signer=signer)
     topology = intent.plan.topology
     database = intent.plan.postgres
     if (
         executor.source_commit != intent.source_commit
         or executor.executor.executor_id != topology.executor.executor_id
+        or docker.source_commit != intent.source_commit
+        or docker.executor_identity_sha256 != canonical_sha256(executor.executor)
+        or docker.engine_fingerprint_sha256 != executor.engine_fingerprint_sha256
+        or intent.plan.docker_engine_control_policy_sha256 != canonical_sha256(docker)
         or postgres.source_commit != intent.source_commit
         or postgres.executor_identity_sha256 != canonical_sha256(executor.executor)
         or postgres.authority != database.authority
@@ -2973,8 +3119,15 @@ def _verify_allocation_control_policy_bindings(
         or postgres.allocation_role_states != database.allocation_role_states
         or postgres.grants != database.grants
         or database.control_policy_sha256 != canonical_sha256(postgres)
+        or database.prepared_control_policy_sha256 != canonical_sha256(postgres_prepared)
         or intent.evidence.executor_control_policy_sha256 != canonical_sha256(executor)
+        or intent.evidence.docker_engine_control_policy_sha256 != canonical_sha256(docker)
         or intent.evidence.postgres_control_policy_sha256 != canonical_sha256(postgres)
+        or intent.evidence.postgres_prepared_control_policy_sha256
+        != canonical_sha256(postgres_prepared)
+        or postgres_prepared.source_commit != intent.source_commit
+        or postgres_prepared.executor_identity_sha256 != canonical_sha256(executor.executor)
+        or postgres_prepared.system_identifier == ""
     ):
         raise AuthorizationError("allocation_control_policy_binding")
 
@@ -2992,28 +3145,51 @@ def _read_allocation_control_policies(
         model_type=ExecutorControlPolicyV1,
         phase="executor_control_policy_artifact",
     )
+    docker_model, docker_raw = _read_canonical_signed_model(
+        reader,
+        name=paths.docker_engine_control_policy_name(),
+        model_type=DockerEngineControlPolicyV1,
+        phase="docker_engine_control_policy_artifact",
+    )
     postgres_model, postgres_raw = _read_canonical_signed_model(
         reader,
         name=paths.postgres_control_policy_name(),
         model_type=PostgreSQLControlPolicyV1,
         phase="postgres_control_policy_artifact",
     )
+    postgres_prepared_model, postgres_prepared_raw = _read_canonical_signed_model(
+        reader,
+        name=paths.postgres_prepared_control_policy_name(),
+        model_type=PostgreSQLPreparedControlPolicyV2,
+        phase="postgres_prepared_control_policy_artifact",
+    )
     if (
         type(executor_model) is not ExecutorControlPolicyV1
+        or type(docker_model) is not DockerEngineControlPolicyV1
         or type(postgres_model) is not PostgreSQLControlPolicyV1
+        or type(postgres_prepared_model) is not PostgreSQLPreparedControlPolicyV2
     ):
         raise AuthorizationError("allocation_control_policy_artifact")
     _verify_allocation_control_policy_bindings(
         intent=intent,
         executor=executor_model,
+        docker=docker_model,
         postgres=postgres_model,
+        postgres_prepared=postgres_prepared_model,
         signer=signer,
     )
     return (
-        _AllocationControlPolicies(executor=executor_model, postgres=postgres_model),
+        _AllocationControlPolicies(
+            executor=executor_model,
+            docker=docker_model,
+            postgres=postgres_model,
+            postgres_prepared=postgres_prepared_model,
+        ),
         {
             paths.executor_control_policy_name(): executor_raw,
+            paths.docker_engine_control_policy_name(): docker_raw,
             paths.postgres_control_policy_name(): postgres_raw,
+            paths.postgres_prepared_control_policy_name(): postgres_prepared_raw,
         },
     )
 
@@ -3023,6 +3199,8 @@ def _verify_materialization_control_policy_bindings(
     allocation_intent: AllocationIntentV2,
     intent: MaterializationIntentV1,
     executor: ExecutorControlPolicyV1,
+    docker: DockerEngineControlPolicyV1,
+    postgres_prepared: PostgreSQLPreparedControlPolicyV2,
     secret_capability: SecretCapabilityPolicyV1,
     secret_handling: SecretHandlingPolicyV1,
     provider_material_attestation_sha256: str,
@@ -3031,9 +3209,13 @@ def _verify_materialization_control_policy_bindings(
     """Bind the only secret delivery sinks to one observed allocation chain."""
 
     _verify_executor_control_policy_signature(executor, signer=signer)
+    _verify_docker_engine_control_policy_signature(docker, signer=signer)
+    _verify_postgres_prepared_control_policy_signature(postgres_prepared, signer=signer)
     _verify_secret_capability_policy_signature(secret_capability, signer=signer)
     _verify_secret_handling_policy_signature(secret_handling, signer=signer)
     executor_hash = canonical_sha256(executor)
+    docker_hash = canonical_sha256(docker)
+    postgres_prepared_hash = canonical_sha256(postgres_prepared)
     secret_capability_hash = canonical_sha256(secret_capability)
     secret_handling_hash = canonical_sha256(secret_handling)
     component_image_bindings = (
@@ -3046,6 +3228,8 @@ def _verify_materialization_control_policy_bindings(
         executor.source_commit != allocation_intent.source_commit
         or executor.executor.executor_id != intent.topology.executor.executor_id
         or intent.evidence.executor_control_policy_sha256 != executor_hash
+        or intent.evidence.docker_engine_control_policy_sha256 != docker_hash
+        or intent.evidence.postgres_prepared_control_policy_sha256 != postgres_prepared_hash
         or intent.evidence.secret_capability_policy_sha256 != secret_capability_hash
         or intent.evidence.secret_handling_policy_sha256 != secret_handling_hash
         or intent.evidence.provider_material_attestation_sha256
@@ -3060,6 +3244,18 @@ def _verify_materialization_control_policy_bindings(
         or secret_handling.provider_identity_sha256 != secret_capability.provider_identity_sha256
         or secret_handling.capability_fingerprint_sha256
         != secret_capability.capability_fingerprint_sha256
+        or docker.source_commit != allocation_intent.source_commit
+        or docker.executor_identity_sha256 != canonical_sha256(executor.executor)
+        or docker_hash != allocation_intent.evidence.docker_engine_control_policy_sha256
+        or postgres_prepared.source_commit != allocation_intent.source_commit
+        or postgres_prepared.executor_identity_sha256 != canonical_sha256(executor.executor)
+        or postgres_prepared_hash
+        != allocation_intent.evidence.postgres_prepared_control_policy_sha256
+        or intent.postgres_login_transition.prepared_control_policy_sha256 != postgres_prepared_hash
+        or intent.postgres_login_transition.scram_verifier_install
+        != postgres_prepared.scram_verifier_install
+        or intent.postgres_login_transition.prepared_operation_id
+        != postgres_prepared.operations[1].operation_id
         or any(
             component.image != binding.image or component.config_sha256 != binding.config_sha256
             for component, binding in component_image_bindings
@@ -3251,8 +3447,8 @@ def _verify_start_runtime_intent_chain(
     _verify_executor_attestation_signature(
         executor_receipt,
         executor=controls.executor,
-        message=lambda item: _executor_operation_receipt_message(
-            cast(ExecutorOperationReceiptV1, item)
+        message=lambda item: _materialization_executor_receipt_message(
+            cast(MaterializationExecutorReceiptV1, item)
         ),
         phase="materialization_executor_receipt_signature",
     )
@@ -3327,6 +3523,12 @@ def _read_materialization_control_policies(
         model_type=ExecutorControlPolicyV1,
         phase="executor_control_policy_artifact",
     )
+    docker_model, docker_raw = _read_canonical_signed_model(
+        reader,
+        name=paths.docker_engine_control_policy_name(),
+        model_type=DockerEngineControlPolicyV1,
+        phase="docker_engine_control_policy_artifact",
+    )
     capability_model, capability_raw = _read_canonical_signed_model(
         reader,
         name=paths.secret_capability_policy_name(),
@@ -3344,6 +3546,12 @@ def _read_materialization_control_policies(
         name=paths.postgres_control_policy_name(),
         model_type=PostgreSQLControlPolicyV1,
         phase="postgres_control_policy_artifact",
+    )
+    postgres_prepared_model, postgres_prepared_raw = _read_canonical_signed_model(
+        reader,
+        name=paths.postgres_prepared_control_policy_name(),
+        model_type=PostgreSQLPreparedControlPolicyV2,
+        phase="postgres_prepared_control_policy_artifact",
     )
     installation_policy_model, installation_policy_raw = _read_canonical_signed_model(
         reader,
@@ -3365,7 +3573,9 @@ def _read_materialization_control_policies(
     )
     if (
         type(executor_model) is not ExecutorControlPolicyV1
+        or type(docker_model) is not DockerEngineControlPolicyV1
         or type(postgres_model) is not PostgreSQLControlPolicyV1
+        or type(postgres_prepared_model) is not PostgreSQLPreparedControlPolicyV2
         or type(installation_policy_model) is not ExecutorInstallationPolicyV1
         or type(installation_intent_model) is not ExecutorInstallationIntentV1
         or type(installation_receipt_model) is not ExecutorInstallationReceiptV1
@@ -3377,6 +3587,8 @@ def _read_materialization_control_policies(
         allocation_intent=allocation_intent,
         intent=intent,
         executor=executor_model,
+        docker=docker_model,
+        postgres_prepared=postgres_prepared_model,
         secret_capability=capability_model,
         secret_handling=handling_model,
         provider_material_attestation_sha256=provider_material_attestation_sha256,
@@ -3385,7 +3597,9 @@ def _read_materialization_control_policies(
     _verify_allocation_control_policy_bindings(
         intent=allocation_intent,
         executor=executor_model,
+        docker=docker_model,
         postgres=postgres_model,
+        postgres_prepared=postgres_prepared_model,
         signer=signer,
     )
     _verify_executor_installation_chain(
@@ -3401,7 +3615,9 @@ def _read_materialization_control_policies(
     return (
         _MaterializationControlPolicies(
             executor=executor_model,
+            docker=docker_model,
             postgres=postgres_model,
+            postgres_prepared=postgres_prepared_model,
             installation_policy=installation_policy_model,
             installation_intent=installation_intent_model,
             installation_receipt=installation_receipt_model,
@@ -3410,7 +3626,9 @@ def _read_materialization_control_policies(
         ),
         {
             paths.executor_control_policy_name(): executor_raw,
+            paths.docker_engine_control_policy_name(): docker_raw,
             paths.postgres_control_policy_name(): postgres_raw,
+            paths.postgres_prepared_control_policy_name(): postgres_prepared_raw,
             paths.executor_installation_policy_name(): installation_policy_raw,
             paths.executor_installation_intent_name(): installation_intent_raw,
             paths.executor_installation_receipt_name(): installation_receipt_raw,
@@ -7350,12 +7568,17 @@ def _validate_allocation_effect_receipt(
             observed.name != expected.name
             or observed.driver != expected.driver
             or observed.options != expected.options
+            or observed.engine_fingerprint_sha256 != resources.engine.engine_fingerprint_sha256
             for observed, expected in expected_volumes
         )
         or resources.postgres.database_name != plan.postgres.database_name
         or resources.postgres.schema_name != plan.postgres.schema_name
         or resources.postgres.owner_role != plan.postgres.owner_role
         or resources.postgres.application_role != plan.postgres.application_role
+        or resources.postgres.prepared_operation_id
+        != context.postgres_allocation_prepared_operation_id
+        or resources.postgres.prepared_operation_result_sha256
+        != context.postgres_allocation_result_projection_sha256
         or tuple(role.role for role in resources.postgres.role_oids) != plan.postgres.role_names
         or tuple((role.can_login, role.password_absent) for role in resources.postgres.role_oids)
         != ((False, True), (False, True))
@@ -7369,7 +7592,53 @@ def _validate_allocation_effect_receipt(
         )
     ):
         raise AuthorizationError("allocation_effect_receipt")
+    executor_receipt = receipt.executor_receipt
+    if (
+        receipt.executor_receipt_sha256 != canonical_sha256(executor_receipt)
+        or executor_receipt.operation_scope != context.operation_scope
+        or executor_receipt.allocation_operation_id != context.allocation_operation_id
+        or executor_receipt.allocation_intent_sha256 != context.allocation_intent_sha256
+        or executor_receipt.idempotency_key != context.idempotency_key
+        or executor_receipt.executor_id != context.executor_expectation.executor_id
+        or executor_receipt.engine_control_policy_sha256
+        != context.docker_engine_control_policy_sha256
+        or executor_receipt.postgres_prepared_control_policy_sha256
+        != context.postgres_prepared_control_policy_sha256
+        or executor_receipt.host_fingerprint_sha256
+        != context.executor_expectation.host_fingerprint_sha256
+        or executor_receipt.engine != resources.engine
+        or executor_receipt.allocated_resources_projection_sha256 != canonical_sha256(resources)
+    ):
+        raise AuthorizationError("allocation_executor_receipt")
+    _verify_context_allocation_executor_receipt(context, executor_receipt)
     return receipt
+
+
+def _verify_context_allocation_executor_receipt(
+    context: AllocationExecutionContext,
+    receipt: AllocationExecutorReceiptV1,
+) -> None:
+    """Verify allocation evidence against the pinned executor attestation key."""
+
+    valid = False
+    try:
+        if receipt.signer_key_id != context.executor_attestation_key_id:
+            raise ValueError
+        public_key = _canonical_base64(context.executor_attestation_public_key_base64)
+        if (
+            len(public_key) != 32
+            or _digest(public_key) != context.executor_attestation_public_key_fingerprint_sha256
+        ):
+            raise ValueError
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            _canonical_base64(receipt.signature_base64),
+            _allocation_executor_receipt_message(receipt),
+        )
+        valid = True
+    except (InvalidSignature, ValueError, binascii.Error):
+        valid = False
+    if not valid:
+        raise AuthorizationError("allocation_executor_receipt_signature")
 
 
 def _bootstrap_inspection_matches(
@@ -7378,20 +7647,37 @@ def _bootstrap_inspection_matches(
     """Compare explicit engine inspection fields; a template digest alone never suffices."""
 
     return (
-        inspection.entrypoint_sha256 == template.entrypoint_sha256
+        inspection.image_policy == template.image_policy
+        and inspection.entrypoint == template.entrypoint
+        and inspection.command == template.command
+        and inspection.entrypoint_sha256 == template.entrypoint_sha256
         and inspection.template_sha256 == template.template_sha256
+        and inspection.bootstrap_wrapper_sha256 == template.bootstrap_wrapper_sha256
+        and inspection.ingress_protocol_sha256 == template.ingress_protocol_sha256
+        and inspection.create_request_sha256 == template.create_request_sha256
+        and inspection.numeric_user == template.numeric_user
+        and inspection.working_directory == template.working_directory
+        and inspection.open_stdin is True
+        and inspection.stdin_once is True
+        and inspection.attach_stdin is True
+        and inspection.tty is False
         and inspection.run_as_non_root is True
         and inspection.read_only_root_filesystem is True
         and inspection.cap_drop_all is True
+        and inspection.cap_add == ()
         and inspection.no_new_privileges is True
+        and inspection.security_options == ("no-new-privileges:true",)
         and inspection.private_pid is True
+        and inspection.pid_mode == "isolated_pid_namespace_v1"
         and inspection.log_driver == template.log_driver
         and inspection.restart_policy == "no"
-        and inspection.mounts == ()
+        and inspection.mounts == template.mounts
         and inspection.docker_socket_mounted is False
         and inspection.host_network is False
+        and inspection.network_mode == "exact_isolated_network_v1"
         and inspection.publish_all_ports is False
         and inspection.port_bindings == ()
+        and inspection.labels == ()
         and inspection.network_name == template.network_name
         and inspection.network_alias == template.network_alias
         and inspection.static_ipv4 == template.static_ipv4
@@ -7402,7 +7688,7 @@ def _bootstrap_inspection_matches(
 
 def _verify_context_executor_operation_receipt(
     context: MaterializationExecutionContext,
-    receipt: ExecutorOperationReceiptV1,
+    receipt: MaterializationExecutorReceiptV1,
 ) -> None:
     """Verify executor attestation without handing an effect a mutable verifier."""
 
@@ -7418,7 +7704,7 @@ def _verify_context_executor_operation_receipt(
             raise ValueError
         Ed25519PublicKey.from_public_bytes(public_key).verify(
             _canonical_base64(receipt.signature_base64),
-            _executor_operation_receipt_message(receipt),
+            _materialization_executor_receipt_message(receipt),
         )
         valid = True
     except (InvalidSignature, ValueError, binascii.Error):
@@ -7484,6 +7770,13 @@ def _validate_materialization_effect_receipt(
         allocated.primary_network.name: allocated.primary_network.network_id,
         allocated.restore_network.name: allocated.restore_network.network_id,
     }
+    if (
+        intent.bootstrap_templates.primary_valkey.mounts[0].source_volume_name
+        != allocated.primary_cache_volume.name
+        or intent.bootstrap_templates.restore_valkey.mounts[0].source_volume_name
+        != allocated.restore_cache_volume.name
+    ):
+        raise AuthorizationError("materialization_volume_binding")
     for observed, plan, placement, template in plans:
         if (
             observed.component != plan.component
@@ -7508,6 +7801,11 @@ def _validate_materialization_effect_receipt(
         or executor_receipt.operation_scope != context.operation_scope
         or executor_receipt.operation_id != context.materialization_operation_id
         or executor_receipt.idempotency_key != context.idempotency_key
+        or executor_receipt.materialization_intent_sha256 != context.materialization_intent_sha256
+        or executor_receipt.observed_allocation_attestation_sha256
+        != context.allocation_attestation_sha256
+        or executor_receipt.docker_engine_control_policy_sha256
+        != context.docker_engine_control_policy_sha256
         or executor_receipt.executor_id != context.executor_expectation.executor_id
         or executor_receipt.host_fingerprint_sha256
         != context.executor_expectation.host_fingerprint_sha256
@@ -7539,6 +7837,10 @@ def _validate_materialization_effect_receipt(
         or transition_receipt.application_role_oid != transition.application_role_oid
         or transition_receipt.application_password_reference_sha256
         != transition.application_password_reference_sha256
+        or transition_receipt.prepared_control_policy_sha256
+        != context.postgres_prepared_control_policy_sha256
+        or transition_receipt.prepared_operation_result_sha256
+        != context.postgres_verifier_result_projection_sha256
         or transition_receipt.owner_can_login is not False
         or transition_receipt.owner_password_absent is not True
         or transition_receipt.application_can_login is not True
@@ -8392,7 +8694,9 @@ def _provision_allocation_journal(
     journal: SQLiteAllocationJournal,
     intent: AllocationIntentV2,
     executor_control_policy: ExecutorControlPolicyV1,
+    docker_engine_control_policy: DockerEngineControlPolicyV1,
     postgres_control_policy: PostgreSQLControlPolicyV1,
+    postgres_prepared_control_policy: PostgreSQLPreparedControlPolicyV2,
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
     replay_policy_artifact: ReplayAuthorityPolicyArtifactV1,
@@ -8405,7 +8709,9 @@ def _provision_allocation_journal(
         or type(journal) is not SQLiteAllocationJournal
         or type(intent) is not AllocationIntentV2
         or type(executor_control_policy) is not ExecutorControlPolicyV1
+        or type(docker_engine_control_policy) is not DockerEngineControlPolicyV1
         or type(postgres_control_policy) is not PostgreSQLControlPolicyV1
+        or type(postgres_prepared_control_policy) is not PostgreSQLPreparedControlPolicyV2
         or type(replay_policy) is not ReplayAuthorityPolicyV1
         or type(replay_policy_artifact) is not ReplayAuthorityPolicyArtifactV1
     ):
@@ -8427,10 +8733,28 @@ def _provision_allocation_journal(
             phase="postgres_control_policy_artifact",
         ),
     )
+    docker_engine_control_policy = cast(
+        DockerEngineControlPolicyV1,
+        _canonical_artifact_model(
+            docker_engine_control_policy,
+            DockerEngineControlPolicyV1,
+            phase="docker_engine_control_policy_artifact",
+        ),
+    )
+    postgres_prepared_control_policy = cast(
+        PostgreSQLPreparedControlPolicyV2,
+        _canonical_artifact_model(
+            postgres_prepared_control_policy,
+            PostgreSQLPreparedControlPolicyV2,
+            phase="postgres_prepared_control_policy_artifact",
+        ),
+    )
     _verify_allocation_control_policy_bindings(
         intent=intent,
         executor=executor_control_policy,
+        docker=docker_engine_control_policy,
         postgres=postgres_control_policy,
+        postgres_prepared=postgres_prepared_control_policy,
         signer=signer,
     )
     replay_policy = cast(
@@ -8504,11 +8828,27 @@ def _provision_allocation_journal(
             phase="executor_control_policy_artifact",
         )
         artifact_lease.write_once_or_require_exact(
+            paths.docker_engine_control_policy_name(),
+            _signed_model_artifact_bytes(
+                docker_engine_control_policy,
+                phase="docker_engine_control_policy_artifact",
+            ),
+            phase="docker_engine_control_policy_artifact",
+        )
+        artifact_lease.write_once_or_require_exact(
             paths.postgres_control_policy_name(),
             _signed_model_artifact_bytes(
                 postgres_control_policy, phase="postgres_control_policy_artifact"
             ),
             phase="postgres_control_policy_artifact",
+        )
+        artifact_lease.write_once_or_require_exact(
+            paths.postgres_prepared_control_policy_name(),
+            _signed_model_artifact_bytes(
+                postgres_prepared_control_policy,
+                phase="postgres_prepared_control_policy_artifact",
+            ),
+            phase="postgres_prepared_control_policy_artifact",
         )
         persisted_controls, persisted_control_raw = _read_allocation_control_policies(
             paths,
@@ -8518,7 +8858,9 @@ def _provision_allocation_journal(
         )
         if (
             persisted_controls.executor != executor_control_policy
+            or persisted_controls.docker != docker_engine_control_policy
             or persisted_controls.postgres != postgres_control_policy
+            or persisted_controls.postgres_prepared != postgres_prepared_control_policy
             or not hmac.compare_digest(
                 persisted_control_raw[paths.executor_control_policy_name()],
                 _signed_model_artifact_bytes(
@@ -8526,9 +8868,23 @@ def _provision_allocation_journal(
                 ),
             )
             or not hmac.compare_digest(
+                persisted_control_raw[paths.docker_engine_control_policy_name()],
+                _signed_model_artifact_bytes(
+                    docker_engine_control_policy,
+                    phase="docker_engine_control_policy_artifact",
+                ),
+            )
+            or not hmac.compare_digest(
                 persisted_control_raw[paths.postgres_control_policy_name()],
                 _signed_model_artifact_bytes(
                     postgres_control_policy, phase="postgres_control_policy_artifact"
+                ),
+            )
+            or not hmac.compare_digest(
+                persisted_control_raw[paths.postgres_prepared_control_policy_name()],
+                _signed_model_artifact_bytes(
+                    postgres_prepared_control_policy,
+                    phase="postgres_prepared_control_policy_artifact",
                 ),
             )
         ):
@@ -8594,7 +8950,9 @@ def provision_allocation_journal(
     journal: SQLiteAllocationJournal,
     intent: AllocationIntentV2,
     executor_control_policy: ExecutorControlPolicyV1,
+    docker_engine_control_policy: DockerEngineControlPolicyV1,
     postgres_control_policy: PostgreSQLControlPolicyV1,
+    postgres_prepared_control_policy: PostgreSQLPreparedControlPolicyV2,
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
     replay_policy_artifact: ReplayAuthorityPolicyArtifactV1,
@@ -8609,7 +8967,9 @@ def provision_allocation_journal(
         journal=journal,
         intent=intent,
         executor_control_policy=executor_control_policy,
+        docker_engine_control_policy=docker_engine_control_policy,
         postgres_control_policy=postgres_control_policy,
+        postgres_prepared_control_policy=postgres_prepared_control_policy,
         replay_authority=replay_authority,
         replay_policy=replay_policy,
         replay_policy_artifact=replay_policy_artifact,
@@ -8818,7 +9178,24 @@ def _run_allocation_authorization(
                 intent=verified_intent.intent,
                 provider_expectations=final_expectations,
                 executor_expectation=final_executor_expectation,
+                executor_attestation_key_id=controls.executor.executor.attestation_key_id,
+                executor_attestation_public_key_base64=(
+                    controls.executor.executor.attestation_public_key_base64
+                ),
+                executor_attestation_public_key_fingerprint_sha256=(
+                    controls.executor.executor.attestation_public_key_fingerprint_sha256
+                ),
+                docker_engine_control_policy_sha256=canonical_sha256(controls.docker),
                 postgres_control_expectation=final_postgres_expectation,
+                postgres_prepared_control_policy_sha256=canonical_sha256(
+                    controls.postgres_prepared
+                ),
+                postgres_allocation_prepared_operation_id=(
+                    controls.postgres_prepared.operations[0].operation_id
+                ),
+                postgres_allocation_result_projection_sha256=(
+                    controls.postgres_prepared.operations[0].result_projection_sha256
+                ),
                 allocation_intent_sha256=verified_intent.intent_sha256,
                 idempotency_key=_allocation_idempotency_key(
                     allocation_operation_id=verified_intent.intent.allocation_operation_id,
@@ -9387,7 +9764,14 @@ def _run_materialization_authorization(
                 executor_attestation_public_key_fingerprint_sha256=(
                     controls.executor.executor.attestation_public_key_fingerprint_sha256
                 ),
+                docker_engine_control_policy_sha256=canonical_sha256(controls.docker),
                 postgres_login_expectation=final_postgres_login_expectation,
+                postgres_prepared_control_policy_sha256=canonical_sha256(
+                    controls.postgres_prepared
+                ),
+                postgres_verifier_result_projection_sha256=(
+                    controls.postgres_prepared.operations[1].result_projection_sha256
+                ),
                 secret_material_expectation=final_secret_expectation,
                 secret_handling_policy_sha256=canonical_sha256(controls.handling),
                 secret_delivery_request=persisted_intent_model.secret_delivery_request,

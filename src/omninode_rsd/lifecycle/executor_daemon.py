@@ -40,7 +40,12 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from omninode_rsd.lifecycle.executor_transport import (
+    ExecutorAllocationTransportReceiptV1,
+    ExecutorAllocationTransportRequestV1,
     ExecutorClientHelloV2,
+    ExecutorEngineOperationKindV1,
+    ExecutorEngineOperationPlanV1,
+    ExecutorEngineOperationTargetV1,
     ExecutorHelloV2,
     ExecutorTransportArtifactPathsV2,
     ExecutorTransportError,
@@ -48,15 +53,26 @@ from omninode_rsd.lifecycle.executor_transport import (
     ExecutorTransportReceiptV2,
     ExecutorTransportRequestV2,
     VerifiedExecutorTransportArtifactsV2,
+    executor_allocation_transport_receipt_message,
+    executor_engine_operation_plan_v1,
     executor_hello_message,
     executor_transport_receipt_message,
     load_verified_executor_transport_artifacts,
     transport_delivery_binding_sha256,
+    verify_executor_allocation_transport_request,
     verify_executor_transport_request,
 )
 from omninode_rsd.lifecycle.infisical_disposable import (
+    AllocationExecutorReceiptV1,
+    EngineIdentityObservationV1,
     ExecutorIdentityV1,
+    MaterializationExecutorReceiptV1,
     SecretDeliverySlotV1,
+    StartRuntimeExecutorReceiptV2,
+    allocation_executor_receipt_message,
+    canonical_sha256,
+    materialization_executor_receipt_message,
+    start_runtime_executor_receipt_message,
 )
 from omninode_rsd.lifecycle.provider_crypto import SignerGenesisV1
 from omninode_rsd.lifecycle.transport import (
@@ -77,10 +93,11 @@ from omninode_rsd.lifecycle.transport import (
 _SHA256: Final = r"^[0-9a-f]{64}$"
 _UUID: Final = r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 _MAX_JOURNAL_BYTES: Final = 2_097_152
-_JOURNAL_SCHEMA: Final = "rsd-executor-session-journal-v2"
+_JOURNAL_SCHEMA: Final = "rsd-executor-session-journal-v5"
 _JOURNAL_SCHEMA_SHA256: Final = hashlib.sha256(_JOURNAL_SCHEMA.encode("ascii")).hexdigest()
 _HELLO_TTL: Final = timedelta(seconds=60)
 _RECOVERY_DOMAIN: Final = b"omninode-rsd.executor-recovery-receipt.ed25519.v2\x00"
+_ENGINE_OPERATION_JOURNAL_DOMAIN: Final = b"omninode-rsd.executor-engine-operations.v1\x00"
 _FRAME_HEADER: Final = struct.Struct("!4sBBII")
 _RELAY_EOF_FRAME: Final = _FRAME_HEADER.pack(FRAME_MAGIC, FRAME_VERSION, 3, 0, 0)
 _DAEMON_ENGINE_CAPABILITY: Final = object()
@@ -141,6 +158,9 @@ def _zeroize(value: bytearray) -> None:
 class ExecutorSessionStateV2(StrEnum):
     """Durable one-way session states; ambiguous states never auto-retry."""
 
+    ALLOCATION_CLAIMED = "allocation_claimed"
+    ALLOCATED = "allocated"
+    ALLOCATION_AMBIGUOUS = "allocation_ambiguous"
     MATERIALIZE_CLAIMED = "materialize_claimed"
     MATERIALIZED = "materialized"
     START_CLAIMED = "start_claimed"
@@ -149,12 +169,50 @@ class ExecutorSessionStateV2(StrEnum):
     ABANDONED = "abandoned"
 
 
+class ExecutorEngineOperationStateV1(StrEnum):
+    """One-way durable state for a filtered Engine/PostgreSQL operation."""
+
+    CLAIMED = "claimed"
+    COMPLETED = "completed"
+    AMBIGUOUS = "ambiguous"
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorEngineOperationClaimV1:
+    """Opaque value-free claim returned to the injected future backend."""
+
+    sequence: int
+    operation_kind: ExecutorEngineOperationKindV1
+    target: ExecutorEngineOperationTargetV1
+
+
+class ExecutorEngineOperationRecorder(Protocol):
+    """Bounded per-effect crash journal; raw engine data is never accepted."""
+
+    def remaining_operations(self) -> int: ...
+
+    def claim_next(self) -> ExecutorEngineOperationClaimV1: ...
+
+    def complete(
+        self,
+        claim: ExecutorEngineOperationClaimV1,
+        *,
+        filtered_projection_sha256: str,
+    ) -> None: ...
+
+    def completed_projection_sha256(self) -> str: ...
+
+
 class ExecutorRecoveryReceiptV2(_Model):
     """Typed signed operator outcome for an otherwise ambiguous session."""
 
     schema_version: Literal["rsd.executor-recovery-receipt.v2"]
     allocation_intent_sha256: str = Field(pattern=_SHA256)
-    operation_scope: Literal["materialize_and_start_runtime_v1", "start_runtime_v2"]
+    operation_scope: Literal[
+        "allocate_isolated_empty_resources_v2",
+        "materialize_and_start_runtime_v1",
+        "start_runtime_v2",
+    ]
     operation_id: str = Field(pattern=_UUID)
     request_id: str = Field(pattern=_UUID)
     journal_uuid: str = Field(pattern=_UUID)
@@ -276,12 +334,140 @@ CREATE TABLE sessions (
     session_binding_sha256 TEXT NOT NULL,
     state TEXT NOT NULL,
     delivery_binding_sha256 TEXT,
-    backend_receipt_sha256 TEXT,
+    executor_receipt_sha256 TEXT,
     recovery_receipt_sha256 TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 ) WITHOUT ROWID;
+CREATE TABLE engine_operations (
+    operation_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    operation_kind TEXT NOT NULL,
+    operation_target TEXT NOT NULL,
+    filtered_projection_sha256 TEXT,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (operation_id, sequence),
+    FOREIGN KEY (operation_id) REFERENCES sessions(operation_id)
+) WITHOUT ROWID;
 """
+
+
+def _normalized_schema_sql(value: object) -> str:
+    """Compare SQLite's durable schema text without whitespace variance."""
+
+    if type(value) is not str:
+        raise ExecutorDaemonError("session_journal")
+    return " ".join(value.split())
+
+
+_EXPECTED_JOURNAL_TABLE_SQL: Final[tuple[tuple[str, str], ...]] = (
+    (
+        "engine_operations",
+        _normalized_schema_sql(
+            """
+            CREATE TABLE engine_operations (
+                operation_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                operation_kind TEXT NOT NULL,
+                operation_target TEXT NOT NULL,
+                filtered_projection_sha256 TEXT,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (operation_id, sequence),
+                FOREIGN KEY (operation_id) REFERENCES sessions(operation_id)
+            ) WITHOUT ROWID
+            """
+        ),
+    ),
+    (
+        "metadata",
+        _normalized_schema_sql(
+            """
+            CREATE TABLE metadata (
+                singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+                schema_sha256 TEXT NOT NULL,
+                journal_id TEXT NOT NULL
+            ) WITHOUT ROWID
+            """
+        ),
+    ),
+    (
+        "sessions",
+        _normalized_schema_sql(
+            """
+            CREATE TABLE sessions (
+                operation_id TEXT PRIMARY KEY NOT NULL,
+                request_id TEXT NOT NULL UNIQUE,
+                predecessor_operation_id TEXT,
+                request_sha256 TEXT NOT NULL,
+                allocation_intent_sha256 TEXT NOT NULL,
+                operation_scope TEXT NOT NULL,
+                executor_id TEXT NOT NULL,
+                executor_policy_sha256 TEXT NOT NULL,
+                session_binding_sha256 TEXT NOT NULL,
+                state TEXT NOT NULL,
+                delivery_binding_sha256 TEXT,
+                executor_receipt_sha256 TEXT,
+                recovery_receipt_sha256 TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            ) WITHOUT ROWID
+            """
+        ),
+    ),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionRequestBinding:
+    """The common value-free replay identity accepted by the durable journal."""
+
+    operation_id: str
+    request_id: str
+    journal_uuid: str
+    allocation_intent_sha256: str
+    operation_scope: str
+    executor_id: str
+    executor_policy_sha256: str
+    session_binding_sha256: str
+    request_sha256: str
+
+
+def _session_binding(
+    request: ExecutorTransportRequestV2 | ExecutorAllocationTransportRequestV1,
+) -> _SessionRequestBinding:
+    """Normalize only already-verified requests for the local journal.
+
+    Allocation intentionally uses its own field spelling in the public wire
+    model.  The journal nevertheless keys every scope by one canonical
+    operation ID and never accepts a caller-selected SQL row shape.
+    """
+
+    if type(request) is ExecutorTransportRequestV2:
+        operation_id = request.operation_id
+    elif type(request) is ExecutorAllocationTransportRequestV1:
+        operation_id = request.allocation_operation_id
+    else:
+        raise ExecutorDaemonError("session_claim")
+    values = (
+        operation_id,
+        request.request_id,
+        request.journal_uuid,
+        request.allocation_intent_sha256,
+        request.operation_scope,
+        request.executor_id,
+        request.executor_policy_sha256,
+        request.session_binding_sha256,
+        request.metadata_sha256(),
+    )
+    if any(type(value) is not str for value in values):
+        raise ExecutorDaemonError("session_claim")
+    return _SessionRequestBinding(*values)
 
 
 def _strict_file(path: Path, *, phase: str) -> os.stat_result:
@@ -407,7 +593,7 @@ class ExecutorSessionJournal:
                 "SELECT schema_sha256, journal_id FROM metadata WHERE singleton = 1"
             ).fetchone()
             objects = connection.execute(
-                "SELECT type, name FROM sqlite_master "
+                "SELECT type, name, sql FROM sqlite_master "
                 "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
             ).fetchall()
             after = _strict_file(self._path, phase="session_journal")
@@ -416,7 +602,18 @@ class ExecutorSessionJournal:
                 row is None
                 or row[0] != _JOURNAL_SCHEMA_SHA256
                 or re_fullmatch(_UUID, row[1]) is None
-                or objects != [("table", "metadata"), ("table", "sessions")]
+                or tuple(
+                    (name, _normalized_schema_sql(sql))
+                    for object_type, name, sql in objects
+                    if object_type == "table"
+                )
+                != _EXPECTED_JOURNAL_TABLE_SQL
+                or tuple((object_type, name) for object_type, name, _ in objects)
+                != (
+                    ("table", "engine_operations"),
+                    ("table", "metadata"),
+                    ("table", "sessions"),
+                )
                 or (before.st_dev, before.st_ino, before.st_nlink)
                 != (after.st_dev, after.st_ino, after.st_nlink)
             ):
@@ -467,6 +664,265 @@ class ExecutorSessionJournal:
         except (TypeError, ValueError):
             raise ExecutorDaemonError("session_journal") from None
 
+    def engine_operation_recorder(
+        self,
+        request: ExecutorTransportRequestV2 | ExecutorAllocationTransportRequestV1,
+    ) -> ExecutorEngineOperationRecorder:
+        """Return the sole bounded checkpoint writer for one claimed effect."""
+
+        binding = _session_binding(request)
+        try:
+            plan = executor_engine_operation_plan_v1(
+                operation_scope=request.operation_scope,
+                operation_id=binding.operation_id,
+            )
+        except ExecutorTransportError:
+            raise ExecutorDaemonError("engine_operation") from None
+        if request.authorization_witness.engine_operation_plan_sha256 != plan.plan_sha256():
+            raise ExecutorDaemonError("engine_operation")
+        return _ExecutorEngineOperationRecorder(self, binding, plan)
+
+    def _claim_engine_operation(
+        self,
+        binding: _SessionRequestBinding,
+        plan: ExecutorEngineOperationPlanV1,
+    ) -> ExecutorEngineOperationClaimV1:
+        if (
+            type(plan) is not ExecutorEngineOperationPlanV1
+            or plan.operation_scope != binding.operation_scope
+            or plan.operation_id != binding.operation_id
+        ):
+            raise ExecutorDaemonError("engine_operation")
+        now = _system_utc_clock().isoformat(timespec="seconds").replace("+00:00", "Z")
+        sequence: int | None = None
+        expected_kind: ExecutorEngineOperationKindV1 | None = None
+        expected_target: ExecutorEngineOperationTargetV1 | None = None
+
+        def action(connection: sqlite3.Connection) -> None:
+            nonlocal expected_kind, expected_target, sequence
+            self._require_journal_uuid(connection, binding)
+            expected_state = (
+                ExecutorSessionStateV2.ALLOCATION_CLAIMED.value
+                if binding.operation_scope == "allocate_isolated_empty_resources_v2"
+                else ExecutorSessionStateV2.START_CLAIMED.value
+            )
+            parent = connection.execute(
+                "SELECT state FROM sessions WHERE operation_id = ? AND request_id = ?",
+                (binding.operation_id, binding.request_id),
+            ).fetchone()
+            if parent != (expected_state,):
+                raise ExecutorDaemonError("engine_operation")
+            row = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM engine_operations WHERE operation_id = ?",
+                (binding.operation_id,),
+            ).fetchone()
+            if row is None or type(row[0]) is not int:
+                raise ExecutorDaemonError("engine_operation")
+            sequence = row[0] + 1
+            if sequence > len(plan.operations):
+                raise ExecutorDaemonError("engine_operation")
+            previous = connection.execute(
+                """
+                SELECT state FROM engine_operations
+                WHERE operation_id = ? AND request_id = ? AND sequence = ?
+                """,
+                (binding.operation_id, binding.request_id, sequence - 1),
+            ).fetchone()
+            if sequence > 1 and previous != (ExecutorEngineOperationStateV1.COMPLETED.value,):
+                raise ExecutorDaemonError("engine_operation")
+            expected = plan.operations[sequence - 1]
+            expected_kind = expected.operation_kind
+            expected_target = expected.target
+            connection.execute(
+                """
+                INSERT INTO engine_operations(
+                    operation_id, request_id, sequence, operation_kind, operation_target,
+                    filtered_projection_sha256, state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                """,
+                (
+                    binding.operation_id,
+                    binding.request_id,
+                    sequence,
+                    expected.operation_kind.value,
+                    expected.target.value,
+                    ExecutorEngineOperationStateV1.CLAIMED.value,
+                    now,
+                    now,
+                ),
+            )
+
+        self._transaction(action)
+        if sequence is None or expected_kind is None or expected_target is None:
+            raise ExecutorDaemonError("engine_operation")
+        return ExecutorEngineOperationClaimV1(
+            sequence=sequence,
+            operation_kind=expected_kind,
+            target=expected_target,
+        )
+
+    def _complete_engine_operation(
+        self,
+        binding: _SessionRequestBinding,
+        plan: ExecutorEngineOperationPlanV1,
+        claim: ExecutorEngineOperationClaimV1,
+        *,
+        filtered_projection_sha256: str,
+    ) -> None:
+        if (
+            type(claim) is not ExecutorEngineOperationClaimV1
+            or type(claim.operation_kind) is not ExecutorEngineOperationKindV1
+            or type(claim.target) is not ExecutorEngineOperationTargetV1
+            or type(claim.sequence) is not int
+            or claim.sequence < 1
+            or claim.sequence > len(plan.operations)
+            or re_fullmatch(_SHA256, filtered_projection_sha256) is None
+        ):
+            raise ExecutorDaemonError("engine_operation")
+        expected = plan.operations[claim.sequence - 1]
+        if (
+            claim.operation_kind is not expected.operation_kind
+            or claim.target is not expected.target
+        ):
+            raise ExecutorDaemonError("engine_operation")
+        now = _system_utc_clock().isoformat(timespec="seconds").replace("+00:00", "Z")
+
+        def action(connection: sqlite3.Connection) -> None:
+            self._require_journal_uuid(connection, binding)
+            result = connection.execute(
+                """
+                UPDATE engine_operations
+                SET filtered_projection_sha256 = ?, state = ?, updated_at = ?
+                WHERE operation_id = ? AND request_id = ? AND sequence = ?
+                  AND operation_kind = ? AND operation_target = ? AND state = ?
+                """,
+                (
+                    filtered_projection_sha256,
+                    ExecutorEngineOperationStateV1.COMPLETED.value,
+                    now,
+                    binding.operation_id,
+                    binding.request_id,
+                    claim.sequence,
+                    claim.operation_kind.value,
+                    claim.target.value,
+                    ExecutorEngineOperationStateV1.CLAIMED.value,
+                ),
+            )
+            if result.rowcount != 1:
+                raise ExecutorDaemonError("engine_operation")
+
+        self._transaction(action)
+
+    def _completed_engine_operation_projection_sha256(
+        self,
+        binding: _SessionRequestBinding,
+        plan: ExecutorEngineOperationPlanV1,
+    ) -> str:
+        with self._lock:
+            connection = self._connection()
+            try:
+                self._require_journal_uuid(connection, binding)
+                rows = connection.execute(
+                    """
+                    SELECT sequence, operation_kind, operation_target,
+                           filtered_projection_sha256, state
+                    FROM engine_operations
+                    WHERE operation_id = ? AND request_id = ?
+                    ORDER BY sequence ASC
+                    """,
+                    (binding.operation_id, binding.request_id),
+                ).fetchall()
+            except ExecutorDaemonError:
+                raise
+            except Exception:
+                raise ExecutorDaemonError("engine_operation") from None
+            finally:
+                connection.close()
+        if len(rows) != len(plan.operations):
+            raise ExecutorDaemonError("engine_operation")
+        values: list[dict[str, object]] = []
+        for expected_sequence, (sequence, operation_kind, target, projection, state) in enumerate(
+            rows, start=1
+        ):
+            expected = plan.operations[expected_sequence - 1]
+            if (
+                type(sequence) is not int
+                or sequence != expected_sequence
+                or type(operation_kind) is not str
+                or type(target) is not str
+                or type(projection) is not str
+                or re_fullmatch(_SHA256, projection) is None
+                or state != ExecutorEngineOperationStateV1.COMPLETED.value
+            ):
+                raise ExecutorDaemonError("engine_operation")
+            try:
+                kind = ExecutorEngineOperationKindV1(operation_kind)
+                operation_target = ExecutorEngineOperationTargetV1(target)
+            except ValueError:
+                raise ExecutorDaemonError("engine_operation") from None
+            if kind is not expected.operation_kind or operation_target is not expected.target:
+                raise ExecutorDaemonError("engine_operation")
+            values.append(
+                {
+                    "sequence": sequence,
+                    "operation_kind": operation_kind,
+                    "operation_target": target,
+                    "filtered_projection_sha256": projection,
+                }
+            )
+        return _digest(
+            _ENGINE_OPERATION_JOURNAL_DOMAIN
+            + _canonical_json(
+                {
+                    "operation_id": binding.operation_id,
+                    "request_sha256": binding.request_sha256,
+                    "engine_operation_plan_sha256": plan.plan_sha256(),
+                    "operations": values,
+                }
+            )
+        )
+
+    def _remaining_engine_operations(
+        self,
+        binding: _SessionRequestBinding,
+        plan: ExecutorEngineOperationPlanV1,
+    ) -> int:
+        """Return the remaining fixed steps, rejecting a pending checkpoint gap."""
+
+        with self._lock:
+            connection = self._connection()
+            try:
+                self._require_journal_uuid(connection, binding)
+                rows = connection.execute(
+                    """
+                    SELECT sequence, operation_kind, operation_target, state
+                    FROM engine_operations
+                    WHERE operation_id = ? AND request_id = ?
+                    ORDER BY sequence ASC
+                    """,
+                    (binding.operation_id, binding.request_id),
+                ).fetchall()
+            except ExecutorDaemonError:
+                raise
+            except Exception:
+                raise ExecutorDaemonError("engine_operation") from None
+            finally:
+                connection.close()
+        if len(rows) > len(plan.operations):
+            raise ExecutorDaemonError("engine_operation")
+        for expected_sequence, (sequence, operation_kind, target, state) in enumerate(
+            rows, start=1
+        ):
+            expected = plan.operations[expected_sequence - 1]
+            if (
+                sequence != expected_sequence
+                or operation_kind != expected.operation_kind.value
+                or target != expected.target.value
+                or state != ExecutorEngineOperationStateV1.COMPLETED.value
+            ):
+                raise ExecutorDaemonError("engine_operation")
+        return len(plan.operations) - len(rows)
+
     @contextmanager
     def acquire_session_lease(self) -> Iterator[None]:
         """Hold one nonblocking OS lease through a whole effect session."""
@@ -504,13 +960,17 @@ class ExecutorSessionJournal:
             with suppress(Exception):
                 os.close(descriptor)
 
-    def claim_materialize(self, request: ExecutorTransportRequestV2) -> None:
-        if request.operation_scope != "materialize_and_start_runtime_v1":
-            raise ExecutorDaemonError("session_claim")
+    def _claim(
+        self,
+        request: ExecutorTransportRequestV2 | ExecutorAllocationTransportRequestV1,
+        *,
+        state: ExecutorSessionStateV2,
+    ) -> None:
+        binding = _session_binding(request)
         now = _system_utc_clock().isoformat(timespec="seconds").replace("+00:00", "Z")
 
         def action(connection: sqlite3.Connection) -> None:
-            self._require_journal_uuid(connection, request)
+            self._require_journal_uuid(connection, binding)
             try:
                 connection.execute(
                     """
@@ -522,15 +982,15 @@ class ExecutorSessionJournal:
                     ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        request.operation_id,
-                        request.request_id,
-                        request.metadata_sha256(),
-                        request.allocation_intent_sha256,
-                        request.operation_scope,
-                        request.executor_id,
-                        request.executor_policy_sha256,
-                        request.session_binding_sha256,
-                        ExecutorSessionStateV2.MATERIALIZE_CLAIMED.value,
+                        binding.operation_id,
+                        binding.request_id,
+                        binding.request_sha256,
+                        binding.allocation_intent_sha256,
+                        binding.operation_scope,
+                        binding.executor_id,
+                        binding.executor_policy_sha256,
+                        binding.session_binding_sha256,
+                        state.value,
                         now,
                         now,
                     ),
@@ -539,6 +999,37 @@ class ExecutorSessionJournal:
                 raise ExecutorDaemonError("session_replayed") from None
 
         self._transaction(action)
+
+    def claim_allocation(self, request: ExecutorAllocationTransportRequestV1) -> None:
+        """Durably claim one zero-chunk allocation before the injected effect."""
+
+        if (
+            type(request) is not ExecutorAllocationTransportRequestV1
+            or request.operation_scope != "allocate_isolated_empty_resources_v2"
+            or request.chunk_count != 0
+        ):
+            raise ExecutorDaemonError("session_claim")
+        self._claim(request, state=ExecutorSessionStateV2.ALLOCATION_CLAIMED)
+
+    def claim_materialize(self, request: ExecutorTransportRequestV2) -> None:
+        if request.operation_scope != "materialize_and_start_runtime_v1":
+            raise ExecutorDaemonError("session_claim")
+        self._claim(request, state=ExecutorSessionStateV2.MATERIALIZE_CLAIMED)
+
+    def mark_allocated(
+        self,
+        request: ExecutorAllocationTransportRequestV1,
+        *,
+        executor_receipt_sha256: str,
+    ) -> None:
+        if re_fullmatch(_SHA256, executor_receipt_sha256) is None:
+            raise ExecutorDaemonError("session_receipt")
+        self._transition(
+            request,
+            expected=ExecutorSessionStateV2.ALLOCATION_CLAIMED,
+            target=ExecutorSessionStateV2.ALLOCATED,
+            executor_receipt_sha256=executor_receipt_sha256,
+        )
 
     def mark_materialized(self, request: ExecutorTransportRequestV2) -> None:
         self._transition(
@@ -561,9 +1052,10 @@ class ExecutorSessionJournal:
         predecessor = request.predecessor_materialization_operation_id
         if predecessor is None:
             raise ExecutorDaemonError("session_claim")
+        binding = _session_binding(request)
 
         def action(connection: sqlite3.Connection) -> None:
-            self._require_journal_uuid(connection, request)
+            self._require_journal_uuid(connection, binding)
             previous = connection.execute(
                 "SELECT state FROM sessions WHERE operation_id = ?", (predecessor,)
             ).fetchone()
@@ -604,11 +1096,11 @@ class ExecutorSessionJournal:
         request: ExecutorTransportRequestV2,
         *,
         delivery_binding_sha256: str,
-        backend_receipt_sha256: str,
+        executor_receipt_sha256: str,
     ) -> None:
         if (
             re_fullmatch(_SHA256, delivery_binding_sha256) is None
-            or re_fullmatch(_SHA256, backend_receipt_sha256) is None
+            or re_fullmatch(_SHA256, executor_receipt_sha256) is None
         ):
             raise ExecutorDaemonError("session_receipt")
         self._transition(
@@ -616,16 +1108,47 @@ class ExecutorSessionJournal:
             expected=ExecutorSessionStateV2.START_CLAIMED,
             target=ExecutorSessionStateV2.STARTED,
             delivery_binding_sha256=delivery_binding_sha256,
-            backend_receipt_sha256=backend_receipt_sha256,
+            executor_receipt_sha256=executor_receipt_sha256,
         )
 
-    def mark_ambiguous(self, request: ExecutorTransportRequestV2) -> None:
+    def mark_ambiguous(
+        self, request: ExecutorTransportRequestV2 | ExecutorAllocationTransportRequestV1
+    ) -> None:
         """Persist an unretryable outcome after any post-claim uncertainty."""
 
+        binding = _session_binding(request)
+        if binding.operation_scope == "allocate_isolated_empty_resources_v2":
+            target = ExecutorSessionStateV2.ALLOCATION_AMBIGUOUS.value
+            allowed_states = (ExecutorSessionStateV2.ALLOCATION_CLAIMED.value,) * 3
+        elif binding.operation_scope in {
+            "materialize_and_start_runtime_v1",
+            "start_runtime_v2",
+        }:
+            target = ExecutorSessionStateV2.START_AMBIGUOUS.value
+            allowed_states = (
+                ExecutorSessionStateV2.MATERIALIZE_CLAIMED.value,
+                ExecutorSessionStateV2.MATERIALIZED.value,
+                ExecutorSessionStateV2.START_CLAIMED.value,
+            )
+        else:
+            raise ExecutorDaemonError("session_state")
         now = _system_utc_clock().isoformat(timespec="seconds").replace("+00:00", "Z")
 
         def action(connection: sqlite3.Connection) -> None:
-            self._require_journal_uuid(connection, request)
+            self._require_journal_uuid(connection, binding)
+            connection.execute(
+                """
+                UPDATE engine_operations SET state = ?, updated_at = ?
+                WHERE operation_id = ? AND request_id = ? AND state = ?
+                """,
+                (
+                    ExecutorEngineOperationStateV1.AMBIGUOUS.value,
+                    now,
+                    binding.operation_id,
+                    binding.request_id,
+                    ExecutorEngineOperationStateV1.CLAIMED.value,
+                ),
+            )
             result = connection.execute(
                 """
                 UPDATE sessions SET state = ?, updated_at = ?
@@ -633,13 +1156,11 @@ class ExecutorSessionJournal:
                   AND state IN (?, ?, ?)
                 """,
                 (
-                    ExecutorSessionStateV2.START_AMBIGUOUS.value,
+                    target,
                     now,
-                    request.operation_id,
-                    request.request_id,
-                    ExecutorSessionStateV2.MATERIALIZE_CLAIMED.value,
-                    ExecutorSessionStateV2.MATERIALIZED.value,
-                    ExecutorSessionStateV2.START_CLAIMED.value,
+                    binding.operation_id,
+                    binding.request_id,
+                    *allowed_states,
                 ),
             )
             if result.rowcount != 1:
@@ -658,6 +1179,11 @@ class ExecutorSessionJournal:
         receipt = verify_executor_recovery_receipt(receipt, artifacts=artifacts)
         now = _system_utc_clock().isoformat(timespec="seconds").replace("+00:00", "Z")
         receipt_sha256 = _digest(_canonical_json(receipt.model_dump(mode="json")))
+        ambiguous_state = (
+            ExecutorSessionStateV2.ALLOCATION_AMBIGUOUS.value
+            if receipt.operation_scope == "allocate_isolated_empty_resources_v2"
+            else ExecutorSessionStateV2.START_AMBIGUOUS.value
+        )
 
         def action(connection: sqlite3.Connection) -> None:
             journal = connection.execute(
@@ -678,7 +1204,7 @@ class ExecutorSessionJournal:
                 receipt.executor_id,
                 receipt.executor_policy_sha256,
                 receipt.session_binding_sha256,
-                ExecutorSessionStateV2.START_AMBIGUOUS.value,
+                ambiguous_state,
             )
             if journal != (receipt.journal_uuid,) or row != expected:
                 raise ExecutorDaemonError("session_recovery")
@@ -693,7 +1219,7 @@ class ExecutorSessionJournal:
                     now,
                     receipt.operation_id,
                     receipt.request_id,
-                    ExecutorSessionStateV2.START_AMBIGUOUS.value,
+                    ambiguous_state,
                 ),
             )
             if result.rowcount != 1:
@@ -703,32 +1229,33 @@ class ExecutorSessionJournal:
 
     def _transition(
         self,
-        request: ExecutorTransportRequestV2,
+        request: ExecutorTransportRequestV2 | ExecutorAllocationTransportRequestV1,
         *,
         expected: ExecutorSessionStateV2,
         target: ExecutorSessionStateV2,
         delivery_binding_sha256: str | None = None,
-        backend_receipt_sha256: str | None = None,
+        executor_receipt_sha256: str | None = None,
     ) -> None:
+        binding = _session_binding(request)
         now = _system_utc_clock().isoformat(timespec="seconds").replace("+00:00", "Z")
 
         def action(connection: sqlite3.Connection) -> None:
-            self._require_journal_uuid(connection, request)
+            self._require_journal_uuid(connection, binding)
             result = connection.execute(
                 """
                 UPDATE sessions
                 SET state = ?, delivery_binding_sha256 = COALESCE(?, delivery_binding_sha256),
-                    backend_receipt_sha256 = COALESCE(?, backend_receipt_sha256), updated_at = ?
+                    executor_receipt_sha256 = COALESCE(?, executor_receipt_sha256), updated_at = ?
                 WHERE operation_id = ? AND request_id = ? AND request_sha256 = ? AND state = ?
                 """,
                 (
                     target.value,
                     delivery_binding_sha256,
-                    backend_receipt_sha256,
+                    executor_receipt_sha256,
                     now,
-                    request.operation_id,
-                    request.request_id,
-                    request.metadata_sha256(),
+                    binding.operation_id,
+                    binding.request_id,
+                    binding.request_sha256,
                     expected.value,
                 ),
             )
@@ -740,13 +1267,51 @@ class ExecutorSessionJournal:
     @staticmethod
     def _require_journal_uuid(
         connection: sqlite3.Connection,
-        request: ExecutorTransportRequestV2,
+        request: _SessionRequestBinding,
     ) -> None:
         """Reject a cross-journal request before its replay state can change."""
 
         row = connection.execute("SELECT journal_id FROM metadata WHERE singleton = 1").fetchone()
         if row != (request.journal_uuid,):
             raise ExecutorDaemonError("session_journal")
+
+
+class _ExecutorEngineOperationRecorder:
+    """Session-bound façade that exposes no database or raw engine evidence."""
+
+    def __init__(
+        self,
+        journal: ExecutorSessionJournal,
+        binding: _SessionRequestBinding,
+        plan: ExecutorEngineOperationPlanV1,
+    ) -> None:
+        self._journal = journal
+        self._binding = binding
+        self._plan = plan
+
+    def remaining_operations(self) -> int:
+        return self._journal._remaining_engine_operations(self._binding, self._plan)
+
+    def claim_next(self) -> ExecutorEngineOperationClaimV1:
+        return self._journal._claim_engine_operation(self._binding, self._plan)
+
+    def complete(
+        self,
+        claim: ExecutorEngineOperationClaimV1,
+        *,
+        filtered_projection_sha256: str,
+    ) -> None:
+        self._journal._complete_engine_operation(
+            self._binding,
+            self._plan,
+            claim,
+            filtered_projection_sha256=filtered_projection_sha256,
+        )
+
+    def completed_projection_sha256(self) -> str:
+        return self._journal._completed_engine_operation_projection_sha256(
+            self._binding, self._plan
+        )
 
 
 def re_fullmatch(pattern: str, value: object) -> object | None:
@@ -802,16 +1367,77 @@ class ExecutorBackendContextV2:
     operation_scope: Literal["materialize_and_start_runtime_v1", "start_runtime_v2"]
     operation_id: str
     request_id: str
+    journal_uuid: str
+    allocation_intent_sha256: str
+    idempotency_key: str
+    effect_intent_sha256: str
+    predecessor_attestation_sha256: str
+    predecessor_materialization_operation_id: str | None
+    docker_engine_control_policy_sha256: str
+    postgres_prepared_control_policy_sha256: str
+    host_fingerprint_sha256: str
+    engine_fingerprint_sha256: str
+    effect_plan_sha256: str
+    artifact_chain_sha256: str
+    authorization_witness_sha256: str
+    request_nonce_sha256: str
+    channel_binding_sha256: str
+    session_binding_sha256: str
     executor_id: str
     policy_sha256: str
+    installation_receipt_sha256: str
     delivery_binding_sha256: str
+    engine_operations: ExecutorEngineOperationRecorder
+
+
+@dataclass(frozen=True, slots=True)
+class AllocationExecutorBackendContextV1:
+    """Value-free, one-shot context for the future allocation backend.
+
+    It exposes no Docker socket, raw policy artifact, SQL template, secret,
+    or replay authority.  A future allowlisted backend receives only the
+    commitments it must prove in its filtered executor receipt and a durable
+    journal identity that prevents adoption/retry after a crash.
+    """
+
+    allocation_operation_id: str
+    request_id: str
+    journal_uuid: str
+    allocation_intent_sha256: str
+    idempotency_key: str
+    executor_id: str
+    executor_policy_sha256: str
+    docker_engine_control_policy_sha256: str
+    postgres_prepared_control_policy_sha256: str
+    host_fingerprint_sha256: str
+    engine_fingerprint_sha256: str
+    allocation_plan_sha256: str
+    artifact_chain_sha256: str
+    authorization_witness_sha256: str
+    engine_operations: ExecutorEngineOperationRecorder
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorAllocationBackendEvidenceV1:
+    """Filtered backend observation that the daemon turns into an attestation.
+
+    The backend cannot select operation identity, policy hashes, or signing
+    fields.  It reports only typed engine identity and opaque projections; the
+    daemon binds and signs every remaining field under its installed
+    attestation key.
+    """
+
+    engine: EngineIdentityObservationV1
+    allocated_resources_projection_sha256: str
+    engine_operation_journal_sha256: str
+    completed_at: str
 
 
 @dataclass(frozen=True, slots=True)
 class ExecutorBackendReceiptV2:
-    """Non-secret backend evidence; concrete engine effects remain unimplemented."""
+    """Typed non-secret executor evidence; hash-only bridges are forbidden."""
 
-    backend_receipt_sha256: str
+    executor_receipt: MaterializationExecutorReceiptV1 | StartRuntimeExecutorReceiptV2
 
 
 class ExecutorMutationBackend(Protocol):
@@ -822,6 +1448,11 @@ class ExecutorMutationBackend(Protocol):
         context: ExecutorBackendContextV2,
         delivery: BoundedExecutorDelivery,
     ) -> ExecutorBackendReceiptV2: ...
+
+    def allocate_empty_resources(
+        self,
+        context: AllocationExecutorBackendContextV1,
+    ) -> ExecutorAllocationBackendEvidenceV1: ...
 
     def start(
         self,
@@ -840,6 +1471,13 @@ class NoMutationBackend:
     ) -> ExecutorBackendReceiptV2:
         del context
         delivery.zeroize()
+        raise ExecutorDaemonError("backend_unavailable")
+
+    def allocate_empty_resources(
+        self,
+        context: AllocationExecutorBackendContextV1,
+    ) -> ExecutorAllocationBackendEvidenceV1:
+        del context
         raise ExecutorDaemonError("backend_unavailable")
 
     def start(
@@ -926,6 +1564,20 @@ class ExecutorAttestationSigner(Protocol):
     def sign_hello(self, hello: ExecutorHelloV2) -> str: ...
 
     def sign_receipt(self, receipt: ExecutorTransportReceiptV2) -> str: ...
+
+    def sign_allocation_executor_receipt(self, receipt: AllocationExecutorReceiptV1) -> str: ...
+
+    def sign_allocation_transport_receipt(
+        self, receipt: ExecutorAllocationTransportReceiptV1
+    ) -> str: ...
+
+    def sign_materialization_executor_receipt(
+        self, receipt: MaterializationExecutorReceiptV1
+    ) -> str: ...
+
+    def sign_start_runtime_executor_receipt(
+        self, receipt: StartRuntimeExecutorReceiptV2
+    ) -> str: ...
 
 
 class SystemdCredentialAttestationSigner:
@@ -1051,6 +1703,22 @@ class SystemdCredentialAttestationSigner:
     def sign_receipt(self, receipt: ExecutorTransportReceiptV2) -> str:
         return self._sign(executor_transport_receipt_message(receipt))
 
+    def sign_allocation_executor_receipt(self, receipt: AllocationExecutorReceiptV1) -> str:
+        return self._sign(allocation_executor_receipt_message(receipt))
+
+    def sign_allocation_transport_receipt(
+        self, receipt: ExecutorAllocationTransportReceiptV1
+    ) -> str:
+        return self._sign(executor_allocation_transport_receipt_message(receipt))
+
+    def sign_materialization_executor_receipt(
+        self, receipt: MaterializationExecutorReceiptV1
+    ) -> str:
+        return self._sign(materialization_executor_receipt_message(receipt))
+
+    def sign_start_runtime_executor_receipt(self, receipt: StartRuntimeExecutorReceiptV2) -> str:
+        return self._sign(start_runtime_executor_receipt_message(receipt))
+
     def close(self) -> None:
         self._closed = True
         _zeroize(self._seed)
@@ -1077,6 +1745,10 @@ class ExecutorDaemonSessionEngine:
             or type(journal) is not ExecutorSessionJournal
             or not hasattr(attestation_signer, "sign_hello")
             or not hasattr(attestation_signer, "sign_receipt")
+            or not hasattr(attestation_signer, "sign_allocation_executor_receipt")
+            or not hasattr(attestation_signer, "sign_allocation_transport_receipt")
+            or not hasattr(attestation_signer, "sign_materialization_executor_receipt")
+            or not hasattr(attestation_signer, "sign_start_runtime_executor_receipt")
         ):
             raise ExecutorDaemonError("daemon_configuration")
         self._policy = policy
@@ -1142,7 +1814,7 @@ class ExecutorDaemonSessionEngine:
         sink: FrameByteWriter,
         *,
         peer_uid: int,
-    ) -> ExecutorTransportReceiptV2:
+    ) -> ExecutorTransportReceiptV2 | ExecutorAllocationTransportReceiptV1:
         """Internal fake-frame seam; installed flows use ``serve_socket`` only."""
 
         if type(peer_uid) is not int or peer_uid != self._policy.force_command_user_uid:
@@ -1155,11 +1827,260 @@ class ExecutorDaemonSessionEngine:
         finally:
             self._active.release()
 
+    def _attest_runtime_executor_receipt(
+        self,
+        request: ExecutorTransportRequestV2,
+        result: ExecutorBackendReceiptV2,
+    ) -> MaterializationExecutorReceiptV1 | StartRuntimeExecutorReceiptV2:
+        """Bind a backend's typed evidence to this exact session and sign it.
+
+        A future backend may observe only its allowlisted engine projections;
+        it cannot choose the attestation key, transport operation, or channel
+        commitments.  This replaces the former opaque backend-hash bridge.
+        """
+
+        if type(result) is not ExecutorBackendReceiptV2:
+            raise ExecutorDaemonError("backend_receipt")
+        now = _system_utc_clock()
+        inner = result.executor_receipt
+        if request.operation_scope == "materialize_and_start_runtime_v1":
+            if type(inner) is not MaterializationExecutorReceiptV1:
+                raise ExecutorDaemonError("backend_receipt")
+            try:
+                inner = MaterializationExecutorReceiptV1.model_validate_json(
+                    _canonical_json(inner.model_dump(mode="json", warnings="error"))
+                )
+            except (ValidationError, ValueError, TypeError):
+                raise ExecutorDaemonError("backend_receipt") from None
+            if (
+                inner.operation_scope != request.operation_scope
+                or inner.operation_id != request.operation_id
+                or inner.executor_id != request.executor_id
+                or inner.installation_receipt_sha256 != request.installation_receipt_sha256
+                or inner.idempotency_key != request.idempotency_key
+                or inner.materialization_intent_sha256 != request.effect_intent_sha256
+                or inner.observed_allocation_attestation_sha256
+                != request.predecessor_attestation_sha256
+                or inner.docker_engine_control_policy_sha256
+                != request.docker_engine_control_policy_sha256
+                or inner.host_fingerprint_sha256 != request.host_fingerprint_sha256
+                or inner.engine_fingerprint_sha256 != request.engine_fingerprint_sha256
+                or inner.channel_binding_sha256 != request.channel_binding_sha256
+                or inner.session_binding_sha256 != request.session_binding_sha256
+                or _timestamp(inner.completed_at) > now
+            ):
+                raise ExecutorDaemonError("backend_receipt")
+            unsigned = inner.model_copy(
+                update={
+                    "signer_key_id": self._attestation_signer.key_id,
+                    "signature_base64": base64.b64encode(b"0" * 64).decode("ascii"),
+                }
+            )
+            return unsigned.model_copy(
+                update={
+                    "signature_base64": (
+                        self._attestation_signer.sign_materialization_executor_receipt(unsigned)
+                    )
+                }
+            )
+        if type(inner) is not StartRuntimeExecutorReceiptV2:
+            raise ExecutorDaemonError("backend_receipt")
+        try:
+            start_inner = StartRuntimeExecutorReceiptV2.model_validate_json(
+                _canonical_json(inner.model_dump(mode="json", warnings="error"))
+            )
+        except (ValidationError, ValueError, TypeError):
+            raise ExecutorDaemonError("backend_receipt") from None
+        if (
+            start_inner.operation_scope != request.operation_scope
+            or start_inner.start_operation_id != request.operation_id
+            or start_inner.executor_id != request.executor_id
+            or start_inner.installation_receipt_sha256 != request.installation_receipt_sha256
+            or start_inner.idempotency_key != request.idempotency_key
+            or start_inner.start_runtime_intent_sha256 != request.effect_intent_sha256
+            or start_inner.request_nonce_sha256 != request.request_nonce_sha256
+            or start_inner.host_fingerprint_sha256 != request.host_fingerprint_sha256
+            or start_inner.engine_fingerprint_sha256 != request.engine_fingerprint_sha256
+            or start_inner.channel_binding_sha256 != request.channel_binding_sha256
+            or start_inner.session_binding_sha256 != request.session_binding_sha256
+            or _timestamp(start_inner.completed_at) > now
+        ):
+            raise ExecutorDaemonError("backend_receipt")
+        unsigned_start = start_inner.model_copy(
+            update={
+                "signer_key_id": self._attestation_signer.key_id,
+                "signature_base64": base64.b64encode(b"0" * 64).decode("ascii"),
+            }
+        )
+        return unsigned_start.model_copy(
+            update={
+                "signature_base64": self._attestation_signer.sign_start_runtime_executor_receipt(
+                    unsigned_start
+                )
+            }
+        )
+
+    def _serve_allocation_request(
+        self,
+        reader: CanonicalFrameReader,
+        request_raw: bytes,
+        *,
+        hello: ExecutorHelloV2,
+        source: FrameByteReader,
+        sink: FrameByteWriter,
+    ) -> ExecutorAllocationTransportReceiptV1:
+        """Handle one fully framed, zero-secret allocation request.
+
+        The durable claim is deliberately after frame completion and relay EOF
+        authentication, but before the injected backend is invoked.  Any
+        uncertainty after that claim becomes an explicit unretryable state.
+        """
+
+        request: ExecutorAllocationTransportRequestV1 | None = None
+        claimed_here = False
+        try:
+            request = ExecutorAllocationTransportRequestV1.model_validate_json(request_raw)
+            request = verify_executor_allocation_transport_request(
+                request,
+                signer_genesis=self._signer_genesis,
+                hello=hello,
+                policy=self._policy,
+            )
+            # This must reject a nonzero chunk count before any durable replay
+            # state or backend path is reached.
+            reader.finish()
+            if type(source) is _UnixSocketFrame:
+                _require_relay_eof_frame(source)
+                source.require_eof()
+            self._journal.claim_allocation(request)
+            claimed_here = True
+            context = AllocationExecutorBackendContextV1(
+                allocation_operation_id=request.allocation_operation_id,
+                request_id=request.request_id,
+                journal_uuid=request.journal_uuid,
+                allocation_intent_sha256=request.allocation_intent_sha256,
+                idempotency_key=request.idempotency_key,
+                executor_id=request.executor_id,
+                executor_policy_sha256=request.executor_policy_sha256,
+                docker_engine_control_policy_sha256=request.docker_engine_control_policy_sha256,
+                postgres_prepared_control_policy_sha256=(
+                    request.postgres_prepared_control_policy_sha256
+                ),
+                host_fingerprint_sha256=request.host_fingerprint_sha256,
+                engine_fingerprint_sha256=request.engine_fingerprint_sha256,
+                allocation_plan_sha256=request.allocation_plan_sha256,
+                artifact_chain_sha256=request.artifact_chain_sha256,
+                authorization_witness_sha256=_digest(
+                    _canonical_json(request.authorization_witness.model_dump(mode="json"))
+                ),
+                engine_operations=self._journal.engine_operation_recorder(request),
+            )
+            allocation_backend_failed = False
+            evidence: ExecutorAllocationBackendEvidenceV1 | None = None
+            try:
+                evidence = self._backend.allocate_empty_resources(context)
+            except Exception:
+                # Do not preserve a backend exception object: its repr, args,
+                # cause, or context may contain a value delivered to the
+                # future backend.  Raise only after the active exception has
+                # unwound so the sanitized error has no exception chain.
+                allocation_backend_failed = True
+            if allocation_backend_failed:
+                raise ExecutorDaemonError("allocation_backend")
+            if (
+                type(evidence) is not ExecutorAllocationBackendEvidenceV1
+                or type(evidence.engine) is not EngineIdentityObservationV1
+                or evidence.engine.engine_fingerprint_sha256 != request.engine_fingerprint_sha256
+                or re_fullmatch(_SHA256, evidence.allocated_resources_projection_sha256) is None
+                or re_fullmatch(_SHA256, evidence.engine_operation_journal_sha256) is None
+                or _timestamp(evidence.completed_at) > _system_utc_clock()
+                or evidence.engine_operation_journal_sha256
+                != context.engine_operations.completed_projection_sha256()
+            ):
+                raise ExecutorDaemonError("allocation_backend_receipt")
+            unsigned_inner = AllocationExecutorReceiptV1(
+                schema_version="rsd.allocation-executor-receipt.v1",
+                operation_scope="allocate_isolated_empty_resources_v2",
+                allocation_operation_id=request.allocation_operation_id,
+                allocation_intent_sha256=request.allocation_intent_sha256,
+                idempotency_key=request.idempotency_key,
+                executor_id=request.executor_id,
+                engine_control_policy_sha256=request.docker_engine_control_policy_sha256,
+                postgres_prepared_control_policy_sha256=(
+                    request.postgres_prepared_control_policy_sha256
+                ),
+                host_fingerprint_sha256=request.host_fingerprint_sha256,
+                engine=evidence.engine,
+                allocated_resources_projection_sha256=(
+                    evidence.allocated_resources_projection_sha256
+                ),
+                engine_operation_journal_sha256=evidence.engine_operation_journal_sha256,
+                completed_at=evidence.completed_at,
+                signer_key_id=self._attestation_signer.key_id,
+                signature_base64=base64.b64encode(b"0" * 64).decode("ascii"),
+            )
+            inner = unsigned_inner.model_copy(
+                update={
+                    "signature_base64": self._attestation_signer.sign_allocation_executor_receipt(
+                        unsigned_inner
+                    )
+                }
+            )
+            inner_sha256 = canonical_sha256(inner)
+            self._journal.mark_allocated(request, executor_receipt_sha256=inner_sha256)
+            unsigned_receipt = ExecutorAllocationTransportReceiptV1(
+                schema_version="rsd.executor-allocation-receipt.v1",
+                operation_scope="allocate_isolated_empty_resources_v2",
+                allocation_operation_id=request.allocation_operation_id,
+                request_id=request.request_id,
+                journal_uuid=request.journal_uuid,
+                client_nonce=request.client_nonce,
+                server_nonce=request.server_nonce,
+                session_id=request.session_id,
+                executor_id=request.executor_id,
+                executor_policy_sha256=request.executor_policy_sha256,
+                allocation_request_sha256=request.metadata_sha256(),
+                allocation_executor_receipt_sha256=inner_sha256,
+                allocation_executor_receipt=inner,
+                status="allocated",
+                completed_at=evidence.completed_at,
+                chunk_count=0,
+                signer_key_id=self._attestation_signer.key_id,
+                signature_base64=base64.b64encode(b"0" * 64).decode("ascii"),
+            )
+            receipt = unsigned_receipt.model_copy(
+                update={
+                    "signature_base64": self._attestation_signer.sign_allocation_transport_receipt(
+                        unsigned_receipt
+                    )
+                }
+            )
+            writer = CanonicalFrameWriter(sink)
+            writer.begin(_canonical_json(receipt.model_dump(mode="json")), chunk_count=0)
+            writer.finish()
+            return receipt
+        except ExecutorDaemonError:
+            if request is not None and claimed_here:
+                with suppress(ExecutorDaemonError):
+                    self._journal.mark_ambiguous(request)
+            raise
+        except (ExecutorTransportError, TransportError, ValidationError, ValueError):
+            if request is not None and claimed_here:
+                with suppress(ExecutorDaemonError):
+                    self._journal.mark_ambiguous(request)
+                raise ExecutorDaemonError("allocation_ambiguous") from None
+            raise ExecutorDaemonError("allocation_request") from None
+        except Exception:
+            if request is not None and claimed_here:
+                with suppress(ExecutorDaemonError):
+                    self._journal.mark_ambiguous(request)
+            raise ExecutorDaemonError("allocation_ambiguous") from None
+
     def _serve_held(
         self,
         source: FrameByteReader,
         sink: FrameByteWriter,
-    ) -> ExecutorTransportReceiptV2:
+    ) -> ExecutorTransportReceiptV2 | ExecutorAllocationTransportReceiptV1:
         """Perform one session while the global OS lease remains held."""
 
         request: ExecutorTransportRequestV2 | None = None
@@ -1203,6 +2124,23 @@ class ExecutorDaemonSessionEngine:
             hello_writer.finish()
             reader = CanonicalFrameReader(source)
             request_raw = reader.read_metadata()
+            try:
+                request_header = json.loads(request_raw)
+                message_kind = (
+                    request_header.get("message_kind") if type(request_header) is dict else None
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise ExecutorDaemonError("session_request") from None
+            if message_kind == "allocation":
+                return self._serve_allocation_request(
+                    reader,
+                    request_raw,
+                    hello=hello,
+                    source=source,
+                    sink=sink,
+                )
+            if message_kind not in {"materialize", "start"}:
+                raise ExecutorDaemonError("session_request")
             request = ExecutorTransportRequestV2.model_validate_json(request_raw)
             request = verify_executor_transport_request(
                 request,
@@ -1241,26 +2179,65 @@ class ExecutorDaemonSessionEngine:
                 operation_scope=request.operation_scope,
                 operation_id=request.operation_id,
                 request_id=request.request_id,
+                journal_uuid=request.journal_uuid,
+                allocation_intent_sha256=request.allocation_intent_sha256,
+                idempotency_key=request.idempotency_key,
+                effect_intent_sha256=request.effect_intent_sha256,
+                predecessor_attestation_sha256=request.predecessor_attestation_sha256,
+                predecessor_materialization_operation_id=(
+                    request.predecessor_materialization_operation_id
+                ),
+                docker_engine_control_policy_sha256=(request.docker_engine_control_policy_sha256),
+                postgres_prepared_control_policy_sha256=(
+                    request.postgres_prepared_control_policy_sha256
+                ),
+                host_fingerprint_sha256=request.host_fingerprint_sha256,
+                engine_fingerprint_sha256=request.engine_fingerprint_sha256,
+                effect_plan_sha256=request.effect_plan_sha256,
+                artifact_chain_sha256=request.artifact_chain_sha256,
+                authorization_witness_sha256=canonical_sha256(request.authorization_witness),
+                request_nonce_sha256=request.request_nonce_sha256,
+                channel_binding_sha256=request.channel_binding_sha256,
+                session_binding_sha256=request.session_binding_sha256,
                 executor_id=request.executor_id,
                 policy_sha256=request.executor_policy_sha256,
+                installation_receipt_sha256=request.installation_receipt_sha256,
                 delivery_binding_sha256=binding,
+                engine_operations=self._journal.engine_operation_recorder(request),
             )
+            backend_failed = False
+            result: ExecutorBackendReceiptV2 | None = None
             if request.operation_scope == "materialize_and_start_runtime_v1":
                 self._journal.mark_materialized(request)
                 self._journal.claim_start(request)
-                result = self._backend.materialize_and_start(context, delivery)
+                try:
+                    result = self._backend.materialize_and_start(context, delivery)
+                except Exception:
+                    backend_failed = True
             else:
-                result = self._backend.start(context, delivery)
+                try:
+                    result = self._backend.start(context, delivery)
+                except Exception:
+                    backend_failed = True
+            if backend_failed:
+                # See allocation above: this occurs outside the ``except``
+                # suite so public callers cannot traverse a secret-bearing
+                # backend error through ``__cause__`` or ``__context__``.
+                raise ExecutorDaemonError("backend_effect")
             delivery.require_consumed()
+            if type(result) is not ExecutorBackendReceiptV2:
+                raise ExecutorDaemonError("backend_receipt")
+            inner = self._attest_runtime_executor_receipt(request, result)
             if (
-                type(result) is not ExecutorBackendReceiptV2
-                or re_fullmatch(_SHA256, result.backend_receipt_sha256) is None
+                inner.engine_operation_journal_sha256
+                != context.engine_operations.completed_projection_sha256()
             ):
                 raise ExecutorDaemonError("backend_receipt")
+            inner_sha256 = canonical_sha256(inner)
             self._journal.mark_started(
                 request,
                 delivery_binding_sha256=binding,
-                backend_receipt_sha256=result.backend_receipt_sha256,
+                executor_receipt_sha256=inner_sha256,
             )
             unsigned_receipt = ExecutorTransportReceiptV2(
                 schema_version="rsd.executor-transport-receipt.v2",
@@ -1279,7 +2256,9 @@ class ExecutorDaemonSessionEngine:
                 package_sha256=request.package_sha256,
                 template_bundle_sha256=request.template_bundle_sha256,
                 delivery_binding_sha256=binding,
-                backend_receipt_sha256=result.backend_receipt_sha256,
+                authorization_witness_sha256=canonical_sha256(request.authorization_witness),
+                executor_receipt_sha256=inner_sha256,
+                executor_receipt=inner,
                 status=(
                     "materialized"
                     if request.operation_scope == "materialize_and_start_runtime_v1"
@@ -1309,6 +2288,11 @@ class ExecutorDaemonSessionEngine:
                 with suppress(ExecutorDaemonError):
                     self._journal.mark_ambiguous(request)
             raise ExecutorDaemonError("session_ambiguous") from None
+        except Exception:
+            if request is not None and claimed_here:
+                with suppress(ExecutorDaemonError):
+                    self._journal.mark_ambiguous(request)
+            raise ExecutorDaemonError("session_ambiguous") from None
         finally:
             if delivery is not None:
                 delivery.zeroize()
@@ -1316,7 +2300,9 @@ class ExecutorDaemonSessionEngine:
                 with suppress(Exception):
                     lease.release()
 
-    def serve_socket(self, connection: socket.socket) -> ExecutorTransportReceiptV2:
+    def serve_socket(
+        self, connection: socket.socket
+    ) -> ExecutorTransportReceiptV2 | ExecutorAllocationTransportReceiptV1:
         """Serve one AF_UNIX connection after obtaining its kernel peer UID."""
 
         if type(connection) is not socket.socket or connection.family != socket.AF_UNIX:
@@ -1415,7 +2401,7 @@ def _activated_listener_identity(
 def _serve_activated_listener(
     engine: ExecutorDaemonSessionEngine,
     listener: socket.socket,
-) -> ExecutorTransportReceiptV2:
+) -> ExecutorTransportReceiptV2 | ExecutorAllocationTransportReceiptV1:
     """Accept exactly one signed local connection from a systemd listener."""
 
     if type(engine) is not ExecutorDaemonSessionEngine:
@@ -1442,7 +2428,7 @@ def _serve_activated_listener(
 
 def serve_systemd_activated_session(
     engine: ExecutorDaemonSessionEngine,
-) -> ExecutorTransportReceiptV2:
+) -> ExecutorTransportReceiptV2 | ExecutorAllocationTransportReceiptV1:
     """Serve one session from the exact systemd socket-activation descriptor.
 
     A signed, separately installed executable must construct the sealed engine
@@ -1954,12 +2940,18 @@ class ForceCommandRelay:
 
 
 __all__ = [
+    "AllocationExecutorBackendContextV1",
     "BoundedExecutorDelivery",
+    "ExecutorAllocationBackendEvidenceV1",
     "ExecutorAttestationSigner",
     "ExecutorBackendContextV2",
     "ExecutorBackendReceiptV2",
     "ExecutorDaemonError",
     "ExecutorDaemonSessionEngine",
+    "ExecutorEngineOperationClaimV1",
+    "ExecutorEngineOperationKindV1",
+    "ExecutorEngineOperationRecorder",
+    "ExecutorEngineOperationStateV1",
     "ExecutorMutationBackend",
     "ExecutorRecoveryReceiptV2",
     "ExecutorSecretSink",

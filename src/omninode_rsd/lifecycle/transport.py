@@ -19,7 +19,11 @@ FRAME_MAGIC: Final[bytes] = b"ONXR"
 FRAME_VERSION: Final[int] = 1
 FRAME_HEADER_BYTES: Final[int] = 14
 MAX_TOTAL_BYTES: Final[int] = 1_048_576
-MAX_METADATA_BYTES: Final[int] = 4_096
+# A complete typed executor receipt includes four filtered container
+# inspections.  Keep the envelope strictly bounded while allowing that
+# redacted evidence to remain canonical metadata rather than being split into
+# an untyped side channel.
+MAX_METADATA_BYTES: Final[int] = 16_384
 MAX_CHUNK_BYTES: Final[int] = 65_536
 MAX_CHUNKS: Final[int] = 64
 

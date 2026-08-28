@@ -347,6 +347,30 @@ and requires the daemon to durably claim a session before accepting any chunk.
 Both ends impose one-session deadlines and aggregate frame limits; a stalled,
 partial, duplicate, or oversized stream fails closed and a fresh authorization
 is required after any delivery attempt.
+
+Allocation uses a distinct zero-chunk request and cannot carry delivery bytes.
+Every allocation, materialization, and start request carries a trusted-signer
+`RemoteEffectAuthorizationWitnessV1` binding the already-claimed external replay
+tombstone, journal, idempotency key, intent/predecessor, executor policy, host
+and Engine fingerprints, and signed plan/artifact chain. The daemon verifies
+that witness before its local claim. The witness also commits a domain-separated
+complete Engine/PostgreSQL checkpoint sequence. A future backend can request
+only the daemon-selected next kind and target, and must durably complete its
+filtered projection before a later step is available. An incomplete or
+ambiguous checkpoint cannot be adopted or retried automatically. Terminal
+allocation/materialization/start envelopes embed a separately executor-signed,
+typed filtered receipt and its canonical digest. They do not treat a raw Engine
+payload or a standalone backend-receipt hash as effect evidence. The metadata
+envelope is bounded to 16 KiB even when it carries the four filtered container
+inspections; secret chunks remain separate opaque bounded frames. The daemon
+and client verifier reject future-dated inner executor receipts.
+
+The exposed future-backend contract is deliberately narrow: it can claim and
+complete only the next signed operation with a SHA-256 of a filtered projection.
+It receives no Docker socket, raw Engine response, raw PostgreSQL result, or
+journal connection. A concrete Engine/PostgreSQL adapter remains outside this
+release and must bind these typed receipts before any live mutation.
+
 The client builds one fixed OpenSSH invocation with strict host-key checking,
 no forwarding, no interactive authentication, no control socket, and pinned
 owner-only known-hosts and identity references inherited by descriptor at exec.

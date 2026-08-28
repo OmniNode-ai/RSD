@@ -466,6 +466,41 @@ def test_request_verifier_rejects_expired_or_cross_session_metadata(
             target_processes=("postgres_application_target",),
         ),
     )
+    witness = transport.RemoteEffectAuthorizationWitnessV1(
+        schema_version="rsd.remote-effect-authorization-witness.v1",
+        operation_scope="materialize_and_start_runtime_v1",
+        operation_id=_UUIDS[0],
+        allocation_intent_sha256=policy.allocation_intent_sha256,
+        external_replay_tombstone_sha256=_H("external-tombstone"),
+        replay_policy_sha256=_H("replay-policy"),
+        executor_policy_sha256=policy.policy_sha256(),
+        journal_uuid=_UUIDS[1],
+        idempotency_key=_H("idempotency"),
+        effect_intent_sha256=_H("effect-intent"),
+        predecessor_attestation_sha256=_H("predecessor-attestation"),
+        predecessor_operation_id=None,
+        docker_engine_control_policy_sha256=_H("docker-policy"),
+        postgres_prepared_control_policy_sha256=_H("postgres-policy"),
+        host_fingerprint_sha256=_H("executor-host"),
+        engine_fingerprint_sha256=_H("engine"),
+        effect_plan_sha256=_H("effect-plan"),
+        engine_operation_plan_sha256=transport.executor_engine_operation_plan_sha256(
+            operation_scope="materialize_and_start_runtime_v1",
+            operation_id=_UUIDS[0],
+        ),
+        artifact_chain_sha256=_H("artifact-chain"),
+        issued_at="2026-08-28T12:04:59Z",
+        expires_at="2026-08-28T12:05:30Z",
+        signer_key_id="signer-1",
+        signature_base64=base64.b64encode(b"w" * 64).decode("ascii"),
+    )
+    witness = witness.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                signer_key.sign(transport.remote_effect_authorization_witness_message(witness))
+            ).decode("ascii")
+        }
+    )
     request = transport.ExecutorTransportRequestV2(
         schema_version="rsd.executor-transport-request.v2",
         message_kind="materialize",
@@ -473,6 +508,16 @@ def test_request_verifier_rejects_expired_or_cross_session_metadata(
         allocation_intent_sha256=policy.allocation_intent_sha256,
         operation_id=_UUIDS[0],
         journal_uuid=_UUIDS[1],
+        idempotency_key=witness.idempotency_key,
+        effect_intent_sha256=cast(str, witness.effect_intent_sha256),
+        predecessor_attestation_sha256=cast(str, witness.predecessor_attestation_sha256),
+        docker_engine_control_policy_sha256=witness.docker_engine_control_policy_sha256,
+        postgres_prepared_control_policy_sha256=(witness.postgres_prepared_control_policy_sha256),
+        host_fingerprint_sha256=witness.host_fingerprint_sha256,
+        engine_fingerprint_sha256=witness.engine_fingerprint_sha256,
+        effect_plan_sha256=witness.effect_plan_sha256,
+        artifact_chain_sha256=witness.artifact_chain_sha256,
+        authorization_witness=witness,
         request_id=_UUIDS[3],
         client_nonce=_UUIDS[0],
         server_nonce=_UUIDS[1],
@@ -505,7 +550,10 @@ def test_request_verifier_rejects_expired_or_cross_session_metadata(
             policy=policy,
         )
 
-    receipt = transport.ExecutorTransportReceiptV2(
+    # This deliberately malformed object exercises the verifier's strict
+    # reparse boundary: an untrusted caller cannot construct an old hash-only
+    # receipt now that runtime evidence is a required typed artifact.
+    receipt = transport.ExecutorTransportReceiptV2.model_construct(
         schema_version="rsd.executor-transport-receipt.v2",
         operation_scope=request.operation_scope,
         operation_id=request.operation_id,
@@ -522,7 +570,9 @@ def test_request_verifier_rejects_expired_or_cross_session_metadata(
         package_sha256=request.package_sha256,
         template_bundle_sha256=request.template_bundle_sha256,
         delivery_binding_sha256=_H("wrong-delivery-binding"),
-        backend_receipt_sha256=_H("backend-receipt"),
+        authorization_witness_sha256=canonical_sha256(request.authorization_witness),
+        executor_receipt_sha256=_H("backend-receipt"),
+        executor_receipt=object(),
         status="materialized",
         completed_at="2026-08-28T12:05:01Z",
         chunk_count=0,

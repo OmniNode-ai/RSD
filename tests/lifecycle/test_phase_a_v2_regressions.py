@@ -22,6 +22,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     DetachedSignatureV1,
     DisposablePreflightError,
     DisposableTransportProfile,
+    DockerEngineFilteredProjectionV1,
     EvidenceBindingsV1,
     GovernedBaselineV1,
     GovernedIdentityV1,
@@ -44,6 +45,8 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     ValkeyIdentityV1,
     canonical_sha256,
     compile_preflight,
+    docker_engine_fingerprint_sha256,
+    docker_volume_instance_fingerprint_sha256,
     main,
     proposal_sha256,
 )
@@ -53,10 +56,34 @@ _COMMIT = "a" * 40
 _HASH = "b" * 64
 _IMAGE = ImageReferenceV1(reference=f"registry.example.test/infisical@sha256:{'c' * 64}")
 _CACHE_IMAGE = ImageReferenceV1(reference=f"registry.example.test/valkey@sha256:{'d' * 64}")
+_VOLUME_ENGINE_FINGERPRINT = docker_engine_fingerprint_sha256(
+    DockerEngineFilteredProjectionV1(
+        daemon_id="phase-a-fixture-engine",
+        api_version="1.47",
+        operating_system="linux",
+        architecture="amd64",
+    )
+)
+_VOLUME_CREATED_AT = "2026-08-28T12:00:00Z"
 
 
 def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _container_identity(name: str) -> str:
+    return _digest(f"container:{name}".encode())
+
+
+def _volume_instance_fingerprint(volume: str) -> str:
+    return docker_volume_instance_fingerprint_sha256(
+        name=volume,
+        engine_fingerprint_sha256=_VOLUME_ENGINE_FINGERPRINT,
+        driver="local",
+        scope="local",
+        created_at=_VOLUME_CREATED_AT,
+        options=(),
+    )
 
 
 def _signature() -> DetachedSignatureV1:
@@ -108,9 +135,8 @@ def _service(
         service_name="infisical",
         network_name=network,
         network_id=_digest(f"network:{network}".encode()),
-        container_id=("a" if number == 31 else "b") * 64,
+        container_id=_container_identity(f"service:{number}"),
         workload_name=f"workload-{number}",
-        workload_id=_digest(f"workload:{number}".encode()),
         image=_IMAGE,
         listener_binding="isolated_network_only"
         if restore
@@ -129,10 +155,9 @@ def _cache(
         network_name=network,
         network_id=_digest(f"network:{network}".encode()),
         volume_name=volume,
-        volume_id=_digest(f"volume:{volume}".encode()),
-        container_id=marker * 64,
+        volume_instance_fingerprint_sha256=_volume_instance_fingerprint(volume),
+        container_id=_container_identity(f"valkey:{marker}"),
         workload_name=f"workload-{namespace}",
-        workload_id=_digest(f"workload:{namespace}".encode()),
         logical_namespace=namespace,
         credential_reference_sha256=reference,
         image=_CACHE_IMAGE,
@@ -214,7 +239,9 @@ def _proposal(*, tls: bool = False) -> ProposalV1:
             registry_verification_sha256="4" * 64,
             provider_declaration_sha256="5" * 64,
             executor_control_policy_sha256="6" * 64,
-            postgres_control_policy_sha256="7" * 64,
+            docker_engine_control_policy_sha256="7" * 64,
+            postgres_control_policy_sha256="8" * 64,
+            postgres_prepared_control_policy_sha256="9" * 64,
         ),
     )
 
@@ -394,19 +421,24 @@ def test_phase_a_duplicate_yaml_key_blocks_before_model_coercion(tmp_path: Path)
 def test_phase_a_candidate_rejects_shared_restore_cache_volume() -> None:
     candidate = _proposal().candidate
     raw = candidate.model_dump(mode="python")
-    raw["restore_valkey"] = candidate.primary_valkey
-    with pytest.raises(ValueError, match="all component container identities"):
+    raw["restore_valkey"] = {
+        **candidate.restore_valkey.model_dump(mode="python"),
+        "volume_name": candidate.primary_valkey.volume_name,
+        "volume_instance_fingerprint_sha256": (
+            candidate.primary_valkey.volume_instance_fingerprint_sha256
+        ),
+    }
+    with pytest.raises(ValueError, match="primary and restore Valkey storage must be distinct"):
         CandidateCompositeV1.model_validate(raw)
 
 
-@pytest.mark.parametrize("field", ("container_id", "workload_id"))
-def test_phase_a_candidate_rejects_service_cache_identity_collision(field: str) -> None:
+def test_phase_a_candidate_rejects_service_cache_identity_collision() -> None:
     candidate = _proposal().candidate
     raw = candidate.model_dump(mode="python")
     cache = candidate.primary_valkey.model_dump(mode="python")
-    cache[field] = getattr(candidate.primary_service, field)
+    cache["container_id"] = candidate.primary_service.container_id
     raw["primary_valkey"] = cache
-    with pytest.raises(ValueError, match=f"all component {field.removesuffix('_id')} identities"):
+    with pytest.raises(ValueError, match="all component container identities"):
         CandidateCompositeV1.model_validate(raw)
 
 

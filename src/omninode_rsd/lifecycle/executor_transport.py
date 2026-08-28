@@ -43,9 +43,11 @@ from omninode_rsd.lifecycle.authorization import (
     TrustedEd25519SignerV1,
 )
 from omninode_rsd.lifecycle.infisical_disposable import (
+    AllocationExecutorReceiptV1,
     AllocationIntentV2,
     ExecutorInstallationPolicyV1,
     ExecutorInstallationReceiptV1,
+    MaterializationExecutorReceiptV1,
     SecretCapabilityPolicyV1,
     SecretDeliveryReceiptV1,
     SecretDeliveryRequestV1,
@@ -53,7 +55,11 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     SecretDeliverySlotV1,
     SecretHandlingPolicyV1,
     SSHConnectionPolicyV1,
+    StartRuntimeExecutorReceiptV2,
+    allocation_executor_receipt_message,
     canonical_sha256,
+    materialization_executor_receipt_message,
+    start_runtime_executor_receipt_message,
 )
 from omninode_rsd.lifecycle.provider_crypto import (
     KeychainEd25519Signer,
@@ -64,6 +70,7 @@ from omninode_rsd.lifecycle.provider_crypto import (
     ProviderMaterialPolicyV2,
     ProviderMaterialPurpose,
     SignerGenesisV1,
+    executor_allocation_metadata_message,
     executor_transport_metadata_message,
     load_verified_provider_material_bundle,
     verify_signer_genesis,
@@ -83,6 +90,10 @@ _TIMESTAMP: Final = re.compile(
 _POLICY_DOMAIN: Final = b"omninode-rsd.executor-transport-policy.ed25519.v2\x00"
 _HELLO_DOMAIN: Final = b"omninode-rsd.executor-hello.ed25519.v2\x00"
 _RECEIPT_DOMAIN: Final = b"omninode-rsd.executor-transport-receipt.ed25519.v2\x00"
+_ALLOCATION_REQUEST_DOMAIN: Final = b"omninode-rsd.executor-allocation-request.ed25519.v1\x00"
+_ALLOCATION_RECEIPT_DOMAIN: Final = b"omninode-rsd.executor-allocation-receipt.ed25519.v1\x00"
+_REMOTE_EFFECT_WITNESS_DOMAIN: Final = b"omninode-rsd.remote-effect-witness.ed25519.v1\x00"
+_ENGINE_OPERATION_PLAN_DOMAIN: Final = b"omninode-rsd.executor-engine-operation-plan.v1\x00"
 _INSTALLATION_POLICY_DOMAIN: Final = b"omninode-rsd.executor-installation-policy.ed25519.v1\x00"
 _INSTALLATION_RECEIPT_DOMAIN: Final = b"omninode-rsd.executor-installation-receipt.ed25519.v1\x00"
 _SECRET_CAPABILITY_POLICY_DOMAIN: Final = b"omninode-rsd.secret-capability-policy.ed25519.v1\x00"
@@ -252,6 +263,7 @@ class ExecutorTransportMessageKind(StrEnum):
     """Wire operation kinds admitted by the remote daemon."""
 
     HELLO = "hello"
+    ALLOCATION = "allocation"
     MATERIALIZE = "materialize"
     START = "start"
 
@@ -427,6 +439,181 @@ class ExecutorClientHelloV2(_Model):
         return self
 
 
+class ExecutorEngineOperationKindV1(StrEnum):
+    """Closed Engine/PostgreSQL steps a future backend may checkpoint."""
+
+    NETWORK_CREATE = "network_create"
+    NETWORK_INSPECT = "network_inspect"
+    VOLUME_CREATE = "volume_create"
+    VOLUME_INSPECT = "volume_inspect"
+    POSTGRES_PREPARED_CONTROL = "postgres_prepared_control"
+    CONTAINER_CREATE = "container_create"
+    CONTAINER_INSPECT = "container_inspect"
+    CONTAINER_START = "container_start"
+    CONTAINER_ATTACH = "container_attach"
+    POSTGRES_SCRAM_VERIFIER_INSTALL = "postgres_scram_verifier_install"
+
+
+class ExecutorEngineOperationTargetV1(StrEnum):
+    """Value-free target identities for the closed checkpoint plan."""
+
+    PRIMARY_NETWORK = "primary_network"
+    RESTORE_NETWORK = "restore_network"
+    PRIMARY_CACHE_VOLUME = "primary_cache_volume"
+    RESTORE_CACHE_VOLUME = "restore_cache_volume"
+    ALLOCATION_POSTGRES = "allocation_postgres"
+    APPLICATION_POSTGRES = "application_postgres"
+    PRIMARY_INFISICAL = "primary_infisical"
+    PRIMARY_VALKEY = "primary_valkey"
+    RESTORE_INFISICAL = "restore_infisical"
+    RESTORE_VALKEY = "restore_valkey"
+
+
+class ExecutorEngineOperationStepV1(_Model):
+    """One fixed, non-secret Engine/PostgreSQL checkpoint step."""
+
+    operation_kind: ExecutorEngineOperationKindV1
+    target: ExecutorEngineOperationTargetV1
+
+
+_RUNTIME_COMPONENT_TARGETS: Final[tuple[ExecutorEngineOperationTargetV1, ...]] = (
+    ExecutorEngineOperationTargetV1.PRIMARY_INFISICAL,
+    ExecutorEngineOperationTargetV1.PRIMARY_VALKEY,
+    ExecutorEngineOperationTargetV1.RESTORE_INFISICAL,
+    ExecutorEngineOperationTargetV1.RESTORE_VALKEY,
+)
+
+
+def _expected_engine_operation_steps(
+    operation_scope: str,
+) -> tuple[ExecutorEngineOperationStepV1, ...]:
+    """Return the complete immutable operation sequence for one effect scope."""
+
+    step = ExecutorEngineOperationStepV1
+    kind = ExecutorEngineOperationKindV1
+    target = ExecutorEngineOperationTargetV1
+    if operation_scope == "allocate_isolated_empty_resources_v2":
+        return (
+            step(operation_kind=kind.NETWORK_CREATE, target=target.PRIMARY_NETWORK),
+            step(operation_kind=kind.NETWORK_INSPECT, target=target.PRIMARY_NETWORK),
+            step(operation_kind=kind.NETWORK_CREATE, target=target.RESTORE_NETWORK),
+            step(operation_kind=kind.NETWORK_INSPECT, target=target.RESTORE_NETWORK),
+            step(operation_kind=kind.VOLUME_CREATE, target=target.PRIMARY_CACHE_VOLUME),
+            step(operation_kind=kind.VOLUME_INSPECT, target=target.PRIMARY_CACHE_VOLUME),
+            step(operation_kind=kind.VOLUME_CREATE, target=target.RESTORE_CACHE_VOLUME),
+            step(operation_kind=kind.VOLUME_INSPECT, target=target.RESTORE_CACHE_VOLUME),
+            step(
+                operation_kind=kind.POSTGRES_PREPARED_CONTROL,
+                target=target.ALLOCATION_POSTGRES,
+            ),
+        )
+    if operation_scope == "materialize_and_start_runtime_v1":
+        steps: list[ExecutorEngineOperationStepV1] = [
+            step(
+                operation_kind=kind.POSTGRES_SCRAM_VERIFIER_INSTALL,
+                target=target.APPLICATION_POSTGRES,
+            )
+        ]
+        for component in _RUNTIME_COMPONENT_TARGETS:
+            steps.extend(
+                (
+                    step(operation_kind=kind.CONTAINER_CREATE, target=component),
+                    step(operation_kind=kind.CONTAINER_INSPECT, target=component),
+                    step(operation_kind=kind.CONTAINER_START, target=component),
+                    step(operation_kind=kind.CONTAINER_INSPECT, target=component),
+                    step(operation_kind=kind.CONTAINER_ATTACH, target=component),
+                    step(operation_kind=kind.CONTAINER_INSPECT, target=component),
+                )
+            )
+        return tuple(steps)
+    if operation_scope == "start_runtime_v2":
+        steps = []
+        for component in _RUNTIME_COMPONENT_TARGETS:
+            steps.extend(
+                (
+                    step(operation_kind=kind.CONTAINER_INSPECT, target=component),
+                    step(operation_kind=kind.CONTAINER_START, target=component),
+                    step(operation_kind=kind.CONTAINER_INSPECT, target=component),
+                    step(operation_kind=kind.CONTAINER_ATTACH, target=component),
+                    step(operation_kind=kind.CONTAINER_INSPECT, target=component),
+                )
+            )
+        return tuple(steps)
+    raise ValueError("engine operation scope is invalid")
+
+
+class ExecutorEngineOperationPlanV1(_Model):
+    """Signed, exact checkpoint sequence for one remote effect operation."""
+
+    schema_version: Literal["rsd.executor-engine-operation-plan.v1"]
+    operation_scope: Literal[
+        "allocate_isolated_empty_resources_v2",
+        "materialize_and_start_runtime_v1",
+        "start_runtime_v2",
+    ]
+    operation_id: str = Field(pattern=_UUID)
+    operations: tuple[ExecutorEngineOperationStepV1, ...]
+
+    @field_validator("operations", mode="before")
+    @classmethod
+    def declared_operations(cls, value: object) -> tuple[object, ...]:
+        if type(value) not in {tuple, list}:
+            raise ValueError("engine operation plan is invalid")
+        return tuple(cast(tuple[object, ...] | list[object], value))
+
+    @model_validator(mode="after")
+    def exact_closed_sequence(self) -> ExecutorEngineOperationPlanV1:
+        if self.operations != _expected_engine_operation_steps(self.operation_scope):
+            raise ValueError("engine operation plan is invalid")
+        return self
+
+    def plan_sha256(self) -> str:
+        """Return the domain-separated exact sequence commitment."""
+
+        return _digest(
+            _ENGINE_OPERATION_PLAN_DOMAIN + _canonical_json(self.model_dump(mode="json"))
+        )
+
+
+def executor_engine_operation_plan_v1(
+    *,
+    operation_scope: Literal[
+        "allocate_isolated_empty_resources_v2",
+        "materialize_and_start_runtime_v1",
+        "start_runtime_v2",
+    ],
+    operation_id: str,
+) -> ExecutorEngineOperationPlanV1:
+    """Construct the only plan permitted for one signed effect operation."""
+
+    try:
+        return ExecutorEngineOperationPlanV1(
+            schema_version="rsd.executor-engine-operation-plan.v1",
+            operation_scope=operation_scope,
+            operation_id=operation_id,
+            operations=_expected_engine_operation_steps(operation_scope),
+        )
+    except (TypeError, ValidationError, ValueError):
+        raise ExecutorTransportError("engine_operation_plan") from None
+
+
+def executor_engine_operation_plan_sha256(
+    *,
+    operation_scope: Literal[
+        "allocate_isolated_empty_resources_v2",
+        "materialize_and_start_runtime_v1",
+        "start_runtime_v2",
+    ],
+    operation_id: str,
+) -> str:
+    """Return the exact signed checkpoint-plan commitment for an operation."""
+
+    return executor_engine_operation_plan_v1(
+        operation_scope=operation_scope,
+        operation_id=operation_id,
+    ).plan_sha256()
+
+
 class ExecutorTransportRequestV2(_Model):
     """Signed value-free Start or Materialize metadata sent before any chunk."""
 
@@ -437,6 +624,16 @@ class ExecutorTransportRequestV2(_Model):
     operation_id: str = Field(pattern=_UUID)
     predecessor_materialization_operation_id: str | None = Field(default=None, pattern=_UUID)
     journal_uuid: str = Field(pattern=_UUID)
+    idempotency_key: str = Field(pattern=_SHA256)
+    effect_intent_sha256: str = Field(pattern=_SHA256)
+    predecessor_attestation_sha256: str = Field(pattern=_SHA256)
+    docker_engine_control_policy_sha256: str = Field(pattern=_SHA256)
+    postgres_prepared_control_policy_sha256: str = Field(pattern=_SHA256)
+    host_fingerprint_sha256: str = Field(pattern=_SHA256)
+    engine_fingerprint_sha256: str = Field(pattern=_SHA256)
+    effect_plan_sha256: str = Field(pattern=_SHA256)
+    artifact_chain_sha256: str = Field(pattern=_SHA256)
+    authorization_witness: RemoteEffectAuthorizationWitnessV1
     request_id: str = Field(pattern=_UUID)
     client_nonce: str = Field(pattern=_UUID)
     server_nonce: str = Field(pattern=_UUID)
@@ -482,6 +679,15 @@ class ExecutorTransportRequestV2(_Model):
             "start_runtime_v2": "start",
         }[self.operation_scope]
         bindings = (
+            self.idempotency_key,
+            self.effect_intent_sha256,
+            self.predecessor_attestation_sha256,
+            self.docker_engine_control_policy_sha256,
+            self.postgres_prepared_control_policy_sha256,
+            self.host_fingerprint_sha256,
+            self.engine_fingerprint_sha256,
+            self.effect_plan_sha256,
+            self.artifact_chain_sha256,
             self.request_nonce_sha256,
             self.channel_binding_sha256,
             self.session_binding_sha256,
@@ -503,6 +709,26 @@ class ExecutorTransportRequestV2(_Model):
             )
             or tuple(slot.purpose for slot in self.slots) != _EXPECTED_PURPOSES
             or len(set(bindings)) != len(bindings)
+            or self.authorization_witness.operation_scope != self.operation_scope
+            or self.authorization_witness.operation_id != self.operation_id
+            or self.authorization_witness.allocation_intent_sha256 != self.allocation_intent_sha256
+            or self.authorization_witness.journal_uuid != self.journal_uuid
+            or self.authorization_witness.idempotency_key != self.idempotency_key
+            or self.authorization_witness.effect_intent_sha256 != self.effect_intent_sha256
+            or self.authorization_witness.predecessor_attestation_sha256
+            != self.predecessor_attestation_sha256
+            or self.authorization_witness.predecessor_operation_id
+            != self.predecessor_materialization_operation_id
+            or self.authorization_witness.docker_engine_control_policy_sha256
+            != self.docker_engine_control_policy_sha256
+            or self.authorization_witness.postgres_prepared_control_policy_sha256
+            != self.postgres_prepared_control_policy_sha256
+            or self.authorization_witness.host_fingerprint_sha256 != self.host_fingerprint_sha256
+            or self.authorization_witness.engine_fingerprint_sha256
+            != self.engine_fingerprint_sha256
+            or self.authorization_witness.effect_plan_sha256 != self.effect_plan_sha256
+            or self.authorization_witness.artifact_chain_sha256 != self.artifact_chain_sha256
+            or _timestamp(self.expires_at) > _timestamp(self.authorization_witness.expires_at)
             or len(_canonical_base64(self.signature_base64)) != 64
         ):
             raise ValueError("executor transport request is invalid")
@@ -510,6 +736,295 @@ class ExecutorTransportRequestV2(_Model):
 
     def metadata_sha256(self) -> str:
         return _digest(_canonical_json(self.model_dump(mode="json", exclude={"signature_base64"})))
+
+
+class RemoteEffectAuthorizationWitnessV1(_Model):
+    """Trusted-signer proof that the external replay claim already succeeded.
+
+    The daemon treats this as an authorization witness, not as a bearer grant:
+    it is bound to one exact operation, signed policy/plan chain, and the
+    non-secret hash of the externally durable tombstone claim.  It contains
+    neither raw Engine data nor a secret value.
+    """
+
+    schema_version: Literal["rsd.remote-effect-authorization-witness.v1"]
+    operation_scope: Literal[
+        "allocate_isolated_empty_resources_v2",
+        "materialize_and_start_runtime_v1",
+        "start_runtime_v2",
+    ]
+    operation_id: str = Field(pattern=_UUID)
+    allocation_intent_sha256: str = Field(pattern=_SHA256)
+    external_replay_tombstone_sha256: str = Field(pattern=_SHA256)
+    replay_policy_sha256: str = Field(pattern=_SHA256)
+    executor_policy_sha256: str = Field(pattern=_SHA256)
+    journal_uuid: str = Field(pattern=_UUID)
+    idempotency_key: str = Field(pattern=_SHA256)
+    effect_intent_sha256: str | None = Field(default=None, pattern=_SHA256)
+    predecessor_attestation_sha256: str | None = Field(default=None, pattern=_SHA256)
+    predecessor_operation_id: str | None = Field(default=None, pattern=_UUID)
+    docker_engine_control_policy_sha256: str = Field(pattern=_SHA256)
+    postgres_prepared_control_policy_sha256: str = Field(pattern=_SHA256)
+    host_fingerprint_sha256: str = Field(pattern=_SHA256)
+    engine_fingerprint_sha256: str = Field(pattern=_SHA256)
+    effect_plan_sha256: str = Field(pattern=_SHA256)
+    engine_operation_plan_sha256: str = Field(pattern=_SHA256)
+    artifact_chain_sha256: str = Field(pattern=_SHA256)
+    issued_at: str
+    expires_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("issued_at", "expires_at")
+    @classmethod
+    def canonical_time(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def exact_one_shot_witness(self) -> RemoteEffectAuthorizationWitnessV1:
+        bindings = (
+            self.external_replay_tombstone_sha256,
+            self.replay_policy_sha256,
+            self.executor_policy_sha256,
+            self.idempotency_key,
+            self.docker_engine_control_policy_sha256,
+            self.postgres_prepared_control_policy_sha256,
+            self.host_fingerprint_sha256,
+            self.engine_fingerprint_sha256,
+            self.effect_plan_sha256,
+            self.engine_operation_plan_sha256,
+            self.artifact_chain_sha256,
+        )
+        runtime_scope = self.operation_scope != "allocate_isolated_empty_resources_v2"
+        has_runtime_bindings = (
+            self.effect_intent_sha256 is not None
+            and self.predecessor_attestation_sha256 is not None
+        )
+        needs_predecessor_operation = self.operation_scope == "start_runtime_v2"
+        if (
+            len(set(bindings)) != len(bindings)
+            or _timestamp(self.expires_at) <= _timestamp(self.issued_at)
+            or len(_canonical_base64(self.signature_base64)) != 64
+            or runtime_scope != has_runtime_bindings
+            or (self.predecessor_operation_id is not None) != needs_predecessor_operation
+            or self.engine_operation_plan_sha256
+            != executor_engine_operation_plan_sha256(
+                operation_scope=self.operation_scope,
+                operation_id=self.operation_id,
+            )
+        ):
+            raise ValueError("remote effect witness is invalid")
+        return self
+
+
+# ``ExecutorTransportRequestV2`` intentionally refers to this witness before
+# its declaration so the allocation and runtime envelopes retain independent
+# wire models.  Rebuild only after the closed witness model is available.
+ExecutorTransportRequestV2.model_rebuild()
+
+
+class ExecutorAllocationTransportRequestV1(_Model):
+    """A distinct zero-secret allocation request; it cannot carry slots."""
+
+    schema_version: Literal["rsd.executor-allocation-request.v1"]
+    message_kind: Literal["allocation"]
+    operation_scope: Literal["allocate_isolated_empty_resources_v2"]
+    allocation_intent_sha256: str = Field(pattern=_SHA256)
+    allocation_operation_id: str = Field(pattern=_UUID)
+    idempotency_key: str = Field(pattern=_SHA256)
+    journal_uuid: str = Field(pattern=_UUID)
+    request_id: str = Field(pattern=_UUID)
+    client_nonce: str = Field(pattern=_UUID)
+    server_nonce: str = Field(pattern=_UUID)
+    session_id: str = Field(pattern=_UUID)
+    request_nonce_sha256: str = Field(pattern=_SHA256)
+    channel_binding_sha256: str = Field(pattern=_SHA256)
+    session_binding_sha256: str = Field(pattern=_SHA256)
+    host_key_fingerprint_sha256: str = Field(pattern=_SHA256)
+    executor_id: str = Field(pattern=_IDENTIFIER)
+    executor_policy_sha256: str = Field(pattern=_SHA256)
+    package_sha256: str = Field(pattern=_SHA256)
+    template_bundle_sha256: str = Field(pattern=_SHA256)
+    installation_receipt_sha256: str = Field(pattern=_SHA256)
+    docker_engine_control_policy_sha256: str = Field(pattern=_SHA256)
+    postgres_prepared_control_policy_sha256: str = Field(pattern=_SHA256)
+    host_fingerprint_sha256: str = Field(pattern=_SHA256)
+    engine_fingerprint_sha256: str = Field(pattern=_SHA256)
+    allocation_plan_sha256: str = Field(pattern=_SHA256)
+    artifact_chain_sha256: str = Field(pattern=_SHA256)
+    authorization_witness: RemoteEffectAuthorizationWitnessV1
+    expires_at: str
+    chunk_count: Literal[0]
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("expires_at")
+    @classmethod
+    def canonical_expiry(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def zero_secret_request(self) -> ExecutorAllocationTransportRequestV1:
+        bindings = (
+            self.request_nonce_sha256,
+            self.channel_binding_sha256,
+            self.session_binding_sha256,
+            self.idempotency_key,
+            self.host_key_fingerprint_sha256,
+            self.executor_policy_sha256,
+            self.package_sha256,
+            self.template_bundle_sha256,
+            self.installation_receipt_sha256,
+            self.docker_engine_control_policy_sha256,
+            self.postgres_prepared_control_policy_sha256,
+            self.host_fingerprint_sha256,
+            self.engine_fingerprint_sha256,
+            self.allocation_plan_sha256,
+            self.artifact_chain_sha256,
+        )
+        witness = self.authorization_witness
+        if (
+            len(set(bindings)) != len(bindings)
+            or witness.operation_scope != self.operation_scope
+            or witness.operation_id != self.allocation_operation_id
+            or witness.allocation_intent_sha256 != self.allocation_intent_sha256
+            or witness.executor_policy_sha256 != self.executor_policy_sha256
+            or witness.journal_uuid != self.journal_uuid
+            or witness.idempotency_key != self.idempotency_key
+            or witness.docker_engine_control_policy_sha256
+            != self.docker_engine_control_policy_sha256
+            or witness.postgres_prepared_control_policy_sha256
+            != self.postgres_prepared_control_policy_sha256
+            or witness.host_fingerprint_sha256 != self.host_fingerprint_sha256
+            or witness.engine_fingerprint_sha256 != self.engine_fingerprint_sha256
+            or witness.effect_plan_sha256 != self.allocation_plan_sha256
+            or witness.artifact_chain_sha256 != self.artifact_chain_sha256
+            or _timestamp(self.expires_at) > _timestamp(witness.expires_at)
+            or len(_canonical_base64(self.signature_base64)) != 64
+        ):
+            raise ValueError("executor allocation request is invalid")
+        return self
+
+    def metadata_sha256(self) -> str:
+        return _digest(_canonical_json(self.model_dump(mode="json", exclude={"signature_base64"})))
+
+
+class ExecutorAllocationTransportReceiptV1(_Model):
+    """Daemon-attested typed allocation evidence, never raw Engine JSON."""
+
+    schema_version: Literal["rsd.executor-allocation-receipt.v1"]
+    operation_scope: Literal["allocate_isolated_empty_resources_v2"]
+    allocation_operation_id: str = Field(pattern=_UUID)
+    request_id: str = Field(pattern=_UUID)
+    journal_uuid: str = Field(pattern=_UUID)
+    client_nonce: str = Field(pattern=_UUID)
+    server_nonce: str = Field(pattern=_UUID)
+    session_id: str = Field(pattern=_UUID)
+    executor_id: str = Field(pattern=_IDENTIFIER)
+    executor_policy_sha256: str = Field(pattern=_SHA256)
+    allocation_request_sha256: str = Field(pattern=_SHA256)
+    allocation_executor_receipt_sha256: str = Field(pattern=_SHA256)
+    allocation_executor_receipt: AllocationExecutorReceiptV1
+    status: Literal["allocated"]
+    completed_at: str
+    chunk_count: Literal[0]
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("completed_at")
+    @classmethod
+    def canonical_completed(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def exact_typed_receipt(self) -> ExecutorAllocationTransportReceiptV1:
+        if (
+            self.allocation_executor_receipt_sha256
+            != canonical_sha256(self.allocation_executor_receipt)
+            or self.allocation_executor_receipt.allocation_operation_id
+            != self.allocation_operation_id
+            or len(_canonical_base64(self.signature_base64)) != 64
+        ):
+            raise ValueError("executor allocation receipt is invalid")
+        return self
+
+
+def remote_effect_authorization_witness_message(
+    witness: RemoteEffectAuthorizationWitnessV1,
+) -> bytes:
+    """Build the exact trusted-signer witness preimage."""
+
+    canonical = cast(
+        RemoteEffectAuthorizationWitnessV1,
+        _strict_model(witness, RemoteEffectAuthorizationWitnessV1, phase="remote_effect_witness"),
+    )
+    return _REMOTE_EFFECT_WITNESS_DOMAIN + _canonical_json(
+        canonical.model_dump(mode="json", exclude={"signature_base64"})
+    )
+
+
+def executor_allocation_transport_request_message(
+    request: ExecutorAllocationTransportRequestV1,
+) -> bytes:
+    """Build the client-signer preimage for one zero-secret allocation request."""
+
+    canonical = cast(
+        ExecutorAllocationTransportRequestV1,
+        _strict_model(request, ExecutorAllocationTransportRequestV1, phase="allocation_request"),
+    )
+    return _ALLOCATION_REQUEST_DOMAIN + _canonical_json(
+        canonical.model_dump(mode="json", exclude={"signature_base64"})
+    )
+
+
+def executor_allocation_transport_receipt_message(
+    receipt: ExecutorAllocationTransportReceiptV1,
+) -> bytes:
+    """Build the executor-attestation preimage for filtered allocation evidence."""
+
+    canonical = cast(
+        ExecutorAllocationTransportReceiptV1,
+        _strict_model(receipt, ExecutorAllocationTransportReceiptV1, phase="allocation_receipt"),
+    )
+    return _ALLOCATION_RECEIPT_DOMAIN + _canonical_json(
+        canonical.model_dump(mode="json", exclude={"signature_base64"})
+    )
+
+
+def sign_executor_allocation_transport_request(
+    request: ExecutorAllocationTransportRequestV1,
+    *,
+    signer: KeychainEd25519Signer,
+) -> ExecutorAllocationTransportRequestV1:
+    """Use the narrow Keychain capability for one zero-secret allocation.
+
+    The public signer is never asked to sign Docker, PostgreSQL, or secret
+    bytes directly.  It signs only the canonical metadata commitment under a
+    separate allocation domain.
+    """
+
+    request = cast(
+        ExecutorAllocationTransportRequestV1,
+        _strict_model(request, ExecutorAllocationTransportRequestV1, phase="allocation_request"),
+    )
+    if type(signer) is not KeychainEd25519Signer or request.signer_key_id != signer.key_id:
+        raise ExecutorTransportError("allocation_request_signature")
+    try:
+        signature = signer.sign_executor_allocation_metadata(
+            allocation_intent_sha256=request.allocation_intent_sha256,
+            allocation_operation_id=request.allocation_operation_id,
+            metadata_sha256=request.metadata_sha256(),
+        )
+        encoded = base64.b64encode(signature).decode("ascii")
+    except Exception:
+        raise ExecutorTransportError("allocation_request_signature") from None
+    try:
+        return request.model_copy(update={"signature_base64": encoded})
+    except ValidationError:
+        raise ExecutorTransportError("allocation_request_signature") from None
 
 
 def executor_transport_policy_message(policy: ExecutorTransportPolicyV2) -> bytes:
@@ -855,7 +1370,7 @@ def _verify_secret_delivery_policies(
 
 
 class ExecutorTransportReceiptV2(_Model):
-    """Redacted daemon result for one non-retryable delivery session."""
+    """Redacted daemon result with typed executor evidence, never a hash bridge."""
 
     schema_version: Literal["rsd.executor-transport-receipt.v2"]
     operation_scope: Literal["materialize_and_start_runtime_v1", "start_runtime_v2"]
@@ -873,7 +1388,9 @@ class ExecutorTransportReceiptV2(_Model):
     package_sha256: str = Field(pattern=_SHA256)
     template_bundle_sha256: str = Field(pattern=_SHA256)
     delivery_binding_sha256: str = Field(pattern=_SHA256)
-    backend_receipt_sha256: str = Field(pattern=_SHA256)
+    authorization_witness_sha256: str = Field(pattern=_SHA256)
+    executor_receipt_sha256: str = Field(pattern=_SHA256)
+    executor_receipt: MaterializationExecutorReceiptV1 | StartRuntimeExecutorReceiptV2
     status: Literal["materialized", "started"]
     completed_at: str
     chunk_count: Literal[0]
@@ -888,7 +1405,30 @@ class ExecutorTransportReceiptV2(_Model):
 
     @model_validator(mode="after")
     def canonical_receipt(self) -> ExecutorTransportReceiptV2:
-        if len(_canonical_base64(self.signature_base64)) != 64:
+        inner = self.executor_receipt
+        if self.operation_scope == "materialize_and_start_runtime_v1":
+            if (
+                type(inner) is not MaterializationExecutorReceiptV1
+                or inner.operation_scope != self.operation_scope
+                or inner.operation_id != self.operation_id
+                or inner.executor_id != self.executor_id
+                or inner.channel_binding_sha256 != self.channel_binding_sha256
+                or inner.session_binding_sha256 != self.session_binding_sha256
+            ):
+                raise ValueError("executor transport receipt is invalid")
+        elif (
+            type(inner) is not StartRuntimeExecutorReceiptV2
+            or inner.operation_scope != self.operation_scope
+            or inner.start_operation_id != self.operation_id
+            or inner.executor_id != self.executor_id
+            or inner.channel_binding_sha256 != self.channel_binding_sha256
+            or inner.session_binding_sha256 != self.session_binding_sha256
+        ):
+            raise ValueError("executor transport receipt is invalid")
+        if (
+            self.executor_receipt_sha256 != canonical_sha256(inner)
+            or len(_canonical_base64(self.signature_base64)) != 64
+        ):
             raise ValueError("executor transport receipt is invalid")
         return self
 
@@ -974,6 +1514,10 @@ def verify_executor_transport_request(
     )
     if type(signer_genesis) is not SignerGenesisV1:
         raise ExecutorTransportError("transport_request_signature")
+    witness = verify_remote_effect_authorization_witness(
+        request.authorization_witness,
+        signer_genesis=signer_genesis,
+    )
     now = _system_utc_clock()
     try:
         public_key = _canonical_base64(signer_genesis.public_key_base64)
@@ -997,12 +1541,29 @@ def verify_executor_transport_request(
             or request.template_bundle_sha256 != policy.template_bundle_sha256
             or request.host_key_fingerprint_sha256 != policy.host_key_fingerprint_sha256
             or request.installation_receipt_sha256 != policy.executor_installation_receipt_sha256
+            or request.authorization_witness != witness
+            or witness.operation_scope != request.operation_scope
+            or witness.operation_id != request.operation_id
+            or witness.journal_uuid != request.journal_uuid
+            or witness.idempotency_key != request.idempotency_key
+            or witness.effect_intent_sha256 != request.effect_intent_sha256
+            or witness.predecessor_attestation_sha256 != request.predecessor_attestation_sha256
+            or witness.predecessor_operation_id != request.predecessor_materialization_operation_id
+            or witness.docker_engine_control_policy_sha256
+            != request.docker_engine_control_policy_sha256
+            or witness.postgres_prepared_control_policy_sha256
+            != request.postgres_prepared_control_policy_sha256
+            or witness.host_fingerprint_sha256 != request.host_fingerprint_sha256
+            or witness.engine_fingerprint_sha256 != request.engine_fingerprint_sha256
+            or witness.effect_plan_sha256 != request.effect_plan_sha256
+            or witness.artifact_chain_sha256 != request.artifact_chain_sha256
             # The client must not be able to select a historical clock or an
             # unbounded future authorization.  ``expires_at`` is an expiry,
             # not a completion timestamp: it must still be live and fit in
             # the signed, one-shot session window.
             or _timestamp(request.expires_at) <= now
             or _timestamp(request.expires_at) > now + timedelta(seconds=policy.max_session_seconds)
+            or _timestamp(witness.expires_at) > now + timedelta(seconds=policy.max_session_seconds)
         ):
             raise ValueError
         Ed25519PublicKey.from_public_bytes(public_key).verify(
@@ -1017,6 +1578,182 @@ def verify_executor_transport_request(
     except (InvalidSignature, ValueError, TypeError, binascii.Error):
         raise ExecutorTransportError("transport_request_signature") from None
     return request
+
+
+def verify_remote_effect_authorization_witness(
+    witness: RemoteEffectAuthorizationWitnessV1,
+    *,
+    signer_genesis: SignerGenesisV1,
+) -> RemoteEffectAuthorizationWitnessV1:
+    """Verify the durable-replay witness before a daemon accepts an effect."""
+
+    witness = cast(
+        RemoteEffectAuthorizationWitnessV1,
+        _strict_model(witness, RemoteEffectAuthorizationWitnessV1, phase="remote_effect_witness"),
+    )
+    if type(signer_genesis) is not SignerGenesisV1:
+        raise ExecutorTransportError("remote_effect_witness")
+    now = _system_utc_clock()
+    try:
+        public_key = _canonical_base64(signer_genesis.public_key_base64)
+        if (
+            len(public_key) != 32
+            or _digest(public_key) != signer_genesis.public_key_fingerprint_sha256
+            or witness.signer_key_id != signer_genesis.key_id
+            or witness.allocation_intent_sha256 != signer_genesis.allocation_intent_sha256
+            or _timestamp(witness.issued_at) > now
+            or _timestamp(witness.expires_at) <= now
+        ):
+            raise ValueError
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            _canonical_base64(witness.signature_base64),
+            remote_effect_authorization_witness_message(witness),
+        )
+    except (InvalidSignature, ValueError, TypeError, binascii.Error):
+        raise ExecutorTransportError("remote_effect_witness") from None
+    return witness
+
+
+def verify_executor_allocation_transport_request(
+    request: ExecutorAllocationTransportRequestV1,
+    *,
+    signer_genesis: SignerGenesisV1,
+    hello: ExecutorHelloV2,
+    policy: ExecutorTransportPolicyV2,
+) -> ExecutorAllocationTransportRequestV1:
+    """Verify zero-chunk allocation metadata and its replay witness together."""
+
+    request = cast(
+        ExecutorAllocationTransportRequestV1,
+        _strict_model(request, ExecutorAllocationTransportRequestV1, phase="allocation_request"),
+    )
+    hello = cast(ExecutorHelloV2, _strict_model(hello, ExecutorHelloV2, phase="hello"))
+    policy = cast(
+        ExecutorTransportPolicyV2,
+        _strict_model(policy, ExecutorTransportPolicyV2, phase="transport_policy"),
+    )
+    witness = verify_remote_effect_authorization_witness(
+        request.authorization_witness, signer_genesis=signer_genesis
+    )
+    now = _system_utc_clock()
+    try:
+        public_key = _canonical_base64(signer_genesis.public_key_base64)
+        if (
+            len(public_key) != 32
+            or _digest(public_key) != signer_genesis.public_key_fingerprint_sha256
+            or request.signer_key_id != signer_genesis.key_id
+            or request.allocation_intent_sha256 != signer_genesis.allocation_intent_sha256
+            or request.allocation_intent_sha256 != hello.allocation_intent_sha256
+            or request.executor_id != hello.executor_id
+            or request.executor_id != policy.executor_id
+            or request.server_nonce != hello.server_nonce
+            or request.client_nonce != hello.client_nonce
+            or request.session_id != hello.session_id
+            or request.request_id != hello.request_id
+            or request.executor_policy_sha256 != hello.executor_policy_sha256
+            or request.executor_policy_sha256 != policy.policy_sha256()
+            or request.package_sha256 != hello.package_sha256
+            or request.package_sha256 != policy.package_sha256
+            or request.template_bundle_sha256 != hello.template_bundle_sha256
+            or request.template_bundle_sha256 != policy.template_bundle_sha256
+            or request.host_key_fingerprint_sha256 != policy.host_key_fingerprint_sha256
+            or request.installation_receipt_sha256 != policy.executor_installation_receipt_sha256
+            or request.authorization_witness != witness
+            or witness.operation_scope != request.operation_scope
+            or witness.operation_id != request.allocation_operation_id
+            or witness.journal_uuid != request.journal_uuid
+            or witness.idempotency_key != request.idempotency_key
+            or witness.docker_engine_control_policy_sha256
+            != request.docker_engine_control_policy_sha256
+            or witness.postgres_prepared_control_policy_sha256
+            != request.postgres_prepared_control_policy_sha256
+            or witness.host_fingerprint_sha256 != request.host_fingerprint_sha256
+            or witness.engine_fingerprint_sha256 != request.engine_fingerprint_sha256
+            or witness.effect_plan_sha256 != request.allocation_plan_sha256
+            or witness.artifact_chain_sha256 != request.artifact_chain_sha256
+            or _timestamp(request.expires_at) <= now
+            or _timestamp(request.expires_at) > now + timedelta(seconds=policy.max_session_seconds)
+            or _timestamp(witness.expires_at) > now + timedelta(seconds=policy.max_session_seconds)
+        ):
+            raise ValueError
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            _canonical_base64(request.signature_base64),
+            executor_allocation_metadata_message(
+                allocation_intent_sha256=request.allocation_intent_sha256,
+                allocation_operation_id=request.allocation_operation_id,
+                metadata_sha256=request.metadata_sha256(),
+            ),
+        )
+    except (InvalidSignature, ValueError, TypeError, binascii.Error):
+        raise ExecutorTransportError("allocation_request_signature") from None
+    return request
+
+
+def verify_executor_allocation_transport_receipt(
+    receipt: ExecutorAllocationTransportReceiptV1,
+    *,
+    request: ExecutorAllocationTransportRequestV1,
+    policy: ExecutorTransportPolicyV2,
+    attestation_public_key_base64: str,
+    attestation_key_id: str,
+) -> ExecutorAllocationTransportReceiptV1:
+    """Verify typed filtered allocation evidence against its one request."""
+
+    receipt = cast(
+        ExecutorAllocationTransportReceiptV1,
+        _strict_model(receipt, ExecutorAllocationTransportReceiptV1, phase="allocation_receipt"),
+    )
+    request = cast(
+        ExecutorAllocationTransportRequestV1,
+        _strict_model(request, ExecutorAllocationTransportRequestV1, phase="allocation_request"),
+    )
+    policy = cast(
+        ExecutorTransportPolicyV2,
+        _strict_model(policy, ExecutorTransportPolicyV2, phase="transport_policy"),
+    )
+    try:
+        public_key = _canonical_base64(attestation_public_key_base64)
+        if (
+            len(public_key) != 32
+            or receipt.signer_key_id != attestation_key_id
+            or receipt.allocation_operation_id != request.allocation_operation_id
+            or receipt.request_id != request.request_id
+            or receipt.journal_uuid != request.journal_uuid
+            or receipt.client_nonce != request.client_nonce
+            or receipt.server_nonce != request.server_nonce
+            or receipt.session_id != request.session_id
+            or receipt.executor_id != policy.executor_id
+            or receipt.executor_policy_sha256 != policy.policy_sha256()
+            or receipt.allocation_request_sha256 != request.metadata_sha256()
+            or receipt.allocation_executor_receipt.operation_scope != request.operation_scope
+            or receipt.allocation_executor_receipt.allocation_intent_sha256
+            != request.allocation_intent_sha256
+            or receipt.allocation_executor_receipt.idempotency_key != request.idempotency_key
+            or receipt.allocation_executor_receipt.signer_key_id != attestation_key_id
+            or receipt.allocation_executor_receipt.executor_id != request.executor_id
+            or receipt.allocation_executor_receipt.engine_control_policy_sha256
+            != request.docker_engine_control_policy_sha256
+            or receipt.allocation_executor_receipt.postgres_prepared_control_policy_sha256
+            != request.postgres_prepared_control_policy_sha256
+            or receipt.allocation_executor_receipt.host_fingerprint_sha256
+            != request.host_fingerprint_sha256
+            or receipt.allocation_executor_receipt.engine.engine_fingerprint_sha256
+            != request.engine_fingerprint_sha256
+            or _timestamp(receipt.completed_at) > _system_utc_clock()
+            or _timestamp(receipt.allocation_executor_receipt.completed_at) > _system_utc_clock()
+        ):
+            raise ValueError
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            _canonical_base64(receipt.allocation_executor_receipt.signature_base64),
+            allocation_executor_receipt_message(receipt.allocation_executor_receipt),
+        )
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            _canonical_base64(receipt.signature_base64),
+            executor_allocation_transport_receipt_message(receipt),
+        )
+    except (InvalidSignature, ValueError, TypeError, binascii.Error):
+        raise ExecutorTransportError("allocation_receipt") from None
+    return receipt
 
 
 def verify_executor_hello(
@@ -1102,10 +1839,55 @@ def verify_executor_transport_receipt(
             or receipt.package_sha256 != policy.package_sha256
             or receipt.template_bundle_sha256 != policy.template_bundle_sha256
             or receipt.delivery_binding_sha256 != transport_delivery_binding_sha256(request)
+            or receipt.authorization_witness_sha256
+            != canonical_sha256(request.authorization_witness)
             or receipt.status != expected_status
+            or receipt.executor_receipt.signer_key_id != attestation_key_id
             or _timestamp(receipt.completed_at) > _system_utc_clock()
         ):
             raise ValueError
+        if request.operation_scope == "materialize_and_start_runtime_v1":
+            if type(receipt.executor_receipt) is not MaterializationExecutorReceiptV1:
+                raise ValueError
+            if (
+                receipt.executor_receipt.installation_receipt_sha256
+                != request.installation_receipt_sha256
+                or receipt.executor_receipt.idempotency_key != request.idempotency_key
+                or receipt.executor_receipt.materialization_intent_sha256
+                != request.effect_intent_sha256
+                or receipt.executor_receipt.observed_allocation_attestation_sha256
+                != request.predecessor_attestation_sha256
+                or receipt.executor_receipt.docker_engine_control_policy_sha256
+                != request.docker_engine_control_policy_sha256
+                or receipt.executor_receipt.host_fingerprint_sha256
+                != request.host_fingerprint_sha256
+                or receipt.executor_receipt.engine_fingerprint_sha256
+                != request.engine_fingerprint_sha256
+                or _timestamp(receipt.executor_receipt.completed_at) > _system_utc_clock()
+            ):
+                raise ValueError
+            inner_message = materialization_executor_receipt_message(receipt.executor_receipt)
+        else:
+            if type(receipt.executor_receipt) is not StartRuntimeExecutorReceiptV2:
+                raise ValueError
+            if (
+                receipt.executor_receipt.installation_receipt_sha256
+                != request.installation_receipt_sha256
+                or receipt.executor_receipt.idempotency_key != request.idempotency_key
+                or receipt.executor_receipt.start_runtime_intent_sha256
+                != request.effect_intent_sha256
+                or receipt.executor_receipt.request_nonce_sha256 != request.request_nonce_sha256
+                or receipt.executor_receipt.host_fingerprint_sha256
+                != request.host_fingerprint_sha256
+                or receipt.executor_receipt.engine_fingerprint_sha256
+                != request.engine_fingerprint_sha256
+                or _timestamp(receipt.executor_receipt.completed_at) > _system_utc_clock()
+            ):
+                raise ValueError
+            inner_message = start_runtime_executor_receipt_message(receipt.executor_receipt)
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            _canonical_base64(receipt.executor_receipt.signature_base64), inner_message
+        )
         Ed25519PublicKey.from_public_bytes(public_key).verify(
             _canonical_base64(receipt.signature_base64),
             executor_transport_receipt_message(receipt),
@@ -1128,6 +1910,7 @@ def request_from_delivery(
     executor_id: str,
     policy: ExecutorTransportPolicyV2,
     predecessor_materialization_operation_id: str | None,
+    authorization_witness: RemoteEffectAuthorizationWitnessV1,
     expires_at: str,
     signer_key_id: str,
     signature_base64: str,
@@ -1135,6 +1918,22 @@ def request_from_delivery(
     """Construct exact metadata from an already validated delivery request."""
 
     if type(request) is not SecretDeliveryRequestV1:
+        raise ExecutorTransportError("transport_request")
+    witness = cast(
+        RemoteEffectAuthorizationWitnessV1,
+        _strict_model(
+            authorization_witness,
+            RemoteEffectAuthorizationWitnessV1,
+            phase="remote_effect_witness",
+        ),
+    )
+    if (
+        witness.operation_scope != request.operation_scope
+        or witness.operation_id != request.operation_id
+        or witness.journal_uuid != request.journal_uuid
+        or witness.effect_intent_sha256 is None
+        or witness.predecessor_attestation_sha256 is None
+    ):
         raise ExecutorTransportError("transport_request")
     return ExecutorTransportRequestV2(
         schema_version="rsd.executor-transport-request.v2",
@@ -1144,6 +1943,16 @@ def request_from_delivery(
         operation_id=request.operation_id,
         predecessor_materialization_operation_id=predecessor_materialization_operation_id,
         journal_uuid=request.journal_uuid,
+        idempotency_key=witness.idempotency_key,
+        effect_intent_sha256=witness.effect_intent_sha256,
+        predecessor_attestation_sha256=witness.predecessor_attestation_sha256,
+        docker_engine_control_policy_sha256=witness.docker_engine_control_policy_sha256,
+        postgres_prepared_control_policy_sha256=(witness.postgres_prepared_control_policy_sha256),
+        host_fingerprint_sha256=witness.host_fingerprint_sha256,
+        engine_fingerprint_sha256=witness.engine_fingerprint_sha256,
+        effect_plan_sha256=witness.effect_plan_sha256,
+        artifact_chain_sha256=witness.artifact_chain_sha256,
+        authorization_witness=witness,
         request_id=request_id,
         client_nonce=client_nonce,
         server_nonce=server_nonce,
@@ -2129,6 +2938,89 @@ class RemoteExecutorTransportClient:
         except (TransportError, ValidationError, ValueError):
             raise ExecutorTransportError("transport_delivery_ambiguous") from None
 
+    def allocate(
+        self,
+        request: ExecutorAllocationTransportRequestV1,
+    ) -> ExecutorAllocationTransportReceiptV1:
+        """Submit exactly one zero-secret allocation request.
+
+        This API deliberately has no material lease, slot writer, or raw
+        payload parameter.  Once signed allocation metadata begins writing to
+        the authenticated channel, every failure is terminally ambiguous: the
+        daemon may have claimed its durable operation journal already.
+        """
+
+        request_started = False
+        try:
+            with self._client.open() as session:
+                request = cast(
+                    ExecutorAllocationTransportRequestV1,
+                    _strict_model(
+                        request,
+                        ExecutorAllocationTransportRequestV1,
+                        phase="allocation_request",
+                    ),
+                )
+                client_hello = ExecutorClientHelloV2(
+                    schema_version="rsd.executor-client-hello.v2",
+                    allocation_intent_sha256=request.allocation_intent_sha256,
+                    client_nonce=request.client_nonce,
+                    session_id=request.session_id,
+                    request_id=request.request_id,
+                    executor_id=request.executor_id,
+                    executor_policy_sha256=request.executor_policy_sha256,
+                    chunk_count=0,
+                )
+                hello_writer = CanonicalFrameWriter(session)
+                hello_writer.begin(
+                    _canonical_json(client_hello.model_dump(mode="json")),
+                    chunk_count=0,
+                )
+                hello_writer.finish()
+                raw_hello = read_raw_transport(session, require_eof=False)
+                hello = ExecutorHelloV2.model_validate_json(raw_hello.metadata_bytes)
+                hello = verify_executor_hello(
+                    hello,
+                    policy=self._policy,
+                    attestation_public_key_base64=self._artifacts.attestation_public_key_base64,
+                    attestation_key_id=self._artifacts.attestation_key_id,
+                )
+                request = verify_executor_allocation_transport_request(
+                    request,
+                    signer_genesis=self._artifacts.signer_genesis,
+                    hello=hello,
+                    policy=self._policy,
+                )
+                request_started = True
+                writer = CanonicalFrameWriter(session)
+                writer.begin(
+                    _canonical_json(request.model_dump(mode="json")),
+                    chunk_count=0,
+                )
+                writer.finish()
+                session.close_input()
+                raw_receipt = read_raw_transport(session)
+                if raw_receipt.chunks:
+                    raise ExecutorTransportError("allocation_receipt")
+                receipt = ExecutorAllocationTransportReceiptV1.model_validate_json(
+                    raw_receipt.metadata_bytes
+                )
+                return verify_executor_allocation_transport_receipt(
+                    receipt,
+                    request=request,
+                    policy=self._policy,
+                    attestation_public_key_base64=self._artifacts.attestation_public_key_base64,
+                    attestation_key_id=self._artifacts.attestation_key_id,
+                )
+        except ExecutorTransportError as error:
+            if request_started:
+                raise ExecutorTransportError("allocation_transport_ambiguous") from None
+            raise error
+        except (TransportError, ValidationError, ValueError):
+            if request_started:
+                raise ExecutorTransportError("allocation_transport_ambiguous") from None
+            raise ExecutorTransportError("allocation_transport") from None
+
 
 class _KeychainValueStore(Protocol):
     def read_if_present(self, service: str, account: str) -> bytearray | None: ...
@@ -2587,7 +3479,13 @@ class _StaticRemoteExecutorSessionCapability:
 
 
 __all__ = [
+    "ExecutorAllocationTransportReceiptV1",
+    "ExecutorAllocationTransportRequestV1",
     "ExecutorClientHelloV2",
+    "ExecutorEngineOperationKindV1",
+    "ExecutorEngineOperationPlanV1",
+    "ExecutorEngineOperationStepV1",
+    "ExecutorEngineOperationTargetV1",
     "ExecutorHelloV2",
     "ExecutorTransportArtifactPathsV2",
     "ExecutorTransportError",
@@ -2596,6 +3494,7 @@ __all__ = [
     "ExecutorTransportRequestV2",
     "MacOSKeychainSecretMaterialCapability",
     "MacOSSecureShellClient",
+    "RemoteEffectAuthorizationWitnessV1",
     "RemoteExecutorTransportClient",
     "SecretFrameWriter",
     "SecureShellIdentityReferenceV1",
@@ -2603,15 +3502,24 @@ __all__ = [
     "SecureShellProcessSession",
     "SecureShellSessionBindingsV2",
     "VerifiedExecutorTransportArtifactsV2",
+    "executor_allocation_transport_receipt_message",
+    "executor_allocation_transport_request_message",
+    "executor_engine_operation_plan_sha256",
+    "executor_engine_operation_plan_v1",
     "executor_hello_message",
     "executor_transport_policy_message",
     "load_keychain_secret_material_capability",
     "load_verified_executor_transport_artifacts",
+    "remote_effect_authorization_witness_message",
     "request_from_delivery",
+    "sign_executor_allocation_transport_request",
     "sign_executor_transport_request",
+    "verify_executor_allocation_transport_receipt",
+    "verify_executor_allocation_transport_request",
     "verify_executor_hello",
     "verify_executor_transport_artifacts",
     "verify_executor_transport_policy",
     "verify_executor_transport_receipt",
     "verify_executor_transport_request",
+    "verify_remote_effect_authorization_witness",
 ]

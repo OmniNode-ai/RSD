@@ -35,9 +35,24 @@ _SHA256: Final = r"^[0-9a-f]{64}$"
 _COMMIT: Final = r"^[0-9a-f]{40}$"
 _UUID: Final = r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 _IDENTIFIER: Final = r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$"
+_DOCKER_DAEMON_ID: Final = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
 _OWNER_IDENTITY: Final = r"^[A-Za-z0-9][A-Za-z0-9@._+-]{0,254}$"
 _TIMESTAMP: Final = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:[.][0-9]{1,6})?Z\Z"
+)
+_ENGINE_FINGERPRINT_DOMAIN: Final = b"omninode-rsd.docker-engine-projection.sha256.v1\x00"
+_VOLUME_INSTANCE_FINGERPRINT_DOMAIN: Final = (
+    b"omninode-rsd.docker-named-volume-instance.sha256.v1\x00"
+)
+_CREATE_TEMPLATE_DOMAIN: Final = b"omninode-rsd.docker-create-template.sha256.v1\x00"
+_ALLOCATION_EXECUTOR_RECEIPT_DOMAIN: Final = (
+    b"omninode-rsd.allocation-executor-receipt.ed25519.v1\x00"
+)
+_MATERIALIZATION_EXECUTOR_RECEIPT_DOMAIN: Final = (
+    b"omninode-rsd.materialization-executor-receipt.ed25519.v1\x00"
+)
+_START_RUNTIME_EXECUTOR_RECEIPT_DOMAIN: Final = (
+    b"omninode-rsd.start-runtime-executor-receipt.ed25519.v2\x00"
 )
 
 
@@ -84,6 +99,14 @@ def canonical_sha256(model: BaseModel) -> str:
     return _digest(
         json.dumps(model.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()
     )
+
+
+def _domain_sha256(domain: bytes, value: BaseModel) -> str:
+    """Hash one canonical, non-secret projection under an explicit domain."""
+
+    if type(domain) is not bytes or not domain.endswith(b"\x00"):
+        raise ValueError("digest domain is invalid")
+    return _digest(domain + _canonical_model_bytes(value))
 
 
 def _canonical_model_bytes(model: BaseModel) -> bytes:
@@ -468,7 +491,6 @@ class ServiceIdentityV1(_Model):
     network_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     workload_name: str = Field(pattern=_IDENTIFIER)
-    workload_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     image: ImageReferenceV1
     listener_binding: Literal["tls_lan", "loopback_only", "isolated_network_only"]
     host_listener_port: int | None = Field(default=None, ge=1, le=65535)
@@ -525,7 +547,10 @@ class ServiceIdentityV1(_Model):
             StableIdentifierV1(
                 kind=StableIdentifierKind.IMAGE_REPO_DIGEST, value=self.image.reference
             ),
-            StableIdentifierV1(kind=StableIdentifierKind.WORKLOAD, value=self.workload_id),
+            # Docker's container ID is the workload identity.  Docker does
+            # not expose a second native ``workload_id`` field, so accepting
+            # one here would create an unverifiable identity claim.
+            StableIdentifierV1(kind=StableIdentifierKind.WORKLOAD, value=self.container_id),
         ]
         if self.authority_sha256 is not None:
             output.append(
@@ -556,10 +581,9 @@ class ValkeyIdentityV1(_Model):
     network_name: str = Field(pattern=_IDENTIFIER)
     network_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     volume_name: str = Field(pattern=_IDENTIFIER)
-    volume_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    volume_instance_fingerprint_sha256: str = Field(pattern=_SHA256)
     container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     workload_name: str = Field(pattern=_IDENTIFIER)
-    workload_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     logical_namespace: str = Field(pattern=_IDENTIFIER)
     credential_reference_sha256: str = Field(pattern=_SHA256)
     image: ImageReferenceV1
@@ -571,10 +595,13 @@ class ValkeyIdentityV1(_Model):
                 value=f"{self.compose_project}/{self.service_name}",
             ),
             StableIdentifierV1(kind=StableIdentifierKind.NETWORK, value=self.network_id),
-            StableIdentifierV1(kind=StableIdentifierKind.VOLUME, value=self.volume_id),
+            StableIdentifierV1(
+                kind=StableIdentifierKind.VOLUME,
+                value=self.volume_instance_fingerprint_sha256,
+            ),
             StableIdentifierV1(
                 kind=StableIdentifierKind.VALKEY_NAMESPACE_WORKLOAD,
-                value=f"{self.logical_namespace}/{self.workload_id}",
+                value=f"{self.logical_namespace}/{self.container_id}",
             ),
             StableIdentifierV1(
                 kind=StableIdentifierKind.PROVIDER_REFERENCE, value=self.credential_reference_sha256
@@ -632,12 +659,10 @@ class CandidateCompositeV1(_Model):
             raise ValueError(
                 "primary and restore component pairs must use distinct shared networks"
             )
-        if len({item.workload_id for item in components}) != 4:
-            raise ValueError("all component workload identities must be distinct")
         if len({item.workload_name for item in components}) != 4:
             raise ValueError("all component workload names must be distinct")
         if (
-            len({item.volume_id for item in caches}) != 2
+            len({item.volume_instance_fingerprint_sha256 for item in caches}) != 2
             or len({item.volume_name for item in caches}) != 2
             or len({item.logical_namespace for item in caches}) != 2
         ):
@@ -934,22 +959,15 @@ class ComponentPlacementV1(_Model):
 
 
 class ExecutorPlacementV1(_Model):
-    """The local executor's explicitly limited disposable-network attachment set."""
+    """A host-control-plane executor, never a disposable-network attachment.
+
+    The executor controls Docker through the separately signed Unix-socket
+    policy. It is not a container and therefore may not be smuggled into the
+    allocation graph as a second attachment to either disposable network.
+    """
 
     executor_id: str = Field(pattern=_IDENTIFIER)
-    placement: Literal["inside_disposable_networks_v1"]
-    attached_network_names: tuple[str, str]
-
-    @field_validator("attached_network_names", mode="before")
-    @classmethod
-    def declared_networks(cls, value: object) -> tuple[object, ...]:
-        networks = _items(value, field="executor attached networks")
-        if not all(
-            type(network) is str and re.fullmatch(_IDENTIFIER, network) is not None
-            for network in networks
-        ):
-            raise ValueError("executor attached networks must be identifiers")
-        return networks
+    placement: Literal["host_control_plane_v1"]
 
 
 class AllocationTopologyV2(_Model):
@@ -1007,8 +1025,8 @@ class AllocationTopologyV2(_Model):
                 or placement.static_ipv4 == network.gateway
             ):
                 raise ValueError("component static address does not belong to its isolated network")
-        if self.executor.attached_network_names != (primary.name, restore.name):
-            raise ValueError("executor attachment set must be exactly both isolated networks")
+        if self.executor.placement != "host_control_plane_v1":
+            raise ValueError("executor must remain a host control plane")
         return self
 
 
@@ -1195,6 +1213,117 @@ class ImageConfigBindingV1(_Model):
     config_sha256: str = Field(pattern=_SHA256)
 
 
+class DockerImagePolicyV1(_Model):
+    """The three immutable OCI digests needed to identify a runnable image.
+
+    A repository digest can name a multi-platform index.  A future Docker
+    adapter therefore must prove the selected linux/amd64 manifest and config
+    as well; a mutable tag is never an image identity at this boundary.
+    """
+
+    image: ImageReferenceV1
+    registry_index_digest_sha256: str = Field(pattern=_SHA256)
+    linux_amd64_manifest_digest_sha256: str = Field(pattern=_SHA256)
+    config_digest_sha256: str = Field(pattern=_SHA256)
+
+    @model_validator(mode="after")
+    def exact_oci_chain(self) -> Self:
+        digest = self.image.reference.rsplit("@", 1)[1].removeprefix("sha256:")
+        values = (
+            self.registry_index_digest_sha256,
+            self.linux_amd64_manifest_digest_sha256,
+            self.config_digest_sha256,
+        )
+        if digest != self.registry_index_digest_sha256 or len(set(values)) != 3:
+            raise ValueError("Docker image policy is not a complete immutable OCI chain")
+        return self
+
+
+class DockerUnixSocketPolicyV1(_Model):
+    """A value-free local Engine endpoint identity; no socket path is public."""
+
+    socket_identity_sha256: str = Field(pattern=_SHA256)
+    owner_uid: int = Field(ge=0, le=2_147_483_647)
+    group_gid: int = Field(ge=0, le=2_147_483_647)
+    mode: Literal[384]
+    endpoint_scheme: Literal["unix"]
+    symlink_allowed: Literal[False]
+    replacement_allowed: Literal[False]
+
+
+class DockerEngineControlPolicyV1(_Model):
+    """Signed closed Docker Engine API contract for the future local backend.
+
+    It intentionally models only the narrow endpoints required by allocation
+    and the future bootstrap wrapper.  Pull, delete, prune, update, restart,
+    network-connect, logs, events, arbitrary exec and shell execution are not
+    representable.
+    """
+
+    schema_version: Literal["rsd.docker-engine-control-policy.v1"]
+    source_commit: str = Field(pattern=_COMMIT)
+    executor_identity_sha256: str = Field(pattern=_SHA256)
+    unix_socket: DockerUnixSocketPolicyV1
+    api_version: str = Field(pattern=r"^[0-9]{1,3}\.[0-9]{1,3}$")
+    engine_projection: DockerEngineFilteredProjectionV1
+    engine_fingerprint_sha256: str = Field(pattern=_SHA256)
+    allowed_operations: tuple[
+        Literal[
+            "network_create",
+            "network_inspect",
+            "volume_create",
+            "volume_inspect",
+            "container_create",
+            "container_inspect",
+            "container_start",
+            "container_attach",
+        ],
+        ...,
+    ]
+    max_request_bytes: int = Field(ge=1, le=131_072)
+    max_response_bytes: int = Field(ge=1, le=1_048_576)
+    max_hijack_bytes: int = Field(ge=1, le=1_048_576)
+    request_timeout_seconds: int = Field(ge=1, le=60)
+    hijack_timeout_seconds: int = Field(ge=1, le=60)
+    created_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("allowed_operations", mode="before")
+    @classmethod
+    def declared_operations(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="Docker Engine operations")
+
+    @field_validator("created_at")
+    @classmethod
+    def canonical_created_at(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def closed_engine_api(self) -> Self:
+        expected = (
+            "network_create",
+            "network_inspect",
+            "volume_create",
+            "volume_inspect",
+            "container_create",
+            "container_inspect",
+            "container_start",
+            "container_attach",
+        )
+        if (
+            self.allowed_operations != expected
+            or self.engine_projection.api_version != self.api_version
+            or self.engine_fingerprint_sha256
+            != docker_engine_fingerprint_sha256(self.engine_projection)
+            or self.max_response_bytes < self.max_request_bytes
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("Docker Engine control policy is invalid")
+        return self
+
+
 class ExecutorControlPolicyV1(_Model):
     """Signed allowlist for the pinned remote executor installation."""
 
@@ -1350,6 +1479,108 @@ class PostgreSQLControlPolicyV1(_Model):
         return self
 
 
+class PostgreSQLPreparedOperationV1(_Model):
+    """One fixed psql stdin template and its value-free result projection."""
+
+    operation_id: str = Field(pattern=_UUID)
+    kind: Literal["allocation_nologin_v1", "install_scram_verifier_v1"]
+    psql_template_sha256: str = Field(pattern=_SHA256)
+    result_projection_sha256: str = Field(pattern=_SHA256)
+    stdin_protocol: Literal["postgresql_prepared_psql_stdin_v1"]
+    secret_input: Literal[False, True]
+
+    @model_validator(mode="after")
+    def exact_operation_shape(self) -> Self:
+        if (
+            (self.kind == "allocation_nologin_v1" and self.secret_input is not False)
+            or (self.kind == "install_scram_verifier_v1" and self.secret_input is not True)
+            or self.psql_template_sha256 == self.result_projection_sha256
+        ):
+            raise ValueError("PostgreSQL prepared operation is invalid")
+        return self
+
+
+class PostgreSQLScramVerifierInstallV1(_Model):
+    """Non-secret protocol for a verifier-only PostgreSQL password transition.
+
+    The executor may derive a verifier in bounded memory from the authorized
+    application password, but this model never represents the password,
+    verifier, SQL text, psql output, or a database URI.
+    """
+
+    schema_version: Literal["rsd.postgresql-scram-verifier-install.v1"]
+    prepared_operation_id: str = Field(pattern=_UUID)
+    application_password_reference_sha256: str = Field(pattern=_SHA256)
+    algorithm: Literal["scram-sha-256"]
+    iterations: int = Field(ge=4096, le=1_000_000)
+    salt_bytes: int = Field(ge=16, le=64)
+    derivation_scope: Literal["executor_bounded_memory_v1"]
+    sink: Literal["postgresql_prepared_psql_stdin_verifier_v1"]
+    plaintext_to_psql_allowed: Literal[False]
+    verifier_in_receipt_allowed: Literal[False]
+    sql_in_receipt_allowed: Literal[False]
+    output_in_receipt_allowed: Literal[False]
+    logs_allowed: Literal[False]
+    template_sha256: str = Field(pattern=_SHA256)
+
+
+class PostgreSQLPreparedControlPolicyV2(_Model):
+    """Signed, exact control-container/psql contract for future effects only."""
+
+    schema_version: Literal["rsd.postgresql-prepared-control-policy.v2"]
+    source_commit: str = Field(pattern=_COMMIT)
+    executor_identity_sha256: str = Field(pattern=_SHA256)
+    control_container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    control_image: DockerImagePolicyV1
+    control_config_sha256: str = Field(pattern=_SHA256)
+    unix_socket_identity_sha256: str = Field(pattern=_SHA256)
+    psql_binary_sha256: str = Field(pattern=_SHA256)
+    system_identifier: str = Field(pattern=r"^[0-9]{8,32}$")
+    password_encryption: Literal["scram-sha-256"]
+    statement_logging: Literal["disabled"]
+    operations: tuple[PostgreSQLPreparedOperationV1, PostgreSQLPreparedOperationV1]
+    scram_verifier_install: PostgreSQLScramVerifierInstallV1
+    created_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("operations", mode="before")
+    @classmethod
+    def declared_operations(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="PostgreSQL prepared operations")
+
+    @field_validator("created_at")
+    @classmethod
+    def canonical_created_at(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def exact_prepared_control(self) -> Self:
+        allocation, verifier = self.operations
+        values = (
+            self.control_config_sha256,
+            self.unix_socket_identity_sha256,
+            self.psql_binary_sha256,
+            allocation.psql_template_sha256,
+            allocation.result_projection_sha256,
+            verifier.psql_template_sha256,
+            verifier.result_projection_sha256,
+        )
+        if (
+            tuple(item.kind for item in self.operations)
+            != ("allocation_nologin_v1", "install_scram_verifier_v1")
+            or allocation.secret_input is not False
+            or verifier.secret_input is not True
+            or verifier.operation_id != self.scram_verifier_install.prepared_operation_id
+            or verifier.psql_template_sha256 != self.scram_verifier_install.template_sha256
+            or len(set(values)) != len(values)
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("PostgreSQL prepared control policy is invalid")
+        return self
+
+
 class SecretCapabilityPolicyV1(_Model):
     """Signed binding for one remote opaque secret-delivery capability."""
 
@@ -1438,6 +1669,10 @@ class SecretHandlingPolicyV1(_Model):
     valkey_stdin_config_allowed: Literal[True]
     postgres_application_target_process_environment_allowed: Literal[True]
     postgres_connection_uri_environment_variable: Literal["DB_CONNECTION_URI"]
+    postgres_scram_verifier_executor_derivation_allowed: Literal[True]
+    postgres_scram_verifier_psql_stdin_allowed: Literal[True]
+    postgres_plaintext_password_to_psql_allowed: Literal[False]
+    postgres_verifier_in_receipt_allowed: Literal[False]
     environment_file_allowed: Literal[False]
     host_environment_allowed: Literal[False]
     docker_config_environment_allowed: Literal[False]
@@ -1486,6 +1721,10 @@ class SecretHandlingPolicyV1(_Model):
             or self.infisical_target_process_environment_allowed is not True
             or self.valkey_stdin_config_allowed is not True
             or self.postgres_application_target_process_environment_allowed is not True
+            or self.postgres_scram_verifier_executor_derivation_allowed is not True
+            or self.postgres_scram_verifier_psql_stdin_allowed is not True
+            or self.postgres_plaintext_password_to_psql_allowed is not False
+            or self.postgres_verifier_in_receipt_allowed is not False
             or self.environment_file_allowed is not False
             or len(set(bindings)) != len(bindings)
             or len(_canonical_base64_bytes(self.signature_base64)) != 64
@@ -1504,7 +1743,9 @@ class AllocationEvidenceBindingsV1(_Model):
     registry_verification_sha256: str = Field(pattern=_SHA256)
     provider_declaration_sha256: str = Field(pattern=_SHA256)
     executor_control_policy_sha256: str = Field(pattern=_SHA256)
+    docker_engine_control_policy_sha256: str = Field(pattern=_SHA256)
     postgres_control_policy_sha256: str = Field(pattern=_SHA256)
+    postgres_prepared_control_policy_sha256: str = Field(pattern=_SHA256)
 
     @model_validator(mode="after")
     def distinct_bindings(self) -> Self:
@@ -1528,6 +1769,7 @@ class AllocationPostgreSQLPlanV2(_Model):
     stage_database_prefix: str = Field(pattern=_IDENTIFIER)
     restore_database_prefix: str = Field(pattern=_IDENTIFIER)
     control_policy_sha256: str = Field(pattern=_SHA256)
+    prepared_control_policy_sha256: str = Field(pattern=_SHA256)
 
     @field_validator("authority")
     @classmethod
@@ -1575,6 +1817,7 @@ class AllocationPlanV2(_Model):
     primary_valkey_volume: AllocationVolumePlanV1
     restore_valkey_volume: AllocationVolumePlanV1
     postgres: AllocationPostgreSQLPlanV2
+    docker_engine_control_policy_sha256: str = Field(pattern=_SHA256)
 
     @model_validator(mode="after")
     def resource_only_non_tls_plan(self) -> Self:
@@ -1636,6 +1879,10 @@ class AllocationIntentV2(_Model):
             or len(_canonical_base64_bytes(self.signature_base64)) != 64
             or self.plan.postgres.control_policy_sha256
             != self.evidence.postgres_control_policy_sha256
+            or self.plan.postgres.prepared_control_policy_sha256
+            != self.evidence.postgres_prepared_control_policy_sha256
+            or self.plan.docker_engine_control_policy_sha256
+            != self.evidence.docker_engine_control_policy_sha256
             or self.provider_references.tls_trust_anchor is not None
         ):
             raise ValueError("allocation intent fields are invalid")
@@ -1690,13 +1937,50 @@ class AllocatedNetworkObservationV1(_Model):
         return self
 
 
+class DockerEngineFilteredProjectionV1(_Model):
+    """The small, canonical subset of Docker daemon identity used for binding.
+
+    Docker reports ``Info.ID`` as a daemon-defined string rather than a
+    container-style 64-hex ID.  Raw daemon responses, labels, paths and all
+    host configuration are deliberately outside this projection.
+    """
+
+    daemon_id: str = Field(pattern=_DOCKER_DAEMON_ID)
+    api_version: str = Field(pattern=r"^[0-9]{1,3}\.[0-9]{1,3}$")
+    operating_system: Literal["linux"]
+    architecture: Literal["amd64"]
+
+
+def docker_engine_fingerprint_sha256(projection: DockerEngineFilteredProjectionV1) -> str:
+    """Derive the engine identity from a typed filtered projection only."""
+
+    if type(projection) is not DockerEngineFilteredProjectionV1:
+        raise ValueError("engine projection is invalid")
+    return _domain_sha256(_ENGINE_FINGERPRINT_DOMAIN, projection)
+
+
 class AllocatedVolumeObservationV1(_Model):
-    """Exact engine observation for one empty volume."""
+    """A native named-volume observation with no fictional Docker volume ID.
+
+    Docker's inspect response identifies a named volume by its name and
+    metadata, not by a stable 64-hex workload-style ID.  The derived
+    fingerprint deliberately excludes ``Mountpoint`` and labels, preventing a
+    host path or opaque label from entering public receipts.
+    """
 
     name: str = Field(pattern=_IDENTIFIER)
-    volume_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    engine_fingerprint_sha256: str = Field(pattern=_SHA256)
     driver: Literal["local"]
+    scope: Literal["local"]
+    created_at: str
     options: tuple[NetworkOptionV1, ...] = Field(default=(), max_length=16)
+    volume_instance_fingerprint_sha256: str = Field(pattern=_SHA256)
+
+    @field_validator("created_at")
+    @classmethod
+    def canonical_created_at(cls, value: str) -> str:
+        _timestamp(value)
+        return value
 
     @field_validator("options", mode="before")
     @classmethod
@@ -1706,9 +1990,55 @@ class AllocatedVolumeObservationV1(_Model):
     @model_validator(mode="after")
     def exact_configuration(self) -> Self:
         pairs = tuple((option.key, option.value) for option in self.options)
-        if pairs != tuple(sorted(pairs)) or len(set(pairs)) != len(pairs):
+        projection = _VolumeInstanceProjectionV1(
+            name=self.name,
+            engine_fingerprint_sha256=self.engine_fingerprint_sha256,
+            driver=self.driver,
+            scope=self.scope,
+            created_at=self.created_at,
+            options=self.options,
+        )
+        if (
+            pairs != tuple(sorted(pairs))
+            or len(set(pairs)) != len(pairs)
+            or self.volume_instance_fingerprint_sha256
+            != _domain_sha256(_VOLUME_INSTANCE_FINGERPRINT_DOMAIN, projection)
+        ):
             raise ValueError("observed volume options must be canonical")
         return self
+
+
+class _VolumeInstanceProjectionV1(_Model):
+    """Internal canonical preimage for a public named-volume fingerprint."""
+
+    name: str = Field(pattern=_IDENTIFIER)
+    engine_fingerprint_sha256: str = Field(pattern=_SHA256)
+    driver: Literal["local"]
+    scope: Literal["local"]
+    created_at: str
+    options: tuple[NetworkOptionV1, ...] = Field(default=(), max_length=16)
+
+
+def docker_volume_instance_fingerprint_sha256(
+    *,
+    name: str,
+    engine_fingerprint_sha256: str,
+    driver: Literal["local"],
+    scope: Literal["local"],
+    created_at: str,
+    options: tuple[NetworkOptionV1, ...],
+) -> str:
+    """Compute the exact value accepted by ``AllocatedVolumeObservationV1``."""
+
+    projection = _VolumeInstanceProjectionV1(
+        name=name,
+        engine_fingerprint_sha256=engine_fingerprint_sha256,
+        driver=driver,
+        scope=scope,
+        created_at=created_at,
+        options=options,
+    )
+    return _domain_sha256(_VOLUME_INSTANCE_FINGERPRINT_DOMAIN, projection)
 
 
 class PostgreSQLRoleObservationV1(_Model):
@@ -1733,6 +2063,8 @@ class AllocatedPostgreSQLObservationV1(_Model):
     database_oid: int = Field(ge=1)
     schema_name: str = Field(pattern=_IDENTIFIER)
     schema_oid: int = Field(ge=1)
+    prepared_operation_id: str = Field(pattern=_UUID)
+    prepared_operation_result_sha256: str = Field(pattern=_SHA256)
     owner_role: str = Field(pattern=_IDENTIFIER)
     owner_role_oid: int = Field(ge=1)
     application_role: str = Field(pattern=_IDENTIFIER)
@@ -1771,8 +2103,16 @@ class AllocatedPostgreSQLObservationV1(_Model):
 
 
 class EngineIdentityObservationV1(_Model):
-    engine_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    """Native Docker daemon identity and its filtered, domain-bound digest."""
+
+    projection: DockerEngineFilteredProjectionV1
     engine_fingerprint_sha256: str = Field(pattern=_SHA256)
+
+    @model_validator(mode="after")
+    def exact_derived_fingerprint(self) -> Self:
+        if self.engine_fingerprint_sha256 != docker_engine_fingerprint_sha256(self.projection):
+            raise ValueError("engine identity fingerprint is invalid")
+        return self
 
 
 class NoHostPublicationGroundworkV1(_Model):
@@ -1802,10 +2142,92 @@ class AllocatedResourceSetV2(_Model):
             self.primary_network.name == self.restore_network.name
             or self.primary_network.network_id == self.restore_network.network_id
             or self.primary_cache_volume.name == self.restore_cache_volume.name
-            or self.primary_cache_volume.volume_id == self.restore_cache_volume.volume_id
+            or self.primary_cache_volume.volume_instance_fingerprint_sha256
+            == self.restore_cache_volume.volume_instance_fingerprint_sha256
         ):
             raise ValueError("allocated resources must be distinct")
         return self
+
+
+class AllocationExecutorReceiptV1(_Model):
+    """Executor-attested filtered evidence for a zero-secret allocation.
+
+    This is deliberately separate from the outer effect receipt.  The outer
+    authorizer validates this signature against the installed executor key,
+    rather than trusting a callback's raw Engine JSON or a hash-only bridge.
+    """
+
+    schema_version: Literal["rsd.allocation-executor-receipt.v1"]
+    operation_scope: Literal["allocate_isolated_empty_resources_v2"]
+    allocation_operation_id: str = Field(pattern=_UUID)
+    allocation_intent_sha256: str = Field(pattern=_SHA256)
+    idempotency_key: str = Field(pattern=_SHA256)
+    executor_id: str = Field(pattern=_IDENTIFIER)
+    engine_control_policy_sha256: str = Field(pattern=_SHA256)
+    postgres_prepared_control_policy_sha256: str = Field(pattern=_SHA256)
+    host_fingerprint_sha256: str = Field(pattern=_SHA256)
+    engine: EngineIdentityObservationV1
+    allocated_resources_projection_sha256: str = Field(pattern=_SHA256)
+    engine_operation_journal_sha256: str = Field(pattern=_SHA256)
+    completed_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("completed_at")
+    @classmethod
+    def canonical_completed_at(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def redacted_filtered_projection(self) -> Self:
+        values = (
+            self.engine_control_policy_sha256,
+            self.postgres_prepared_control_policy_sha256,
+            self.host_fingerprint_sha256,
+            self.allocated_resources_projection_sha256,
+            self.engine_operation_journal_sha256,
+        )
+        if (
+            len(set(values)) != len(values)
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("allocation executor receipt is invalid")
+        return self
+
+
+def allocation_executor_receipt_message(receipt: AllocationExecutorReceiptV1) -> bytes:
+    """Return the exact public, domain-separated allocation attestation bytes.
+
+    The remote executor daemon uses this helper to sign its typed filtered
+    evidence.  Keeping the preimage beside the receipt model prevents a
+    hash-only transport bridge or a non-public authorization helper from becoming
+    the effective signature specification.
+    """
+
+    receipt = _strict_canonical_model(receipt, AllocationExecutorReceiptV1)
+    try:
+        material = json.dumps(
+            receipt.model_dump(mode="json", exclude={"signature_base64"}, warnings="error"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except Exception:
+        raise ValueError("allocation executor receipt is invalid") from None
+    return _ALLOCATION_EXECUTOR_RECEIPT_DOMAIN + material
+
+
+def _executor_receipt_message(domain: bytes, receipt: _Model) -> bytes:
+    """Render the common canonical preimage for a typed executor receipt."""
+
+    try:
+        return domain + json.dumps(
+            receipt.model_dump(mode="json", exclude={"signature_base64"}, warnings="error"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except Exception:
+        raise ValueError("executor receipt is invalid") from None
 
 
 class AllocationEffectReceiptV2(_Model):
@@ -1820,6 +2242,8 @@ class AllocationEffectReceiptV2(_Model):
     journal_uuid: str = Field(pattern=_UUID)
     idempotency_key: str = Field(pattern=_SHA256)
     allocated_resources: AllocatedResourceSetV2
+    executor_receipt_sha256: str = Field(pattern=_SHA256)
+    executor_receipt: AllocationExecutorReceiptV1
     effect_receipt_sha256: str = Field(pattern=_SHA256)
     completed_at: str
 
@@ -1828,6 +2252,12 @@ class AllocationEffectReceiptV2(_Model):
     def completed_time(cls, value: str) -> str:
         _timestamp(value)
         return value
+
+    @model_validator(mode="after")
+    def exact_executor_receipt(self) -> Self:
+        if self.executor_receipt_sha256 != canonical_sha256(self.executor_receipt):
+            raise ValueError("allocation effect receipt is invalid")
+        return self
 
 
 def allocation_effect_receipt_sha256(receipt: AllocationEffectReceiptV2) -> str:
@@ -1887,6 +2317,8 @@ class PostgreSQLLoginTransitionIntentV1(_Model):
     application_role: str = Field(pattern=_IDENTIFIER)
     application_role_oid: int = Field(ge=1)
     application_password_reference_sha256: str = Field(pattern=_SHA256)
+    prepared_control_policy_sha256: str = Field(pattern=_SHA256)
+    scram_verifier_install: PostgreSQLScramVerifierInstallV1
     owner_can_login: Literal[False]
     owner_password_absent: Literal[True]
     application_can_login: Literal[True]
@@ -1897,6 +2329,9 @@ class PostgreSQLLoginTransitionIntentV1(_Model):
         if (
             self.owner_role == self.application_role
             or self.owner_role_oid == self.application_role_oid
+            or self.scram_verifier_install.prepared_operation_id != self.prepared_operation_id
+            or self.scram_verifier_install.application_password_reference_sha256
+            != self.application_password_reference_sha256
         ):
             raise ValueError("PostgreSQL login transition is invalid")
         return self
@@ -1915,6 +2350,8 @@ class PostgreSQLLoginTransitionReceiptV1(_Model):
     application_role: str = Field(pattern=_IDENTIFIER)
     application_role_oid: int = Field(ge=1)
     application_password_reference_sha256: str = Field(pattern=_SHA256)
+    prepared_control_policy_sha256: str = Field(pattern=_SHA256)
+    prepared_operation_result_sha256: str = Field(pattern=_SHA256)
     owner_can_login: Literal[False]
     owner_password_absent: Literal[True]
     application_can_login: Literal[True]
@@ -1925,6 +2362,7 @@ class PostgreSQLLoginTransitionReceiptV1(_Model):
         if (
             self.owner_role == self.application_role
             or self.owner_role_oid == self.application_role_oid
+            or self.prepared_control_policy_sha256 == self.prepared_operation_result_sha256
         ):
             raise ValueError("PostgreSQL login transition receipt is invalid")
         return self
@@ -2049,6 +2487,24 @@ class ContainerSecretSinkV1(StrEnum):
     VALKEY_STDIN_CONFIGURATION = "valkey_stdin_configuration_v1"
 
 
+class DockerNamedVolumeMountV1(_Model):
+    """The sole mutable-storage mount shape allowed in this lifecycle.
+
+    Only the allocated named Valkey volumes may be mounted, at ``/data`` and
+    read/write.  Bind sources, tmpfs configuration and mount propagation are
+    intentionally not representable, so a raw Docker ``Mountpoint`` can never
+    leak into a plan or receipt.
+    """
+
+    mount_type: Literal["volume"]
+    source_volume_name: str = Field(pattern=_IDENTIFIER)
+    target_path: Literal["/data"]
+    read_only: Literal[False]
+    bind_allowed: Literal[False]
+    tmpfs_allowed: Literal[False]
+    propagation: Literal["none"]
+
+
 class ContainerBootstrapTemplateV1(_Model):
     """Canonical non-secret Docker bootstrap contract for one component.
 
@@ -2064,20 +2520,37 @@ class ContainerBootstrapTemplateV1(_Model):
         "restore_valkey",
     ]
     image: ImageReferenceV1
+    image_policy: DockerImagePolicyV1
+    entrypoint: tuple[str, ...] = Field(min_length=1, max_length=16)
+    command: tuple[str, ...] = Field(default=(), max_length=32)
     entrypoint_sha256: str = Field(pattern=_SHA256)
     template_sha256: str = Field(pattern=_SHA256)
+    bootstrap_wrapper_sha256: str = Field(pattern=_SHA256)
+    ingress_protocol_sha256: str = Field(pattern=_SHA256)
+    create_request_sha256: str = Field(pattern=_SHA256)
+    numeric_user: str = Field(pattern=r"^[1-9][0-9]{0,8}:[1-9][0-9]{0,8}$")
+    working_directory: str = Field(pattern=r"^/[A-Za-z0-9._/-]{0,255}$")
+    open_stdin: Literal[True]
+    stdin_once: Literal[True]
+    attach_stdin: Literal[True]
+    tty: Literal[False]
     run_as_non_root: Literal[True]
     read_only_root_filesystem: Literal[True]
     cap_drop_all: Literal[True]
+    cap_add: tuple[str, ...] = Field(default=(), max_length=0)
     no_new_privileges: Literal[True]
+    security_options: tuple[Literal["no-new-privileges:true"],]
     private_pid: Literal[True]
+    pid_mode: Literal["isolated_pid_namespace_v1"]
     log_driver: Literal["none"]
     restart_policy: Literal["no"]
-    mounts: tuple[str, ...] = Field(default=(), max_length=0)
+    mounts: tuple[DockerNamedVolumeMountV1, ...] = Field(default=(), max_length=1)
     docker_socket_mounted: Literal[False]
     host_network: Literal[False]
+    network_mode: Literal["exact_isolated_network_v1"]
     publish_all_ports: Literal[False]
     port_bindings: tuple[str, ...] = Field(default=(), max_length=0)
+    labels: tuple[str, ...] = Field(default=(), max_length=0)
     network_name: str = Field(pattern=_IDENTIFIER)
     network_alias: str = Field(pattern=_IDENTIFIER)
     static_ipv4: str
@@ -2088,9 +2561,18 @@ class ContainerBootstrapTemplateV1(_Model):
     def canonical_address(cls, value: str) -> str:
         return _isolated_ipv4(value, field="container bootstrap static IPv4")
 
-    @field_validator("mounts", "port_bindings", mode="before")
+    @field_validator(
+        "entrypoint",
+        "command",
+        "cap_add",
+        "security_options",
+        "mounts",
+        "port_bindings",
+        "labels",
+        mode="before",
+    )
     @classmethod
-    def declared_empty_sequence(cls, value: object) -> tuple[object, ...]:
+    def declared_sequence(cls, value: object) -> tuple[object, ...]:
         return _items(value, field="container bootstrap sequence")
 
     @field_validator("accepted_secret_sink", mode="before")
@@ -2115,10 +2597,35 @@ class ContainerBootstrapTemplateV1(_Model):
         if (
             type(self.accepted_secret_sink) is not ContainerSecretSinkV1
             or self.accepted_secret_sink is not expected_sink
+            or self.image_policy.image != self.image
+            or self.entrypoint_sha256
+            != _digest(
+                json.dumps(self.entrypoint, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            )
             or self.entrypoint_sha256 == self.template_sha256
+            or self.bootstrap_wrapper_sha256 == self.ingress_protocol_sha256
+            or self.security_options != ("no-new-privileges:true",)
+            or self.cap_add != ()
+            or self.labels != ()
+            or (self.component.endswith("valkey") and len(self.mounts) != 1)
+            or (not self.component.endswith("valkey") and self.mounts != ())
+            or self.create_request_sha256 != container_create_template_sha256(self)
         ):
             raise ValueError("container bootstrap template is invalid")
         return self
+
+
+def container_create_template_sha256(template: ContainerBootstrapTemplateV1) -> str:
+    """Commit to every canonical Docker create-request field without a cycle."""
+
+    if type(template) is not ContainerBootstrapTemplateV1:
+        raise ValueError("container bootstrap template is invalid")
+    payload = json.dumps(
+        template.model_dump(mode="json", exclude={"create_request_sha256"}),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _digest(_CREATE_TEMPLATE_DOMAIN + payload)
 
 
 class ContainerBootstrapTemplatesV1(_Model):
@@ -2142,6 +2649,12 @@ class ContainerBootstrapTemplatesV1(_Model):
             != ("primary_infisical", "primary_valkey", "restore_infisical", "restore_valkey")
             or len({template.template_sha256 for template in templates}) != 4
             or len({template.entrypoint_sha256 for template in templates}) != 4
+            or len({template.create_request_sha256 for template in templates}) != 4
+            or tuple(template.mounts for template in templates[:1] + templates[2:3]) != ((), ())
+            or tuple(template.mounts for template in (templates[1], templates[3]))
+            != ((templates[1].mounts[0],), (templates[3].mounts[0],))
+            or templates[1].mounts[0].source_volume_name
+            == templates[3].mounts[0].source_volume_name
         ):
             raise ValueError("container bootstrap templates are invalid")
         return self
@@ -2398,6 +2911,8 @@ class MaterializationEvidenceBindingsV1(_Model):
     allocation_effect_receipt_sha256: str = Field(pattern=_SHA256)
     observed_allocation_attestation_sha256: str = Field(pattern=_SHA256)
     executor_control_policy_sha256: str = Field(pattern=_SHA256)
+    docker_engine_control_policy_sha256: str = Field(pattern=_SHA256)
+    postgres_prepared_control_policy_sha256: str = Field(pattern=_SHA256)
     executor_installation_policy_sha256: str = Field(pattern=_SHA256)
     executor_installation_intent_sha256: str = Field(pattern=_SHA256)
     executor_installation_receipt_sha256: str = Field(pattern=_SHA256)
@@ -2407,7 +2922,7 @@ class MaterializationEvidenceBindingsV1(_Model):
 
     @model_validator(mode="after")
     def distinct_bindings(self) -> Self:
-        if len(set(self.model_dump(mode="python").values())) != 10:
+        if len(set(self.model_dump(mode="python").values())) != 12:
             raise ValueError("materialization evidence bindings must be distinct")
         return self
 
@@ -2482,6 +2997,8 @@ class MaterializationIntentV1(_Model):
             != self.observed_allocation_attestation_sha256
             or self.evidence.executor_control_policy_sha256
             == self.evidence.secret_capability_policy_sha256
+            or self.evidence.docker_engine_control_policy_sha256
+            == self.evidence.executor_control_policy_sha256
             or self.evidence.executor_installation_policy_sha256
             == self.evidence.executor_control_policy_sha256
             or self.evidence.executor_installation_intent_sha256
@@ -2510,6 +3027,7 @@ class MaterializationIntentV1(_Model):
             or any(
                 template.component != component.component
                 or template.image != component.image
+                or template.image_policy.config_digest_sha256 != component.config_sha256
                 or template.network_name != placement.network_name
                 or template.network_alias != placement.alias
                 or template.static_ipv4 != placement.static_ipv4
@@ -2518,6 +3036,10 @@ class MaterializationIntentV1(_Model):
                 )
             )
             or len({component.config_sha256 for component in components}) != 4
+            or self.bootstrap_templates.primary_valkey.mounts[0].source_volume_name
+            != self.plan.primary_valkey.volume_name
+            or self.bootstrap_templates.restore_valkey.mounts[0].source_volume_name
+            != self.plan.restore_valkey.volume_name
         ):
             raise ValueError("materialization intent is invalid")
         references = {
@@ -2582,20 +3104,37 @@ class NoHostPublicationEvidenceV1(_Model):
 class ContainerBootstrapInspectionV1(_Model):
     """Explicit engine inspection fields required after a future container start."""
 
+    image_policy: DockerImagePolicyV1
+    entrypoint: tuple[str, ...] = Field(min_length=1, max_length=16)
+    command: tuple[str, ...] = Field(default=(), max_length=32)
     entrypoint_sha256: str = Field(pattern=_SHA256)
     template_sha256: str = Field(pattern=_SHA256)
+    bootstrap_wrapper_sha256: str = Field(pattern=_SHA256)
+    ingress_protocol_sha256: str = Field(pattern=_SHA256)
+    create_request_sha256: str = Field(pattern=_SHA256)
+    numeric_user: str = Field(pattern=r"^[1-9][0-9]{0,8}:[1-9][0-9]{0,8}$")
+    working_directory: str = Field(pattern=r"^/[A-Za-z0-9._/-]{0,255}$")
+    open_stdin: Literal[True]
+    stdin_once: Literal[True]
+    attach_stdin: Literal[True]
+    tty: Literal[False]
     run_as_non_root: Literal[True]
     read_only_root_filesystem: Literal[True]
     cap_drop_all: Literal[True]
+    cap_add: tuple[str, ...] = Field(default=(), max_length=0)
     no_new_privileges: Literal[True]
+    security_options: tuple[Literal["no-new-privileges:true"],]
     private_pid: Literal[True]
+    pid_mode: Literal["isolated_pid_namespace_v1"]
     log_driver: Literal["none"]
     restart_policy: Literal["no"]
-    mounts: tuple[str, ...] = Field(default=(), max_length=0)
+    mounts: tuple[DockerNamedVolumeMountV1, ...] = Field(default=(), max_length=1)
     docker_socket_mounted: Literal[False]
     host_network: Literal[False]
+    network_mode: Literal["exact_isolated_network_v1"]
     publish_all_ports: Literal[False]
     port_bindings: tuple[str, ...] = Field(default=(), max_length=0)
+    labels: tuple[str, ...] = Field(default=(), max_length=0)
     network_name: str = Field(pattern=_IDENTIFIER)
     network_alias: str = Field(pattern=_IDENTIFIER)
     static_ipv4: str
@@ -2607,9 +3146,18 @@ class ContainerBootstrapInspectionV1(_Model):
     def canonical_address(cls, value: str) -> str:
         return _isolated_ipv4(value, field="container inspection static IPv4")
 
-    @field_validator("mounts", "port_bindings", mode="before")
+    @field_validator(
+        "entrypoint",
+        "command",
+        "cap_add",
+        "security_options",
+        "mounts",
+        "port_bindings",
+        "labels",
+        mode="before",
+    )
     @classmethod
-    def declared_empty_sequence(cls, value: object) -> tuple[object, ...]:
+    def declared_sequence(cls, value: object) -> tuple[object, ...]:
         return _items(value, field="container inspection sequence")
 
     @field_validator("accepted_secret_sink", mode="before")
@@ -2619,7 +3167,17 @@ class ContainerBootstrapInspectionV1(_Model):
 
     @model_validator(mode="after")
     def distinct_template_fields(self) -> Self:
-        if self.entrypoint_sha256 == self.template_sha256:
+        if (
+            self.entrypoint_sha256
+            != _digest(
+                json.dumps(self.entrypoint, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            )
+            or self.entrypoint_sha256 == self.template_sha256
+            or self.bootstrap_wrapper_sha256 == self.ingress_protocol_sha256
+            or self.security_options != ("no-new-privileges:true",)
+            or self.cap_add != ()
+            or self.labels != ()
+        ):
             raise ValueError("container inspection is invalid")
         return self
 
@@ -2634,9 +3192,9 @@ class RuntimeContainerObservationV1(_Model):
         "restore_valkey",
     ]
     container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
-    workload_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     image: ImageReferenceV1
     config_sha256: str = Field(pattern=_SHA256)
+    image_policy: DockerImagePolicyV1
     attachments: tuple[RuntimeNetworkAttachmentV1, ...] = Field(min_length=1, max_length=1)
     no_host_publication: NoHostPublicationEvidenceV1
     inspection: ContainerBootstrapInspectionV1
@@ -2645,6 +3203,15 @@ class RuntimeContainerObservationV1(_Model):
     @classmethod
     def declared_attachments(cls, value: object) -> tuple[object, ...]:
         return _items(value, field="runtime attachments")
+
+    @model_validator(mode="after")
+    def image_chain_is_explicit(self) -> Self:
+        if (
+            self.image_policy.image != self.image
+            or self.image_policy.config_digest_sha256 != self.config_sha256
+        ):
+            raise ValueError("runtime image identity is invalid")
+        return self
 
 
 class ExecutorInstallationIntentV1(_Model):
@@ -2729,20 +3296,24 @@ class ExecutorContainerInspectionV1(_Model):
     inspection: ContainerBootstrapInspectionV1
 
 
-class ExecutorOperationReceiptV1(_Model):
-    """Executor-attested, redacted result for materialization or a fresh start."""
+class MaterializationExecutorReceiptV1(_Model):
+    """Executor-attested, redacted materialization inspection result."""
 
-    schema_version: Literal["rsd.executor-operation-receipt.v1"]
+    schema_version: Literal["rsd.materialization-executor-receipt.v1"]
     executor_id: str = Field(pattern=_IDENTIFIER)
     installation_receipt_sha256: str = Field(pattern=_SHA256)
-    operation_scope: Literal["materialize_and_start_runtime_v1", "start_runtime_v2"]
+    operation_scope: Literal["materialize_and_start_runtime_v1"]
     operation_id: str = Field(pattern=_UUID)
     idempotency_key: str = Field(pattern=_SHA256)
+    materialization_intent_sha256: str = Field(pattern=_SHA256)
+    observed_allocation_attestation_sha256: str = Field(pattern=_SHA256)
+    docker_engine_control_policy_sha256: str = Field(pattern=_SHA256)
     secret_delivery_receipt_sha256: str = Field(pattern=_SHA256)
     channel_binding_sha256: str = Field(pattern=_SHA256)
     session_binding_sha256: str = Field(pattern=_SHA256)
     host_fingerprint_sha256: str = Field(pattern=_SHA256)
     engine_fingerprint_sha256: str = Field(pattern=_SHA256)
+    engine_operation_journal_sha256: str = Field(pattern=_SHA256)
     containers: tuple[
         ExecutorContainerInspectionV1,
         ExecutorContainerInspectionV1,
@@ -2776,6 +3347,13 @@ class ExecutorOperationReceiptV1(_Model):
         return self
 
 
+def materialization_executor_receipt_message(receipt: MaterializationExecutorReceiptV1) -> bytes:
+    """Return the exact attestation preimage for materialization evidence."""
+
+    receipt = _strict_canonical_model(receipt, MaterializationExecutorReceiptV1)
+    return _executor_receipt_message(_MATERIALIZATION_EXECUTOR_RECEIPT_DOMAIN, receipt)
+
+
 class MaterializationEffectReceiptV1(_Model):
     """The one value-free receipt that can introduce final runtime container IDs."""
 
@@ -2791,7 +3369,7 @@ class MaterializationEffectReceiptV1(_Model):
     journal_uuid: str = Field(pattern=_UUID)
     idempotency_key: str = Field(pattern=_SHA256)
     executor_receipt_sha256: str = Field(pattern=_SHA256)
-    executor_receipt: ExecutorOperationReceiptV1
+    executor_receipt: MaterializationExecutorReceiptV1
     postgres_login_transition: PostgreSQLLoginTransitionReceiptV1
     delivery_receipt: SecretDeliveryReceiptV1
     primary_infisical: RuntimeContainerObservationV1
@@ -2819,7 +3397,6 @@ class MaterializationEffectReceiptV1(_Model):
             tuple(item.component for item in components)
             != ("primary_infisical", "primary_valkey", "restore_infisical", "restore_valkey")
             or len({item.container_id for item in components}) != 4
-            or len({item.workload_id for item in components}) != 4
             or self.executor_receipt_sha256 != canonical_sha256(self.executor_receipt)
             or self.executor_receipt.secret_delivery_receipt_sha256
             != canonical_sha256(self.delivery_receipt)
@@ -2960,6 +3537,7 @@ class StartRuntimeExecutorReceiptV2(_Model):
     executor_id: str = Field(pattern=_IDENTIFIER)
     host_fingerprint_sha256: str = Field(pattern=_SHA256)
     engine_fingerprint_sha256: str = Field(pattern=_SHA256)
+    engine_operation_journal_sha256: str = Field(pattern=_SHA256)
     containers: tuple[
         ExecutorContainerInspectionV1,
         ExecutorContainerInspectionV1,
@@ -2991,6 +3569,13 @@ class StartRuntimeExecutorReceiptV2(_Model):
         ):
             raise ValueError("start executor receipt is invalid")
         return self
+
+
+def start_runtime_executor_receipt_message(receipt: StartRuntimeExecutorReceiptV2) -> bytes:
+    """Return the exact attestation preimage for one fresh runtime start."""
+
+    receipt = _strict_canonical_model(receipt, StartRuntimeExecutorReceiptV2)
+    return _executor_receipt_message(_START_RUNTIME_EXECUTOR_RECEIPT_DOMAIN, receipt)
 
 
 class StartRuntimeEffectReceiptV2(_Model):
@@ -3127,7 +3712,6 @@ def _matches_runtime_component(
     attachment = observed.attachments[0]
     return (
         observed.container_id == candidate.container_id
-        and observed.workload_id == candidate.workload_id
         and observed.image == candidate.image
         and attachment.network_name == candidate.network_name
         and attachment.network_id == candidate.network_id

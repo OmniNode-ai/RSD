@@ -201,6 +201,7 @@ def _start_effect_receipt(context: StartRuntimeExecutionContext) -> StartRuntime
         executor_id=context.executor_expectation.executor_id,
         host_fingerprint_sha256=context.executor_expectation.host_fingerprint_sha256,
         engine_fingerprint_sha256=context.executor_expectation.engine_fingerprint_sha256,
+        engine_operation_journal_sha256=_hash("start-engine-operation-journal"),
         containers=context.materialization_receipt.executor_receipt.containers,
         completed_at="2026-08-28T12:07:00Z",
         signer_key_id=context.executor_attestation_key_id,
@@ -482,7 +483,9 @@ def test_start_runtime_boundary_has_no_caller_clock_or_generic_effect() -> None:
 
 
 def test_start_runtime_tls_type_drift_creates_no_artifact_root(tmp_path: Path) -> None:
-    signer, signing_key, allocation, _, _, journal, policy, _ = _signed_allocation_bundle(tmp_path)
+    signer, signing_key, allocation, _, _, _, _, journal, policy, _ = _signed_allocation_bundle(
+        tmp_path
+    )
     raw = allocation.model_construct(
         **{
             **allocation.model_dump(mode="python"),

@@ -79,6 +79,7 @@ _MATERIAL_GENERATION_RECEIPT_DOMAIN: Final = (
     b"omninode-rsd.provider-crypto.material-generation-receipt.v1\x00"
 )
 _EXECUTOR_TRANSPORT_METADATA_DOMAIN: Final = b"omninode-rsd.executor-transport-metadata.v2\x00"
+_EXECUTOR_ALLOCATION_METADATA_DOMAIN: Final = b"omninode-rsd.executor-allocation-metadata.v1\x00"
 _ALLOCATION_INTENT_SIGNATURE_DOMAIN: Final = b"omninode-rsd.allocation-intent.ed25519.v2\x00"
 _MATERIAL_POLICY_NAME: Final = "provider-material-policy.yaml"
 _MATERIAL_GENESIS_NAME: Final = "provider-material-genesis.yaml"
@@ -823,6 +824,44 @@ def executor_transport_metadata_message(
             "metadata_sha256": metadata_sha256,
             "operation_id": operation_id,
             "operation_scope": operation_scope,
+        }
+    )
+
+
+def executor_allocation_metadata_message(
+    *,
+    allocation_intent_sha256: str,
+    allocation_operation_id: str,
+    metadata_sha256: str,
+) -> bytes:
+    """Build the sole Keychain-signable zero-secret allocation commitment.
+
+    Allocation is intentionally excluded from the material/start transport
+    signing surface.  Its domain admits only the V2 empty-resource operation,
+    the genesis-bound allocation digest, one canonical operation UUID, and a
+    commitment to canonical value-free request metadata.  It cannot sign an
+    arbitrary Docker or PostgreSQL payload.
+    """
+
+    if (
+        type(allocation_intent_sha256) is not str
+        or re.fullmatch(_SHA256, allocation_intent_sha256) is None
+        or type(allocation_operation_id) is not str
+        or type(metadata_sha256) is not str
+        or re.fullmatch(_SHA256, metadata_sha256) is None
+    ):
+        raise ProviderCryptoError("executor_allocation_signature")
+    try:
+        parsed_operation = uuid.UUID(allocation_operation_id)
+    except ValueError:
+        raise ProviderCryptoError("executor_allocation_signature") from None
+    if str(parsed_operation) != allocation_operation_id:
+        raise ProviderCryptoError("executor_allocation_signature")
+    return _EXECUTOR_ALLOCATION_METADATA_DOMAIN + _canonical_json(
+        {
+            "allocation_intent_sha256": allocation_intent_sha256,
+            "allocation_operation_id": allocation_operation_id,
+            "metadata_sha256": metadata_sha256,
         }
     )
 
@@ -1984,6 +2023,35 @@ class KeychainEd25519Signer:
             return Ed25519PrivateKey.from_private_bytes(seed).sign(message)
         except ValueError:
             raise ProviderCryptoError("executor_transport_signature") from None
+        finally:
+            _zeroize(seed)
+
+    def sign_executor_allocation_metadata(
+        self,
+        *,
+        allocation_intent_sha256: str,
+        allocation_operation_id: str,
+        metadata_sha256: str,
+    ) -> bytes:
+        """Sign only a genesis-bound, zero-secret allocation request.
+
+        This remains a bounded capability rather than a generic signing
+        oracle.  In particular, the signature is unusable for material/start
+        delivery and never accepts secret chunks or a caller-selected domain.
+        """
+
+        if allocation_intent_sha256 != self._genesis.allocation_intent_sha256:
+            raise ProviderCryptoError("executor_allocation_signature")
+        message = executor_allocation_metadata_message(
+            allocation_intent_sha256=allocation_intent_sha256,
+            allocation_operation_id=allocation_operation_id,
+            metadata_sha256=metadata_sha256,
+        )
+        seed = self._seed()
+        try:
+            return Ed25519PrivateKey.from_private_bytes(seed).sign(message)
+        except ValueError:
+            raise ProviderCryptoError("executor_allocation_signature") from None
         finally:
             _zeroize(seed)
 
@@ -3865,6 +3933,7 @@ __all__: Sequence[str] = (
     "ProviderMaterialSpecV1",
     "ReplayAuthorityPolicyArtifactV1",
     "SignerGenesisV1",
+    "executor_allocation_metadata_message",
     "executor_transport_metadata_message",
     "load_keychain_ed25519_signer",
     "load_verified_provider_material_bundle",

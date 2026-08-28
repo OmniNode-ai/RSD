@@ -61,6 +61,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     AllocatedVolumeObservationV1,
     AllocationEffectReceiptV2,
     AllocationEvidenceBindingsV1,
+    AllocationExecutorReceiptV1,
     AllocationIntentV2,
     AllocationPlanV2,
     AllocationPostgreSQLPlanV2,
@@ -73,12 +74,16 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     ContainerSecretSinkV1,
     DetachedSignatureV1,
     DisposableTransportProfile,
+    DockerEngineControlPolicyV1,
+    DockerEngineFilteredProjectionV1,
+    DockerImagePolicyV1,
+    DockerNamedVolumeMountV1,
+    DockerUnixSocketPolicyV1,
     EngineIdentityObservationV1,
     EphemeralPostgreSQLConnectionPolicyV1,
     ExecutorContainerInspectionV1,
     ExecutorControlPolicyV1,
     ExecutorIdentityV1,
-    ExecutorOperationReceiptV1,
     ExecutorPlacementV1,
     ImageConfigBindingV1,
     ImageReferenceV1,
@@ -86,6 +91,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     MaterializationComponentPlanV1,
     MaterializationEffectReceiptV1,
     MaterializationEvidenceBindingsV1,
+    MaterializationExecutorReceiptV1,
     MaterializationIntentV1,
     MaterializationPlanV1,
     NetworkOptionV1,
@@ -98,7 +104,10 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     PostgreSQLGrantPlanV1,
     PostgreSQLLoginTransitionIntentV1,
     PostgreSQLLoginTransitionReceiptV1,
+    PostgreSQLPreparedControlPolicyV2,
+    PostgreSQLPreparedOperationV1,
     PostgreSQLRoleObservationV1,
+    PostgreSQLScramVerifierInstallV1,
     ProviderReferencesV2,
     ProviderReferenceV1,
     RuntimeContainerObservationV1,
@@ -115,6 +124,9 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     allocation_effect_receipt_sha256,
     allocation_intent_sha256,
     canonical_sha256,
+    container_create_template_sha256,
+    docker_engine_fingerprint_sha256,
+    docker_volume_instance_fingerprint_sha256,
     materialization_intent_sha256,
     observed_allocation_attestation_sha256,
     strict_canonical_allocation_intent,
@@ -209,6 +221,32 @@ def _image(name: str, character: str) -> ImageReferenceV1:
     return ImageReferenceV1(reference=f"registry.example.test/{name}@sha256:{character * 64}")
 
 
+def _image_policy(name: str, character: str, *, config_sha256: str) -> DockerImagePolicyV1:
+    return DockerImagePolicyV1(
+        image=_image(name, character),
+        registry_index_digest_sha256=character * 64,
+        linux_amd64_manifest_digest_sha256=_hash(f"{name}-linux-amd64-manifest"),
+        config_digest_sha256=config_sha256,
+    )
+
+
+def _engine_projection() -> DockerEngineFilteredProjectionV1:
+    return DockerEngineFilteredProjectionV1(
+        daemon_id="daemon-test-1",
+        api_version="1.47",
+        operating_system="linux",
+        architecture="amd64",
+    )
+
+
+def _engine_observation() -> EngineIdentityObservationV1:
+    projection = _engine_projection()
+    return EngineIdentityObservationV1(
+        projection=projection,
+        engine_fingerprint_sha256=docker_engine_fingerprint_sha256(projection),
+    )
+
+
 def _topology() -> AllocationTopologyV2:
     primary = IsolatedNetworkPlanV1(
         name="primary-net",
@@ -254,8 +292,7 @@ def _topology() -> AllocationTopologyV2:
         ),
         executor=ExecutorPlacementV1(
             executor_id="local-executor",
-            placement="inside_disposable_networks_v1",
-            attached_network_names=(primary.name, restore.name),
+            placement="host_control_plane_v1",
         ),
     )
 
@@ -281,7 +318,7 @@ def _executor_policy(topology: AllocationTopologyV2) -> ExecutorControlPolicyV1:
             expires_at=_RETAINS,
         ),
         installation_policy_sha256=_hash("executor-installation-policy"),
-        engine_fingerprint_sha256=_hash("engine"),
+        engine_fingerprint_sha256=docker_engine_fingerprint_sha256(_engine_projection()),
         allowed_operations=(
             "allocate_isolated_empty_resources_v2",
             "materialize_and_start_runtime_v1",
@@ -355,12 +392,113 @@ def _postgres_policy(executor: ExecutorControlPolicyV1) -> PostgreSQLControlPoli
     )
 
 
+def _docker_policy(executor: ExecutorControlPolicyV1) -> DockerEngineControlPolicyV1:
+    projection = _engine_projection()
+    return DockerEngineControlPolicyV1(
+        schema_version="rsd.docker-engine-control-policy.v1",
+        source_commit=_COMMIT,
+        executor_identity_sha256=canonical_sha256(executor.executor),
+        unix_socket=DockerUnixSocketPolicyV1(
+            socket_identity_sha256=_hash("docker-socket"),
+            owner_uid=1,
+            group_gid=2,
+            mode=0o600,
+            endpoint_scheme="unix",
+            symlink_allowed=False,
+            replacement_allowed=False,
+        ),
+        api_version=projection.api_version,
+        engine_projection=projection,
+        engine_fingerprint_sha256=docker_engine_fingerprint_sha256(projection),
+        allowed_operations=(
+            "network_create",
+            "network_inspect",
+            "volume_create",
+            "volume_inspect",
+            "container_create",
+            "container_inspect",
+            "container_start",
+            "container_attach",
+        ),
+        max_request_bytes=4096,
+        max_response_bytes=8192,
+        max_hijack_bytes=8192,
+        request_timeout_seconds=10,
+        hijack_timeout_seconds=10,
+        created_at=_NOW,
+        signer_key_id="test-signer",
+        signature_base64=_SIGNATURE,
+    )
+
+
+def _postgres_prepared_policy(
+    executor: ExecutorControlPolicyV1,
+) -> PostgreSQLPreparedControlPolicyV2:
+    verifier = PostgreSQLScramVerifierInstallV1(
+        schema_version="rsd.postgresql-scram-verifier-install.v1",
+        prepared_operation_id="123e4567-e89b-42d3-a456-426614174003",
+        application_password_reference_sha256=(
+            _references().postgres_application_password.reference_sha256
+        ),
+        algorithm="scram-sha-256",
+        iterations=4096,
+        salt_bytes=16,
+        derivation_scope="executor_bounded_memory_v1",
+        sink="postgresql_prepared_psql_stdin_verifier_v1",
+        plaintext_to_psql_allowed=False,
+        verifier_in_receipt_allowed=False,
+        sql_in_receipt_allowed=False,
+        output_in_receipt_allowed=False,
+        logs_allowed=False,
+        template_sha256=_hash("postgres-verifier-template"),
+    )
+    return PostgreSQLPreparedControlPolicyV2(
+        schema_version="rsd.postgresql-prepared-control-policy.v2",
+        source_commit=_COMMIT,
+        executor_identity_sha256=canonical_sha256(executor.executor),
+        control_container_id=_hash("postgres-control-container"),
+        control_image=_image_policy(
+            "postgres-control", "c", config_sha256=_hash("postgres-control-config")
+        ),
+        control_config_sha256=_hash("postgres-control-config-binding"),
+        unix_socket_identity_sha256=_hash("postgres-control-socket"),
+        psql_binary_sha256=_hash("postgres-psql-binary"),
+        system_identifier="12345678",
+        password_encryption="scram-sha-256",
+        statement_logging="disabled",
+        operations=(
+            PostgreSQLPreparedOperationV1(
+                operation_id="123e4567-e89b-42d3-a456-426614174004",
+                kind="allocation_nologin_v1",
+                psql_template_sha256=_hash("postgres-allocation-template"),
+                result_projection_sha256=_hash("postgres-allocation-result"),
+                stdin_protocol="postgresql_prepared_psql_stdin_v1",
+                secret_input=False,
+            ),
+            PostgreSQLPreparedOperationV1(
+                operation_id=verifier.prepared_operation_id,
+                kind="install_scram_verifier_v1",
+                psql_template_sha256=verifier.template_sha256,
+                result_projection_sha256=_hash("postgres-verifier-result"),
+                stdin_protocol="postgresql_prepared_psql_stdin_v1",
+                secret_input=True,
+            ),
+        ),
+        scram_verifier_install=verifier,
+        created_at=_NOW,
+        signer_key_id="test-signer",
+        signature_base64=_SIGNATURE,
+    )
+
+
 def _allocation_bundle(
     tmp_path: Path,
 ) -> tuple[AllocationIntentV2, ExecutorControlPolicyV1, PostgreSQLControlPolicyV1]:
     topology = _topology()
     executor = _executor_policy(topology)
     postgres = _postgres_policy(executor)
+    docker = _docker_policy(executor)
+    postgres_prepared = _postgres_prepared_policy(executor)
     plan = AllocationPlanV2(
         transport=TransportContractV1(
             profile=DisposableTransportProfile.UNPUBLISHED_LOOPBACK_OR_NETWORK,
@@ -385,7 +523,9 @@ def _allocation_bundle(
             stage_database_prefix="stage-db",
             restore_database_prefix="restore-db",
             control_policy_sha256=canonical_sha256(postgres),
+            prepared_control_policy_sha256=canonical_sha256(postgres_prepared),
         ),
+        docker_engine_control_policy_sha256=canonical_sha256(docker),
     )
     journal_path = tmp_path / "allocation-journal.sqlite3"
     return (
@@ -405,7 +545,9 @@ def _allocation_bundle(
                 registry_verification_sha256=_hash("registry"),
                 provider_declaration_sha256=_hash("provider-declaration"),
                 executor_control_policy_sha256=canonical_sha256(executor),
+                docker_engine_control_policy_sha256=canonical_sha256(docker),
                 postgres_control_policy_sha256=canonical_sha256(postgres),
+                postgres_prepared_control_policy_sha256=canonical_sha256(postgres_prepared),
             ),
             retention_expires_at=_RETAINS,
             disposal_owner=_OWNER,
@@ -554,7 +696,9 @@ def _signed_allocation_bundle(
     Ed25519PrivateKey,
     AllocationIntentV2,
     ExecutorControlPolicyV1,
+    DockerEngineControlPolicyV1,
     PostgreSQLControlPolicyV1,
+    PostgreSQLPreparedControlPolicyV2,
     SQLiteAllocationJournal,
     ReplayAuthorityPolicyV1,
     ReplayAuthorityPolicyArtifactV1,
@@ -566,6 +710,8 @@ def _signed_allocation_bundle(
     journal = SQLiteAllocationJournal(journal_root / "allocation.sqlite3")
     signer, key = _trusted_signer()
     unsigned_intent, unsigned_executor, unsigned_postgres = _allocation_bundle(tmp_path)
+    unsigned_docker = _docker_policy(unsigned_executor)
+    unsigned_postgres_prepared = _postgres_prepared_policy(unsigned_executor)
     executor = unsigned_executor.model_copy(
         update={
             "signature_base64": base64.b64encode(
@@ -580,11 +726,33 @@ def _signed_allocation_bundle(
             ).decode("ascii")
         }
     )
+    docker = unsigned_docker.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                key.sign(authorization._docker_engine_control_policy_message(unsigned_docker))
+            ).decode("ascii")
+        }
+    )
+    postgres_prepared = unsigned_postgres_prepared.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                key.sign(
+                    authorization._postgres_prepared_control_policy_message(
+                        unsigned_postgres_prepared
+                    )
+                )
+            ).decode("ascii")
+        }
+    )
     plan = unsigned_intent.plan.model_copy(
         update={
             "postgres": unsigned_intent.plan.postgres.model_copy(
-                update={"control_policy_sha256": canonical_sha256(postgres)}
-            )
+                update={
+                    "control_policy_sha256": canonical_sha256(postgres),
+                    "prepared_control_policy_sha256": canonical_sha256(postgres_prepared),
+                }
+            ),
+            "docker_engine_control_policy_sha256": canonical_sha256(docker),
         }
     )
     policy = ReplayAuthorityPolicyV1(
@@ -598,7 +766,9 @@ def _signed_allocation_bundle(
             "evidence": unsigned_intent.evidence.model_copy(
                 update={
                     "executor_control_policy_sha256": canonical_sha256(executor),
+                    "docker_engine_control_policy_sha256": canonical_sha256(docker),
                     "postgres_control_policy_sha256": canonical_sha256(postgres),
+                    "postgres_prepared_control_policy_sha256": canonical_sha256(postgres_prepared),
                 }
             ),
             "journal_path": str(journal._path),
@@ -631,16 +801,28 @@ def _signed_allocation_bundle(
             ).decode("ascii")
         }
     )
-    return signer, key, intent, executor, postgres, journal, policy, artifact
+    return (
+        signer,
+        key,
+        intent,
+        executor,
+        docker,
+        postgres,
+        postgres_prepared,
+        journal,
+        policy,
+        artifact,
+    )
 
 
 def _allocated_resources(intent: AllocationIntentV2) -> AllocatedResourceSetV2:
     topology = intent.plan.topology
     postgres = intent.plan.postgres
+    engine = _engine_observation()
+    primary_volume_created_at = "2026-08-28T12:00:30Z"
+    restore_volume_created_at = "2026-08-28T12:00:31Z"
     return AllocatedResourceSetV2(
-        engine=EngineIdentityObservationV1(
-            engine_id=_hash("engine-id"), engine_fingerprint_sha256=_hash("engine")
-        ),
+        engine=engine,
         primary_network=AllocatedNetworkObservationV1(
             name=topology.primary_network.name,
             network_id=_hash("primary-network-id"),
@@ -661,15 +843,35 @@ def _allocated_resources(intent: AllocationIntentV2) -> AllocatedResourceSetV2:
         ),
         primary_cache_volume=AllocatedVolumeObservationV1(
             name=intent.plan.primary_valkey_volume.name,
-            volume_id=_hash("primary-volume-id"),
+            engine_fingerprint_sha256=engine.engine_fingerprint_sha256,
             driver="local",
+            scope="local",
+            created_at=primary_volume_created_at,
             options=intent.plan.primary_valkey_volume.options,
+            volume_instance_fingerprint_sha256=docker_volume_instance_fingerprint_sha256(
+                name=intent.plan.primary_valkey_volume.name,
+                engine_fingerprint_sha256=engine.engine_fingerprint_sha256,
+                driver="local",
+                scope="local",
+                created_at=primary_volume_created_at,
+                options=intent.plan.primary_valkey_volume.options,
+            ),
         ),
         restore_cache_volume=AllocatedVolumeObservationV1(
             name=intent.plan.restore_valkey_volume.name,
-            volume_id=_hash("restore-volume-id"),
+            engine_fingerprint_sha256=engine.engine_fingerprint_sha256,
             driver="local",
+            scope="local",
+            created_at=restore_volume_created_at,
             options=intent.plan.restore_valkey_volume.options,
+            volume_instance_fingerprint_sha256=docker_volume_instance_fingerprint_sha256(
+                name=intent.plan.restore_valkey_volume.name,
+                engine_fingerprint_sha256=engine.engine_fingerprint_sha256,
+                driver="local",
+                scope="local",
+                created_at=restore_volume_created_at,
+                options=intent.plan.restore_valkey_volume.options,
+            ),
         ),
         postgres=AllocatedPostgreSQLObservationV1(
             system_identifier="12345678",
@@ -677,6 +879,8 @@ def _allocated_resources(intent: AllocationIntentV2) -> AllocatedResourceSetV2:
             database_oid=101,
             schema_name=postgres.schema_name,
             schema_oid=102,
+            prepared_operation_id="123e4567-e89b-42d3-a456-426614174004",
+            prepared_operation_result_sha256=_hash("postgres-allocation-result"),
             owner_role=postgres.owner_role,
             owner_role_oid=103,
             application_role=postgres.application_role,
@@ -708,6 +912,37 @@ def _allocated_resources(intent: AllocationIntentV2) -> AllocatedResourceSetV2:
 
 
 def _allocation_receipt(intent: AllocationIntentV2) -> AllocationEffectReceiptV2:
+    resources = _allocated_resources(intent)
+    unsigned_executor_receipt = AllocationExecutorReceiptV1(
+        schema_version="rsd.allocation-executor-receipt.v1",
+        operation_scope="allocate_isolated_empty_resources_v2",
+        allocation_operation_id=intent.allocation_operation_id,
+        allocation_intent_sha256=allocation_intent_sha256(intent),
+        idempotency_key=_hash("allocation-idempotency"),
+        executor_id=intent.plan.topology.executor.executor_id,
+        engine_control_policy_sha256=intent.plan.docker_engine_control_policy_sha256,
+        postgres_prepared_control_policy_sha256=(
+            intent.plan.postgres.prepared_control_policy_sha256
+        ),
+        host_fingerprint_sha256=_executor_policy(
+            intent.plan.topology
+        ).executor.host_fingerprint_sha256,
+        engine=resources.engine,
+        allocated_resources_projection_sha256=canonical_sha256(resources),
+        engine_operation_journal_sha256=_hash("allocation-engine-operation-journal"),
+        completed_at="2026-08-28T12:01:00Z",
+        signer_key_id="executor-attestation",
+        signature_base64=_SIGNATURE,
+    )
+    executor_receipt = unsigned_executor_receipt.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                _EXECUTOR_ATTESTATION_PRIVATE_KEY.sign(
+                    authorization._allocation_executor_receipt_message(unsigned_executor_receipt)
+                )
+            ).decode("ascii")
+        }
+    )
     return AllocationEffectReceiptV2(
         schema_version="rsd.allocation-effect-receipt.v2",
         operation_kind="allocation_v2",
@@ -717,7 +952,9 @@ def _allocation_receipt(intent: AllocationIntentV2) -> AllocationEffectReceiptV2
         allocation_intent_sha256=allocation_intent_sha256(intent),
         journal_uuid=intent.journal_uuid,
         idempotency_key=_hash("allocation-idempotency"),
-        allocated_resources=_allocated_resources(intent),
+        allocated_resources=resources,
+        executor_receipt_sha256=canonical_sha256(executor_receipt),
+        executor_receipt=executor_receipt,
         effect_receipt_sha256=_hash("allocation-effect"),
         completed_at="2026-08-28T12:01:00Z",
     )
@@ -770,6 +1007,10 @@ def _secret_policies(
         restart_authorization_schema="rsd.start-runtime-intent.v2",
         restart_authorization_scope="start_runtime_v2",
         fresh_keychain_redelivery_required=True,
+        postgres_scram_verifier_executor_derivation_allowed=True,
+        postgres_scram_verifier_psql_stdin_allowed=True,
+        postgres_plaintext_password_to_psql_allowed=False,
+        postgres_verifier_in_receipt_allowed=False,
         created_at=_NOW,
         signer_key_id="test-signer",
         signature_base64=_SIGNATURE,
@@ -846,33 +1087,75 @@ def _materialization_intent(
     def template(name: str) -> ContainerBootstrapTemplateV1:
         component_plan = getattr(plan, name)
         placement = getattr(topology, name)
-        return ContainerBootstrapTemplateV1(
-            schema_version="rsd.container-bootstrap-template.v1",
-            component=cast(Any, name),
-            image=component_plan.image,
-            entrypoint_sha256=_hash(f"{name}-entrypoint"),
-            template_sha256=_hash(f"{name}-template"),
-            run_as_non_root=True,
-            read_only_root_filesystem=True,
-            cap_drop_all=True,
-            no_new_privileges=True,
-            private_pid=True,
-            log_driver="none",
-            restart_policy="no",
-            mounts=(),
-            docker_socket_mounted=False,
-            host_network=False,
-            publish_all_ports=False,
-            port_bindings=(),
-            network_name=placement.network_name,
-            network_alias=placement.alias,
-            static_ipv4=placement.static_ipv4,
-            accepted_secret_sink=(
+        entrypoint = ("/usr/local/bin/rsd-bootstrap", name)
+        mounts: tuple[DockerNamedVolumeMountV1, ...] = (
+            (
+                DockerNamedVolumeMountV1(
+                    mount_type="volume",
+                    source_volume_name=cast(str, component_plan.volume_name),
+                    target_path="/data",
+                    read_only=False,
+                    bind_allowed=False,
+                    tmpfs_allowed=False,
+                    propagation="none",
+                ),
+            )
+            if name.endswith("valkey")
+            else ()
+        )
+        fields: dict[str, Any] = {
+            "schema_version": "rsd.container-bootstrap-template.v1",
+            "component": name,
+            "image": component_plan.image,
+            "image_policy": _image_policy(
+                "valkey" if name.endswith("valkey") else "infisical",
+                "b" if name.endswith("valkey") else "a",
+                config_sha256=component_plan.config_sha256,
+            ),
+            "entrypoint": entrypoint,
+            "command": (),
+            "entrypoint_sha256": hashlib.sha256(
+                b'["/usr/local/bin/rsd-bootstrap","' + name.encode("ascii") + b'"]'
+            ).hexdigest(),
+            "template_sha256": _hash(f"{name}-template"),
+            "bootstrap_wrapper_sha256": _hash(f"{name}-bootstrap-wrapper"),
+            "ingress_protocol_sha256": _hash(f"{name}-ingress-protocol"),
+            "create_request_sha256": _hash(f"{name}-placeholder-create-request"),
+            "numeric_user": "1000:1000",
+            "working_directory": "/work",
+            "open_stdin": True,
+            "stdin_once": True,
+            "attach_stdin": True,
+            "tty": False,
+            "run_as_non_root": True,
+            "read_only_root_filesystem": True,
+            "cap_drop_all": True,
+            "cap_add": (),
+            "no_new_privileges": True,
+            "security_options": ("no-new-privileges:true",),
+            "private_pid": True,
+            "pid_mode": "isolated_pid_namespace_v1",
+            "log_driver": "none",
+            "restart_policy": "no",
+            "mounts": mounts,
+            "docker_socket_mounted": False,
+            "host_network": False,
+            "network_mode": "exact_isolated_network_v1",
+            "publish_all_ports": False,
+            "port_bindings": (),
+            "labels": (),
+            "network_name": placement.network_name,
+            "network_alias": placement.alias,
+            "static_ipv4": placement.static_ipv4,
+            "accepted_secret_sink": (
                 ContainerSecretSinkV1.VALKEY_STDIN_CONFIGURATION
                 if name.endswith("valkey")
                 else ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT
             ),
-        )
+        }
+        draft = ContainerBootstrapTemplateV1.model_construct(**fields)
+        fields["create_request_sha256"] = container_create_template_sha256(draft)
+        return ContainerBootstrapTemplateV1(**fields)
 
     templates = ContainerBootstrapTemplatesV1(
         primary_infisical=template("primary_infisical"),
@@ -881,6 +1164,7 @@ def _materialization_intent(
         restore_valkey=template("restore_valkey"),
     )
     observed_postgres = attestation.allocated_resources.postgres
+    postgres_prepared = _postgres_prepared_policy(executor)
     login_transition = PostgreSQLLoginTransitionIntentV1(
         schema_version="rsd.postgresql-login-transition-intent.v1",
         transition_kind="enable_application_login_with_provider_verifier_v1",
@@ -895,6 +1179,8 @@ def _materialization_intent(
         application_password_reference_sha256=(
             allocation.provider_references.postgres_application_password.reference_sha256
         ),
+        prepared_control_policy_sha256=canonical_sha256(postgres_prepared),
+        scram_verifier_install=postgres_prepared.scram_verifier_install,
         owner_can_login=False,
         owner_password_absent=True,
         application_can_login=True,
@@ -1003,6 +1289,8 @@ def _materialization_intent(
                     attestation
                 ),
                 executor_control_policy_sha256=canonical_sha256(executor),
+                docker_engine_control_policy_sha256=canonical_sha256(_docker_policy(executor)),
+                postgres_prepared_control_policy_sha256=canonical_sha256(postgres_prepared),
                 executor_installation_policy_sha256=executor.installation_policy_sha256,
                 executor_installation_intent_sha256=_hash("executor-installation-intent"),
                 executor_installation_receipt_sha256=_hash("executor-installation-receipt"),
@@ -1048,6 +1336,7 @@ def _materialization_context(
         executor_attestation_public_key_fingerprint_sha256=hashlib.sha256(
             _EXECUTOR_ATTESTATION_PUBLIC_BYTES
         ).hexdigest(),
+        docker_engine_control_policy_sha256=(intent.evidence.docker_engine_control_policy_sha256),
         postgres_login_expectation=PostgreSQLLoginTransitionExpectationV1(
             authority=intent.ephemeral_postgres_connection.authority,
             system_identifier=intent.postgres_login_transition.system_identifier,
@@ -1060,6 +1349,10 @@ def _materialization_context(
             ),
             capability_fingerprint_sha256=_hash("postgres-login-capability"),
         ),
+        postgres_prepared_control_policy_sha256=(
+            intent.postgres_login_transition.prepared_control_policy_sha256
+        ),
+        postgres_verifier_result_projection_sha256=_hash("postgres-verifier-result"),
         secret_material_expectation=SecretMaterialExpectationV1(
             provider_identity_sha256=_hash("provider-material-attestation"),
             capability_fingerprint_sha256=_hash("secret-capability"),
@@ -1089,13 +1382,24 @@ def _allocation_context(intent: AllocationIntentV2) -> AllocationExecutionContex
             endpoint_sha256=_hash("executor-endpoint"),
             host_fingerprint_sha256=_hash("executor-host"),
             control_capability_fingerprint_sha256=_hash("executor-control"),
-            engine_fingerprint_sha256=_hash("engine"),
+            engine_fingerprint_sha256=docker_engine_fingerprint_sha256(_engine_projection()),
         ),
+        executor_attestation_key_id="executor-attestation",
+        executor_attestation_public_key_base64=_EXECUTOR_ATTESTATION_PUBLIC_KEY,
+        executor_attestation_public_key_fingerprint_sha256=hashlib.sha256(
+            _EXECUTOR_ATTESTATION_PUBLIC_BYTES
+        ).hexdigest(),
+        docker_engine_control_policy_sha256=intent.evidence.docker_engine_control_policy_sha256,
         postgres_control_expectation=PostgreSQLControlExpectationV1(
             authority="postgresql://192.0.2.40:5432",
             maintenance_reference_sha256=_hash("postgres-maintenance"),
             capability_fingerprint_sha256=_hash("postgres-capability"),
         ),
+        postgres_prepared_control_policy_sha256=(
+            intent.plan.postgres.prepared_control_policy_sha256
+        ),
+        postgres_allocation_prepared_operation_id="123e4567-e89b-42d3-a456-426614174004",
+        postgres_allocation_result_projection_sha256=_hash("postgres-allocation-result"),
         allocation_intent_sha256=allocation_intent_sha256(intent),
         idempotency_key=_hash("allocation-idempotency"),
         provider_provenance_sha256=_hash("provider-provenance"),
@@ -1116,20 +1420,37 @@ def _materialization_receipt(
     def inspection(name: str) -> ContainerBootstrapInspectionV1:
         template = getattr(context.intent.bootstrap_templates, name)
         return ContainerBootstrapInspectionV1(
+            image_policy=template.image_policy,
+            entrypoint=template.entrypoint,
+            command=template.command,
             entrypoint_sha256=template.entrypoint_sha256,
             template_sha256=template.template_sha256,
+            bootstrap_wrapper_sha256=template.bootstrap_wrapper_sha256,
+            ingress_protocol_sha256=template.ingress_protocol_sha256,
+            create_request_sha256=template.create_request_sha256,
+            numeric_user=template.numeric_user,
+            working_directory=template.working_directory,
+            open_stdin=True,
+            stdin_once=True,
+            attach_stdin=True,
+            tty=False,
             run_as_non_root=True,
             read_only_root_filesystem=True,
             cap_drop_all=True,
+            cap_add=(),
             no_new_privileges=True,
+            security_options=("no-new-privileges:true",),
             private_pid=True,
+            pid_mode="isolated_pid_namespace_v1",
             log_driver="none",
             restart_policy="no",
-            mounts=(),
+            mounts=template.mounts,
             docker_socket_mounted=False,
             host_network=False,
+            network_mode="exact_isolated_network_v1",
             publish_all_ports=False,
             port_bindings=(),
+            labels=(),
             network_name=template.network_name,
             network_alias=template.network_alias,
             static_ipv4=template.static_ipv4,
@@ -1143,9 +1464,9 @@ def _materialization_receipt(
         return RuntimeContainerObservationV1(
             component=cast(Any, name),
             container_id=_hash(f"container-{marker}"),
-            workload_id=_hash(f"workload-{marker}"),
             image=plan.image,
             config_sha256=plan.config_sha256,
+            image_policy=getattr(context.intent.bootstrap_templates, name).image_policy,
             attachments=(
                 RuntimeNetworkAttachmentV1(
                     network_name=placement.network_name,
@@ -1184,18 +1505,22 @@ def _materialization_receipt(
             inspection=inspection("restore_valkey"),
         ),
     )
-    unsigned_executor_receipt = ExecutorOperationReceiptV1(
-        schema_version="rsd.executor-operation-receipt.v1",
+    unsigned_executor_receipt = MaterializationExecutorReceiptV1(
+        schema_version="rsd.materialization-executor-receipt.v1",
         executor_id=context.executor_expectation.executor_id,
         installation_receipt_sha256=_hash("executor-installation-receipt"),
         operation_scope="materialize_and_start_runtime_v1",
         operation_id=context.materialization_operation_id,
         idempotency_key=context.idempotency_key,
+        materialization_intent_sha256=context.materialization_intent_sha256,
+        observed_allocation_attestation_sha256=context.allocation_attestation_sha256,
+        docker_engine_control_policy_sha256=context.docker_engine_control_policy_sha256,
         secret_delivery_receipt_sha256=_hash("pending-secret-delivery-receipt"),
         channel_binding_sha256=context.secret_delivery_request.channel_binding_sha256,
         session_binding_sha256=context.secret_delivery_request.session_binding_sha256,
         host_fingerprint_sha256=context.executor_expectation.host_fingerprint_sha256,
         engine_fingerprint_sha256=context.executor_expectation.engine_fingerprint_sha256,
+        engine_operation_journal_sha256=_hash("materialization-engine-operation-journal"),
         containers=inspections,
         completed_at="2026-08-28T12:04:00Z",
         signer_key_id="executor-attestation",
@@ -1213,6 +1538,8 @@ def _materialization_receipt(
         application_role=transition.application_role,
         application_role_oid=transition.application_role_oid,
         application_password_reference_sha256=(transition.application_password_reference_sha256),
+        prepared_control_policy_sha256=transition.prepared_control_policy_sha256,
+        prepared_operation_result_sha256=context.postgres_verifier_result_projection_sha256,
         owner_can_login=False,
         owner_password_absent=True,
         application_can_login=True,
@@ -1246,7 +1573,9 @@ def _materialization_receipt(
         update={
             "signature_base64": base64.b64encode(
                 _EXECUTOR_ATTESTATION_PRIVATE_KEY.sign(
-                    authorization._executor_operation_receipt_message(unsigned_executor_receipt)
+                    authorization._materialization_executor_receipt_message(
+                        unsigned_executor_receipt
+                    )
                 )
             ).decode("ascii")
         }
@@ -1439,8 +1768,12 @@ def test_materialization_control_policy_pins_component_images_and_configs(
     materialization, capability, handling = _materialization_intent(
         allocation, executor, receipt, attestation
     )
+    docker = _docker_policy(executor)
+    postgres_prepared = _postgres_prepared_policy(executor)
     for name in (
         "_verify_executor_control_policy_signature",
+        "_verify_docker_engine_control_policy_signature",
+        "_verify_postgres_prepared_control_policy_signature",
         "_verify_secret_capability_policy_signature",
         "_verify_secret_handling_policy_signature",
     ):
@@ -1450,6 +1783,8 @@ def test_materialization_control_policy_pins_component_images_and_configs(
         allocation_intent=allocation,
         intent=materialization,
         executor=executor,
+        docker=docker,
+        postgres_prepared=postgres_prepared,
         secret_capability=capability,
         secret_handling=handling,
         provider_material_attestation_sha256=_hash("provider-material-attestation"),
@@ -1469,6 +1804,8 @@ def test_materialization_control_policy_pins_component_images_and_configs(
                 }
             ),
             executor=executor,
+            docker=docker,
+            postgres_prepared=postgres_prepared,
             secret_capability=capability,
             secret_handling=handling,
             provider_material_attestation_sha256=_hash("provider-material-attestation"),
@@ -1698,13 +2035,24 @@ def test_allocation_context_is_value_free_and_non_bearer(tmp_path: Path) -> None
             endpoint_sha256=_hash("executor-endpoint"),
             host_fingerprint_sha256=_hash("executor-host"),
             control_capability_fingerprint_sha256=_hash("executor-control"),
-            engine_fingerprint_sha256=_hash("engine"),
+            engine_fingerprint_sha256=docker_engine_fingerprint_sha256(_engine_projection()),
         ),
+        executor_attestation_key_id="executor-attestation",
+        executor_attestation_public_key_base64=_EXECUTOR_ATTESTATION_PUBLIC_KEY,
+        executor_attestation_public_key_fingerprint_sha256=hashlib.sha256(
+            _EXECUTOR_ATTESTATION_PUBLIC_BYTES
+        ).hexdigest(),
+        docker_engine_control_policy_sha256=intent.evidence.docker_engine_control_policy_sha256,
         postgres_control_expectation=PostgreSQLControlExpectationV1(
             authority="postgresql://192.0.2.40:5432",
             maintenance_reference_sha256=_hash("postgres-maintenance"),
             capability_fingerprint_sha256=_hash("postgres-capability"),
         ),
+        postgres_prepared_control_policy_sha256=(
+            intent.plan.postgres.prepared_control_policy_sha256
+        ),
+        postgres_allocation_prepared_operation_id="123e4567-e89b-42d3-a456-426614174004",
+        postgres_allocation_result_projection_sha256=_hash("postgres-allocation-result"),
         allocation_intent_sha256=allocation_intent_sha256(intent),
         idempotency_key=_hash("allocation-idempotency"),
         provider_provenance_sha256=_hash("provider-provenance"),
@@ -1720,8 +2068,8 @@ def test_allocation_journal_is_explicit_and_replay_policy_is_durable_first(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(authorization, "_system_utc_clock", lambda: _TEST_CLOCK)
-    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
-        tmp_path
+    signer, _, intent, executor, docker, postgres, postgres_prepared, journal, policy, artifact = (
+        _signed_allocation_bundle(tmp_path)
     )
     root = tmp_path / "artifacts"
     root.mkdir(mode=0o700)
@@ -1739,6 +2087,8 @@ def test_allocation_journal_is_explicit_and_replay_policy_is_durable_first(
         intent=intent,
         executor_control_policy=executor,
         postgres_control_policy=postgres,
+        docker_engine_control_policy=docker,
+        postgres_prepared_control_policy=postgres_prepared,
         replay_authority=authority,
         replay_policy=policy,
         replay_policy_artifact=artifact,
@@ -1762,6 +2112,8 @@ def test_allocation_journal_is_explicit_and_replay_policy_is_durable_first(
             intent=intent,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=artifact,
@@ -1775,7 +2127,7 @@ def test_v2_allocation_authorization_absent_journal_never_initializes(
     """The execution boundary cannot turn an absent allocation journal into genesis."""
 
     monkeypatch.setattr(authorization, "_system_utc_clock", lambda: _TEST_CLOCK)
-    signer, _, intent, _, _, journal, policy, _ = _signed_allocation_bundle(tmp_path)
+    signer, _, intent, _, _, _, _, journal, policy, _ = _signed_allocation_bundle(tmp_path)
     root = tmp_path / "artifacts"
     root.mkdir(mode=0o700)
     authority = _AtomicReplayAuthority(root=root)
@@ -1805,8 +2157,8 @@ def test_allocation_genesis_crash_leaves_a_terminal_pending_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(authorization, "_system_utc_clock", lambda: _TEST_CLOCK)
-    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
-        tmp_path
+    signer, _, intent, executor, docker, postgres, postgres_prepared, journal, policy, artifact = (
+        _signed_allocation_bundle(tmp_path)
     )
     root = tmp_path / "artifacts"
     root.mkdir(mode=0o700)
@@ -1827,6 +2179,8 @@ def test_allocation_genesis_crash_leaves_a_terminal_pending_state(
             intent=intent,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=artifact,
@@ -1845,6 +2199,8 @@ def test_allocation_genesis_crash_leaves_a_terminal_pending_state(
             intent=intent,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=artifact,
@@ -1858,8 +2214,8 @@ def test_v2_allocation_journal_unknown_or_legacy_local_state_blocks_without_recr
     """An unrelated legacy-shaped database is neither adopted nor migrated by V2."""
 
     monkeypatch.setattr(authorization, "_system_utc_clock", lambda: _TEST_CLOCK)
-    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
-        tmp_path
+    signer, _, intent, executor, docker, postgres, postgres_prepared, journal, policy, artifact = (
+        _signed_allocation_bundle(tmp_path)
     )
     connection = sqlite3.connect(journal._path)
     try:
@@ -1883,6 +2239,8 @@ def test_v2_allocation_journal_unknown_or_legacy_local_state_blocks_without_recr
             intent=intent,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=artifact,
@@ -1899,8 +2257,8 @@ def test_external_allocation_genesis_tombstone_blocks_a_second_local_journal(
     second = tmp_path / "second"
     first.mkdir(mode=0o700)
     second.mkdir(mode=0o700)
-    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
-        first
+    signer, _, intent, executor, docker, postgres, postgres_prepared, journal, policy, artifact = (
+        _signed_allocation_bundle(first)
     )
     first_root = first / "artifacts"
     first_root.mkdir(mode=0o700)
@@ -1914,6 +2272,8 @@ def test_external_allocation_genesis_tombstone_blocks_a_second_local_journal(
         intent=intent,
         executor_control_policy=executor,
         postgres_control_policy=postgres,
+        docker_engine_control_policy=docker,
+        postgres_prepared_control_policy=postgres_prepared,
         replay_authority=authority,
         replay_policy=policy,
         replay_policy_artifact=artifact,
@@ -1924,7 +2284,9 @@ def test_external_allocation_genesis_tombstone_blocks_a_second_local_journal(
         _,
         second_intent,
         second_executor,
+        second_docker,
         second_postgres,
+        second_postgres_prepared,
         second_journal,
         _,
         second_artifact,
@@ -1941,6 +2303,8 @@ def test_external_allocation_genesis_tombstone_blocks_a_second_local_journal(
             intent=second_intent,
             executor_control_policy=second_executor,
             postgres_control_policy=second_postgres,
+            docker_engine_control_policy=second_docker,
+            postgres_prepared_control_policy=second_postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=second_artifact,
@@ -1954,8 +2318,8 @@ def test_materialization_journal_requires_committed_allocation_and_never_replays
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(authorization, "_system_utc_clock", lambda: _TEST_CLOCK)
-    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
-        tmp_path
+    signer, _, intent, executor, docker, postgres, postgres_prepared, journal, policy, artifact = (
+        _signed_allocation_bundle(tmp_path)
     )
     root = tmp_path / "artifacts"
     root.mkdir(mode=0o700)
@@ -1968,6 +2332,8 @@ def test_materialization_journal_requires_committed_allocation_and_never_replays
         intent=intent,
         executor_control_policy=executor,
         postgres_control_policy=postgres,
+        docker_engine_control_policy=docker,
+        postgres_prepared_control_policy=postgres_prepared,
         replay_authority=_AtomicReplayAuthority(root=root),
         replay_policy=policy,
         replay_policy_artifact=artifact,
@@ -2094,8 +2460,8 @@ def _provisioned_allocation(
     """Create a durable V2 allocation fixture through the signed boundary."""
 
     monkeypatch.setattr(authorization, "_system_utc_clock", lambda: _TEST_CLOCK)
-    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
-        tmp_path
+    signer, _, intent, executor, docker, postgres, postgres_prepared, journal, policy, artifact = (
+        _signed_allocation_bundle(tmp_path)
     )
     root = tmp_path / "artifacts"
     root.mkdir(mode=0o700)
@@ -2110,11 +2476,31 @@ def _provisioned_allocation(
         intent=intent,
         executor_control_policy=executor,
         postgres_control_policy=postgres,
+        docker_engine_control_policy=docker,
+        postgres_prepared_control_policy=postgres_prepared,
         replay_authority=authority,
         replay_policy=policy,
         replay_policy_artifact=artifact,
     )
     return paths, signer, intent, executor, postgres, journal, policy, authority
+
+
+def _persisted_allocation_control_policies(
+    paths: AuthorizationPaths,
+) -> tuple[DockerEngineControlPolicyV1, PostgreSQLPreparedControlPolicyV2]:
+    """Reload the signed allocation controls instead of reconstructing them."""
+
+    docker = DockerEngineControlPolicyV1.model_validate(
+        yaml.safe_load(
+            (paths.root / paths.docker_engine_control_policy_name()).read_text(encoding="utf-8")
+        )
+    )
+    postgres_prepared = PostgreSQLPreparedControlPolicyV2.model_validate(
+        yaml.safe_load(
+            (paths.root / paths.postgres_prepared_control_policy_name()).read_text(encoding="utf-8")
+        )
+    )
+    return docker, postgres_prepared
 
 
 def _verified_allocation(
@@ -2268,8 +2654,8 @@ def test_v2_allocation_genesis_crash_after_tombstone_is_not_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(authorization, "_system_utc_clock", lambda: _TEST_CLOCK)
-    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
-        tmp_path
+    signer, _, intent, executor, docker, postgres, postgres_prepared, journal, policy, artifact = (
+        _signed_allocation_bundle(tmp_path)
     )
     root = tmp_path / "artifacts"
     root.mkdir(mode=0o700)
@@ -2293,6 +2679,8 @@ def test_v2_allocation_genesis_crash_after_tombstone_is_not_retried(
             intent=intent,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=artifact,
@@ -2310,6 +2698,8 @@ def test_v2_allocation_genesis_crash_after_tombstone_is_not_retried(
             intent=intent,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=artifact,
@@ -2554,8 +2944,8 @@ def test_v2_sidecar_swap_and_noncanonical_signature_alias_are_rejected() -> None
 def test_v2_owner_and_approval_mismatch_block_before_provisioning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
-        tmp_path
+    signer, _, intent, executor, docker, postgres, postgres_prepared, journal, policy, artifact = (
+        _signed_allocation_bundle(tmp_path)
     )
     root = tmp_path / "artifacts"
     paths = AuthorizationPaths(root=root)
@@ -2571,6 +2961,8 @@ def test_v2_owner_and_approval_mismatch_block_before_provisioning(
             intent=intent,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=artifact,
@@ -2587,6 +2979,8 @@ def test_v2_owner_and_approval_mismatch_block_before_provisioning(
             intent=intent,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=artifact,
@@ -2600,8 +2994,8 @@ def test_v2_historical_time_blocks_allocation_provisioning(
 ) -> None:
     """The internal current-time read cannot be rewound through a public argument."""
 
-    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
-        tmp_path
+    signer, _, intent, executor, docker, postgres, postgres_prepared, journal, policy, artifact = (
+        _signed_allocation_bundle(tmp_path)
     )
     root = tmp_path / "artifacts"
     authority = _AtomicReplayAuthority()
@@ -2618,6 +3012,8 @@ def test_v2_historical_time_blocks_allocation_provisioning(
             intent=intent,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=artifact,
@@ -2629,8 +3025,8 @@ def test_v2_historical_time_blocks_allocation_provisioning(
 def test_v2_missing_replay_authority_blocks_before_journal_provisioning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
-        tmp_path
+    signer, _, intent, executor, docker, postgres, postgres_prepared, journal, policy, artifact = (
+        _signed_allocation_bundle(tmp_path)
     )
     root = tmp_path / "artifacts"
     paths = AuthorizationPaths(root=root)
@@ -2646,6 +3042,8 @@ def test_v2_missing_replay_authority_blocks_before_journal_provisioning(
             intent=intent,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=cast(Any, object()),
             replay_policy=policy,
             replay_policy_artifact=artifact,
@@ -2656,8 +3054,8 @@ def test_v2_missing_replay_authority_blocks_before_journal_provisioning(
 def test_v2_replay_policy_substitution_blocks_before_external_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
-        tmp_path
+    signer, _, intent, executor, docker, postgres, postgres_prepared, journal, policy, artifact = (
+        _signed_allocation_bundle(tmp_path)
     )
     root = tmp_path / "artifacts"
     root.mkdir(mode=0o700)
@@ -2677,6 +3075,8 @@ def test_v2_replay_policy_substitution_blocks_before_external_claim(
             intent=intent,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=artifact,
@@ -2687,7 +3087,7 @@ def test_v2_replay_policy_substitution_blocks_before_external_claim(
 def test_v2_keychain_replay_authority_is_create_only_and_stores_hashes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, _, intent, _, _, _, policy, _ = _signed_allocation_bundle(tmp_path)
+    _, _, intent, _, _, _, _, _, policy, _ = _signed_allocation_bundle(tmp_path)
     verified = authorization._VerifiedAllocationIntent(
         intent=intent,
         intent_sha256=allocation_intent_sha256(intent),
@@ -2722,7 +3122,7 @@ def test_v2_keychain_replay_authority_is_create_only_and_stores_hashes(
 def test_v2_external_replay_claim_is_atomic_across_processes(tmp_path: Path) -> None:
     """An external create-once adapter admits exactly one concurrent claim."""
 
-    _, _, intent, _, _, _, policy, _ = _signed_allocation_bundle(tmp_path)
+    _, _, intent, _, _, _, _, _, policy, _ = _signed_allocation_bundle(tmp_path)
     verified = authorization._VerifiedAllocationIntent(
         intent=intent,
         intent_sha256=allocation_intent_sha256(intent),
@@ -2755,7 +3155,7 @@ def test_v2_external_replay_claim_is_atomic_across_processes(tmp_path: Path) -> 
 def test_v2_replay_authority_errors_are_redacted_and_block_the_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, _, intent, _, _, _, policy, _ = _signed_allocation_bundle(tmp_path)
+    _, _, intent, _, _, _, _, _, policy, _ = _signed_allocation_bundle(tmp_path)
     verified = authorization._VerifiedAllocationIntent(
         intent=intent,
         intent_sha256=allocation_intent_sha256(intent),
@@ -2830,6 +3230,7 @@ def test_v2_allocation_journal_pair_removal_never_recreates_replay_protection(
     paths, signer, intent, executor, postgres, journal, policy, authority = _provisioned_allocation(
         tmp_path, monkeypatch
     )
+    docker, postgres_prepared = _persisted_allocation_control_policies(paths)
     journal._path.unlink()
     journal._anchor_path().unlink()
 
@@ -2844,6 +3245,8 @@ def test_v2_allocation_journal_pair_removal_never_recreates_replay_protection(
             intent=intent,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=ReplayAuthorityPolicyArtifactV1.model_validate(
@@ -2863,6 +3266,7 @@ def test_v2_allocation_journal_marker_removal_blocks_without_recreation(
     paths, signer, intent, executor, postgres, journal, policy, authority = _provisioned_allocation(
         tmp_path, monkeypatch
     )
+    docker, postgres_prepared = _persisted_allocation_control_policies(paths)
     journal._marker_path().unlink()
 
     assert journal.migration_status() is AllocationJournalStatus.JOURNAL_MISSING
@@ -2876,6 +3280,8 @@ def test_v2_allocation_journal_marker_removal_blocks_without_recreation(
             intent=intent,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=ReplayAuthorityPolicyArtifactV1.model_validate(
@@ -2893,9 +3299,18 @@ def test_v2_signed_journal_intent_mismatch_is_not_a_second_provisioning(
     """A separately valid signature cannot rotate a current allocation journal."""
 
     monkeypatch.setattr(authorization, "_system_utc_clock", lambda: _TEST_CLOCK)
-    signer, key, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
-        tmp_path
-    )
+    (
+        signer,
+        key,
+        intent,
+        executor,
+        docker,
+        postgres,
+        postgres_prepared,
+        journal,
+        policy,
+        artifact,
+    ) = _signed_allocation_bundle(tmp_path)
     root = tmp_path / "artifacts"
     root.mkdir(mode=0o700)
     paths = AuthorizationPaths(root=root)
@@ -2909,6 +3324,8 @@ def test_v2_signed_journal_intent_mismatch_is_not_a_second_provisioning(
         intent=intent,
         executor_control_policy=executor,
         postgres_control_policy=postgres,
+        docker_engine_control_policy=docker,
+        postgres_prepared_control_policy=postgres_prepared,
         replay_authority=authority,
         replay_policy=policy,
         replay_policy_artifact=artifact,
@@ -2937,6 +3354,8 @@ def test_v2_signed_journal_intent_mismatch_is_not_a_second_provisioning(
             intent=mismatched,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=artifact,
@@ -2950,9 +3369,18 @@ def test_v2_allocation_genesis_recovery_requires_a_signed_nonretry_receipt(
     """A crash can be abandoned only by a signer-approved recovery record."""
 
     monkeypatch.setattr(authorization, "_system_utc_clock", lambda: _TEST_CLOCK)
-    signer, key, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
-        tmp_path
-    )
+    (
+        signer,
+        key,
+        intent,
+        executor,
+        docker,
+        postgres,
+        postgres_prepared,
+        journal,
+        policy,
+        artifact,
+    ) = _signed_allocation_bundle(tmp_path)
     root = tmp_path / "artifacts"
     root.mkdir(mode=0o700)
     paths = AuthorizationPaths(root=root)
@@ -2972,6 +3400,8 @@ def test_v2_allocation_genesis_recovery_requires_a_signed_nonretry_receipt(
             intent=intent,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=artifact,
@@ -3094,8 +3524,8 @@ def test_v2_pinned_allocation_journal_identity_blocks_database_replacement(
 def test_v2_tls_type_drift_blocks_provisioning_before_root_or_tombstone(
     profile: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    signer, _, intent, executor, postgres, journal, policy, artifact = _signed_allocation_bundle(
-        tmp_path
+    signer, _, intent, executor, docker, postgres, postgres_prepared, journal, policy, artifact = (
+        _signed_allocation_bundle(tmp_path)
     )
     drift = intent.model_construct(
         **{
@@ -3126,6 +3556,8 @@ def test_v2_tls_type_drift_blocks_provisioning_before_root_or_tombstone(
             intent=drift,
             executor_control_policy=executor,
             postgres_control_policy=postgres,
+            docker_engine_control_policy=docker,
+            postgres_prepared_control_policy=postgres_prepared,
             replay_authority=authority,
             replay_policy=policy,
             replay_policy_artifact=artifact,
