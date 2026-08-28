@@ -24,6 +24,7 @@ import os
 import re
 import stat
 import sys
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -69,17 +70,22 @@ _MAX_ARTIFACT_BYTES: Final = 131_072
 _MATERIAL_ATTESTATION_FRESHNESS: Final = timedelta(minutes=15)
 _SIGNER_GENESIS_DOMAIN: Final = b"omninode-rsd.provider-crypto.signer-genesis.v1\x00"
 _REPLAY_POLICY_DOMAIN: Final = b"omninode-rsd.provider-crypto.replay-policy.v1\x00"
-_MATERIAL_POLICY_DOMAIN: Final = b"omninode-rsd.provider-crypto.material-policy.v1\x00"
+_MATERIAL_POLICY_DOMAIN: Final = b"omninode-rsd.provider-crypto.material-policy.v2\x00"
 _FINGERPRINT_ATTESTATION_DOMAIN: Final = (
-    b"omninode-rsd.provider-crypto.fingerprint-attestation.v1\x00"
+    b"omninode-rsd.provider-crypto.fingerprint-attestation.v2\x00"
 )
-_MATERIAL_GENESIS_DOMAIN: Final = b"omninode-rsd.provider-crypto.material-genesis.v1\x00"
+_MATERIAL_GENESIS_DOMAIN: Final = b"omninode-rsd.provider-crypto.material-genesis.v2\x00"
+_MATERIAL_GENERATION_RECEIPT_DOMAIN: Final = (
+    b"omninode-rsd.provider-crypto.material-generation-receipt.v1\x00"
+)
 _ALLOCATION_INTENT_SIGNATURE_DOMAIN: Final = b"omninode-rsd.allocation-intent.ed25519.v2\x00"
 _MATERIAL_POLICY_NAME: Final = "provider-material-policy.yaml"
 _MATERIAL_GENESIS_NAME: Final = "provider-material-genesis.yaml"
 _FINGERPRINT_ATTESTATION_NAME: Final = "provider-fingerprint-attestation.yaml"
+_MATERIAL_GENERATION_RECEIPT_NAME: Final = "material-generation-receipt.yaml"
 _REPLAY_POLICY_NAME: Final = "replay-authority-policy.yaml"
 _SIGNER_GENESIS_NAME: Final = "signer-genesis.yaml"
+_MATERIAL_GENERATOR_ID: Final = "macos_security_secrandom_v1"
 _TRANSPORT_FAILURE: Final = object()
 
 
@@ -114,6 +120,7 @@ class ProviderMaterialPurpose(StrEnum):
     INFISICAL_AUTH_SECRET = "auth_secret"
     PRIMARY_VALKEY_PASSWORD = "primary_valkey_password"
     RESTORE_VALKEY_PASSWORD = "restore_valkey_password"
+    POSTGRES_APPLICATION_PASSWORD = "postgres_application_password"
     TLS_TRUST_ANCHOR = "tls_trust_anchor"
 
 
@@ -138,6 +145,7 @@ class ProviderMaterialFormat(StrEnum):
     INFISICAL_HEX_16_V1 = "infisical_hex_16_v1"
     INFISICAL_AUTH_SECRET_BASE64_32_V1 = "infisical_auth_secret_base64_32_v1"
     VALKEY_PASSWORD_BASE64URL_32_V1 = "valkey_password_base64url_32_v1"
+    POSTGRES_APPLICATION_PASSWORD_BASE64URL_32_V1 = "postgres_application_password_base64url_32_v1"
     X509_CA_PEM_V1 = "x509_ca_pem_v1"
 
 
@@ -154,6 +162,9 @@ _PURPOSE_FORMATS: Final[Mapping[ProviderMaterialPurpose, ProviderMaterialFormat]
     ProviderMaterialPurpose.RESTORE_VALKEY_PASSWORD: (
         ProviderMaterialFormat.VALKEY_PASSWORD_BASE64URL_32_V1
     ),
+    ProviderMaterialPurpose.POSTGRES_APPLICATION_PASSWORD: (
+        ProviderMaterialFormat.POSTGRES_APPLICATION_PASSWORD_BASE64URL_32_V1
+    ),
     ProviderMaterialPurpose.TLS_TRUST_ANCHOR: ProviderMaterialFormat.X509_CA_PEM_V1,
 }
 _FORMAT_LENGTHS: Final[Mapping[ProviderMaterialFormat, tuple[int, int]]] = {
@@ -162,6 +173,7 @@ _FORMAT_LENGTHS: Final[Mapping[ProviderMaterialFormat, tuple[int, int]]] = {
     ProviderMaterialFormat.INFISICAL_HEX_16_V1: (32, 32),
     ProviderMaterialFormat.INFISICAL_AUTH_SECRET_BASE64_32_V1: (44, 44),
     ProviderMaterialFormat.VALKEY_PASSWORD_BASE64URL_32_V1: (43, 43),
+    ProviderMaterialFormat.POSTGRES_APPLICATION_PASSWORD_BASE64URL_32_V1: (43, 43),
     ProviderMaterialFormat.X509_CA_PEM_V1: (1, _MAX_ARTIFACT_BYTES),
 }
 
@@ -312,10 +324,10 @@ class ProviderMaterialSpecV1(_Model):
         return self
 
 
-class ProviderMaterialPolicyV1(_Model):
-    """Signed policy that binds all material purposes to the allocation intent."""
+class ProviderMaterialPolicyV2(_Model):
+    """Signed v2 policy that binds every runtime material purpose to an intent."""
 
-    schema_version: Literal["rsd.provider-crypto.material-policy.v1"]
+    schema_version: Literal["rsd.provider-crypto.material-policy.v2"]
     allocation_intent_sha256: str = Field(pattern=_SHA256)
     disposal_owner: str = Field(pattern=_OWNER_IDENTITY)
     approver_identity: str = Field(pattern=_OWNER_IDENTITY)
@@ -324,7 +336,7 @@ class ProviderMaterialPolicyV1(_Model):
     signer_seed_fingerprint_sha256: str = Field(pattern=_SHA256)
     created_at: str = Field(min_length=20, max_length=40)
     retention_expires_at: str = Field(min_length=20, max_length=40)
-    materials: tuple[ProviderMaterialSpecV1, ...] = Field(min_length=6, max_length=7)
+    materials: tuple[ProviderMaterialSpecV1, ...] = Field(min_length=7, max_length=8)
     signer_key_id: str = Field(pattern=_IDENTIFIER)
     signature_base64: str = Field(min_length=4, max_length=256)
 
@@ -336,7 +348,7 @@ class ProviderMaterialPolicyV1(_Model):
         return tuple(cast(list[object] | tuple[object, ...], value))
 
     @model_validator(mode="after")
-    def complete_distinct_material_set(self) -> ProviderMaterialPolicyV1:
+    def complete_distinct_material_set(self) -> ProviderMaterialPolicyV2:
         try:
             created = _parse_timestamp(self.created_at)
             expires = _parse_timestamp(self.retention_expires_at)
@@ -396,15 +408,15 @@ class ProviderMaterialFingerprintV1(_Model):
         raise ValueError("provider fingerprint attestation fields are invalid")
 
 
-class ProviderFingerprintAttestationV1(_Model):
+class ProviderFingerprintAttestationV2(_Model):
     """Signed, value-free observed fingerprints for one material policy."""
 
-    schema_version: Literal["rsd.provider-crypto.fingerprint-attestation.v1"]
+    schema_version: Literal["rsd.provider-crypto.fingerprint-attestation.v2"]
     allocation_intent_sha256: str = Field(pattern=_SHA256)
     provider_material_policy_sha256: str = Field(pattern=_SHA256)
     attestation_id: str = Field(pattern=_UUID)
     observed_at: str = Field(min_length=20, max_length=40)
-    materials: tuple[ProviderMaterialFingerprintV1, ...] = Field(min_length=6, max_length=7)
+    materials: tuple[ProviderMaterialFingerprintV1, ...] = Field(min_length=7, max_length=8)
     signer_key_id: str = Field(pattern=_IDENTIFIER)
     signature_base64: str = Field(min_length=4, max_length=256)
 
@@ -416,7 +428,7 @@ class ProviderFingerprintAttestationV1(_Model):
         return tuple(cast(list[object] | tuple[object, ...], value))
 
     @model_validator(mode="after")
-    def distinct_materials(self) -> ProviderFingerprintAttestationV1:
+    def distinct_materials(self) -> ProviderFingerprintAttestationV2:
         try:
             observed = _parse_timestamp(self.observed_at)
         except ValueError:
@@ -438,21 +450,71 @@ class ProviderFingerprintAttestationV1(_Model):
         return {item.reference_sha256: item.fingerprint_sha256 for item in self.materials}
 
 
-class ProviderMaterialGenesisV1(_Model):
+class MaterialGenerationReceiptV1(_Model):
+    """Signed, value-free evidence of one bounded material generation attempt.
+
+    The receipt records the production generator identity and the resulting
+    purpose/reference/fingerprint bindings.  It deliberately proves neither
+    the entropy of an already-generated value nor possession of a value.  Its
+    role is to pin the signed preimage that must exist before any create-only
+    Keychain row can be written.
+    """
+
+    schema_version: Literal["rsd.provider-crypto.material-generation-receipt.v1"]
+    generation_id: str = Field(pattern=_UUID)
+    generator_id: Literal["macos_security_secrandom_v1"]
+    allocation_intent_sha256: str = Field(pattern=_SHA256)
+    provider_material_policy_sha256: str = Field(pattern=_SHA256)
+    provider_fingerprint_attestation_sha256: str = Field(pattern=_SHA256)
+    generated_at: str = Field(min_length=20, max_length=40)
+    materials: tuple[ProviderMaterialFingerprintV1, ...] = Field(min_length=7, max_length=7)
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("materials", mode="before")
+    @classmethod
+    def material_items(cls, value: object) -> tuple[object, ...]:
+        if type(value) not in {list, tuple}:
+            raise ValueError("material generation receipt fields are invalid")
+        return tuple(cast(list[object] | tuple[object, ...], value))
+
+    @model_validator(mode="after")
+    def distinct_materials(self) -> MaterialGenerationReceiptV1:
+        try:
+            generated = _parse_timestamp(self.generated_at)
+        except ValueError:
+            raise ValueError("material generation receipt fields are invalid") from None
+        purposes = tuple(item.purpose for item in self.materials)
+        references = tuple(item.reference_sha256 for item in self.materials)
+        fingerprints = tuple(item.fingerprint_sha256 for item in self.materials)
+        if (
+            generated is None
+            or len(set(purposes)) != len(purposes)
+            or len(set(references)) != len(references)
+            or len(set(fingerprints)) != len(fingerprints)
+            or ProviderMaterialPurpose.TLS_TRUST_ANCHOR in purposes
+            or len(_canonical_base64(self.signature_base64)) != 64
+        ):
+            raise ValueError("material generation receipt fields are invalid")
+        return self
+
+
+class ProviderMaterialGenesisV2(_Model):
     """Signed pending manifest persisted before the first Keychain write."""
 
-    schema_version: Literal["rsd.provider-crypto.material-genesis.v1"]
+    schema_version: Literal["rsd.provider-crypto.material-genesis.v2"]
     status: Literal["pending"]
     genesis_id: str = Field(pattern=_UUID)
     allocation_intent_sha256: str = Field(pattern=_SHA256)
     provider_material_policy_sha256: str = Field(pattern=_SHA256)
     provider_fingerprint_attestation_sha256: str = Field(pattern=_SHA256)
+    material_generation_receipt_sha256: str = Field(pattern=_SHA256)
     created_at: str = Field(min_length=20, max_length=40)
     signer_key_id: str = Field(pattern=_IDENTIFIER)
     signature_base64: str = Field(min_length=4, max_length=256)
 
     @model_validator(mode="after")
-    def canonical_fields(self) -> ProviderMaterialGenesisV1:
+    def canonical_fields(self) -> ProviderMaterialGenesisV2:
         if (
             _parse_timestamp(self.created_at) is None
             or len(_canonical_base64(self.signature_base64)) != 64
@@ -526,6 +588,15 @@ def _create_keychain_value(
 def _canonical_json(value: object) -> bytes:
     try:
         return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError):
+        raise ProviderCryptoError("canonical_encoding") from None
+
+
+def _canonical_model_sha256(model: BaseModel) -> str:
+    """Digest the exact canonical public representation of a signed artifact."""
+
+    try:
+        return _sha256(_canonical_json(model.model_dump(mode="json")))
     except (TypeError, ValueError):
         raise ProviderCryptoError("canonical_encoding") from None
 
@@ -678,30 +749,38 @@ def replay_authority_policy_message(artifact: ReplayAuthorityPolicyArtifactV1) -
     return _signature_message(_REPLAY_POLICY_DOMAIN, artifact)
 
 
-def provider_material_policy_message(policy: ProviderMaterialPolicyV1) -> bytes:
+def provider_material_policy_message(policy: ProviderMaterialPolicyV2) -> bytes:
     """Canonical bytes to sign for a material-policy artifact."""
 
-    if type(policy) is not ProviderMaterialPolicyV1:
+    if type(policy) is not ProviderMaterialPolicyV2:
         raise ProviderCryptoError("material_policy")
     return _signature_message(_MATERIAL_POLICY_DOMAIN, policy)
 
 
 def provider_fingerprint_attestation_message(
-    attestation: ProviderFingerprintAttestationV1,
+    attestation: ProviderFingerprintAttestationV2,
 ) -> bytes:
     """Canonical bytes to sign for an observed fingerprint attestation."""
 
-    if type(attestation) is not ProviderFingerprintAttestationV1:
+    if type(attestation) is not ProviderFingerprintAttestationV2:
         raise ProviderCryptoError("fingerprint_attestation")
     return _signature_message(_FINGERPRINT_ATTESTATION_DOMAIN, attestation)
 
 
-def provider_material_genesis_message(genesis: ProviderMaterialGenesisV1) -> bytes:
+def provider_material_genesis_message(genesis: ProviderMaterialGenesisV2) -> bytes:
     """Canonical bytes to sign for a pending material-genesis artifact."""
 
-    if type(genesis) is not ProviderMaterialGenesisV1:
+    if type(genesis) is not ProviderMaterialGenesisV2:
         raise ProviderCryptoError("material_genesis")
     return _signature_message(_MATERIAL_GENESIS_DOMAIN, genesis)
+
+
+def material_generation_receipt_message(receipt: MaterialGenerationReceiptV1) -> bytes:
+    """Canonical bytes to sign for pre-Keychain generation evidence."""
+
+    if type(receipt) is not MaterialGenerationReceiptV1:
+        raise ProviderCryptoError("material_generation_receipt")
+    return _signature_message(_MATERIAL_GENERATION_RECEIPT_DOMAIN, receipt)
 
 
 def replay_authority_policy_sha256(service: str, account_prefix: str) -> str:
@@ -807,6 +886,9 @@ def _reference_map(
         ProviderMaterialPurpose.INFISICAL_AUTH_SECRET: references.auth_secret,
         ProviderMaterialPurpose.PRIMARY_VALKEY_PASSWORD: references.primary_valkey_password,
         ProviderMaterialPurpose.RESTORE_VALKEY_PASSWORD: references.restore_valkey_password,
+        ProviderMaterialPurpose.POSTGRES_APPLICATION_PASSWORD: (
+            references.postgres_application_password
+        ),
     }
     if references.tls_trust_anchor is not None:
         result[ProviderMaterialPurpose.TLS_TRUST_ANCHOR] = references.tls_trust_anchor
@@ -851,7 +933,7 @@ def _verify_material_signer(
 
 
 def _verify_provider_material_policy_at(
-    policy: ProviderMaterialPolicyV1,
+    policy: ProviderMaterialPolicyV2,
     *,
     signer: _TrustedSigner,
     signer_genesis: SignerGenesisV1,
@@ -864,8 +946,8 @@ def _verify_provider_material_policy_at(
     """Verify all policy references, purposes, and retention before use."""
 
     policy = cast(
-        ProviderMaterialPolicyV1,
-        _canonical_artifact(policy, ProviderMaterialPolicyV1, phase="material_policy"),
+        ProviderMaterialPolicyV2,
+        _canonical_artifact(policy, ProviderMaterialPolicyV2, phase="material_policy"),
     )
     signer_genesis = cast(
         SignerGenesisV1,
@@ -911,7 +993,7 @@ def _verify_provider_material_policy_at(
 
 
 def verify_provider_material_policy(
-    policy: ProviderMaterialPolicyV1,
+    policy: ProviderMaterialPolicyV2,
     *,
     signer: _TrustedSigner,
     signer_genesis: SignerGenesisV1,
@@ -935,9 +1017,9 @@ def verify_provider_material_policy(
 
 
 def _verify_provider_fingerprint_attestation_at(
-    attestation: ProviderFingerprintAttestationV1,
+    attestation: ProviderFingerprintAttestationV2,
     *,
-    policy: ProviderMaterialPolicyV1,
+    policy: ProviderMaterialPolicyV2,
     signer: _TrustedSigner,
     signer_genesis: SignerGenesisV1,
     issuer: _TrustedSigner,
@@ -947,16 +1029,16 @@ def _verify_provider_fingerprint_attestation_at(
     """Return trusted reference-to-fingerprint bindings after strict verification."""
 
     attestation = cast(
-        ProviderFingerprintAttestationV1,
+        ProviderFingerprintAttestationV2,
         _canonical_artifact(
             attestation,
-            ProviderFingerprintAttestationV1,
+            ProviderFingerprintAttestationV2,
             phase="fingerprint_attestation",
         ),
     )
     policy = cast(
-        ProviderMaterialPolicyV1,
-        _canonical_artifact(policy, ProviderMaterialPolicyV1, phase="material_policy"),
+        ProviderMaterialPolicyV2,
+        _canonical_artifact(policy, ProviderMaterialPolicyV2, phase="material_policy"),
     )
     signer_genesis = cast(
         SignerGenesisV1,
@@ -999,9 +1081,9 @@ def _verify_provider_fingerprint_attestation_at(
 
 
 def verify_provider_fingerprint_attestation(
-    attestation: ProviderFingerprintAttestationV1,
+    attestation: ProviderFingerprintAttestationV2,
     *,
-    policy: ProviderMaterialPolicyV1,
+    policy: ProviderMaterialPolicyV2,
     signer: _TrustedSigner,
     signer_genesis: SignerGenesisV1,
     issuer: _TrustedSigner,
@@ -1020,9 +1102,102 @@ def verify_provider_fingerprint_attestation(
     )
 
 
+def _verify_material_generation_receipt_at(
+    receipt: MaterialGenerationReceiptV1,
+    *,
+    policy: ProviderMaterialPolicyV2,
+    attestation: ProviderFingerprintAttestationV2,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    allocation_intent: AllocationIntentV2,
+    now: datetime,
+) -> None:
+    """Verify value-free pre-write generation evidence under the trusted clock."""
+
+    receipt = cast(
+        MaterialGenerationReceiptV1,
+        _canonical_artifact(
+            receipt,
+            MaterialGenerationReceiptV1,
+            phase="material_generation_receipt",
+        ),
+    )
+    policy = cast(
+        ProviderMaterialPolicyV2,
+        _canonical_artifact(policy, ProviderMaterialPolicyV2, phase="material_policy"),
+    )
+    attestation = cast(
+        ProviderFingerprintAttestationV2,
+        _canonical_artifact(
+            attestation,
+            ProviderFingerprintAttestationV2,
+            phase="fingerprint_attestation",
+        ),
+    )
+    allocation_intent = _reject_unsupported_tls_termination(allocation_intent)
+    if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:
+        raise ProviderCryptoError("material_generation_receipt")
+    _verify_provider_material_bundle_at(
+        policy,
+        attestation,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        allocation_intent=allocation_intent,
+        expected_disposal_owner=allocation_intent.disposal_owner,
+        expected_approver_identity=allocation_intent.approver_identity,
+        now=now,
+    )
+    _verify_material_signer(
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        allocation_intent=allocation_intent,
+    )
+    _verify_signed(receipt, domain=_MATERIAL_GENERATION_RECEIPT_DOMAIN, signer=signer)
+    generated_at = _parse_timestamp(receipt.generated_at)
+    normalized_now = now.astimezone(UTC)
+    if (
+        generated_at is None
+        or generated_at > normalized_now
+        or normalized_now - generated_at > _MATERIAL_ATTESTATION_FRESHNESS
+        or receipt.allocation_intent_sha256 != allocation_intent_sha256(allocation_intent)
+        or receipt.provider_material_policy_sha256 != policy.policy_sha256()
+        or receipt.provider_fingerprint_attestation_sha256
+        != _sha256(_canonical_json(attestation.model_dump(mode="json")))
+        or receipt.materials != attestation.materials
+    ):
+        raise ProviderCryptoError("material_generation_receipt_binding")
+
+
+def verify_material_generation_receipt(
+    receipt: MaterialGenerationReceiptV1,
+    *,
+    policy: ProviderMaterialPolicyV2,
+    attestation: ProviderFingerprintAttestationV2,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    allocation_intent: AllocationIntentV2,
+) -> None:
+    """Verify one signed value-free generation receipt using system UTC."""
+
+    _verify_material_generation_receipt_at(
+        receipt,
+        policy=policy,
+        attestation=attestation,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        allocation_intent=allocation_intent,
+        now=_system_utc_clock(),
+    )
+
+
 def _verify_provider_material_bundle_at(
-    policy: ProviderMaterialPolicyV1,
-    attestation: ProviderFingerprintAttestationV1,
+    policy: ProviderMaterialPolicyV2,
+    attestation: ProviderFingerprintAttestationV2,
     *,
     signer: _TrustedSigner,
     signer_genesis: SignerGenesisV1,
@@ -1056,8 +1231,8 @@ def _verify_provider_material_bundle_at(
 
 
 def verify_provider_material_bundle(
-    policy: ProviderMaterialPolicyV1,
-    attestation: ProviderFingerprintAttestationV1,
+    policy: ProviderMaterialPolicyV2,
+    attestation: ProviderFingerprintAttestationV2,
     *,
     signer: _TrustedSigner,
     signer_genesis: SignerGenesisV1,
@@ -1082,16 +1257,17 @@ def verify_provider_material_bundle(
 
 
 def verify_provider_material_genesis(
-    genesis: ProviderMaterialGenesisV1,
+    genesis: ProviderMaterialGenesisV2,
     *,
-    policy: ProviderMaterialPolicyV1,
-    attestation: ProviderFingerprintAttestationV1,
+    policy: ProviderMaterialPolicyV2,
+    attestation: ProviderFingerprintAttestationV2,
+    generation_receipt: MaterialGenerationReceiptV1,
     signer: _TrustedSigner,
     signer_genesis: SignerGenesisV1,
     issuer: _TrustedSigner,
     allocation_intent: AllocationIntentV2,
 ) -> None:
-    """Verify the pending manifest binds the exact policy and attestation.
+    """Verify the pending manifest binds the exact policy, receipt, and attestation.
 
     A valid manifest proves the only supported provisioning sequence was
     declared before a Keychain write. It is not a bearer capability and cannot
@@ -1099,19 +1275,27 @@ def verify_provider_material_genesis(
     """
 
     genesis = cast(
-        ProviderMaterialGenesisV1,
-        _canonical_artifact(genesis, ProviderMaterialGenesisV1, phase="material_genesis"),
+        ProviderMaterialGenesisV2,
+        _canonical_artifact(genesis, ProviderMaterialGenesisV2, phase="material_genesis"),
     )
     policy = cast(
-        ProviderMaterialPolicyV1,
-        _canonical_artifact(policy, ProviderMaterialPolicyV1, phase="material_policy"),
+        ProviderMaterialPolicyV2,
+        _canonical_artifact(policy, ProviderMaterialPolicyV2, phase="material_policy"),
     )
     attestation = cast(
-        ProviderFingerprintAttestationV1,
+        ProviderFingerprintAttestationV2,
         _canonical_artifact(
             attestation,
-            ProviderFingerprintAttestationV1,
+            ProviderFingerprintAttestationV2,
             phase="fingerprint_attestation",
+        ),
+    )
+    generation_receipt = cast(
+        MaterialGenerationReceiptV1,
+        _canonical_artifact(
+            generation_receipt,
+            MaterialGenerationReceiptV1,
+            phase="material_generation_receipt",
         ),
     )
     signer_genesis = cast(
@@ -1129,8 +1313,8 @@ def verify_provider_material_genesis(
     if (
         genesis.allocation_intent_sha256 != allocation_intent_sha256(allocation_intent)
         or genesis.provider_material_policy_sha256 != policy.policy_sha256()
-        or genesis.provider_fingerprint_attestation_sha256
-        != _sha256(_canonical_json(attestation.model_dump(mode="json")))
+        or genesis.provider_fingerprint_attestation_sha256 != _canonical_model_sha256(attestation)
+        or genesis.material_generation_receipt_sha256 != _canonical_model_sha256(generation_receipt)
     ):
         raise ProviderCryptoError("material_genesis_binding")
 
@@ -1142,12 +1326,217 @@ def _zeroize(value: bytearray) -> None:
         value[index] = 0
 
 
+class _MaterialRandomSource(Protocol):
+    """Internal source used only by the bounded material generation helper."""
+
+    def fill(self, destination: bytearray) -> None: ...
+
+
+class _MacOSSecurityRandom:
+    """Direct ``SecRandomCopyBytes`` adapter; no subprocess or ambient input."""
+
+    _ERR_SEC_SUCCESS: Final = 0
+
+    def __init__(self) -> None:
+        if sys.platform != "darwin":
+            raise ProviderCryptoError("material_generator")
+        try:
+            security: Any = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
+            security.SecRandomCopyBytes.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_void_p,
+            ]
+            security.SecRandomCopyBytes.restype = ctypes.c_int32
+            default = ctypes.c_void_p.in_dll(security, "kSecRandomDefault").value
+        except Exception:
+            raise ProviderCryptoError("material_generator") from None
+        if default is None:
+            raise ProviderCryptoError("material_generator")
+        self._security = security
+        self._default = ctypes.c_void_p(default)
+
+    def fill(self, destination: bytearray) -> None:
+        if type(destination) is not bytearray or not destination:
+            raise ProviderCryptoError("material_generator")
+        failed = False
+        try:
+            buffer = (ctypes.c_ubyte * len(destination)).from_buffer(destination)
+            status = self._security.SecRandomCopyBytes(
+                self._default,
+                len(destination),
+                ctypes.cast(buffer, ctypes.c_void_p),
+            )
+        except Exception:
+            failed = True
+            status = -1
+        if failed:
+            _zeroize(destination)
+            raise ProviderCryptoError("material_generator")
+        if status != self._ERR_SEC_SUCCESS:
+            _zeroize(destination)
+            raise ProviderCryptoError("material_generator")
+
+
 _STANDARD_BASE64_ALPHABET: Final = (
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 )
 _URLSAFE_BASE64_ALPHABET: Final = (
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 )
+
+
+def _encode_lower_hex(raw: bytearray) -> bytearray:
+    """Encode a bounded mutable buffer without producing a secret-bearing str."""
+
+    if type(raw) is not bytearray:
+        raise ProviderCryptoError("material_generator")
+    alphabet = b"0123456789abcdef"
+    encoded = bytearray(len(raw) * 2)
+    for index, value in enumerate(raw):
+        encoded[index * 2] = alphabet[value >> 4]
+        encoded[index * 2 + 1] = alphabet[value & 0x0F]
+    return encoded
+
+
+def _encode_base64(
+    raw: bytearray,
+    *,
+    alphabet: bytes,
+    padded: bool,
+) -> bytearray:
+    """Encode one mutable buffer into a mutable canonical Base64 representation."""
+
+    if type(raw) is not bytearray or type(alphabet) is not bytes or len(alphabet) != 64:
+        raise ProviderCryptoError("material_generator")
+    remainder = len(raw) % 3
+    encoded_length = ((len(raw) + 2) // 3) * 4
+    if not padded and remainder:
+        encoded_length -= 3 - remainder
+    encoded = bytearray(encoded_length)
+    source_index = 0
+    destination_index = 0
+    while source_index + 3 <= len(raw):
+        first = raw[source_index]
+        second = raw[source_index + 1]
+        third = raw[source_index + 2]
+        encoded[destination_index] = alphabet[first >> 2]
+        encoded[destination_index + 1] = alphabet[((first & 0x03) << 4) | (second >> 4)]
+        encoded[destination_index + 2] = alphabet[((second & 0x0F) << 2) | (third >> 6)]
+        encoded[destination_index + 3] = alphabet[third & 0x3F]
+        source_index += 3
+        destination_index += 4
+    if remainder == 1:
+        first = raw[source_index]
+        encoded[destination_index] = alphabet[first >> 2]
+        encoded[destination_index + 1] = alphabet[(first & 0x03) << 4]
+        if padded:
+            encoded[destination_index + 2] = ord("=")
+            encoded[destination_index + 3] = ord("=")
+    elif remainder == 2:
+        first = raw[source_index]
+        second = raw[source_index + 1]
+        encoded[destination_index] = alphabet[first >> 2]
+        encoded[destination_index + 1] = alphabet[((first & 0x03) << 4) | (second >> 4)]
+        encoded[destination_index + 2] = alphabet[(second & 0x0F) << 2]
+        if padded:
+            encoded[destination_index + 3] = ord("=")
+    return encoded
+
+
+def _encode_standard_base64(raw: bytearray) -> bytearray:
+    """Encode a mutable buffer with canonical padded standard Base64."""
+
+    return _encode_base64(raw, alphabet=_STANDARD_BASE64_ALPHABET, padded=True)
+
+
+def _encode_urlsafe_base64_unpadded(raw: bytearray) -> bytearray:
+    """Encode a mutable buffer with canonical unpadded Base64URL."""
+
+    return _encode_base64(raw, alphabet=_URLSAFE_BASE64_ALPHABET, padded=False)
+
+
+def _generate_value(
+    spec: ProviderMaterialSpecV1,
+    random_source: _MaterialRandomSource,
+) -> bytearray:
+    """Generate exactly one policy-bound value in mutable bounded memory."""
+
+    if type(spec) is not ProviderMaterialSpecV1:
+        raise ProviderCryptoError("material_generator")
+    format_value = spec.format.value
+    raw_length: int
+    encoder: Callable[[bytearray], bytearray] | None
+    if format_value in {
+        ProviderMaterialFormat.HMAC_SHA256_RAW_32_V1.value,
+        ProviderMaterialFormat.AES_256_GCM_RAW_32_V1.value,
+    }:
+        raw_length = 32
+        encoder = None
+    elif format_value == ProviderMaterialFormat.INFISICAL_HEX_16_V1.value:
+        raw_length = 16
+        encoder = _encode_lower_hex
+    elif format_value == ProviderMaterialFormat.INFISICAL_AUTH_SECRET_BASE64_32_V1.value:
+        raw_length = 32
+        encoder = _encode_standard_base64
+    elif format_value in {
+        ProviderMaterialFormat.VALKEY_PASSWORD_BASE64URL_32_V1.value,
+        ProviderMaterialFormat.POSTGRES_APPLICATION_PASSWORD_BASE64URL_32_V1.value,
+    }:
+        raw_length = 32
+        encoder = _encode_urlsafe_base64_unpadded
+    else:
+        # A TLS termination amendment must define a certificate/key issuance
+        # path.  Random bytes cannot safely stand in for that artifact.
+        raise ProviderCryptoError("material_generator_tls_unsupported")
+    raw = bytearray(raw_length)
+    generated: bytearray | None = None
+    failure_phase: str | None = None
+    try:
+        random_source.fill(raw)
+        generated = raw if encoder is None else encoder(raw)
+        _validate_value(spec, generated)
+    except ProviderCryptoError as error:
+        failure_phase = error.phase
+    except Exception:
+        failure_phase = "material_generator"
+    if failure_phase is not None:
+        if generated is not None and generated is not raw:
+            _zeroize(generated)
+        _zeroize(raw)
+        raise ProviderCryptoError(failure_phase)
+    if generated is None:
+        _zeroize(raw)
+        raise ProviderCryptoError("material_generator")
+    if encoder is not None:
+        _zeroize(raw)
+    return generated
+
+
+def _generate_material_values(
+    policy: ProviderMaterialPolicyV2,
+    random_source: _MaterialRandomSource,
+) -> dict[ProviderMaterialPurpose, bytearray]:
+    """Generate only the policy's non-TLS material set, zeroizing on any failure."""
+
+    values: dict[ProviderMaterialPurpose, bytearray] = {}
+    failure_phase: str | None = None
+    try:
+        if type(policy) is not ProviderMaterialPolicyV2:
+            raise ProviderCryptoError("material_generator")
+        for spec in policy.materials:
+            values[spec.purpose] = _generate_value(spec, random_source)
+        if set(values) != {spec.purpose for spec in policy.materials}:
+            raise ProviderCryptoError("material_generator")
+    except ProviderCryptoError as error:
+        failure_phase = error.phase
+    except Exception:
+        failure_phase = "material_generator"
+    if failure_phase is not None:
+        for value in values.values():
+            _zeroize(value)
+        raise ProviderCryptoError(failure_phase)
+    return values
 
 
 def _alphabet_index(value: int, alphabet: bytes) -> int:
@@ -1214,7 +1603,10 @@ def _validate_value(spec: ProviderMaterialSpecV1, value: bytearray) -> None:
         if not _is_canonical_standard_base64_32(raw):
             raise ProviderCryptoError("material_format")
         return
-    if format_value == ProviderMaterialFormat.VALKEY_PASSWORD_BASE64URL_32_V1.value:
+    if format_value in {
+        ProviderMaterialFormat.VALKEY_PASSWORD_BASE64URL_32_V1.value,
+        ProviderMaterialFormat.POSTGRES_APPLICATION_PASSWORD_BASE64URL_32_V1.value,
+    }:
         if not _is_canonical_base64url_32(raw):
             raise ProviderCryptoError("material_format")
         return
@@ -1466,9 +1858,10 @@ class KeychainEd25519Signer:
         self,
         artifact: (
             ReplayAuthorityPolicyArtifactV1
-            | ProviderMaterialPolicyV1
-            | ProviderFingerprintAttestationV1
-            | ProviderMaterialGenesisV1
+            | ProviderMaterialPolicyV2
+            | ProviderFingerprintAttestationV2
+            | MaterialGenerationReceiptV1
+            | ProviderMaterialGenesisV2
         ),
     ) -> bytes:
         """Sign only one exact, intent-bound provider bootstrap artifact.
@@ -1480,9 +1873,10 @@ class KeychainEd25519Signer:
 
         messages: tuple[tuple[type[BaseModel], Callable[[Any], bytes]], ...] = (
             (ReplayAuthorityPolicyArtifactV1, replay_authority_policy_message),
-            (ProviderMaterialPolicyV1, provider_material_policy_message),
-            (ProviderFingerprintAttestationV1, provider_fingerprint_attestation_message),
-            (ProviderMaterialGenesisV1, provider_material_genesis_message),
+            (ProviderMaterialPolicyV2, provider_material_policy_message),
+            (ProviderFingerprintAttestationV2, provider_fingerprint_attestation_message),
+            (MaterialGenerationReceiptV1, material_generation_receipt_message),
+            (ProviderMaterialGenesisV2, provider_material_genesis_message),
         )
         message: bytes | None = None
         for model_type, build_message in messages:
@@ -1663,13 +2057,13 @@ class MacOSKeychainProviderProvenanceAdapter:
 
     def __init__(
         self,
-        policy: ProviderMaterialPolicyV1,
+        policy: ProviderMaterialPolicyV2,
         *,
         _store: _KeychainTransport | None = None,
     ) -> None:
         policy = cast(
-            ProviderMaterialPolicyV1,
-            _canonical_artifact(policy, ProviderMaterialPolicyV1, phase="material_policy"),
+            ProviderMaterialPolicyV2,
+            _canonical_artifact(policy, ProviderMaterialPolicyV2, phase="material_policy"),
         )
         self._specs = policy.by_reference()
         self._store = _default_keychain_store() if _store is None else _store
@@ -1700,6 +2094,10 @@ class ProviderMaterialArtifactPaths:
     @staticmethod
     def attestation_name() -> str:
         return _FINGERPRINT_ATTESTATION_NAME
+
+    @staticmethod
+    def generation_receipt_name() -> str:
+        return _MATERIAL_GENERATION_RECEIPT_NAME
 
     @staticmethod
     def replay_policy_name() -> str:
@@ -1751,6 +2149,7 @@ class _OwnerOnlyArtifactDirectory:
             _MATERIAL_POLICY_NAME,
             _MATERIAL_GENESIS_NAME,
             _FINGERPRINT_ATTESTATION_NAME,
+            _MATERIAL_GENERATION_RECEIPT_NAME,
             _REPLAY_POLICY_NAME,
             _SIGNER_GENESIS_NAME,
         }:
@@ -1797,6 +2196,7 @@ class _OwnerOnlyArtifactDirectory:
             _MATERIAL_POLICY_NAME,
             _MATERIAL_GENESIS_NAME,
             _FINGERPRINT_ATTESTATION_NAME,
+            _MATERIAL_GENERATION_RECEIPT_NAME,
             _REPLAY_POLICY_NAME,
             _SIGNER_GENESIS_NAME,
         }:
@@ -1845,6 +2245,7 @@ class _OwnerOnlyArtifactDirectory:
             _MATERIAL_POLICY_NAME,
             _MATERIAL_GENESIS_NAME,
             _FINGERPRINT_ATTESTATION_NAME,
+            _MATERIAL_GENERATION_RECEIPT_NAME,
             _REPLAY_POLICY_NAME,
             _SIGNER_GENESIS_NAME,
         }:
@@ -1984,6 +2385,7 @@ class _OwnerOnlyArtifactDirectory:
                 _MATERIAL_POLICY_NAME,
                 _MATERIAL_GENESIS_NAME,
                 _FINGERPRINT_ATTESTATION_NAME,
+                _MATERIAL_GENERATION_RECEIPT_NAME,
                 _REPLAY_POLICY_NAME,
                 _SIGNER_GENESIS_NAME,
             }
@@ -2042,6 +2444,20 @@ def _load_model(raw: bytes, model_type: type[_Model], *, phase: str) -> _Model:
         return model_type.model_validate(document)
     except (TypeError, UnicodeDecodeError, ValidationError, ValueError, yaml.YAMLError):
         raise ProviderCryptoError(phase) from None
+
+
+def _load_canonical_persisted_model(
+    raw: bytes,
+    model_type: type[_Model],
+    *,
+    phase: str,
+) -> _Model:
+    """Parse one signed artifact only if its owner-only bytes are canonical."""
+
+    model = _canonical_artifact(_load_model(raw, model_type, phase=phase), model_type, phase=phase)
+    if not hmac.compare_digest(raw, _yaml_bytes(model)):
+        raise ProviderCryptoError(phase)
+    return model
 
 
 def persist_replay_authority_policy_artifact(
@@ -2253,7 +2669,7 @@ def _load_verified_signer_genesis_from_reader(
 
 def persist_provider_material_policy(
     paths: ProviderMaterialArtifactPaths,
-    policy: ProviderMaterialPolicyV1,
+    policy: ProviderMaterialPolicyV2,
     *,
     signer: _TrustedSigner,
     signer_genesis: SignerGenesisV1,
@@ -2266,8 +2682,8 @@ def persist_provider_material_policy(
 
     allocation_intent = _reject_unsupported_tls_termination(allocation_intent)
     policy = cast(
-        ProviderMaterialPolicyV1,
-        _canonical_artifact(policy, ProviderMaterialPolicyV1, phase="material_policy"),
+        ProviderMaterialPolicyV2,
+        _canonical_artifact(policy, ProviderMaterialPolicyV2, phase="material_policy"),
     )
     signer_genesis = _require_persisted_signer_genesis(
         paths,
@@ -2286,15 +2702,136 @@ def persist_provider_material_policy(
         now=_system_utc_clock(),
     )
     with _OwnerOnlyArtifactDirectory(paths.root) as directory:
-        directory.write_once(paths.policy_name(), _yaml_bytes(policy))
+        expected = _yaml_bytes(policy)
+        directory.write_once_or_require_exact(paths.policy_name(), expected)
+        persisted_raw = directory.read(paths.policy_name())
+        if not hmac.compare_digest(persisted_raw, expected):
+            raise ProviderCryptoError("material_policy")
+        persisted = cast(
+            ProviderMaterialPolicyV2,
+            _load_model(
+                persisted_raw,
+                ProviderMaterialPolicyV2,
+                phase="material_policy",
+            ),
+        )
+        persisted = cast(
+            ProviderMaterialPolicyV2,
+            _canonical_artifact(
+                persisted,
+                ProviderMaterialPolicyV2,
+                phase="material_policy",
+            ),
+        )
+        _verify_provider_material_policy_at(
+            persisted,
+            signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            allocation_intent=allocation_intent,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            now=_system_utc_clock(),
+        )
+        if persisted != policy:
+            raise ProviderCryptoError("material_policy")
+
+
+def persist_material_generation_receipt(
+    paths: ProviderMaterialArtifactPaths,
+    receipt: MaterialGenerationReceiptV1,
+    *,
+    policy: ProviderMaterialPolicyV2,
+    attestation: ProviderFingerprintAttestationV2,
+    signer: _TrustedSigner,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    allocation_intent: AllocationIntentV2,
+) -> None:
+    """Persist verified pre-Keychain generation evidence exactly once.
+
+    The receipt is intentionally durable before a pending genesis or any
+    Keychain write.  Exact bytes are the sole supported crash recovery case;
+    a different receipt is an irreversible reconciliation condition.
+    """
+
+    allocation_intent = _reject_unsupported_tls_termination(allocation_intent)
+    receipt = cast(
+        MaterialGenerationReceiptV1,
+        _canonical_artifact(
+            receipt,
+            MaterialGenerationReceiptV1,
+            phase="material_generation_receipt",
+        ),
+    )
+    policy = cast(
+        ProviderMaterialPolicyV2,
+        _canonical_artifact(policy, ProviderMaterialPolicyV2, phase="material_policy"),
+    )
+    attestation = cast(
+        ProviderFingerprintAttestationV2,
+        _canonical_artifact(
+            attestation,
+            ProviderFingerprintAttestationV2,
+            phase="fingerprint_attestation",
+        ),
+    )
+    signer_genesis = _require_persisted_signer_genesis(
+        paths,
+        signer_genesis,
+        issuer=issuer,
+        allocation_intent=allocation_intent,
+    )
+    _verify_material_generation_receipt_at(
+        receipt,
+        policy=policy,
+        attestation=attestation,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        allocation_intent=allocation_intent,
+        now=_system_utc_clock(),
+    )
+    expected_policy = _yaml_bytes(policy)
+    expected_receipt = _yaml_bytes(receipt)
+    with _OwnerOnlyArtifactDirectory(paths.root) as directory:
+        raw_policy = directory.read(paths.policy_name())
+        if not hmac.compare_digest(raw_policy, expected_policy):
+            raise ProviderCryptoError("material_generation_receipt")
+        directory.fsync_existing(paths.policy_name())
+        directory.write_once_or_require_exact(paths.generation_receipt_name(), expected_receipt)
+        persisted_raw = directory.read(paths.generation_receipt_name())
+        if not hmac.compare_digest(persisted_raw, expected_receipt):
+            raise ProviderCryptoError("material_generation_receipt")
+        persisted = cast(
+            MaterialGenerationReceiptV1,
+            _load_model(
+                persisted_raw,
+                MaterialGenerationReceiptV1,
+                phase="material_generation_receipt",
+            ),
+        )
+        _verify_material_generation_receipt_at(
+            persisted,
+            policy=policy,
+            attestation=attestation,
+            signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            allocation_intent=allocation_intent,
+            now=_system_utc_clock(),
+        )
+        if persisted != receipt:
+            raise ProviderCryptoError("material_generation_receipt")
 
 
 def persist_provider_material_genesis(
     paths: ProviderMaterialArtifactPaths,
-    genesis: ProviderMaterialGenesisV1,
+    genesis: ProviderMaterialGenesisV2,
     *,
-    policy: ProviderMaterialPolicyV1,
-    attestation: ProviderFingerprintAttestationV1,
+    policy: ProviderMaterialPolicyV2,
+    attestation: ProviderFingerprintAttestationV2,
+    generation_receipt: MaterialGenerationReceiptV1,
     signer: _TrustedSigner,
     signer_genesis: SignerGenesisV1,
     issuer: _TrustedSigner,
@@ -2306,19 +2843,27 @@ def persist_provider_material_genesis(
 
     allocation_intent = _reject_unsupported_tls_termination(allocation_intent)
     policy = cast(
-        ProviderMaterialPolicyV1,
-        _canonical_artifact(policy, ProviderMaterialPolicyV1, phase="material_policy"),
+        ProviderMaterialPolicyV2,
+        _canonical_artifact(policy, ProviderMaterialPolicyV2, phase="material_policy"),
     )
     genesis = cast(
-        ProviderMaterialGenesisV1,
-        _canonical_artifact(genesis, ProviderMaterialGenesisV1, phase="material_genesis"),
+        ProviderMaterialGenesisV2,
+        _canonical_artifact(genesis, ProviderMaterialGenesisV2, phase="material_genesis"),
     )
     attestation = cast(
-        ProviderFingerprintAttestationV1,
+        ProviderFingerprintAttestationV2,
         _canonical_artifact(
             attestation,
-            ProviderFingerprintAttestationV1,
+            ProviderFingerprintAttestationV2,
             phase="fingerprint_attestation",
+        ),
+    )
+    generation_receipt = cast(
+        MaterialGenerationReceiptV1,
+        _canonical_artifact(
+            generation_receipt,
+            MaterialGenerationReceiptV1,
+            phase="material_generation_receipt",
         ),
     )
     signer_genesis = _require_persisted_signer_genesis(
@@ -2338,30 +2883,86 @@ def persist_provider_material_genesis(
         expected_approver_identity=expected_approver_identity,
         now=_system_utc_clock(),
     )
-    verify_provider_material_genesis(
-        genesis,
+    _verify_material_generation_receipt_at(
+        generation_receipt,
         policy=policy,
         attestation=attestation,
         signer=signer,
         signer_genesis=signer_genesis,
         issuer=issuer,
         allocation_intent=allocation_intent,
+        now=_system_utc_clock(),
+    )
+    verify_provider_material_genesis(
+        genesis,
+        policy=policy,
+        attestation=attestation,
+        generation_receipt=generation_receipt,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        allocation_intent=allocation_intent,
     )
     with _OwnerOnlyArtifactDirectory(paths.root) as directory:
+        raw_policy = directory.read(paths.policy_name())
         persisted_policy = cast(
-            ProviderMaterialPolicyV1,
-            _load_model(
-                directory.read(paths.policy_name()),
-                ProviderMaterialPolicyV1,
+            ProviderMaterialPolicyV2,
+            _load_canonical_persisted_model(
+                raw_policy,
+                ProviderMaterialPolicyV2,
                 phase="material_policy",
+            ),
+        )
+        raw_generation_receipt = directory.read(paths.generation_receipt_name())
+        persisted_generation_receipt = cast(
+            MaterialGenerationReceiptV1,
+            _load_canonical_persisted_model(
+                raw_generation_receipt,
+                MaterialGenerationReceiptV1,
+                phase="material_generation_receipt",
             ),
         )
         if (
             persisted_policy != policy
+            or persisted_generation_receipt != generation_receipt
             or directory.read_optional(paths.attestation_name()) is not None
         ):
             raise ProviderCryptoError("material_genesis_state")
-        directory.write_once(paths.genesis_name(), _yaml_bytes(genesis))
+        _verify_material_generation_receipt_at(
+            persisted_generation_receipt,
+            policy=persisted_policy,
+            attestation=attestation,
+            signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            allocation_intent=allocation_intent,
+            now=_system_utc_clock(),
+        )
+        directory.fsync_existing(paths.policy_name())
+        directory.fsync_existing(paths.generation_receipt_name())
+        expected_genesis = _yaml_bytes(genesis)
+        directory.write_once_or_require_exact(paths.genesis_name(), expected_genesis)
+        persisted_raw = directory.read(paths.genesis_name())
+        persisted_genesis = cast(
+            ProviderMaterialGenesisV2,
+            _load_canonical_persisted_model(
+                persisted_raw,
+                ProviderMaterialGenesisV2,
+                phase="material_genesis",
+            ),
+        )
+        if not hmac.compare_digest(persisted_raw, expected_genesis) or persisted_genesis != genesis:
+            raise ProviderCryptoError("material_genesis")
+        verify_provider_material_genesis(
+            persisted_genesis,
+            policy=persisted_policy,
+            attestation=attestation,
+            generation_receipt=persisted_generation_receipt,
+            signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            allocation_intent=allocation_intent,
+        )
 
 
 def _read_material_artifacts_from_directory(
@@ -2369,50 +2970,66 @@ def _read_material_artifacts_from_directory(
     *,
     policy_name: str,
     genesis_name: str,
+    generation_receipt_name: str,
     attestation_name: str,
 ) -> tuple[
-    ProviderMaterialPolicyV1, ProviderMaterialGenesisV1, ProviderFingerprintAttestationV1 | None
+    ProviderMaterialPolicyV2,
+    ProviderMaterialGenesisV2,
+    MaterialGenerationReceiptV1,
+    ProviderFingerprintAttestationV2 | None,
 ]:
     """Read material state only through a caller-held artifact-root descriptor."""
 
     policy = cast(
-        ProviderMaterialPolicyV1,
-        _load_model(
+        ProviderMaterialPolicyV2,
+        _load_canonical_persisted_model(
             directory.read(policy_name),
-            ProviderMaterialPolicyV1,
+            ProviderMaterialPolicyV2,
             phase="material_policy",
         ),
     )
     genesis = cast(
-        ProviderMaterialGenesisV1,
-        _load_model(
+        ProviderMaterialGenesisV2,
+        _load_canonical_persisted_model(
             directory.read(genesis_name),
-            ProviderMaterialGenesisV1,
+            ProviderMaterialGenesisV2,
             phase="material_genesis",
+        ),
+    )
+    generation_receipt = cast(
+        MaterialGenerationReceiptV1,
+        _load_canonical_persisted_model(
+            directory.read(generation_receipt_name),
+            MaterialGenerationReceiptV1,
+            phase="material_generation_receipt",
         ),
     )
     raw_attestation = directory.read_optional(attestation_name)
     if raw_attestation is None:
-        return policy, genesis, None
+        return policy, genesis, generation_receipt, None
     attestation = cast(
-        ProviderFingerprintAttestationV1,
-        _load_model(
-            raw_attestation, ProviderFingerprintAttestationV1, phase="fingerprint_attestation"
+        ProviderFingerprintAttestationV2,
+        _load_canonical_persisted_model(
+            raw_attestation, ProviderFingerprintAttestationV2, phase="fingerprint_attestation"
         ),
     )
-    return policy, genesis, attestation
+    return policy, genesis, generation_receipt, attestation
 
 
 def _read_material_artifacts(
     paths: ProviderMaterialArtifactPaths,
 ) -> tuple[
-    ProviderMaterialPolicyV1, ProviderMaterialGenesisV1, ProviderFingerprintAttestationV1 | None
+    ProviderMaterialPolicyV2,
+    ProviderMaterialGenesisV2,
+    MaterialGenerationReceiptV1,
+    ProviderFingerprintAttestationV2 | None,
 ]:
     with _OwnerOnlyArtifactDirectory(paths.root) as directory:
         return _read_material_artifacts_from_directory(
             directory,
             policy_name=paths.policy_name(),
             genesis_name=paths.genesis_name(),
+            generation_receipt_name=paths.generation_receipt_name(),
             attestation_name=paths.attestation_name(),
         )
 
@@ -2429,6 +3046,7 @@ def provider_material_genesis_status(
             raw_signer_genesis = directory.read_optional(paths.signer_genesis_name())
             raw_policy = directory.read_optional(paths.policy_name())
             raw_genesis = directory.read_optional(paths.genesis_name())
+            raw_generation_receipt = directory.read_optional(paths.generation_receipt_name())
             raw_attestation = directory.read_optional(paths.attestation_name())
     except ProviderCryptoError:
         return ProviderMaterialGenesisStatus.INVALID
@@ -2436,26 +3054,37 @@ def provider_material_genesis_status(
         raw_signer_genesis is None
         and raw_policy is None
         and raw_genesis is None
+        and raw_generation_receipt is None
         and raw_attestation is None
     ):
         return ProviderMaterialGenesisStatus.ABSENT
-    if raw_signer_genesis is None or raw_policy is None or raw_genesis is None:
+    if (
+        raw_signer_genesis is None
+        or raw_policy is None
+        or raw_genesis is None
+        or raw_generation_receipt is None
+    ):
         return ProviderMaterialGenesisStatus.INVALID
     try:
         _load_model(raw_signer_genesis, SignerGenesisV1, phase="signer_genesis")
         policy = cast(
-            ProviderMaterialPolicyV1,
-            _load_model(raw_policy, ProviderMaterialPolicyV1, phase="material_policy"),
+            ProviderMaterialPolicyV2,
+            _load_model(raw_policy, ProviderMaterialPolicyV2, phase="material_policy"),
         )
-        _load_model(raw_genesis, ProviderMaterialGenesisV1, phase="material_genesis")
+        _load_model(raw_genesis, ProviderMaterialGenesisV2, phase="material_genesis")
+        _load_model(
+            raw_generation_receipt,
+            MaterialGenerationReceiptV1,
+            phase="material_generation_receipt",
+        )
         attestation = (
             None
             if raw_attestation is None
             else cast(
-                ProviderFingerprintAttestationV1,
+                ProviderFingerprintAttestationV2,
                 _load_model(
                     raw_attestation,
-                    ProviderFingerprintAttestationV1,
+                    ProviderFingerprintAttestationV2,
                     phase="fingerprint_attestation",
                 ),
             )
@@ -2491,9 +3120,10 @@ def provider_material_genesis_status(
 def _provision_keychain_materials(
     paths: ProviderMaterialArtifactPaths,
     *,
-    policy: ProviderMaterialPolicyV1,
-    genesis: ProviderMaterialGenesisV1,
-    attestation: ProviderFingerprintAttestationV1,
+    policy: ProviderMaterialPolicyV2,
+    genesis: ProviderMaterialGenesisV2,
+    attestation: ProviderFingerprintAttestationV2,
+    generation_receipt: MaterialGenerationReceiptV1,
     signer: _TrustedSigner,
     signer_genesis: SignerGenesisV1,
     issuer: _TrustedSigner,
@@ -2525,19 +3155,27 @@ def _provision_keychain_materials(
             raise ProviderCryptoError("material_values")
         allocation_intent = _reject_unsupported_tls_termination(allocation_intent)
         policy = cast(
-            ProviderMaterialPolicyV1,
-            _canonical_artifact(policy, ProviderMaterialPolicyV1, phase="material_policy"),
+            ProviderMaterialPolicyV2,
+            _canonical_artifact(policy, ProviderMaterialPolicyV2, phase="material_policy"),
         )
         genesis = cast(
-            ProviderMaterialGenesisV1,
-            _canonical_artifact(genesis, ProviderMaterialGenesisV1, phase="material_genesis"),
+            ProviderMaterialGenesisV2,
+            _canonical_artifact(genesis, ProviderMaterialGenesisV2, phase="material_genesis"),
         )
         attestation = cast(
-            ProviderFingerprintAttestationV1,
+            ProviderFingerprintAttestationV2,
             _canonical_artifact(
                 attestation,
-                ProviderFingerprintAttestationV1,
+                ProviderFingerprintAttestationV2,
                 phase="fingerprint_attestation",
+            ),
+        )
+        generation_receipt = cast(
+            MaterialGenerationReceiptV1,
+            _canonical_artifact(
+                generation_receipt,
+                MaterialGenerationReceiptV1,
+                phase="material_generation_receipt",
             ),
         )
         with _OwnerOnlyArtifactDirectory(paths.root) as directory:
@@ -2563,10 +3201,21 @@ def _provision_keychain_materials(
                 expected_approver_identity=expected_approver_identity,
                 now=now,
             )
+            _verify_material_generation_receipt_at(
+                generation_receipt,
+                policy=policy,
+                attestation=attestation,
+                signer=signer,
+                signer_genesis=signer_genesis,
+                issuer=issuer,
+                allocation_intent=allocation_intent,
+                now=now,
+            )
             verify_provider_material_genesis(
                 genesis,
                 policy=policy,
                 attestation=attestation,
+                generation_receipt=generation_receipt,
                 signer=signer,
                 signer_genesis=signer_genesis,
                 issuer=issuer,
@@ -2576,20 +3225,26 @@ def _provision_keychain_materials(
                 raise ProviderCryptoError("material_values")
             if any(spec.reference.provider != "macos_keychain" for spec in policy.materials):
                 raise ProviderCryptoError("material_provider")
-            persisted_policy, persisted_genesis, persisted_attestation = (
-                _read_material_artifacts_from_directory(
-                    directory,
-                    policy_name=paths.policy_name(),
-                    genesis_name=paths.genesis_name(),
-                    attestation_name=paths.attestation_name(),
-                )
+            (
+                persisted_policy,
+                persisted_genesis,
+                persisted_generation_receipt,
+                persisted_attestation,
+            ) = _read_material_artifacts_from_directory(
+                directory,
+                policy_name=paths.policy_name(),
+                genesis_name=paths.genesis_name(),
+                generation_receipt_name=paths.generation_receipt_name(),
+                attestation_name=paths.attestation_name(),
             )
             if (
                 persisted_policy != policy
                 or persisted_genesis != genesis
+                or persisted_generation_receipt != generation_receipt
                 or persisted_attestation is not None
             ):
                 raise ProviderCryptoError("material_genesis_state")
+            directory.fsync_existing(paths.generation_receipt_name())
             store = _default_keychain_store() if _store is None else _store
             expected_fingerprints = attestation.fingerprint_by_reference()
             for spec in policy.materials:
@@ -2604,20 +3259,26 @@ def _provision_keychain_materials(
                     issuer=issuer,
                     allocation_intent=allocation_intent,
                 )
-                current_policy, current_genesis, current_attestation = (
-                    _read_material_artifacts_from_directory(
-                        directory,
-                        policy_name=paths.policy_name(),
-                        genesis_name=paths.genesis_name(),
-                        attestation_name=paths.attestation_name(),
-                    )
+                (
+                    current_policy,
+                    current_genesis,
+                    current_generation_receipt,
+                    current_attestation,
+                ) = _read_material_artifacts_from_directory(
+                    directory,
+                    policy_name=paths.policy_name(),
+                    genesis_name=paths.genesis_name(),
+                    generation_receipt_name=paths.generation_receipt_name(),
+                    attestation_name=paths.attestation_name(),
                 )
                 if (
                     current_policy != policy
                     or current_genesis != genesis
+                    or current_generation_receipt != generation_receipt
                     or current_attestation is not None
                 ):
                     raise ProviderCryptoError("material_genesis_state")
+                directory.fsync_existing(paths.generation_receipt_name())
                 value = supplied[spec.purpose]
                 _validate_value(spec, value)
                 fingerprint = _sha256(value)
@@ -2637,17 +3298,22 @@ def _provision_keychain_materials(
                     raise ProviderCryptoError("material_provider")
                 if not created:
                     raise ProviderCryptoError("material_duplicate_or_partial")
-            terminal_policy, terminal_genesis, terminal_attestation = (
-                _read_material_artifacts_from_directory(
-                    directory,
-                    policy_name=paths.policy_name(),
-                    genesis_name=paths.genesis_name(),
-                    attestation_name=paths.attestation_name(),
-                )
+            (
+                terminal_policy,
+                terminal_genesis,
+                terminal_generation_receipt,
+                terminal_attestation,
+            ) = _read_material_artifacts_from_directory(
+                directory,
+                policy_name=paths.policy_name(),
+                genesis_name=paths.genesis_name(),
+                generation_receipt_name=paths.generation_receipt_name(),
+                attestation_name=paths.attestation_name(),
             )
             if (
                 terminal_policy != policy
                 or terminal_genesis != genesis
+                or terminal_generation_receipt != generation_receipt
                 or terminal_attestation is not None
             ):
                 raise ProviderCryptoError("material_genesis_state")
@@ -2657,12 +3323,116 @@ def _provision_keychain_materials(
             _zeroize(value)
 
 
-def provision_keychain_materials(
+def _artifact_timestamp(now: datetime) -> str:
+    if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:
+        raise ProviderCryptoError("material_generator")
+    return now.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _sign_generated_artifact(
+    signer: KeychainEd25519Signer,
+    artifact: (
+        ProviderFingerprintAttestationV2 | MaterialGenerationReceiptV1 | ProviderMaterialGenesisV2
+    ),
+) -> str:
+    """Sign one exact pre-write artifact without exposing a generic signing oracle."""
+
+    signature = signer.sign_artifact(artifact)
+    return base64.b64encode(signature).decode("ascii")
+
+
+def _generated_material_artifacts(
+    *,
+    policy: ProviderMaterialPolicyV2,
+    signer: KeychainEd25519Signer,
+    allocation_intent: AllocationIntentV2,
+    random_source: _MaterialRandomSource,
+) -> tuple[
+    dict[ProviderMaterialPurpose, bytearray],
+    ProviderFingerprintAttestationV2,
+    MaterialGenerationReceiptV1,
+    ProviderMaterialGenesisV2,
+]:
+    """Build all signed pre-write artifacts from bounded mutable material buffers."""
+
+    values = _generate_material_values(policy, random_source)
+    try:
+        timestamp = _artifact_timestamp(_system_utc_clock())
+        intent_sha256 = allocation_intent_sha256(allocation_intent)
+        unsigned_attestation = ProviderFingerprintAttestationV2(
+            schema_version="rsd.provider-crypto.fingerprint-attestation.v2",
+            allocation_intent_sha256=intent_sha256,
+            provider_material_policy_sha256=policy.policy_sha256(),
+            attestation_id=str(uuid.uuid4()),
+            observed_at=timestamp,
+            materials=tuple(
+                ProviderMaterialFingerprintV1(
+                    purpose=spec.purpose,
+                    reference_sha256=spec.reference.reference_sha256,
+                    fingerprint_sha256=_sha256(values[spec.purpose]),
+                )
+                for spec in policy.materials
+            ),
+            signer_key_id=signer.key_id,
+            signature_base64=base64.b64encode(b"0" * 64).decode("ascii"),
+        )
+        attestation = unsigned_attestation.model_copy(
+            update={"signature_base64": _sign_generated_artifact(signer, unsigned_attestation)}
+        )
+        attestation_sha256 = _canonical_model_sha256(attestation)
+        unsigned_generation_receipt = MaterialGenerationReceiptV1(
+            schema_version="rsd.provider-crypto.material-generation-receipt.v1",
+            generation_id=str(uuid.uuid4()),
+            generator_id=_MATERIAL_GENERATOR_ID,
+            allocation_intent_sha256=intent_sha256,
+            provider_material_policy_sha256=policy.policy_sha256(),
+            provider_fingerprint_attestation_sha256=attestation_sha256,
+            generated_at=timestamp,
+            materials=attestation.materials,
+            signer_key_id=signer.key_id,
+            signature_base64=base64.b64encode(b"0" * 64).decode("ascii"),
+        )
+        generation_receipt = unsigned_generation_receipt.model_copy(
+            update={
+                "signature_base64": _sign_generated_artifact(
+                    signer,
+                    unsigned_generation_receipt,
+                )
+            }
+        )
+        unsigned_genesis = ProviderMaterialGenesisV2(
+            schema_version="rsd.provider-crypto.material-genesis.v2",
+            status="pending",
+            genesis_id=str(uuid.uuid4()),
+            allocation_intent_sha256=intent_sha256,
+            provider_material_policy_sha256=policy.policy_sha256(),
+            provider_fingerprint_attestation_sha256=attestation_sha256,
+            material_generation_receipt_sha256=_canonical_model_sha256(generation_receipt),
+            created_at=timestamp,
+            signer_key_id=signer.key_id,
+            signature_base64=base64.b64encode(b"0" * 64).decode("ascii"),
+        )
+        genesis = unsigned_genesis.model_copy(
+            update={"signature_base64": _sign_generated_artifact(signer, unsigned_genesis)}
+        )
+        return values, attestation, generation_receipt, genesis
+    except ProviderCryptoError:
+        for value in values.values():
+            _zeroize(value)
+        raise
+    except Exception:
+        for value in values.values():
+            _zeroize(value)
+        raise ProviderCryptoError("material_generator") from None
+
+
+def _provision_keychain_materials_for_test(
     paths: ProviderMaterialArtifactPaths,
     *,
-    policy: ProviderMaterialPolicyV1,
-    genesis: ProviderMaterialGenesisV1,
-    attestation: ProviderFingerprintAttestationV1,
+    policy: ProviderMaterialPolicyV2,
+    genesis: ProviderMaterialGenesisV2,
+    attestation: ProviderFingerprintAttestationV2,
+    generation_receipt: MaterialGenerationReceiptV1,
     signer: _TrustedSigner,
     signer_genesis: SignerGenesisV1,
     issuer: _TrustedSigner,
@@ -2670,15 +3440,16 @@ def provision_keychain_materials(
     expected_disposal_owner: str,
     expected_approver_identity: str,
     materials: Mapping[ProviderMaterialPurpose, bytearray],
-    _store: _KeychainTransport | None = None,
+    _store: _KeychainTransport,
 ) -> None:
-    """Create material rows only once using the trusted production UTC clock."""
+    """Internal deterministic seam used only by adversarial unit tests."""
 
     _provision_keychain_materials(
         paths,
         policy=policy,
         genesis=genesis,
         attestation=attestation,
+        generation_receipt=generation_receipt,
         signer=signer,
         signer_genesis=signer_genesis,
         issuer=issuer,
@@ -2688,6 +3459,100 @@ def provision_keychain_materials(
         materials=materials,
         _store=_store,
     )
+
+
+def provision_keychain_materials(
+    paths: ProviderMaterialArtifactPaths,
+    *,
+    policy: ProviderMaterialPolicyV2,
+    signer: KeychainEd25519Signer,
+    signer_genesis: SignerGenesisV1,
+    issuer: _TrustedSigner,
+    allocation_intent: AllocationIntentV2,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+) -> MaterialGenerationReceiptV1:
+    """Generate and create material exactly once using macOS Security.framework.
+
+    Callers never supply a material value, random source, clock, store, or
+    fingerprint.  This production entry point writes no secret to argv,
+    environment, file, or log.  It records a signed value-free receipt before
+    the first irreversible ``SecItemAdd``; a crash or duplicate consequently
+    stays blocked for explicit reconciliation.
+    """
+
+    allocation_intent = _reject_unsupported_tls_termination(allocation_intent)
+    if type(signer) is not KeychainEd25519Signer or sys.platform != "darwin":
+        raise ProviderCryptoError("material_generator")
+    policy = cast(
+        ProviderMaterialPolicyV2,
+        _canonical_artifact(policy, ProviderMaterialPolicyV2, phase="material_policy"),
+    )
+    signer_genesis = cast(
+        SignerGenesisV1,
+        _canonical_artifact(signer_genesis, SignerGenesisV1, phase="signer_genesis"),
+    )
+    # A policy is the only exact-idempotent durable precursor.  It is
+    # re-opened and verified before entropy is requested or a Keychain row is
+    # considered, so a standalone helper cannot skip the signed preimage.
+    persist_provider_material_policy(
+        paths,
+        policy,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        allocation_intent=allocation_intent,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+    )
+    values, attestation, generation_receipt, genesis = _generated_material_artifacts(
+        policy=policy,
+        signer=signer,
+        allocation_intent=allocation_intent,
+        random_source=_MacOSSecurityRandom(),
+    )
+    try:
+        persist_material_generation_receipt(
+            paths,
+            generation_receipt,
+            policy=policy,
+            attestation=attestation,
+            signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            allocation_intent=allocation_intent,
+        )
+        persist_provider_material_genesis(
+            paths,
+            genesis,
+            policy=policy,
+            attestation=attestation,
+            generation_receipt=generation_receipt,
+            signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            allocation_intent=allocation_intent,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+        )
+        _provision_keychain_materials(
+            paths,
+            policy=policy,
+            genesis=genesis,
+            attestation=attestation,
+            generation_receipt=generation_receipt,
+            signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            allocation_intent=allocation_intent,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            materials=values,
+        )
+        return generation_receipt
+    finally:
+        for value in values.values():
+            _zeroize(value)
 
 
 def _load_verified_provider_material_bundle_at(
@@ -2700,11 +3565,11 @@ def _load_verified_provider_material_bundle_at(
     expected_disposal_owner: str,
     expected_approver_identity: str,
     now: datetime,
-) -> tuple[ProviderMaterialPolicyV1, ProviderMaterialGenesisV1, ProviderFingerprintAttestationV1]:
+) -> tuple[ProviderMaterialPolicyV2, ProviderMaterialGenesisV2, ProviderFingerprintAttestationV2]:
     """Load and verify only completed material artifacts through one root fd."""
 
     allocation_intent = _reject_unsupported_tls_termination(allocation_intent)
-    policy, genesis, attestation = _read_material_artifacts(paths)
+    policy, genesis, generation_receipt, attestation = _read_material_artifacts(paths)
     if attestation is None:
         raise ProviderCryptoError("material_genesis_pending")
     _verify_provider_material_bundle_at(
@@ -2718,10 +3583,21 @@ def _load_verified_provider_material_bundle_at(
         expected_approver_identity=expected_approver_identity,
         now=now,
     )
+    _verify_material_generation_receipt_at(
+        generation_receipt,
+        policy=policy,
+        attestation=attestation,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        allocation_intent=allocation_intent,
+        now=now,
+    )
     verify_provider_material_genesis(
         genesis,
         policy=policy,
         attestation=attestation,
+        generation_receipt=generation_receipt,
         signer=signer,
         signer_genesis=signer_genesis,
         issuer=issuer,
@@ -2739,7 +3615,7 @@ def load_verified_provider_material_bundle(
     allocation_intent: AllocationIntentV2,
     expected_disposal_owner: str,
     expected_approver_identity: str,
-) -> tuple[ProviderMaterialPolicyV1, ProviderMaterialGenesisV1, ProviderFingerprintAttestationV1]:
+) -> tuple[ProviderMaterialPolicyV2, ProviderMaterialGenesisV2, ProviderFingerprintAttestationV2]:
     """Load only a cryptographically verified terminal material state."""
 
     allocation_intent = _reject_unsupported_tls_termination(allocation_intent)
@@ -2772,18 +3648,19 @@ def _load_verified_provider_material_bundle_from_reader_at(
     expected_approver_identity: str,
     now: datetime,
 ) -> tuple[
-    ProviderMaterialPolicyV1,
-    ProviderMaterialGenesisV1,
-    ProviderFingerprintAttestationV1,
-    tuple[str, str, str],
+    ProviderMaterialPolicyV2,
+    ProviderMaterialGenesisV2,
+    ProviderFingerprintAttestationV2,
+    tuple[str, str, str, str],
 ]:
     """Verify terminal artifacts from an authorization-pinned directory FD.
 
     Authorization uses this internal helper rather than reopening the root by
     path, then compares the returned raw-file hashes at each snapshot. The
-    terminal fingerprint-attestation artifact is the durable completion marker;
-    a manually populated provider without these three artifacts cannot enter an
-    effect path.
+    terminal fingerprint-attestation artifact is the durable completion marker.
+    A manually populated provider without the signer, policy, generation
+    receipt, pending manifest, and terminal attestation cannot enter an effect
+    path.
     """
 
     allocation_intent = _reject_unsupported_tls_termination(allocation_intent)
@@ -2791,23 +3668,18 @@ def _load_verified_provider_material_bundle_from_reader_at(
         raw_signer_genesis = reader.read(_SIGNER_GENESIS_NAME)
         raw_policy = reader.read(_MATERIAL_POLICY_NAME)
         raw_genesis = reader.read(_MATERIAL_GENESIS_NAME)
+        raw_generation_receipt = reader.read(_MATERIAL_GENERATION_RECEIPT_NAME)
         raw_attestation = reader.read(_FINGERPRINT_ATTESTATION_NAME)
     except Exception:
         raise ProviderCryptoError("material_artifact") from None
     persisted_signer_genesis = cast(
         SignerGenesisV1,
-        _load_model(raw_signer_genesis, SignerGenesisV1, phase="signer_genesis"),
-    )
-    persisted_signer_genesis = cast(
-        SignerGenesisV1,
-        _canonical_artifact(
-            persisted_signer_genesis,
+        _load_canonical_persisted_model(
+            raw_signer_genesis,
             SignerGenesisV1,
             phase="signer_genesis",
         ),
     )
-    if not hmac.compare_digest(raw_signer_genesis, _yaml_bytes(persisted_signer_genesis)):
-        raise ProviderCryptoError("signer_genesis")
     verify_signer_genesis(
         persisted_signer_genesis,
         issuer=issuer,
@@ -2820,18 +3692,34 @@ def _load_verified_provider_material_bundle_from_reader_at(
     if persisted_signer_genesis != signer_genesis:
         raise ProviderCryptoError("signer_genesis")
     policy = cast(
-        ProviderMaterialPolicyV1,
-        _load_model(raw_policy, ProviderMaterialPolicyV1, phase="material_policy"),
+        ProviderMaterialPolicyV2,
+        _load_canonical_persisted_model(
+            raw_policy,
+            ProviderMaterialPolicyV2,
+            phase="material_policy",
+        ),
     )
     genesis = cast(
-        ProviderMaterialGenesisV1,
-        _load_model(raw_genesis, ProviderMaterialGenesisV1, phase="material_genesis"),
+        ProviderMaterialGenesisV2,
+        _load_canonical_persisted_model(
+            raw_genesis,
+            ProviderMaterialGenesisV2,
+            phase="material_genesis",
+        ),
+    )
+    generation_receipt = cast(
+        MaterialGenerationReceiptV1,
+        _load_canonical_persisted_model(
+            raw_generation_receipt,
+            MaterialGenerationReceiptV1,
+            phase="material_generation_receipt",
+        ),
     )
     attestation = cast(
-        ProviderFingerprintAttestationV1,
-        _load_model(
+        ProviderFingerprintAttestationV2,
+        _load_canonical_persisted_model(
             raw_attestation,
-            ProviderFingerprintAttestationV1,
+            ProviderFingerprintAttestationV2,
             phase="fingerprint_attestation",
         ),
     )
@@ -2846,10 +3734,21 @@ def _load_verified_provider_material_bundle_from_reader_at(
         expected_approver_identity=expected_approver_identity,
         now=now,
     )
+    _verify_material_generation_receipt_at(
+        generation_receipt,
+        policy=policy,
+        attestation=attestation,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        allocation_intent=allocation_intent,
+        now=now,
+    )
     verify_provider_material_genesis(
         genesis,
         policy=policy,
         attestation=attestation,
+        generation_receipt=generation_receipt,
         signer=signer,
         signer_genesis=signer_genesis,
         issuer=issuer,
@@ -2862,6 +3761,7 @@ def _load_verified_provider_material_bundle_from_reader_at(
         (
             _sha256(raw_policy),
             _sha256(raw_genesis),
+            _sha256(raw_generation_receipt),
             _sha256(raw_attestation),
         ),
     )
@@ -2872,14 +3772,15 @@ __all__: Sequence[str] = (
     "KeychainItemReferenceV1",
     "KeychainProviderProvenance",
     "MacOSKeychainProviderProvenanceAdapter",
+    "MaterialGenerationReceiptV1",
     "ProviderCryptoError",
-    "ProviderFingerprintAttestationV1",
+    "ProviderFingerprintAttestationV2",
     "ProviderMaterialArtifactPaths",
     "ProviderMaterialFingerprintV1",
     "ProviderMaterialFormat",
     "ProviderMaterialGenesisStatus",
-    "ProviderMaterialGenesisV1",
-    "ProviderMaterialPolicyV1",
+    "ProviderMaterialGenesisV2",
+    "ProviderMaterialPolicyV2",
     "ProviderMaterialPurpose",
     "ProviderMaterialSpecV1",
     "ReplayAuthorityPolicyArtifactV1",
@@ -2887,6 +3788,8 @@ __all__: Sequence[str] = (
     "load_keychain_ed25519_signer",
     "load_verified_provider_material_bundle",
     "load_verified_signer_genesis",
+    "material_generation_receipt_message",
+    "persist_material_generation_receipt",
     "persist_provider_material_genesis",
     "persist_provider_material_policy",
     "persist_replay_authority_policy_artifact",
@@ -2901,6 +3804,7 @@ __all__: Sequence[str] = (
     "replay_authority_policy_sha256",
     "signer_genesis_message",
     "trusted_signer_from_genesis",
+    "verify_material_generation_receipt",
     "verify_provider_fingerprint_attestation",
     "verify_provider_material_bundle",
     "verify_provider_material_genesis",

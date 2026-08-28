@@ -249,25 +249,32 @@ prefix plus the typed replay-policy digest. Allocation journal provisioning writ
 that immutable artifact before it claims a tombstone, and both authorization
 stages re-read and verify it before they can claim an operation tombstone.
 
-`ProviderMaterialPolicyV1`, `ProviderFingerprintAttestationV1`, and the
-pending `ProviderMaterialGenesisV1` bind the exact intent, owner, approver,
-retention, purpose, provider reference, version, encoding, and value-free
-fingerprint for every material item. The material genesis is persisted only
-after the matching policy and before any Keychain write. A completed
-attestation is written only after all create-once rows succeed. Any duplicate,
-partial, missing, changed, malformed, or interrupted state is diagnostic-only
-and blocks automatic retry or replacement.
+`ProviderMaterialPolicyV2`, `ProviderFingerprintAttestationV2`,
+`MaterialGenerationReceiptV1`, and the pending `ProviderMaterialGenesisV2`
+bind the exact intent, owner, approver, retention, purpose, provider reference,
+version, encoding, generator identity, and value-free fingerprint for every
+material item. The production bootstrap uses Security.framework
+`SecRandomCopyBytes` directly to fill bounded mutable buffers; it records the
+signed generation receipt before the pending genesis and before any Keychain
+write. The pending genesis separately signs the canonical generation-receipt
+digest, so a later receipt substitution cannot be treated as the preimage for
+an existing create-only state. The receipt records the selected OS generator
+and resulting public fingerprints, not a post-hoc proof of entropy. A completed attestation is
+written only after all create-once rows succeed. Any duplicate, partial,
+missing, changed, malformed, or interrupted state is diagnostic-only and
+blocks automatic retry or replacement.
 
 Authorization never accepts material policy, genesis, or fingerprint models
 from its caller. Under the held artifact-root descriptor it loads the persisted
-issuer-signed `SignerGenesisV1`, policy, pending genesis, and terminal
-attestation; verifies their canonical hashes, Ed25519 domains, intent/owner/
-approver/reference bindings, distinct fingerprints, and declared formats; and
-rechecks that exact four-file snapshot before an effect and before commit. A
-manually populated Keychain item without this verified terminal artifact set
-cannot reach an effect. `provider_material_genesis_status()` is deliberately a
-structural diagnostic only: its `structurally_complete_unverified` result is
-never an authorization signal.
+issuer-signed `SignerGenesisV1`, policy, generation receipt, pending genesis,
+and terminal attestation; verifies their canonical hashes, Ed25519 domains,
+intent/owner/approver/reference bindings, distinct fingerprints, generator
+receipt bindings, and declared formats; and rechecks that exact five-file
+snapshot before an effect and before commit. A manually populated Keychain item
+without this verified terminal artifact set cannot reach an effect.
+`provider_material_genesis_status()` is deliberately a structural diagnostic
+only: its `structurally_complete_unverified` result is never an authorization
+signal.
 
 For macOS Keychain material, the immutable account name carries its declared
 version as a `.v<version>` suffix, in addition to the signed reference hash.
@@ -289,10 +296,11 @@ orphaned signer state fails closed.
 The public material policy has fixed purpose-to-format bindings: commitment
 HMAC and backup AES-256-GCM keys are each 32 raw bytes; the normal Infisical
 encryption key is 16 random bytes in 32 lower-case hex characters; Infisical
-auth secret is 32 random bytes in canonical standard Base64; each Valkey
-password is a distinct 32-random-byte unpadded Base64URL value; and the TLS
-trust anchor is exactly one canonical PEM X.509 CA certificate. Fingerprints
-must be pairwise distinct, so HMAC and AEAD key material cannot be
+auth secret is 32 random bytes in canonical standard Base64; each primary and
+restore Valkey password and the distinct PostgreSQL application-login password
+are 32-random-byte unpadded Base64URL values; and the TLS trust anchor is
+exactly one canonical PEM X.509 CA certificate. Fingerprints must be pairwise
+distinct, so HMAC, AEAD, signer, and application material cannot be
 cross-substituted. The FIPS-specific Infisical encryption-key spelling is not
 accepted by this policy version.
 
@@ -322,10 +330,14 @@ logs, receipts, disk plaintext, and public artifacts to remain forbidden.
 The future executor receives only an opaque `SecretMaterialLease` and must
 enforce those sink restrictions before any provider read.
 
-The policy fixes restart behavior to `no`. A future restart is outside this
-release and must require a fresh signed `rsd.start-runtime-intent.v2` with
-`start_runtime_v2` scope and fresh Keychain redelivery; no existing start or
-materialization receipt can be reused as restart authority.
+The policy fixes restart behavior to `no`. The public authorization boundary
+models a fresh signed `rsd.start-runtime-intent.v2` with `start_runtime_v2`
+scope, a globally fresh delivery nonce, external replay tombstone, durable
+start journal state, and fresh bounded Keychain redelivery for every start or
+restart. No existing start or materialization receipt can be reused as restart
+authority. Concrete SSH, executor, Docker, and process-delivery transport
+remain future separately authorized effects; this package does not start a
+runtime today.
 
 The observed SQLite journal requires an owner-only directory and database file, uses
 `BEGIN IMMEDIATE`, `DELETE` journaling, and `FULL` synchronous durability. A

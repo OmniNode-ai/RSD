@@ -44,15 +44,23 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     AllocationEffectReceiptV2,
     AllocationIntentV2,
     ApprovalEvidenceV1,
+    ContainerBootstrapInspectionV1,
+    ContainerBootstrapTemplateV1,
     DisposablePreflightError,
     DisposableTransportProfile,
+    EphemeralPostgreSQLConnectionPolicyV1,
     ExecutorControlPolicyV1,
+    ExecutorInstallationIntentV1,
+    ExecutorInstallationPolicyV1,
+    ExecutorInstallationReceiptV1,
+    ExecutorOperationReceiptV1,
     GovernedBaselineV1,
     MaterializationEffectReceiptV1,
     MaterializationIntentV1,
     ObservedAllocationAttestationV1,
     ObservedRuntimeAttestationV1,
     PostgreSQLControlPolicyV1,
+    PostgreSQLLoginTransitionIntentV1,
     PreflightPaths,
     PreflightReceiptV1,
     ProposalV1,
@@ -61,7 +69,12 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     RegistryVerificationV1,
     RuntimeContractV1,
     SecretCapabilityPolicyV1,
+    SecretDeliveryReceiptV1,
+    SecretDeliveryRequestV1,
     SecretHandlingPolicyV1,
+    StartRuntimeEffectReceiptV2,
+    StartRuntimeExecutorReceiptV2,
+    StartRuntimeIntentV2,
     TargetAttestationV1,
     _OwnerOnlyReader,
     _strict_canonical_model,
@@ -73,8 +86,12 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     materialization_effect_receipt_sha256,
     materialization_intent_sha256,
     observed_allocation_attestation_sha256,
+    observed_runtime_attestation_sha256,
+    start_runtime_effect_receipt_sha256,
+    start_runtime_intent_sha256,
     strict_canonical_allocation_intent,
     strict_canonical_materialization_intent,
+    strict_canonical_start_runtime_intent,
     validate_observed_allocation_transition,
     validate_observed_runtime_transition,
 )
@@ -112,6 +129,11 @@ _EXECUTOR_CONTROL_POLICY_ARTIFACT_NAME: Final = "executor-control-policy.yaml"
 _POSTGRES_CONTROL_POLICY_ARTIFACT_NAME: Final = "postgres-control-policy.yaml"
 _SECRET_CAPABILITY_POLICY_ARTIFACT_NAME: Final = "secret-capability-policy.yaml"
 _SECRET_HANDLING_POLICY_ARTIFACT_NAME: Final = "secret-handling-policy.yaml"
+_EXECUTOR_INSTALLATION_POLICY_ARTIFACT_NAME: Final = "executor-installation-policy.yaml"
+_EXECUTOR_INSTALLATION_INTENT_ARTIFACT_NAME: Final = "executor-installation-intent.yaml"
+_EXECUTOR_INSTALLATION_RECEIPT_ARTIFACT_NAME: Final = "executor-installation-receipt.yaml"
+_START_RUNTIME_INTENT_PREFIX: Final = "start-runtime-intent-"
+_START_RUNTIME_RECEIPT_PREFIX: Final = "start-runtime-receipt-"
 _REPLAY_POLICY_ARTIFACT_NAME: Final = "replay-authority-policy.yaml"
 _MARKED_EVIDENCE_NAMES: Final[frozenset[str]] = frozenset(_ARTIFACT_NAMES[2:-1])
 _SIGNATURE_DOMAIN: Final = b"omninode-rsd.authorization.ed25519.v3\x00"
@@ -137,6 +159,22 @@ _SECRET_CAPABILITY_POLICY_SIGNATURE_DOMAIN: Final = (
 _SECRET_HANDLING_POLICY_SIGNATURE_DOMAIN: Final = (
     b"omninode-rsd.secret-handling-policy.ed25519.v1\x00"
 )
+_EXECUTOR_INSTALLATION_POLICY_SIGNATURE_DOMAIN: Final = (
+    b"omninode-rsd.executor-installation-policy.ed25519.v1\x00"
+)
+_EXECUTOR_INSTALLATION_INTENT_SIGNATURE_DOMAIN: Final = (
+    b"omninode-rsd.executor-installation-intent.ed25519.v1\x00"
+)
+_EXECUTOR_INSTALLATION_RECEIPT_SIGNATURE_DOMAIN: Final = (
+    b"omninode-rsd.executor-installation-receipt.ed25519.v1\x00"
+)
+_EXECUTOR_OPERATION_RECEIPT_SIGNATURE_DOMAIN: Final = (
+    b"omninode-rsd.executor-operation-receipt.ed25519.v1\x00"
+)
+_START_RUNTIME_INTENT_SIGNATURE_DOMAIN: Final = b"omninode-rsd.start-runtime-intent.ed25519.v2\x00"
+_START_RUNTIME_EXECUTOR_RECEIPT_SIGNATURE_DOMAIN: Final = (
+    b"omninode-rsd.start-runtime-executor-receipt.ed25519.v2\x00"
+)
 _ALLOCATION_EFFECT_RECEIPT_DOMAIN: Final = b"omninode-rsd.allocation-effect-receipt.v2\x00"
 _MATERIALIZATION_EFFECT_RECEIPT_DOMAIN: Final = (
     b"omninode-rsd.materialization-effect-receipt.v1\x00"
@@ -144,6 +182,7 @@ _MATERIALIZATION_EFFECT_RECEIPT_DOMAIN: Final = (
 _IDEMPOTENCY_DOMAIN: Final = b"omninode-rsd.authorization.effect.v1\x00"
 _ALLOCATION_IDEMPOTENCY_DOMAIN: Final = b"omninode-rsd.allocation-effect.v2\x00"
 _MATERIALIZATION_IDEMPOTENCY_DOMAIN: Final = b"omninode-rsd.materialization-effect.v1\x00"
+_START_RUNTIME_IDEMPOTENCY_DOMAIN: Final = b"omninode-rsd.start-runtime-effect.v2\x00"
 _RECONCILIATION_DOMAIN: Final = b"omninode-rsd.authorization.reconciliation.v1\x00"
 _JOURNAL_GENESIS_DOMAIN: Final = b"omninode-rsd.authorization.journal-genesis.v1\x00"
 _JOURNAL_GENESIS_RECONCILIATION_DOMAIN: Final = (
@@ -167,6 +206,7 @@ _ALLOCATION_VERIFIED_CAPABILITY: Final = object()
 _ALLOCATION_INTENT_CAPABILITY: Final = object()
 _MATERIALIZATION_VERIFIED_CAPABILITY: Final = object()
 _MATERIALIZATION_INTENT_CAPABILITY: Final = object()
+_START_RUNTIME_VERIFIED_CAPABILITY: Final = object()
 _JOURNAL_PIN_CAPABILITY: Final = object()
 _ALLOCATION_JOURNAL_PIN_CAPABILITY: Final = object()
 _SAFE_CALL_FAILURE: Final = object()
@@ -174,16 +214,18 @@ _OPERATION_TABLE: Final = "authorization_operation_journal"
 _JOURNAL_METADATA_TABLE: Final = "authorization_journal_metadata"
 _ALLOCATION_OPERATION_TABLE: Final = "allocation_operation_journal"
 _MATERIALIZATION_OPERATION_TABLE: Final = "materialization_operation_journal"
+_START_RUNTIME_OPERATION_TABLE: Final = "start_runtime_operation_journal"
 _ALLOCATION_JOURNAL_METADATA_TABLE: Final = "allocation_journal_metadata"
 _LEGACY_OPERATION_TABLE: Final = "authorization_nonce_journal"
 _JOURNAL_SCHEMA_VERSION: Final = "rsd.authorization-journal.v1"
-_ALLOCATION_JOURNAL_SCHEMA_VERSION: Final = "rsd.allocation-materialization-journal.v2"
+_ALLOCATION_JOURNAL_SCHEMA_VERSION: Final = "rsd.allocation-materialization-start-journal.v4"
 _JOURNAL_ANCHOR_SCHEMA_VERSION: Final = "rsd.authorization-journal-anchor.v1"
 _JOURNAL_GENESIS_MARKER_SCHEMA_VERSION: Final = "rsd.authorization-journal-genesis-marker.v1"
 _JOURNAL_OPERATION_DOMAIN: Final = "rsd.observed-lifecycle-operation.v1"
 _OBSERVED_OPERATION_KIND: Final = "observed_lifecycle_v1"
 _ALLOCATION_OPERATION_KIND: Final = "allocation_v2"
 _MATERIALIZATION_OPERATION_KIND: Final = "materialization_v1"
+_START_RUNTIME_OPERATION_KIND: Final = "start_runtime_v2"
 _OPERATION_SCHEMA: Final = f"""
 CREATE TABLE IF NOT EXISTS {_OPERATION_TABLE} (
     operation_id TEXT PRIMARY KEY NOT NULL,
@@ -244,10 +286,13 @@ CREATE TABLE IF NOT EXISTS {_MATERIALIZATION_OPERATION_TABLE} (
     materialization_intent_sha256 TEXT NOT NULL,
     allocation_effect_receipt_sha256 TEXT NOT NULL,
     observed_allocation_attestation_sha256 TEXT NOT NULL,
+    request_nonce_sha256 TEXT NOT NULL UNIQUE,
     nonce TEXT NOT NULL UNIQUE,
     provider_provenance_sha256 TEXT NOT NULL,
     executor_provenance_sha256 TEXT NOT NULL,
+    postgres_login_provenance_sha256 TEXT NOT NULL,
     secret_capability_provenance_sha256 TEXT NOT NULL,
+    secret_delivery_provenance_sha256 TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     state TEXT NOT NULL,
     effect_receipt_sha256 TEXT,
@@ -255,6 +300,33 @@ CREATE TABLE IF NOT EXISTS {_MATERIALIZATION_OPERATION_TABLE} (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     CHECK (state IN ('claimed', 'in_progress', 'materialized', 'failed_recovery_required'))
+) WITHOUT ROWID
+"""
+_START_RUNTIME_OPERATION_SCHEMA: Final = f"""
+CREATE TABLE IF NOT EXISTS {_START_RUNTIME_OPERATION_TABLE} (
+    start_operation_id TEXT PRIMARY KEY NOT NULL,
+    operation_kind TEXT NOT NULL CHECK (operation_kind = '{_START_RUNTIME_OPERATION_KIND}'),
+    operation_scope TEXT NOT NULL CHECK (operation_scope = 'start_runtime_v2'),
+    materialization_operation_id TEXT NOT NULL,
+    materialization_intent_sha256 TEXT NOT NULL,
+    materialization_effect_receipt_sha256 TEXT NOT NULL,
+    observed_runtime_attestation_sha256 TEXT NOT NULL,
+    start_runtime_intent_sha256 TEXT NOT NULL,
+    request_nonce_sha256 TEXT NOT NULL UNIQUE,
+    channel_binding_sha256 TEXT NOT NULL,
+    session_binding_sha256 TEXT NOT NULL,
+    nonce TEXT NOT NULL UNIQUE,
+    provider_provenance_sha256 TEXT NOT NULL,
+    executor_provenance_sha256 TEXT NOT NULL,
+    secret_capability_provenance_sha256 TEXT NOT NULL,
+    remote_session_provenance_sha256 TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    state TEXT NOT NULL,
+    effect_receipt_sha256 TEXT,
+    failure_phase TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (state IN ('claimed', 'in_progress', 'started', 'failed_recovery_required'))
 ) WITHOUT ROWID
 """
 _ALLOCATION_JOURNAL_METADATA_SCHEMA: Final = f"""
@@ -300,6 +372,7 @@ class AuthorizationOperationKind(StrEnum):
 
     ALLOCATION = _ALLOCATION_OPERATION_KIND
     MATERIALIZATION = _MATERIALIZATION_OPERATION_KIND
+    START_RUNTIME = _START_RUNTIME_OPERATION_KIND
     OBSERVED_LIFECYCLE = _OBSERVED_OPERATION_KIND
 
 
@@ -318,6 +391,15 @@ class MaterializationOperationState(StrEnum):
     CLAIMED = "claimed"
     IN_PROGRESS = "in_progress"
     MATERIALIZED = "materialized"
+    FAILED_RECOVERY_REQUIRED = "failed_recovery_required"
+
+
+class StartRuntimeOperationState(StrEnum):
+    """Durable states for one fresh post-materialization runtime start."""
+
+    CLAIMED = "claimed"
+    IN_PROGRESS = "in_progress"
+    STARTED = "started"
     FAILED_RECOVERY_REQUIRED = "failed_recovery_required"
 
 
@@ -403,10 +485,13 @@ class ReplayTombstoneV1(_Model):
         "allocation_genesis",
         "allocation_operation",
         "materialization_operation",
+        "start_runtime_operation",
         "observed_genesis",
         "observed_operation",
     ]
-    operation_kind: Literal["allocation_v2", "materialization_v1", "observed_lifecycle_v1"]
+    operation_kind: Literal[
+        "allocation_v2", "materialization_v1", "start_runtime_v2", "observed_lifecycle_v1"
+    ]
     service: str = Field(pattern=_IDENTIFIER, min_length=1, max_length=128)
     account: str = Field(pattern=_IDENTIFIER, min_length=1, max_length=128)
     journal_genesis_id: str = Field(pattern=_UUID)
@@ -416,7 +501,11 @@ class ReplayTombstoneV1(_Model):
     allocation_intent_sha256: str | None = Field(default=None, pattern=_SHA256)
     materialization_intent_sha256: str | None = Field(default=None, pattern=_SHA256)
     allocation_effect_receipt_sha256: str | None = Field(default=None, pattern=_SHA256)
+    materialization_effect_receipt_sha256: str | None = Field(default=None, pattern=_SHA256)
     observed_allocation_attestation_sha256: str | None = Field(default=None, pattern=_SHA256)
+    observed_runtime_attestation_sha256: str | None = Field(default=None, pattern=_SHA256)
+    start_runtime_intent_sha256: str | None = Field(default=None, pattern=_SHA256)
+    request_nonce_sha256: str | None = Field(default=None, pattern=_SHA256)
     provider_provenance_sha256: str | None = None
     idempotency_key: str | None = None
 
@@ -431,15 +520,18 @@ class ReplayTombstoneV1(_Model):
         observed = self.kind in {"observed_genesis", "observed_operation"}
         allocation = self.kind in {"allocation_genesis", "allocation_operation"}
         materialization = self.kind == "materialization_operation"
+        start = self.kind == "start_runtime_operation"
         operation = self.kind in {
             "allocation_operation",
             "materialization_operation",
+            "start_runtime_operation",
             "observed_operation",
         }
         if (
             observed != (self.operation_kind == _OBSERVED_OPERATION_KIND)
             or allocation != (self.operation_kind == _ALLOCATION_OPERATION_KIND)
             or materialization != (self.operation_kind == _MATERIALIZATION_OPERATION_KIND)
+            or start != (self.operation_kind == _START_RUNTIME_OPERATION_KIND)
         ):
             raise ValueError("replay tombstone binding is invalid")
         if observed:
@@ -449,28 +541,58 @@ class ReplayTombstoneV1(_Model):
                 or self.allocation_intent_sha256 is not None
                 or self.materialization_intent_sha256 is not None
                 or self.allocation_effect_receipt_sha256 is not None
+                or self.materialization_effect_receipt_sha256 is not None
                 or self.observed_allocation_attestation_sha256 is not None
+                or self.observed_runtime_attestation_sha256 is not None
+                or self.start_runtime_intent_sha256 is not None
+                or self.request_nonce_sha256 is not None
             ):
                 raise ValueError("replay tombstone binding is invalid")
         elif (
-            allocation
-            and (
-                type(self.allocation_intent_sha256) is not str
-                or self.proposal_sha256 is not None
-                or self.contract_sha256 is not None
-                or self.materialization_intent_sha256 is not None
-                or self.allocation_effect_receipt_sha256 is not None
-                or self.observed_allocation_attestation_sha256 is not None
+            (
+                allocation
+                and (
+                    type(self.allocation_intent_sha256) is not str
+                    or self.proposal_sha256 is not None
+                    or self.contract_sha256 is not None
+                    or self.materialization_intent_sha256 is not None
+                    or self.allocation_effect_receipt_sha256 is not None
+                    or self.materialization_effect_receipt_sha256 is not None
+                    or self.observed_allocation_attestation_sha256 is not None
+                    or self.observed_runtime_attestation_sha256 is not None
+                    or self.start_runtime_intent_sha256 is not None
+                    or self.request_nonce_sha256 is not None
+                )
             )
-        ) or (
-            materialization
-            and (
-                type(self.allocation_intent_sha256) is not str
-                or type(self.materialization_intent_sha256) is not str
-                or type(self.allocation_effect_receipt_sha256) is not str
-                or type(self.observed_allocation_attestation_sha256) is not str
-                or self.proposal_sha256 is not None
-                or self.contract_sha256 is not None
+            or (
+                materialization
+                and (
+                    type(self.allocation_intent_sha256) is not str
+                    or type(self.materialization_intent_sha256) is not str
+                    or type(self.allocation_effect_receipt_sha256) is not str
+                    or self.materialization_effect_receipt_sha256 is not None
+                    or type(self.observed_allocation_attestation_sha256) is not str
+                    or self.proposal_sha256 is not None
+                    or self.contract_sha256 is not None
+                    or self.observed_runtime_attestation_sha256 is not None
+                    or self.start_runtime_intent_sha256 is not None
+                    or type(self.request_nonce_sha256) is not str
+                )
+            )
+            or (
+                start
+                and (
+                    type(self.proposal_sha256) is not str
+                    or type(self.contract_sha256) is not str
+                    or type(self.materialization_intent_sha256) is not str
+                    or type(self.allocation_effect_receipt_sha256) is not str
+                    or type(self.materialization_effect_receipt_sha256) is not str
+                    or type(self.observed_allocation_attestation_sha256) is not str
+                    or type(self.observed_runtime_attestation_sha256) is not str
+                    or type(self.start_runtime_intent_sha256) is not str
+                    or type(self.request_nonce_sha256) is not str
+                    or self.allocation_intent_sha256 is not None
+                )
             )
         ):
             raise ValueError("replay tombstone binding is invalid")
@@ -654,6 +776,49 @@ class PostgreSQLControlCapability(Protocol):
     ) -> AbstractContextManager[PostgreSQLControlLease]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class PostgreSQLLoginTransitionProvenance:
+    """Value-free identity of one prepared observed-OID login transition."""
+
+    authority: str
+    system_identifier: str
+    database_oid: int
+    owner_role_oid: int
+    application_role_oid: int
+    prepared_operation_id: str
+    application_password_reference_sha256: str
+    capability_fingerprint_sha256: str
+
+
+class PostgreSQLLoginTransitionLease(Protocol):
+    """One-shot OID-bound PostgreSQL transition lease with no SQL/DSN surface."""
+
+    def inspect(
+        self,
+        policy: PostgreSQLControlPolicyV1,
+        transition: PostgreSQLLoginTransitionIntentV1,
+        connection: EphemeralPostgreSQLConnectionPolicyV1,
+    ) -> PostgreSQLLoginTransitionProvenance | None: ...
+
+    def recheck(
+        self,
+        policy: PostgreSQLControlPolicyV1,
+        transition: PostgreSQLLoginTransitionIntentV1,
+        connection: EphemeralPostgreSQLConnectionPolicyV1,
+    ) -> PostgreSQLLoginTransitionProvenance | None: ...
+
+
+class PostgreSQLLoginTransitionCapability(Protocol):
+    """Acquire only a prepared transition lease; no raw query or URI is accepted."""
+
+    def acquire(
+        self,
+        policy: PostgreSQLControlPolicyV1,
+        transition: PostgreSQLLoginTransitionIntentV1,
+        connection: EphemeralPostgreSQLConnectionPolicyV1,
+    ) -> AbstractContextManager[PostgreSQLLoginTransitionLease]: ...
+
+
 class PostgreSQLControlExpectationV1(_Model):
     """Exact bounded PostgreSQL-control provenance visible to allocation effects."""
 
@@ -662,11 +827,34 @@ class PostgreSQLControlExpectationV1(_Model):
     capability_fingerprint_sha256: str = Field(pattern=_SHA256)
 
 
+class PostgreSQLLoginTransitionExpectationV1(_Model):
+    """Non-secret, exact transition binding exposed to the materialization effect."""
+
+    authority: str
+    system_identifier: str = Field(pattern=r"^[0-9]{8,32}$")
+    database_oid: int = Field(ge=1)
+    owner_role_oid: int = Field(ge=1)
+    application_role_oid: int = Field(ge=1)
+    prepared_operation_id: str = Field(pattern=_UUID)
+    application_password_reference_sha256: str = Field(pattern=_SHA256)
+    capability_fingerprint_sha256: str = Field(pattern=_SHA256)
+
+
 @dataclass(frozen=True, slots=True)
 class SecretMaterialProvenance:
     """Value-free identity of an opaque local secret-use capability."""
 
     provider_identity_sha256: str
+    capability_fingerprint_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class SecretDeliveryProvenance:
+    """Value-free delivery-channel proof; it contains no value or URI."""
+
+    request_nonce_sha256: str
+    channel_binding_sha256: str
+    session_binding_sha256: str
     capability_fingerprint_sha256: str
 
 
@@ -685,6 +873,16 @@ class SecretMaterialLease(Protocol):
         handling_policy: SecretHandlingPolicyV1,
     ) -> SecretMaterialProvenance | None: ...
 
+    def inspect_delivery(
+        self, request: SecretDeliveryRequestV1
+    ) -> SecretDeliveryProvenance | None: ...
+
+    def recheck_delivery(
+        self, request: SecretDeliveryRequestV1
+    ) -> SecretDeliveryProvenance | None: ...
+
+    def deliver(self, request: SecretDeliveryRequestV1) -> SecretDeliveryReceiptV1 | None: ...
+
 
 class SecretMaterialCapability(Protocol):
     """Acquire only an operation-scoped secret lease for materialization."""
@@ -694,6 +892,33 @@ class SecretMaterialCapability(Protocol):
         policy: SecretCapabilityPolicyV1,
         handling_policy: SecretHandlingPolicyV1,
     ) -> AbstractContextManager[SecretMaterialLease]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteExecutorSessionProvenance:
+    """Pinned value-free remote session metadata for a future forced command."""
+
+    executor_id: str
+    host_fingerprint_sha256: str
+    channel_binding_sha256: str
+    session_binding_sha256: str
+    attestation_key_fingerprint_sha256: str
+
+
+class RemoteExecutorSessionLease(Protocol):
+    """Opaque forced-command session lease; no Secure Shell client or stream is exposed."""
+
+    def inspect(self, intent: StartRuntimeIntentV2) -> RemoteExecutorSessionProvenance | None: ...
+
+    def recheck(self, intent: StartRuntimeIntentV2) -> RemoteExecutorSessionProvenance | None: ...
+
+
+class RemoteExecutorSessionCapability(Protocol):
+    """Acquire a bounded remote execution session for a single signed start."""
+
+    def acquire(
+        self, intent: StartRuntimeIntentV2
+    ) -> AbstractContextManager[RemoteExecutorSessionLease]: ...
 
 
 class _DirectlySignedArtifact(Protocol):
@@ -929,13 +1154,20 @@ class MaterializationExecutionContext:
     allocation_attestation_sha256: str
     provider_expectations: tuple[ProviderExpectationV1, ...]
     executor_expectation: ExecutorControlExpectationV1
+    executor_attestation_key_id: str
+    executor_attestation_public_key_base64: str
+    executor_attestation_public_key_fingerprint_sha256: str
+    postgres_login_expectation: PostgreSQLLoginTransitionExpectationV1
     secret_material_expectation: SecretMaterialExpectationV1
     secret_handling_policy_sha256: str
+    secret_delivery_request: SecretDeliveryRequestV1
     materialization_intent_sha256: str
     idempotency_key: str
     provider_provenance_sha256: str
     executor_provenance_sha256: str
+    postgres_login_provenance_sha256: str
     secret_capability_provenance_sha256: str
+    secret_delivery_provenance_sha256: str
 
 
 class MaterializationExecutor(Protocol):
@@ -945,8 +1177,59 @@ class MaterializationExecutor(Protocol):
         self,
         context: MaterializationExecutionContext,
         executor_control: ExecutorControlLease,
+        postgres_login: PostgreSQLLoginTransitionLease,
         secret_material: SecretMaterialLease,
     ) -> MaterializationEffectReceiptV1: ...
+
+
+@dataclass(frozen=True, slots=True)
+class StartRuntimeExecutionContext:
+    """Opaque, value-free input for one fresh runtime start or restart.
+
+    The context deliberately exposes only authenticated predecessor evidence,
+    requested secret-delivery metadata, and a pinned remote-session identity.
+    It has no URI, provider value, stream, artifact path, or journal handle.
+    """
+
+    operation_kind: Literal["start_runtime_v2"]
+    operation_scope: Literal["start_runtime_v2"]
+    start_operation_id: str
+    intent: StartRuntimeIntentV2
+    materialization_intent: MaterializationIntentV1
+    materialization_receipt: MaterializationEffectReceiptV1
+    observed_runtime_attestation: ObservedRuntimeAttestationV1
+    provider_expectations: tuple[ProviderExpectationV1, ...]
+    executor_expectation: ExecutorControlExpectationV1
+    executor_attestation_key_id: str
+    executor_attestation_public_key_base64: str
+    executor_attestation_public_key_fingerprint_sha256: str
+    secret_material_expectation: SecretMaterialExpectationV1
+    secret_handling_policy_sha256: str
+    secret_delivery_request: SecretDeliveryRequestV1
+    start_runtime_intent_sha256: str
+    idempotency_key: str
+    proposal_sha256: str
+    contract_sha256: str
+    provider_provenance_sha256: str
+    executor_provenance_sha256: str
+    secret_capability_provenance_sha256: str
+    secret_delivery_provenance_sha256: str
+    remote_session_provenance_sha256: str
+
+
+class StartRuntimeExecutor(Protocol):
+    """Future forced-command effect boundary for a fresh opaque delivery/start.
+
+    No Secure Shell client, Docker client, provider value, URI, command line, or raw
+    process environment is made public through this protocol.
+    """
+
+    def start_runtime(
+        self,
+        context: StartRuntimeExecutionContext,
+        remote_session: RemoteExecutorSessionLease,
+        secret_material: SecretMaterialLease,
+    ) -> StartRuntimeEffectReceiptV2: ...
 
 
 class AllocationJournalProvisioningReceiptV1(_Model):
@@ -988,6 +1271,23 @@ class MaterializationExecutionReceiptV1(_Model):
     allocation_operation_id: str = Field(pattern=_UUID)
     allocation_effect_receipt_sha256: str = Field(pattern=_SHA256)
     observed_allocation_attestation_sha256: str = Field(pattern=_SHA256)
+    idempotency_key: str = Field(pattern=_SHA256)
+    effect_receipt_sha256: str = Field(pattern=_SHA256)
+    committed_at: str
+
+
+class StartRuntimeExecutionReceiptV2(_Model):
+    """Non-bearer audit result after a fresh start commits exactly once."""
+
+    schema_version: Literal["rsd.start-runtime-execution-receipt.v2"]
+    status: Literal["started_runtime"]
+    operation_kind: Literal["start_runtime_v2"]
+    operation_scope: Literal["start_runtime_v2"]
+    start_operation_id: str = Field(pattern=_UUID)
+    start_runtime_intent_sha256: str = Field(pattern=_SHA256)
+    materialization_operation_id: str = Field(pattern=_UUID)
+    materialization_effect_receipt_sha256: str = Field(pattern=_SHA256)
+    observed_runtime_attestation_sha256: str = Field(pattern=_SHA256)
     idempotency_key: str = Field(pattern=_SHA256)
     effect_receipt_sha256: str = Field(pattern=_SHA256)
     committed_at: str
@@ -1057,6 +1357,30 @@ class AuthorizationPaths:
         return _SECRET_HANDLING_POLICY_ARTIFACT_NAME
 
     @staticmethod
+    def executor_installation_policy_name() -> str:
+        return _EXECUTOR_INSTALLATION_POLICY_ARTIFACT_NAME
+
+    @staticmethod
+    def executor_installation_intent_name() -> str:
+        return _EXECUTOR_INSTALLATION_INTENT_ARTIFACT_NAME
+
+    @staticmethod
+    def executor_installation_receipt_name() -> str:
+        return _EXECUTOR_INSTALLATION_RECEIPT_ARTIFACT_NAME
+
+    @staticmethod
+    def start_runtime_intent_name(start_operation_id: str) -> str:
+        if type(start_operation_id) is not str or re.fullmatch(_UUID, start_operation_id) is None:
+            raise AuthorizationError("start_runtime_operation_id")
+        return f"{_START_RUNTIME_INTENT_PREFIX}{start_operation_id}.yaml"
+
+    @staticmethod
+    def start_runtime_receipt_name(start_operation_id: str) -> str:
+        if type(start_operation_id) is not str or re.fullmatch(_UUID, start_operation_id) is None:
+            raise AuthorizationError("start_runtime_operation_id")
+        return f"{_START_RUNTIME_RECEIPT_PREFIX}{start_operation_id}.yaml"
+
+    @staticmethod
     def replay_policy_name() -> str:
         """Fixed signed preimage for the external replay namespace."""
 
@@ -1101,6 +1425,10 @@ class _MaterializationControlPolicies:
     """Signed secret-use constraints re-opened before a runtime effect."""
 
     executor: ExecutorControlPolicyV1
+    postgres: PostgreSQLControlPolicyV1
+    installation_policy: ExecutorInstallationPolicyV1
+    installation_intent: ExecutorInstallationIntentV1
+    installation_receipt: ExecutorInstallationReceiptV1
     secret_capability: SecretCapabilityPolicyV1
     handling: SecretHandlingPolicyV1
 
@@ -1148,6 +1476,16 @@ class _VerifiedMaterialization:
     """Capability-bound local claim for one post-allocation runtime effect."""
 
     context: MaterializationExecutionContext
+    nonce: str
+    authorized_at: str
+    capability: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedStartRuntime:
+    """Capability-bound local claim for one fresh remote runtime start."""
+
+    context: StartRuntimeExecutionContext
     nonce: str
     authorized_at: str
     capability: object = field(repr=False, compare=False)
@@ -1212,6 +1550,7 @@ def _replay_account(
         "allocation_genesis",
         "allocation_operation",
         "materialization_operation",
+        "start_runtime_operation",
         "observed_genesis",
         "observed_operation",
     ],
@@ -1233,6 +1572,7 @@ def _replay_account(
         "allocation_genesis": "a",
         "allocation_operation": "a",
         "materialization_operation": "m",
+        "start_runtime_operation": "s",
         "observed_genesis": "o",
         "observed_operation": "o",
     }[kind]
@@ -1374,6 +1714,51 @@ def _materialization_operation_tombstone(
         materialization_intent_sha256=context.materialization_intent_sha256,
         allocation_effect_receipt_sha256=context.intent.allocation_effect_receipt_sha256,
         observed_allocation_attestation_sha256=context.allocation_attestation_sha256,
+        request_nonce_sha256=context.secret_delivery_request.request_nonce_sha256,
+        provider_provenance_sha256=context.provider_provenance_sha256,
+        idempotency_key=context.idempotency_key,
+    )
+
+
+def _start_runtime_operation_tombstone(
+    policy: ReplayAuthorityPolicyV1,
+    verified: _VerifiedStartRuntime,
+) -> ReplayTombstoneV1:
+    """Bind an external create-once claim to one fresh signed start request."""
+
+    if (
+        type(verified) is not _VerifiedStartRuntime
+        or verified.capability is not _START_RUNTIME_VERIFIED_CAPABILITY
+    ):
+        raise AuthorizationError("replay_authority_binding")
+    context = verified.context
+    return ReplayTombstoneV1(
+        schema_version="rsd.replay-tombstone.v1",
+        kind="start_runtime_operation",
+        operation_kind=_START_RUNTIME_OPERATION_KIND,
+        service=policy.service,
+        account=_replay_account(
+            policy,
+            kind="start_runtime_operation",
+            operation_id=context.start_operation_id,
+        ),
+        journal_genesis_id=context.intent.journal_uuid,
+        operation_id=context.start_operation_id,
+        proposal_sha256=context.proposal_sha256,
+        contract_sha256=context.contract_sha256,
+        materialization_intent_sha256=materialization_intent_sha256(context.materialization_intent),
+        allocation_effect_receipt_sha256=(
+            context.materialization_intent.allocation_effect_receipt_sha256
+        ),
+        materialization_effect_receipt_sha256=materialization_effect_receipt_sha256(
+            context.materialization_receipt
+        ),
+        observed_allocation_attestation_sha256=(
+            context.materialization_intent.observed_allocation_attestation_sha256
+        ),
+        observed_runtime_attestation_sha256=(context.intent.observed_runtime_attestation_sha256),
+        start_runtime_intent_sha256=context.start_runtime_intent_sha256,
+        request_nonce_sha256=context.secret_delivery_request.request_nonce_sha256,
         provider_provenance_sha256=context.provider_provenance_sha256,
         idempotency_key=context.idempotency_key,
     )
@@ -1708,6 +2093,42 @@ def _secret_handling_policy_message(policy: SecretHandlingPolicyV1) -> bytes:
     return _direct_signature_message(_SECRET_HANDLING_POLICY_SIGNATURE_DOMAIN, policy)
 
 
+def _executor_installation_policy_message(policy: ExecutorInstallationPolicyV1) -> bytes:
+    if type(policy) is not ExecutorInstallationPolicyV1:
+        raise AuthorizationError("executor_installation_policy_signature")
+    return _direct_signature_message(_EXECUTOR_INSTALLATION_POLICY_SIGNATURE_DOMAIN, policy)
+
+
+def _executor_installation_intent_message(intent: ExecutorInstallationIntentV1) -> bytes:
+    if type(intent) is not ExecutorInstallationIntentV1:
+        raise AuthorizationError("executor_installation_intent_signature")
+    return _direct_signature_message(_EXECUTOR_INSTALLATION_INTENT_SIGNATURE_DOMAIN, intent)
+
+
+def _executor_installation_receipt_message(receipt: ExecutorInstallationReceiptV1) -> bytes:
+    if type(receipt) is not ExecutorInstallationReceiptV1:
+        raise AuthorizationError("executor_installation_receipt_signature")
+    return _direct_signature_message(_EXECUTOR_INSTALLATION_RECEIPT_SIGNATURE_DOMAIN, receipt)
+
+
+def _executor_operation_receipt_message(receipt: ExecutorOperationReceiptV1) -> bytes:
+    if type(receipt) is not ExecutorOperationReceiptV1:
+        raise AuthorizationError("executor_operation_receipt_signature")
+    return _direct_signature_message(_EXECUTOR_OPERATION_RECEIPT_SIGNATURE_DOMAIN, receipt)
+
+
+def _start_runtime_intent_message(intent: StartRuntimeIntentV2) -> bytes:
+    if type(intent) is not StartRuntimeIntentV2:
+        raise AuthorizationError("start_runtime_intent_signature")
+    return _direct_signature_message(_START_RUNTIME_INTENT_SIGNATURE_DOMAIN, intent)
+
+
+def _start_runtime_executor_receipt_message(receipt: StartRuntimeExecutorReceiptV2) -> bytes:
+    if type(receipt) is not StartRuntimeExecutorReceiptV2:
+        raise AuthorizationError("start_runtime_executor_receipt_signature")
+    return _direct_signature_message(_START_RUNTIME_EXECUTOR_RECEIPT_SIGNATURE_DOMAIN, receipt)
+
+
 def _verify_direct_signature(
     model: BaseModel,
     *,
@@ -1856,6 +2277,108 @@ def _verify_secret_handling_policy_signature(
         signer=signer,
         message=lambda model: _secret_handling_policy_message(cast(SecretHandlingPolicyV1, model)),
         phase="secret_handling_policy_signature",
+    )
+
+
+def _verify_executor_installation_policy_signature(
+    policy: ExecutorInstallationPolicyV1, *, signer: TrustedEd25519SignerV1
+) -> None:
+    policy = cast(
+        ExecutorInstallationPolicyV1,
+        _canonical_artifact_model(
+            policy, ExecutorInstallationPolicyV1, phase="executor_installation_policy_signature"
+        ),
+    )
+    _verify_direct_signature(
+        policy,
+        signer=signer,
+        message=lambda model: _executor_installation_policy_message(
+            cast(ExecutorInstallationPolicyV1, model)
+        ),
+        phase="executor_installation_policy_signature",
+    )
+
+
+def _verify_executor_installation_intent_signature(
+    intent: ExecutorInstallationIntentV1, *, signer: TrustedEd25519SignerV1
+) -> None:
+    intent = cast(
+        ExecutorInstallationIntentV1,
+        _canonical_artifact_model(
+            intent, ExecutorInstallationIntentV1, phase="executor_installation_intent_signature"
+        ),
+    )
+    _verify_direct_signature(
+        intent,
+        signer=signer,
+        message=lambda model: _executor_installation_intent_message(
+            cast(ExecutorInstallationIntentV1, model)
+        ),
+        phase="executor_installation_intent_signature",
+    )
+
+
+def _verify_executor_attestation_signature(
+    receipt: ExecutorInstallationReceiptV1
+    | ExecutorOperationReceiptV1
+    | StartRuntimeExecutorReceiptV2,
+    *,
+    executor: ExecutorControlPolicyV1,
+    message: Callable[
+        [
+            ExecutorInstallationReceiptV1
+            | ExecutorOperationReceiptV1
+            | StartRuntimeExecutorReceiptV2
+        ],
+        bytes,
+    ],
+    phase: str,
+) -> None:
+    """Verify a receipt against the exact pinned executor attestation key."""
+
+    valid = False
+    try:
+        if (
+            type(executor) is not ExecutorControlPolicyV1
+            or type(receipt)
+            not in {
+                ExecutorInstallationReceiptV1,
+                ExecutorOperationReceiptV1,
+                StartRuntimeExecutorReceiptV2,
+            }
+            or receipt.signer_key_id != executor.executor.attestation_key_id
+        ):
+            raise ValueError
+        public_key = _canonical_base64(executor.executor.attestation_public_key_base64)
+        if (
+            len(public_key) != 32
+            or _digest(public_key) != executor.executor.attestation_public_key_fingerprint_sha256
+        ):
+            raise ValueError
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            _canonical_base64(receipt.signature_base64), message(receipt)
+        )
+        valid = True
+    except (InvalidSignature, ValueError, TypeError, binascii.Error):
+        valid = False
+    if not valid:
+        raise AuthorizationError(phase)
+
+
+def _verify_start_runtime_intent_signature(
+    intent: StartRuntimeIntentV2, *, signer: TrustedEd25519SignerV1
+) -> None:
+    intent = cast(
+        StartRuntimeIntentV2,
+        _canonical_artifact_model(
+            intent, StartRuntimeIntentV2, phase="start_runtime_intent_signature"
+        ),
+    )
+    _verify_direct_signature(
+        intent,
+        signer=signer,
+        message=lambda model: _start_runtime_intent_message(cast(StartRuntimeIntentV2, model)),
+        phase="start_runtime_intent_signature",
     )
 
 
@@ -2445,7 +2968,9 @@ def _verify_allocation_control_policy_bindings(
         or postgres.database_name != database.database_name
         or postgres.schema_name != database.schema_name
         or postgres.owner_role != database.owner_role
+        or postgres.application_role != database.application_role
         or postgres.role_names != database.role_names
+        or postgres.allocation_role_states != database.allocation_role_states
         or postgres.grants != database.grants
         or database.control_policy_sha256 != canonical_sha256(postgres)
         or intent.evidence.executor_control_policy_sha256 != canonical_sha256(executor)
@@ -2543,6 +3068,94 @@ def _verify_materialization_control_policy_bindings(
         raise AuthorizationError("materialization_control_policy_binding")
 
 
+def _verify_executor_installation_chain(
+    *,
+    allocation_intent: AllocationIntentV2,
+    materialization_intent: MaterializationIntentV1,
+    executor: ExecutorControlPolicyV1,
+    policy: ExecutorInstallationPolicyV1,
+    intent: ExecutorInstallationIntentV1,
+    receipt: ExecutorInstallationReceiptV1,
+    signer: TrustedEd25519SignerV1,
+    now: datetime,
+) -> None:
+    """Require the signed, attested remote-installation predecessor exactly once."""
+
+    _verify_executor_installation_policy_signature(policy, signer=signer)
+    _verify_executor_installation_intent_signature(intent, signer=signer)
+    _verify_executor_attestation_signature(
+        receipt,
+        executor=executor,
+        message=lambda item: _executor_installation_receipt_message(
+            cast(ExecutorInstallationReceiptV1, item)
+        ),
+        phase="executor_installation_receipt_signature",
+    )
+    try:
+        created = datetime.fromisoformat(policy.created_at.removesuffix("Z") + "+00:00")
+        expires = datetime.fromisoformat(policy.expires_at.removesuffix("Z") + "+00:00")
+        intent_created = datetime.fromisoformat(intent.created_at.removesuffix("Z") + "+00:00")
+        intent_retention = datetime.fromisoformat(
+            intent.retention_expires_at.removesuffix("Z") + "+00:00"
+        )
+        completed = datetime.fromisoformat(receipt.completed_at.removesuffix("Z") + "+00:00")
+    except ValueError:
+        raise AuthorizationError("executor_installation_freshness") from None
+    policy_hash = canonical_sha256(policy)
+    installation_intent_hash = canonical_sha256(intent)
+    if (
+        any(
+            value.tzinfo is None
+            for value in (created, expires, intent_created, intent_retention, completed)
+        )
+        or created.astimezone(UTC) > now
+        or expires.astimezone(UTC) <= now
+        or intent_created.astimezone(UTC) > now
+        or intent_retention.astimezone(UTC) <= now
+        or completed.astimezone(UTC) > now
+        or policy.source_commit != allocation_intent.source_commit
+        or policy.allocation_intent_sha256 != allocation_intent_sha256(allocation_intent)
+        or policy.disposal_owner != allocation_intent.disposal_owner
+        or policy.approver_identity != allocation_intent.approver_identity
+        or policy.executor != executor.executor
+        or policy.allowed_engine_fingerprint_sha256 != executor.engine_fingerprint_sha256
+        or policy.template_bundle_sha256
+        != canonical_sha256(materialization_intent.bootstrap_templates)
+        or policy.allowed_postgres_identity_sha256
+        != canonical_sha256(materialization_intent.postgres_login_transition)
+        or executor.installation_policy_sha256 != policy_hash
+        or materialization_intent.evidence.executor_installation_policy_sha256 != policy_hash
+        or intent.source_commit != allocation_intent.source_commit
+        or intent.allocation_intent_sha256 != allocation_intent_sha256(allocation_intent)
+        or intent.executor_installation_policy_sha256 != policy_hash
+        or intent.disposal_owner != allocation_intent.disposal_owner
+        or intent.approver_identity != allocation_intent.approver_identity
+        or materialization_intent.executor_installation_intent_sha256 != installation_intent_hash
+        or materialization_intent.evidence.executor_installation_intent_sha256
+        != installation_intent_hash
+        or receipt.installation_operation_id != intent.installation_operation_id
+        or receipt.allocation_intent_sha256 != allocation_intent_sha256(allocation_intent)
+        or receipt.installation_intent_sha256 != installation_intent_hash
+        or receipt.executor_installation_policy_sha256 != policy_hash
+        or receipt.executor_id != executor.executor.executor_id
+        or receipt.host_fingerprint_sha256 != executor.executor.host_fingerprint_sha256
+        or receipt.engine_fingerprint_sha256 != executor.engine_fingerprint_sha256
+        or receipt.package_sha256 != policy.package_sha256
+        or receipt.executable_sha256 != policy.executable_sha256
+        or receipt.template_bundle_sha256 != policy.template_bundle_sha256
+        or receipt.systemd_unit_sha256 != policy.systemd_unit_sha256
+        or receipt.unix_socket_policy_sha256 != policy.unix_socket_policy_sha256
+        or receipt.ssh_policy_sha256 != canonical_sha256(policy.ssh)
+        or receipt.attestation_public_key_fingerprint_sha256
+        != executor.executor.attestation_public_key_fingerprint_sha256
+        or receipt.monotonic_revision != executor.executor.monotonic_revision
+        or materialization_intent.executor_installation_receipt_sha256 != canonical_sha256(receipt)
+        or materialization_intent.evidence.executor_installation_receipt_sha256
+        != canonical_sha256(receipt)
+    ):
+        raise AuthorizationError("executor_installation_binding")
+
+
 def _verify_materialization_intent_chain(
     *,
     allocation: _AllocationStageArtifacts,
@@ -2584,6 +3197,118 @@ def _verify_materialization_intent_chain(
         or intent.approver_identity != expected_approver_identity
     ):
         raise AuthorizationError("materialization_intent_binding")
+    postgres = allocation.attestation.allocated_resources.postgres
+    transition = intent.postgres_login_transition
+    connection = intent.ephemeral_postgres_connection
+    if (
+        transition.system_identifier != postgres.system_identifier
+        or transition.database_name != postgres.database_name
+        or transition.database_oid != postgres.database_oid
+        or transition.owner_role != postgres.owner_role
+        or transition.owner_role_oid != postgres.owner_role_oid
+        or transition.application_role != postgres.application_role
+        or transition.application_role_oid != postgres.application_role_oid
+        or transition.application_password_reference_sha256
+        != allocation.intent.provider_references.postgres_application_password.reference_sha256
+        or connection.authority != allocation.intent.plan.postgres.authority
+        or connection.database_name != postgres.database_name
+        or connection.application_role != postgres.application_role
+        or connection.application_password_reference_sha256
+        != transition.application_password_reference_sha256
+        or connection.prepared_operation_id != transition.prepared_operation_id
+    ):
+        raise AuthorizationError("materialization_postgres_transition_binding")
+
+
+def _verify_start_runtime_intent_chain(
+    *,
+    allocation: _AllocationStageArtifacts,
+    materialization: _MaterializationStageArtifacts,
+    intent: StartRuntimeIntentV2,
+    controls: _MaterializationControlPolicies,
+    provider_material_attestation_sha256: str,
+    replay_policy: ReplayAuthorityPolicyV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    now: datetime,
+) -> None:
+    """Bind a fresh start to every signed, observed predecessor exactly.
+
+    This does not treat a materialization receipt as a bearer grant.  The
+    caller's StartRuntime intent must name the committed observed chain, the
+    executor installation chain, the opaque delivery policy, and a new nonce.
+    """
+
+    try:
+        created = datetime.fromisoformat(intent.created_at.removesuffix("Z") + "+00:00")
+        retained = datetime.fromisoformat(intent.retention_expires_at.removesuffix("Z") + "+00:00")
+    except ValueError:
+        raise AuthorizationError("start_runtime_intent_freshness") from None
+    materialization_intent = materialization.intent
+    materialization_receipt = materialization.receipt
+    evidence = intent.evidence
+    executor_receipt = materialization_receipt.executor_receipt
+    _verify_executor_attestation_signature(
+        executor_receipt,
+        executor=controls.executor,
+        message=lambda item: _executor_operation_receipt_message(
+            cast(ExecutorOperationReceiptV1, item)
+        ),
+        phase="materialization_executor_receipt_signature",
+    )
+    if (
+        created.tzinfo is None
+        or retained.tzinfo is None
+        or created.astimezone(UTC) > now
+        or now - created.astimezone(UTC) > _STAGE_ATTESTATION_FRESHNESS
+        or retained.astimezone(UTC) <= now
+        or intent.source_commit != allocation.intent.source_commit
+        or intent.materialization_operation_id
+        != materialization_intent.materialization_operation_id
+        or intent.materialization_intent_sha256
+        != materialization_intent_sha256(materialization_intent)
+        or intent.materialization_effect_receipt_sha256
+        != materialization_effect_receipt_sha256(materialization_receipt)
+        or intent.observed_runtime_attestation_sha256
+        != observed_runtime_attestation_sha256(materialization.attestation)
+        or intent.provider_references != allocation.intent.provider_references
+        or intent.provider_references != materialization_intent.provider_references
+        or intent.journal_uuid != allocation.intent.journal_uuid
+        or intent.journal_uuid != materialization_intent.journal_uuid
+        or intent.replay_policy_sha256 != replay_policy.sha256()
+        or intent.disposal_owner != expected_disposal_owner
+        or intent.approver_identity != expected_approver_identity
+        or evidence.materialization_intent_sha256
+        != materialization_intent_sha256(materialization_intent)
+        or evidence.materialization_effect_receipt_sha256
+        != materialization_effect_receipt_sha256(materialization_receipt)
+        or evidence.observed_runtime_attestation_sha256
+        != observed_runtime_attestation_sha256(materialization.attestation)
+        or evidence.executor_control_policy_sha256 != canonical_sha256(controls.executor)
+        or evidence.executor_installation_policy_sha256
+        != canonical_sha256(controls.installation_policy)
+        or evidence.executor_installation_intent_sha256
+        != canonical_sha256(controls.installation_intent)
+        or evidence.executor_installation_receipt_sha256
+        != canonical_sha256(controls.installation_receipt)
+        or evidence.secret_capability_policy_sha256 != canonical_sha256(controls.secret_capability)
+        or evidence.secret_handling_policy_sha256 != canonical_sha256(controls.handling)
+        or evidence.provider_material_attestation_sha256 != provider_material_attestation_sha256
+        or executor_receipt.operation_scope != materialization_intent.operation_scope
+        or executor_receipt.operation_id != materialization_intent.materialization_operation_id
+        or executor_receipt.installation_receipt_sha256
+        != canonical_sha256(controls.installation_receipt)
+        or executor_receipt.executor_id != controls.executor.executor.executor_id
+        or executor_receipt.host_fingerprint_sha256
+        != controls.executor.executor.host_fingerprint_sha256
+        or executor_receipt.engine_fingerprint_sha256 != controls.executor.engine_fingerprint_sha256
+        or intent.delivery_request.operation_scope != "start_runtime_v2"
+        or intent.delivery_request.operation_id != intent.start_operation_id
+        or intent.delivery_request.journal_uuid != intent.journal_uuid
+        or intent.delivery_request.provider_material_attestation_sha256
+        != provider_material_attestation_sha256
+    ):
+        raise AuthorizationError("start_runtime_intent_binding")
 
 
 def _read_materialization_control_policies(
@@ -2593,6 +3318,7 @@ def _read_materialization_control_policies(
     intent: MaterializationIntentV1,
     provider_material_attestation_sha256: str,
     signer: TrustedEd25519SignerV1,
+    now: datetime,
     reader: _OwnerOnlyReader,
 ) -> tuple[_MaterializationControlPolicies, dict[str, bytes]]:
     executor_model, executor_raw = _read_canonical_signed_model(
@@ -2613,8 +3339,36 @@ def _read_materialization_control_policies(
         model_type=SecretHandlingPolicyV1,
         phase="secret_handling_policy_artifact",
     )
+    postgres_model, postgres_raw = _read_canonical_signed_model(
+        reader,
+        name=paths.postgres_control_policy_name(),
+        model_type=PostgreSQLControlPolicyV1,
+        phase="postgres_control_policy_artifact",
+    )
+    installation_policy_model, installation_policy_raw = _read_canonical_signed_model(
+        reader,
+        name=paths.executor_installation_policy_name(),
+        model_type=ExecutorInstallationPolicyV1,
+        phase="executor_installation_policy_artifact",
+    )
+    installation_intent_model, installation_intent_raw = _read_canonical_signed_model(
+        reader,
+        name=paths.executor_installation_intent_name(),
+        model_type=ExecutorInstallationIntentV1,
+        phase="executor_installation_intent_artifact",
+    )
+    installation_receipt_model, installation_receipt_raw = _read_canonical_signed_model(
+        reader,
+        name=paths.executor_installation_receipt_name(),
+        model_type=ExecutorInstallationReceiptV1,
+        phase="executor_installation_receipt_artifact",
+    )
     if (
         type(executor_model) is not ExecutorControlPolicyV1
+        or type(postgres_model) is not PostgreSQLControlPolicyV1
+        or type(installation_policy_model) is not ExecutorInstallationPolicyV1
+        or type(installation_intent_model) is not ExecutorInstallationIntentV1
+        or type(installation_receipt_model) is not ExecutorInstallationReceiptV1
         or type(capability_model) is not SecretCapabilityPolicyV1
         or type(handling_model) is not SecretHandlingPolicyV1
     ):
@@ -2628,14 +3382,38 @@ def _read_materialization_control_policies(
         provider_material_attestation_sha256=provider_material_attestation_sha256,
         signer=signer,
     )
+    _verify_allocation_control_policy_bindings(
+        intent=allocation_intent,
+        executor=executor_model,
+        postgres=postgres_model,
+        signer=signer,
+    )
+    _verify_executor_installation_chain(
+        allocation_intent=allocation_intent,
+        materialization_intent=intent,
+        executor=executor_model,
+        policy=installation_policy_model,
+        intent=installation_intent_model,
+        receipt=installation_receipt_model,
+        signer=signer,
+        now=now,
+    )
     return (
         _MaterializationControlPolicies(
             executor=executor_model,
+            postgres=postgres_model,
+            installation_policy=installation_policy_model,
+            installation_intent=installation_intent_model,
+            installation_receipt=installation_receipt_model,
             secret_capability=capability_model,
             handling=handling_model,
         ),
         {
             paths.executor_control_policy_name(): executor_raw,
+            paths.postgres_control_policy_name(): postgres_raw,
+            paths.executor_installation_policy_name(): installation_policy_raw,
+            paths.executor_installation_intent_name(): installation_intent_raw,
+            paths.executor_installation_receipt_name(): installation_receipt_raw,
             paths.secret_capability_policy_name(): capability_raw,
             paths.secret_handling_policy_name(): handling_raw,
         },
@@ -2650,7 +3428,7 @@ def _trusted_provider_fingerprints(
     expected_approver_identity: str,
     now: datetime,
     reader: _OwnerOnlyReader,
-) -> tuple[dict[str, str], tuple[str, str, str, str]]:
+) -> tuple[dict[str, str], tuple[str, str, str, str, str]]:
     """Load the completed material state from the locked artifact root only.
 
     Caller models are deliberately not accepted here.  The signer genesis,
@@ -2659,7 +3437,7 @@ def _trusted_provider_fingerprints(
     authorization snapshot so a replacement cannot survive to an effect.
     """
 
-    def verify() -> tuple[dict[str, str], tuple[str, str, str, str]]:
+    def verify() -> tuple[dict[str, str], tuple[str, str, str, str, str]]:
         signer_genesis, signer_hash = _load_verified_signer_genesis_from_reader(
             reader,
             issuer=signer,
@@ -2686,7 +3464,7 @@ def _trusted_provider_fingerprints(
         or len(result) != 2
         or type(result[0]) is not dict
         or type(result[1]) is not tuple
-        or len(result[1]) != 4
+        or len(result[1]) != 5
         or not all(
             type(reference) is str and type(fingerprint) is str
             for reference, fingerprint in result[0].items()
@@ -2842,7 +3620,9 @@ def _materialization_idempotency_key(
     observed_allocation_attestation_sha256: str,
     provider_sha256: str,
     executor_sha256: str,
+    postgres_login_sha256: str,
     secret_capability_sha256: str,
+    secret_delivery_sha256: str,
 ) -> str:
     material = "\x00".join(
         (
@@ -2852,10 +3632,42 @@ def _materialization_idempotency_key(
             observed_allocation_attestation_sha256,
             provider_sha256,
             executor_sha256,
+            postgres_login_sha256,
             secret_capability_sha256,
+            secret_delivery_sha256,
         )
     ).encode("ascii")
     return _digest(_MATERIALIZATION_IDEMPOTENCY_DOMAIN + material)
+
+
+def _start_runtime_idempotency_key(
+    *,
+    start_operation_id: str,
+    start_runtime_intent_sha256: str,
+    materialization_effect_receipt_sha256: str,
+    observed_runtime_attestation_sha256: str,
+    provider_sha256: str,
+    executor_sha256: str,
+    secret_capability_sha256: str,
+    secret_delivery_sha256: str,
+    remote_session_sha256: str,
+) -> str:
+    """Derive a non-bearer idempotency key for one signed fresh start."""
+
+    material = "\x00".join(
+        (
+            start_operation_id,
+            start_runtime_intent_sha256,
+            materialization_effect_receipt_sha256,
+            observed_runtime_attestation_sha256,
+            provider_sha256,
+            executor_sha256,
+            secret_capability_sha256,
+            secret_delivery_sha256,
+            remote_session_sha256,
+        )
+    ).encode("ascii")
+    return _digest(_START_RUNTIME_IDEMPOTENCY_DOMAIN + material)
 
 
 class ArtifactRootLease:
@@ -5029,6 +5841,10 @@ class SQLiteAllocationJournal:
         return SQLiteAuthorizationJournal._schema_sha256(_MATERIALIZATION_OPERATION_SCHEMA)
 
     @classmethod
+    def _start_runtime_operation_schema_sha256(cls) -> str:
+        return SQLiteAuthorizationJournal._schema_sha256(_START_RUNTIME_OPERATION_SCHEMA)
+
+    @classmethod
     def _metadata_schema_sha256(cls) -> str:
         return SQLiteAuthorizationJournal._schema_sha256(_ALLOCATION_JOURNAL_METADATA_SCHEMA)
 
@@ -5040,6 +5856,7 @@ class SQLiteAllocationJournal:
             "materialization_operation_schema_sha256": (
                 cls._materialization_operation_schema_sha256()
             ),
+            "start_runtime_operation_schema_sha256": (cls._start_runtime_operation_schema_sha256()),
             "schema_version": _ALLOCATION_JOURNAL_SCHEMA_VERSION,
         }
         return _digest(json.dumps(material, sort_keys=True, separators=(",", ":")).encode())
@@ -5073,6 +5890,18 @@ class SQLiteAllocationJournal:
             operation_id,
             nonblocking=nonblocking,
             prefix=f"{_ALLOCATION_JOURNAL_MARKER_PREFIX}materialization-",
+        )
+
+    def _start_runtime_operation_lease(
+        self, operation_id: str, *, nonblocking: bool = False
+    ) -> _OperationLease:
+        if type(operation_id) is not str or not operation_id:
+            raise AuthorizationError("start_runtime_operation_id")
+        return _OperationLease(
+            cast(SQLiteAuthorizationJournal, self),
+            operation_id,
+            nonblocking=nonblocking,
+            prefix=f"{_ALLOCATION_JOURNAL_MARKER_PREFIX}start-runtime-",
         )
 
     @staticmethod
@@ -5272,12 +6101,14 @@ class SQLiteAllocationJournal:
         if names != {
             _ALLOCATION_OPERATION_TABLE,
             _MATERIALIZATION_OPERATION_TABLE,
+            _START_RUNTIME_OPERATION_TABLE,
             _ALLOCATION_JOURNAL_METADATA_TABLE,
         }:
             raise AuthorizationError("allocation_journal_schema")
         expected_tables = (
             (_ALLOCATION_OPERATION_TABLE, _ALLOCATION_OPERATION_SCHEMA),
             (_MATERIALIZATION_OPERATION_TABLE, _MATERIALIZATION_OPERATION_SCHEMA),
+            (_START_RUNTIME_OPERATION_TABLE, _START_RUNTIME_OPERATION_SCHEMA),
             (_ALLOCATION_JOURNAL_METADATA_TABLE, _ALLOCATION_JOURNAL_METADATA_SCHEMA),
         )
         for name, expected in expected_tables:
@@ -5536,6 +6367,7 @@ class SQLiteAllocationJournal:
                 connection.execute("BEGIN IMMEDIATE")
                 connection.execute(_ALLOCATION_OPERATION_SCHEMA)
                 connection.execute(_MATERIALIZATION_OPERATION_SCHEMA)
+                connection.execute(_START_RUNTIME_OPERATION_SCHEMA)
                 connection.execute(_ALLOCATION_JOURNAL_METADATA_SCHEMA)
                 connection.execute("COMMIT")
                 anchor = _AllocationJournalAnchorV1(
@@ -5982,14 +6814,23 @@ class SQLiteAllocationJournal:
                 raise AuthorizationError("materialization_allocation_predecessor")
             existing = connection.execute(
                 f"SELECT 1 FROM {_MATERIALIZATION_OPERATION_TABLE} "
-                "WHERE materialization_operation_id = ? OR allocation_operation_id = ?",
-                (context.materialization_operation_id, context.intent.allocation_operation_id),
+                "WHERE materialization_operation_id = ? OR allocation_operation_id = ? "
+                "OR request_nonce_sha256 = ?",
+                (
+                    context.materialization_operation_id,
+                    context.intent.allocation_operation_id,
+                    context.secret_delivery_request.request_nonce_sha256,
+                ),
+            ).fetchone()
+            start_request_nonce = connection.execute(
+                f"SELECT 1 FROM {_START_RUNTIME_OPERATION_TABLE} WHERE request_nonce_sha256 = ?",
+                (context.secret_delivery_request.request_nonce_sha256,),
             ).fetchone()
             nonce = connection.execute(
                 f"SELECT 1 FROM {_MATERIALIZATION_OPERATION_TABLE} WHERE nonce = ?",
                 (verified.nonce,),
             ).fetchone()
-            if existing is not None:
+            if existing is not None or start_request_nonce is not None:
                 raise AuthorizationError("materialization_operation_replayed")
             if nonce is not None:
                 raise AuthorizationError("materialization_nonce_replayed")
@@ -5999,10 +6840,12 @@ class SQLiteAllocationJournal:
                     materialization_operation_id, operation_kind, operation_scope,
                     allocation_operation_id, materialization_intent_sha256,
                     allocation_effect_receipt_sha256, observed_allocation_attestation_sha256,
-                    nonce, provider_provenance_sha256, executor_provenance_sha256,
-                    secret_capability_provenance_sha256, idempotency_key, state,
+                    request_nonce_sha256, nonce, provider_provenance_sha256,
+                    executor_provenance_sha256,
+                    postgres_login_provenance_sha256, secret_capability_provenance_sha256,
+                    secret_delivery_provenance_sha256, idempotency_key, state,
                     effect_receipt_sha256, failure_phase, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
                 """,
                 (
                     context.materialization_operation_id,
@@ -6012,10 +6855,13 @@ class SQLiteAllocationJournal:
                     context.materialization_intent_sha256,
                     context.intent.allocation_effect_receipt_sha256,
                     context.allocation_attestation_sha256,
+                    context.secret_delivery_request.request_nonce_sha256,
                     verified.nonce,
                     context.provider_provenance_sha256,
                     context.executor_provenance_sha256,
+                    context.postgres_login_provenance_sha256,
                     context.secret_capability_provenance_sha256,
+                    context.secret_delivery_provenance_sha256,
                     context.idempotency_key,
                     MaterializationOperationState.CLAIMED.value,
                     verified.authorized_at,
@@ -6202,6 +7048,238 @@ class SQLiteAllocationJournal:
             lease.assert_stable()
         return MaterializationOperationState.FAILED_RECOVERY_REQUIRED
 
+    @staticmethod
+    def _require_verified_start_runtime(verified: _VerifiedStartRuntime) -> None:
+        if (
+            type(verified) is not _VerifiedStartRuntime
+            or verified.capability is not _START_RUNTIME_VERIFIED_CAPABILITY
+        ):
+            raise AuthorizationError("start_runtime_journal")
+
+    def _claim_start_runtime_verified(self, verified: _VerifiedStartRuntime) -> None:
+        """Atomically claim one fresh delivery/start after materialization committed.
+
+        A restart is deliberately not a mutation of the materialization row.
+        Each fresh signed StartRuntime intent has its own operation ID and
+        request nonce, while the materialization predecessor remains immutable.
+        """
+
+        self._require_verified_start_runtime(verified)
+        context = verified.context
+
+        def claim(connection: sqlite3.Connection) -> None:
+            predecessor = connection.execute(
+                f"""
+                SELECT state, materialization_intent_sha256, effect_receipt_sha256
+                FROM {_MATERIALIZATION_OPERATION_TABLE}
+                WHERE materialization_operation_id = ?
+                """,
+                (context.materialization_intent.materialization_operation_id,),
+            ).fetchone()
+            if predecessor != (
+                MaterializationOperationState.MATERIALIZED.value,
+                materialization_intent_sha256(context.materialization_intent),
+                materialization_effect_receipt_sha256(context.materialization_receipt),
+            ):
+                raise AuthorizationError("start_runtime_materialization_predecessor")
+            existing = connection.execute(
+                f"SELECT 1 FROM {_START_RUNTIME_OPERATION_TABLE} "
+                "WHERE start_operation_id = ? OR request_nonce_sha256 = ?",
+                (
+                    context.start_operation_id,
+                    context.secret_delivery_request.request_nonce_sha256,
+                ),
+            ).fetchone()
+            nonce = connection.execute(
+                f"SELECT 1 FROM {_START_RUNTIME_OPERATION_TABLE} WHERE nonce = ?",
+                (verified.nonce,),
+            ).fetchone()
+            materialization_request_nonce = connection.execute(
+                f"SELECT 1 FROM {_MATERIALIZATION_OPERATION_TABLE} WHERE request_nonce_sha256 = ?",
+                (context.secret_delivery_request.request_nonce_sha256,),
+            ).fetchone()
+            if existing is not None or materialization_request_nonce is not None:
+                raise AuthorizationError("start_runtime_operation_replayed")
+            if nonce is not None:
+                raise AuthorizationError("start_runtime_nonce_replayed")
+            connection.execute(
+                f"""
+                INSERT INTO {_START_RUNTIME_OPERATION_TABLE} (
+                    start_operation_id, operation_kind, operation_scope,
+                    materialization_operation_id, materialization_intent_sha256,
+                    materialization_effect_receipt_sha256,
+                    observed_runtime_attestation_sha256, start_runtime_intent_sha256,
+                    request_nonce_sha256, channel_binding_sha256, session_binding_sha256,
+                    nonce, provider_provenance_sha256, executor_provenance_sha256,
+                    secret_capability_provenance_sha256,
+                    remote_session_provenance_sha256, idempotency_key, state,
+                    effect_receipt_sha256, failure_phase, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                """,
+                (
+                    context.start_operation_id,
+                    context.operation_kind,
+                    context.operation_scope,
+                    context.materialization_intent.materialization_operation_id,
+                    materialization_intent_sha256(context.materialization_intent),
+                    materialization_effect_receipt_sha256(context.materialization_receipt),
+                    context.intent.observed_runtime_attestation_sha256,
+                    context.start_runtime_intent_sha256,
+                    context.secret_delivery_request.request_nonce_sha256,
+                    context.secret_delivery_request.channel_binding_sha256,
+                    context.secret_delivery_request.session_binding_sha256,
+                    verified.nonce,
+                    context.provider_provenance_sha256,
+                    context.executor_provenance_sha256,
+                    context.secret_capability_provenance_sha256,
+                    context.remote_session_provenance_sha256,
+                    context.idempotency_key,
+                    StartRuntimeOperationState.CLAIMED.value,
+                    verified.authorized_at,
+                    verified.authorized_at,
+                ),
+            )
+
+        self._transaction(claim)
+
+    def _begin_start_runtime_effect(self, verified: _VerifiedStartRuntime) -> None:
+        self._require_verified_start_runtime(verified)
+        context = verified.context
+
+        def begin(connection: sqlite3.Connection) -> None:
+            result = connection.execute(
+                f"""
+                UPDATE {_START_RUNTIME_OPERATION_TABLE}
+                SET state = ?, updated_at = ?
+                WHERE start_operation_id = ? AND start_runtime_intent_sha256 = ?
+                  AND nonce = ? AND idempotency_key = ? AND state = ?
+                """,
+                (
+                    StartRuntimeOperationState.IN_PROGRESS.value,
+                    verified.authorized_at,
+                    context.start_operation_id,
+                    context.start_runtime_intent_sha256,
+                    verified.nonce,
+                    context.idempotency_key,
+                    StartRuntimeOperationState.CLAIMED.value,
+                ),
+            )
+            if result.rowcount != 1:
+                raise AuthorizationError("start_runtime_operation_state")
+
+        self._transaction(begin)
+
+    def _commit_start_runtime_effect(
+        self,
+        verified: _VerifiedStartRuntime,
+        receipt: StartRuntimeEffectReceiptV2,
+    ) -> None:
+        self._require_verified_start_runtime(verified)
+        context = verified.context
+
+        def commit(connection: sqlite3.Connection) -> None:
+            result = connection.execute(
+                f"""
+                UPDATE {_START_RUNTIME_OPERATION_TABLE}
+                SET state = ?, effect_receipt_sha256 = ?, failure_phase = NULL, updated_at = ?
+                WHERE start_operation_id = ? AND start_runtime_intent_sha256 = ?
+                  AND nonce = ? AND idempotency_key = ? AND state = ?
+                """,
+                (
+                    StartRuntimeOperationState.STARTED.value,
+                    start_runtime_effect_receipt_sha256(receipt),
+                    verified.authorized_at,
+                    context.start_operation_id,
+                    context.start_runtime_intent_sha256,
+                    verified.nonce,
+                    context.idempotency_key,
+                    StartRuntimeOperationState.IN_PROGRESS.value,
+                ),
+            )
+            if result.rowcount != 1:
+                raise AuthorizationError("start_runtime_operation_state")
+
+        self._transaction(commit)
+
+    def _fail_start_runtime_effect(self, verified: _VerifiedStartRuntime) -> None:
+        self._require_verified_start_runtime(verified)
+        context = verified.context
+
+        def fail(connection: sqlite3.Connection) -> None:
+            result = connection.execute(
+                f"""
+                UPDATE {_START_RUNTIME_OPERATION_TABLE}
+                SET state = ?, failure_phase = ?, updated_at = ?
+                WHERE start_operation_id = ? AND nonce = ? AND state IN (?, ?)
+                """,
+                (
+                    StartRuntimeOperationState.FAILED_RECOVERY_REQUIRED.value,
+                    "effect_failed_recovery_required",
+                    verified.authorized_at,
+                    context.start_operation_id,
+                    verified.nonce,
+                    StartRuntimeOperationState.CLAIMED.value,
+                    StartRuntimeOperationState.IN_PROGRESS.value,
+                ),
+            )
+            if result.rowcount != 1:
+                raise AuthorizationError("start_runtime_operation_state")
+
+        self._transaction(fail)
+
+    def start_runtime_operation_state(
+        self, start_operation_id: str
+    ) -> StartRuntimeOperationState | None:
+        if type(start_operation_id) is not str or not start_operation_id:
+            raise AuthorizationError("start_runtime_operation_id")
+        connection, _ = self._connect()
+        try:
+            row = connection.execute(
+                f"SELECT state FROM {_START_RUNTIME_OPERATION_TABLE} WHERE start_operation_id = ?",
+                (start_operation_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            raise AuthorizationError("start_runtime_journal_transaction") from None
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        try:
+            return StartRuntimeOperationState(row[0])
+        except (TypeError, ValueError):
+            raise AuthorizationError("start_runtime_journal_schema") from None
+
+    def require_start_runtime_recovery(self, start_operation_id: str) -> StartRuntimeOperationState:
+        """Mark an ambiguous start terminally; never automatically redeliver secrets."""
+
+        if type(start_operation_id) is not str or not start_operation_id:
+            raise AuthorizationError("start_runtime_operation_id")
+
+        def recover(connection: sqlite3.Connection) -> None:
+            result = connection.execute(
+                f"""
+                UPDATE {_START_RUNTIME_OPERATION_TABLE}
+                SET state = ?, failure_phase = ?, updated_at = ?
+                WHERE start_operation_id = ? AND state IN (?, ?)
+                """,
+                (
+                    StartRuntimeOperationState.FAILED_RECOVERY_REQUIRED.value,
+                    "explicit_recovery",
+                    _system_utc_clock().isoformat(timespec="seconds").replace("+00:00", "Z"),
+                    start_operation_id,
+                    StartRuntimeOperationState.CLAIMED.value,
+                    StartRuntimeOperationState.IN_PROGRESS.value,
+                ),
+            )
+            if result.rowcount != 1:
+                raise AuthorizationError("start_runtime_operation_state")
+
+        with self._start_runtime_operation_lease(start_operation_id, nonblocking=True) as lease:
+            lease.assert_stable()
+            self._transaction(recover)
+            lease.assert_stable()
+        return StartRuntimeOperationState.FAILED_RECOVERY_REQUIRED
+
 
 def _validate_effect_receipt(context: VerifiedExecutionContext, value: object) -> EffectReceiptV1:
     receipt = cast(
@@ -6277,7 +7355,10 @@ def _validate_allocation_effect_receipt(
         or resources.postgres.database_name != plan.postgres.database_name
         or resources.postgres.schema_name != plan.postgres.schema_name
         or resources.postgres.owner_role != plan.postgres.owner_role
+        or resources.postgres.application_role != plan.postgres.application_role
         or tuple(role.role for role in resources.postgres.role_oids) != plan.postgres.role_names
+        or tuple((role.can_login, role.password_absent) for role in resources.postgres.role_oids)
+        != ((False, True), (False, True))
         or tuple(
             (grant.role, grant.grantee, grant.privilege, grant.schema_name)
             for grant in resources.postgres.grants
@@ -6289,6 +7370,61 @@ def _validate_allocation_effect_receipt(
     ):
         raise AuthorizationError("allocation_effect_receipt")
     return receipt
+
+
+def _bootstrap_inspection_matches(
+    inspection: ContainerBootstrapInspectionV1, template: ContainerBootstrapTemplateV1
+) -> bool:
+    """Compare explicit engine inspection fields; a template digest alone never suffices."""
+
+    return (
+        inspection.entrypoint_sha256 == template.entrypoint_sha256
+        and inspection.template_sha256 == template.template_sha256
+        and inspection.run_as_non_root is True
+        and inspection.read_only_root_filesystem is True
+        and inspection.cap_drop_all is True
+        and inspection.no_new_privileges is True
+        and inspection.private_pid is True
+        and inspection.log_driver == template.log_driver
+        and inspection.restart_policy == "no"
+        and inspection.mounts == ()
+        and inspection.docker_socket_mounted is False
+        and inspection.host_network is False
+        and inspection.publish_all_ports is False
+        and inspection.port_bindings == ()
+        and inspection.network_name == template.network_name
+        and inspection.network_alias == template.network_alias
+        and inspection.static_ipv4 == template.static_ipv4
+        and inspection.accepted_secret_sink == template.accepted_secret_sink
+        and inspection.running is True
+    )
+
+
+def _verify_context_executor_operation_receipt(
+    context: MaterializationExecutionContext,
+    receipt: ExecutorOperationReceiptV1,
+) -> None:
+    """Verify executor attestation without handing an effect a mutable verifier."""
+
+    valid = False
+    try:
+        if receipt.signer_key_id != context.executor_attestation_key_id:
+            raise ValueError
+        public_key = _canonical_base64(context.executor_attestation_public_key_base64)
+        if (
+            len(public_key) != 32
+            or _digest(public_key) != context.executor_attestation_public_key_fingerprint_sha256
+        ):
+            raise ValueError
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            _canonical_base64(receipt.signature_base64),
+            _executor_operation_receipt_message(receipt),
+        )
+        valid = True
+    except (InvalidSignature, ValueError, binascii.Error):
+        valid = False
+    if not valid:
+        raise AuthorizationError("materialization_executor_receipt_signature")
 
 
 def _validate_materialization_effect_receipt(
@@ -6322,21 +7458,33 @@ def _validate_materialization_effect_receipt(
             receipt.primary_infisical,
             intent.plan.primary_infisical,
             intent.topology.primary_infisical,
+            intent.bootstrap_templates.primary_infisical,
         ),
-        (receipt.primary_valkey, intent.plan.primary_valkey, intent.topology.primary_valkey),
+        (
+            receipt.primary_valkey,
+            intent.plan.primary_valkey,
+            intent.topology.primary_valkey,
+            intent.bootstrap_templates.primary_valkey,
+        ),
         (
             receipt.restore_infisical,
             intent.plan.restore_infisical,
             intent.topology.restore_infisical,
+            intent.bootstrap_templates.restore_infisical,
         ),
-        (receipt.restore_valkey, intent.plan.restore_valkey, intent.topology.restore_valkey),
+        (
+            receipt.restore_valkey,
+            intent.plan.restore_valkey,
+            intent.topology.restore_valkey,
+            intent.bootstrap_templates.restore_valkey,
+        ),
     )
     allocated = context.allocation_attestation.allocated_resources
     network_ids = {
         allocated.primary_network.name: allocated.primary_network.network_id,
         allocated.restore_network.name: allocated.restore_network.network_id,
     }
-    for observed, plan, placement in plans:
+    for observed, plan, placement, template in plans:
         if (
             observed.component != plan.component
             or observed.image != plan.image
@@ -6350,8 +7498,241 @@ def _validate_materialization_effect_receipt(
             or observed.no_host_publication.host_network is not False
             or observed.no_host_publication.publish_all_ports is not False
             or observed.no_host_publication.port_bindings != ()
+            or not _bootstrap_inspection_matches(observed.inspection, template)
         ):
             raise AuthorizationError("materialization_effect_receipt")
+    executor_receipt = receipt.executor_receipt
+    request = context.secret_delivery_request
+    if (
+        receipt.executor_receipt_sha256 != canonical_sha256(executor_receipt)
+        or executor_receipt.operation_scope != context.operation_scope
+        or executor_receipt.operation_id != context.materialization_operation_id
+        or executor_receipt.idempotency_key != context.idempotency_key
+        or executor_receipt.executor_id != context.executor_expectation.executor_id
+        or executor_receipt.host_fingerprint_sha256
+        != context.executor_expectation.host_fingerprint_sha256
+        or executor_receipt.engine_fingerprint_sha256
+        != context.executor_expectation.engine_fingerprint_sha256
+        or executor_receipt.channel_binding_sha256 != request.channel_binding_sha256
+        or executor_receipt.session_binding_sha256 != request.session_binding_sha256
+        or tuple(item.container_id for item in executor_receipt.containers)
+        != tuple(item.container_id for item, *_rest in plans)
+        or any(
+            executor_item.inspection != observed.inspection
+            for executor_item, (observed, *_rest) in zip(
+                executor_receipt.containers, plans, strict=True
+            )
+        )
+    ):
+        raise AuthorizationError("materialization_executor_receipt")
+    _verify_context_executor_operation_receipt(context, executor_receipt)
+    transition = intent.postgres_login_transition
+    transition_receipt = receipt.postgres_login_transition
+    if (
+        transition_receipt.prepared_operation_id != transition.prepared_operation_id
+        or transition_receipt.system_identifier != transition.system_identifier
+        or transition_receipt.database_name != transition.database_name
+        or transition_receipt.database_oid != transition.database_oid
+        or transition_receipt.owner_role != transition.owner_role
+        or transition_receipt.owner_role_oid != transition.owner_role_oid
+        or transition_receipt.application_role != transition.application_role
+        or transition_receipt.application_role_oid != transition.application_role_oid
+        or transition_receipt.application_password_reference_sha256
+        != transition.application_password_reference_sha256
+        or transition_receipt.owner_can_login is not False
+        or transition_receipt.owner_password_absent is not True
+        or transition_receipt.application_can_login is not True
+        or transition_receipt.application_password_verifier_installed is not True
+        or context.postgres_login_expectation.prepared_operation_id
+        != transition.prepared_operation_id
+        or context.postgres_login_expectation.database_oid != transition.database_oid
+        or context.postgres_login_expectation.owner_role_oid != transition.owner_role_oid
+        or context.postgres_login_expectation.application_role_oid
+        != transition.application_role_oid
+        or context.postgres_login_expectation.application_password_reference_sha256
+        != transition.application_password_reference_sha256
+    ):
+        raise AuthorizationError("materialization_postgres_transition_receipt")
+    delivery = receipt.delivery_receipt
+    if (
+        delivery.operation_scope != request.operation_scope
+        or delivery.operation_id != request.operation_id
+        or delivery.journal_uuid != request.journal_uuid
+        or delivery.request_nonce_sha256 != request.request_nonce_sha256
+        or delivery.channel_binding_sha256 != request.channel_binding_sha256
+        or delivery.session_binding_sha256 != request.session_binding_sha256
+        or any(
+            (
+                delivered.purpose,
+                delivered.reference_sha256,
+                delivered.sink,
+                delivered.target_processes,
+                delivered.delivered,
+            )
+            != (
+                slot.purpose,
+                slot.reference_sha256,
+                slot.sink,
+                slot.target_processes,
+                True,
+            )
+            for delivered, slot in zip(delivery.slots, request.slots, strict=True)
+        )
+    ):
+        raise AuthorizationError("materialization_secret_delivery_receipt")
+    if executor_receipt.secret_delivery_receipt_sha256 != canonical_sha256(delivery):
+        raise AuthorizationError("materialization_executor_receipt")
+    return receipt
+
+
+def _verify_context_start_runtime_executor_receipt(
+    context: StartRuntimeExecutionContext,
+    receipt: StartRuntimeExecutorReceiptV2,
+) -> None:
+    """Verify a redacted start receipt against the pinned executor key."""
+
+    valid = False
+    try:
+        if receipt.signer_key_id != context.executor_attestation_key_id:
+            raise ValueError
+        public_key = _canonical_base64(context.executor_attestation_public_key_base64)
+        if (
+            len(public_key) != 32
+            or _digest(public_key) != context.executor_attestation_public_key_fingerprint_sha256
+        ):
+            raise ValueError
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            _canonical_base64(receipt.signature_base64),
+            _start_runtime_executor_receipt_message(receipt),
+        )
+        valid = True
+    except (InvalidSignature, ValueError, binascii.Error):
+        valid = False
+    if not valid:
+        raise AuthorizationError("start_runtime_executor_receipt_signature")
+
+
+def _validate_start_runtime_effect_receipt(
+    context: StartRuntimeExecutionContext, value: object
+) -> StartRuntimeEffectReceiptV2:
+    """Accept only a signed restart of the exact previously observed runtime.
+
+    A fresh StartRuntime authorization may redeliver the five bounded slots,
+    but cannot use that fact to swap images, container identities, attachment
+    graphs, hardening fields, or the executor installation chain.
+    """
+
+    receipt = cast(
+        StartRuntimeEffectReceiptV2,
+        _canonical_artifact_model(
+            value,
+            StartRuntimeEffectReceiptV2,
+            phase="start_runtime_effect_receipt",
+        ),
+    )
+    request = context.secret_delivery_request
+    if (
+        receipt.operation_kind != context.operation_kind
+        or receipt.operation_scope != context.operation_scope
+        or receipt.start_operation_id != context.start_operation_id
+        or receipt.start_runtime_intent_sha256 != context.start_runtime_intent_sha256
+        or receipt.materialization_operation_id
+        != context.materialization_intent.materialization_operation_id
+        or receipt.materialization_effect_receipt_sha256
+        != materialization_effect_receipt_sha256(context.materialization_receipt)
+        or receipt.journal_uuid != context.intent.journal_uuid
+        or receipt.idempotency_key != context.idempotency_key
+    ):
+        raise AuthorizationError("start_runtime_effect_receipt")
+    executor_receipt = receipt.executor_receipt
+    expected_observations = (
+        context.materialization_receipt.primary_infisical,
+        context.materialization_receipt.primary_valkey,
+        context.materialization_receipt.restore_infisical,
+        context.materialization_receipt.restore_valkey,
+    )
+    if (
+        executor_receipt.operation_kind != context.operation_kind
+        or executor_receipt.operation_scope != context.operation_scope
+        or executor_receipt.start_operation_id != context.start_operation_id
+        or executor_receipt.start_runtime_intent_sha256 != context.start_runtime_intent_sha256
+        or executor_receipt.idempotency_key != context.idempotency_key
+        or executor_receipt.request_nonce_sha256 != request.request_nonce_sha256
+        or executor_receipt.channel_binding_sha256 != request.channel_binding_sha256
+        or executor_receipt.session_binding_sha256 != request.session_binding_sha256
+        or executor_receipt.installation_receipt_sha256
+        != context.intent.evidence.executor_installation_receipt_sha256
+        or executor_receipt.executor_id != context.executor_expectation.executor_id
+        or executor_receipt.host_fingerprint_sha256
+        != context.executor_expectation.host_fingerprint_sha256
+        or executor_receipt.engine_fingerprint_sha256
+        != context.executor_expectation.engine_fingerprint_sha256
+        or tuple(item.component for item in executor_receipt.containers)
+        != tuple(item.component for item in expected_observations)
+        or tuple(item.container_id for item in executor_receipt.containers)
+        != tuple(item.container_id for item in expected_observations)
+        or any(
+            item.inspection != observed.inspection
+            for item, observed in zip(
+                executor_receipt.containers, expected_observations, strict=True
+            )
+        )
+    ):
+        raise AuthorizationError("start_runtime_executor_receipt")
+    _verify_context_start_runtime_executor_receipt(context, executor_receipt)
+    delivery = receipt.delivery_receipt
+    if (
+        delivery.operation_scope != request.operation_scope
+        or delivery.operation_id != request.operation_id
+        or delivery.journal_uuid != request.journal_uuid
+        or delivery.request_nonce_sha256 != request.request_nonce_sha256
+        or delivery.channel_binding_sha256 != request.channel_binding_sha256
+        or delivery.session_binding_sha256 != request.session_binding_sha256
+        or any(
+            (
+                delivered.purpose,
+                delivered.reference_sha256,
+                delivered.sink,
+                delivered.target_processes,
+                delivered.delivered,
+            )
+            != (
+                slot.purpose,
+                slot.reference_sha256,
+                slot.sink,
+                slot.target_processes,
+                True,
+            )
+            for delivered, slot in zip(delivery.slots, request.slots, strict=True)
+        )
+    ):
+        raise AuthorizationError("start_runtime_secret_delivery_receipt")
+    if executor_receipt.secret_delivery_receipt_sha256 != canonical_sha256(delivery):
+        raise AuthorizationError("start_runtime_executor_receipt")
+    try:
+        completed_at = tuple(
+            datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+            for value in (
+                receipt.completed_at,
+                executor_receipt.completed_at,
+                delivery.completed_at,
+            )
+        )
+    except ValueError:
+        raise AuthorizationError("start_runtime_effect_receipt") from None
+    now = _system_utc_clock()
+    if (
+        type(now) is not datetime
+        or now.tzinfo is None
+        or now.utcoffset() is None
+        or any(value.tzinfo is None or value.utcoffset() is None for value in completed_at)
+        or any(value.astimezone(UTC) > now.astimezone(UTC) for value in completed_at)
+        or any(
+            now.astimezone(UTC) - value.astimezone(UTC) > _STAGE_ATTESTATION_FRESHNESS
+            for value in completed_at
+        )
+    ):
+        raise AuthorizationError("start_runtime_effect_receipt")
     return receipt
 
 
@@ -6533,19 +7914,30 @@ def _acquire_control_lease(
     *,
     phase: str,
     secondary_policy: BaseModel | None = None,
+    tertiary_policy: BaseModel | None = None,
 ) -> tuple[object, object]:
     """Open one injected capability lease without exposing adapter exceptions."""
 
     acquire = _safe_call(lambda: cast(_ControlLeaseAcquirer, adapter).acquire)
     if acquire is _SAFE_CALL_FAILURE or not callable(acquire):
         raise AuthorizationError(phase)
-    # The secret-material capability is deliberately the one two-policy
-    # boundary: its acquisition must bind both the material-use allowlist and
-    # the narrow destination/sink policy.  Do not collapse that pair into a
-    # caller-created composite object, because an adapter could otherwise
-    # silently ignore the destination restrictions.
+    # The secret-material capability is deliberately a two-policy boundary,
+    # and the PostgreSQL login capability is deliberately a three-policy
+    # boundary. Do not collapse either into a caller-created composite object:
+    # an adapter could otherwise silently ignore a destination or observed-OID
+    # restriction.
+    if tertiary_policy is not None and secondary_policy is None:
+        raise AuthorizationError(phase)
     manager = _safe_call(
-        lambda: acquire(policy) if secondary_policy is None else acquire(policy, secondary_policy)
+        lambda: (
+            acquire(policy)
+            if secondary_policy is None
+            else (
+                acquire(policy, secondary_policy)
+                if tertiary_policy is None
+                else acquire(policy, secondary_policy, tertiary_policy)
+            )
+        )
     )
     if manager is _SAFE_CALL_FAILURE:
         raise AuthorizationError(phase)
@@ -6651,6 +8043,59 @@ def _postgres_control_commitment(
     return _digest(_canonical_json_bytes(expectation.model_dump(mode="json"))), expectation
 
 
+def _postgres_login_transition_commitment(
+    lease: PostgreSQLLoginTransitionLease,
+    policy: PostgreSQLControlPolicyV1,
+    transition: PostgreSQLLoginTransitionIntentV1,
+    connection: EphemeralPostgreSQLConnectionPolicyV1,
+    *,
+    recheck: bool,
+) -> tuple[str, PostgreSQLLoginTransitionExpectationV1]:
+    """Commit one lease to the exact observed-OID, prepared login transition."""
+
+    method = _safe_call(lambda: getattr(lease, "recheck" if recheck else "inspect"))
+    if method is _SAFE_CALL_FAILURE or not callable(method):
+        raise AuthorizationError("postgres_login_transition_provenance")
+    value = _safe_call(lambda: method(policy, transition, connection))
+    if value is _SAFE_CALL_FAILURE or type(value) is not PostgreSQLLoginTransitionProvenance:
+        raise AuthorizationError("postgres_login_transition_provenance")
+    provenance = value
+    if (
+        type(provenance.authority) is not str
+        or type(provenance.system_identifier) is not str
+        or type(provenance.database_oid) is not int
+        or type(provenance.owner_role_oid) is not int
+        or type(provenance.application_role_oid) is not int
+        or type(provenance.prepared_operation_id) is not str
+        or type(provenance.application_password_reference_sha256) is not str
+        or type(provenance.capability_fingerprint_sha256) is not str
+        or provenance.authority != policy.authority
+        or provenance.authority != connection.authority
+        or provenance.system_identifier != transition.system_identifier
+        or provenance.database_oid != transition.database_oid
+        or provenance.owner_role_oid != transition.owner_role_oid
+        or provenance.application_role_oid != transition.application_role_oid
+        or provenance.prepared_operation_id != transition.prepared_operation_id
+        or provenance.application_password_reference_sha256
+        != transition.application_password_reference_sha256
+        or provenance.application_password_reference_sha256
+        != connection.application_password_reference_sha256
+        or re.fullmatch(_SHA256, provenance.capability_fingerprint_sha256) is None
+    ):
+        raise AuthorizationError("postgres_login_transition_provenance")
+    expectation = PostgreSQLLoginTransitionExpectationV1(
+        authority=provenance.authority,
+        system_identifier=provenance.system_identifier,
+        database_oid=provenance.database_oid,
+        owner_role_oid=provenance.owner_role_oid,
+        application_role_oid=provenance.application_role_oid,
+        prepared_operation_id=provenance.prepared_operation_id,
+        application_password_reference_sha256=(provenance.application_password_reference_sha256),
+        capability_fingerprint_sha256=provenance.capability_fingerprint_sha256,
+    )
+    return _digest(_canonical_json_bytes(expectation.model_dump(mode="json"))), expectation
+
+
 def _secret_material_commitment(
     lease: SecretMaterialLease,
     capability_policy: SecretCapabilityPolicyV1,
@@ -6679,6 +8124,92 @@ def _secret_material_commitment(
         secret_handling_policy_sha256=canonical_sha256(handling_policy),
     )
     return _digest(_canonical_json_bytes(expectation.model_dump(mode="json"))), expectation
+
+
+def _secret_delivery_commitment(
+    lease: SecretMaterialLease,
+    request: SecretDeliveryRequestV1,
+    capability_policy: SecretCapabilityPolicyV1,
+    *,
+    recheck: bool,
+) -> str:
+    """Require the opaque lease to bind the exact signed slots and session."""
+
+    method = _safe_call(
+        lambda: getattr(lease, "recheck_delivery" if recheck else "inspect_delivery")
+    )
+    if method is _SAFE_CALL_FAILURE or not callable(method):
+        raise AuthorizationError("secret_delivery_provenance")
+    value = _safe_call(lambda: method(request))
+    if value is _SAFE_CALL_FAILURE or type(value) is not SecretDeliveryProvenance:
+        raise AuthorizationError("secret_delivery_provenance")
+    provenance = value
+    if (
+        type(provenance.request_nonce_sha256) is not str
+        or type(provenance.channel_binding_sha256) is not str
+        or type(provenance.session_binding_sha256) is not str
+        or type(provenance.capability_fingerprint_sha256) is not str
+        or provenance.request_nonce_sha256 != request.request_nonce_sha256
+        or provenance.channel_binding_sha256 != request.channel_binding_sha256
+        or provenance.session_binding_sha256 != request.session_binding_sha256
+        or provenance.capability_fingerprint_sha256
+        != capability_policy.capability_fingerprint_sha256
+    ):
+        raise AuthorizationError("secret_delivery_provenance")
+    return _digest(
+        _canonical_json_bytes(
+            {
+                "capability_fingerprint_sha256": provenance.capability_fingerprint_sha256,
+                "channel_binding_sha256": provenance.channel_binding_sha256,
+                "request_nonce_sha256": provenance.request_nonce_sha256,
+                "session_binding_sha256": provenance.session_binding_sha256,
+            }
+        )
+    )
+
+
+def _remote_executor_session_commitment(
+    lease: RemoteExecutorSessionLease,
+    intent: StartRuntimeIntentV2,
+    executor: ExecutorControlPolicyV1,
+    *,
+    recheck: bool,
+) -> str:
+    """Pin a forced-command remote session to one signed start request."""
+
+    method = _safe_call(lambda: getattr(lease, "recheck" if recheck else "inspect"))
+    if method is _SAFE_CALL_FAILURE or not callable(method):
+        raise AuthorizationError("remote_executor_session_provenance")
+    value = _safe_call(lambda: method(intent))
+    if value is _SAFE_CALL_FAILURE or type(value) is not RemoteExecutorSessionProvenance:
+        raise AuthorizationError("remote_executor_session_provenance")
+    provenance = value
+    request = intent.delivery_request
+    if (
+        type(provenance.executor_id) is not str
+        or type(provenance.host_fingerprint_sha256) is not str
+        or type(provenance.channel_binding_sha256) is not str
+        or type(provenance.session_binding_sha256) is not str
+        or type(provenance.attestation_key_fingerprint_sha256) is not str
+        or provenance.executor_id != executor.executor.executor_id
+        or provenance.host_fingerprint_sha256 != executor.executor.host_fingerprint_sha256
+        or provenance.channel_binding_sha256 != request.channel_binding_sha256
+        or provenance.session_binding_sha256 != request.session_binding_sha256
+        or provenance.attestation_key_fingerprint_sha256
+        != executor.executor.attestation_public_key_fingerprint_sha256
+    ):
+        raise AuthorizationError("remote_executor_session_provenance")
+    return _digest(
+        _canonical_json_bytes(
+            {
+                "attestation_key_fingerprint_sha256": provenance.attestation_key_fingerprint_sha256,
+                "channel_binding_sha256": provenance.channel_binding_sha256,
+                "executor_id": provenance.executor_id,
+                "host_fingerprint_sha256": provenance.host_fingerprint_sha256,
+                "session_binding_sha256": provenance.session_binding_sha256,
+            }
+        )
+    )
 
 
 def _mark_effect_ambiguous(
@@ -6824,6 +8355,31 @@ def _require_signed_non_tls_materialization_intent(
     _verify_materialization_intent_signature(canonical, signer=signer)
     if canonical.allocation_intent_sha256 != allocation_intent_sha256(allocation_intent):
         raise AuthorizationError("materialization_intent_binding")
+    return canonical
+
+
+def _require_signed_non_tls_start_runtime_intent(
+    intent: StartRuntimeIntentV2,
+    *,
+    allocation_intent: AllocationIntentV2,
+    signer: TrustedEd25519SignerV1,
+) -> StartRuntimeIntentV2:
+    """Validate a fresh start authority before it can create a lock or claim.
+
+    The allocation intent is deliberately reverified first, so a raw string,
+    subclass, or model-constructed TLS profile can never reach a provider,
+    replay authority, artifact root, or remote-session adapter through this
+    later mutation path.
+    """
+
+    _require_signed_non_tls_allocation_intent(allocation_intent, signer=signer)
+    try:
+        canonical = strict_canonical_start_runtime_intent(intent)
+    except (TypeError, ValueError, ValidationError):
+        raise AuthorizationError("start_runtime_intent_signature") from None
+    _verify_start_runtime_intent_signature(canonical, signer=signer)
+    if canonical.provider_references != allocation_intent.provider_references:
+        raise AuthorizationError("start_runtime_intent_binding")
     return canonical
 
 
@@ -7465,6 +9021,30 @@ def _mark_materialization_effect_ambiguous(
         raise AuthorizationError("materialization_effect_failed_recovery_required")
 
 
+def _mark_start_runtime_effect_ambiguous(
+    journal: SQLiteAllocationJournal, verified: _VerifiedStartRuntime
+) -> None:
+    if _safe_call(lambda: journal._fail_start_runtime_effect(verified)) is _SAFE_CALL_FAILURE:
+        raise AuthorizationError("start_runtime_effect_failed_recovery_required")
+
+
+def _check_materialization_execution_stability(
+    journal: SQLiteAllocationJournal,
+    journal_pin: _AllocationJournalExecutionPin,
+    allocation: _VerifiedAllocationIntent,
+    materialization_intent: MaterializationIntentV1,
+    materialization_receipt: MaterializationEffectReceiptV1,
+    artifact_lease: ArtifactRootLease,
+    operation_lease: _OperationLease,
+) -> None:
+    """Keep every allocation/materialization predecessor pinned through a start."""
+
+    _check_allocation_execution_stability(
+        journal, journal_pin, allocation, artifact_lease, operation_lease
+    )
+    journal.assert_committed_materialization_stage(materialization_intent, materialization_receipt)
+
+
 def _run_materialization_authorization(
     paths: AuthorizationPaths,
     *,
@@ -7479,6 +9059,7 @@ def _run_materialization_authorization(
     journal: SQLiteAllocationJournal,
     executor: MaterializationExecutor,
     executor_control: ExecutorControlAdapter,
+    postgres_login_transition: PostgreSQLLoginTransitionCapability,
     secret_material: SecretMaterialCapability,
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
@@ -7633,6 +9214,7 @@ def _run_materialization_authorization(
             intent=persisted_intent_model,
             provider_material_attestation_sha256=provider_material_attestation_sha256,
             signer=signer,
+            now=_system_utc_clock(),
             reader=artifact_lease.reader(),
         )
         if (
@@ -7643,14 +9225,23 @@ def _run_materialization_authorization(
         references = verified_allocation.intent.provider_references.all()
         provider_manager, provider_lease = _acquire_provider_lease(provider, references)
         executor_manager: object | None = None
+        postgres_login_manager: object | None = None
         secret_manager: object | None = None
         provider_released = True
         executor_released = True
+        postgres_login_released = True
         secret_released = True
         execution_receipt: MaterializationExecutionReceiptV1 | None = None
         try:
             executor_manager, executor_lease = _acquire_control_lease(
                 executor_control, controls.executor, phase="executor_control_provenance"
+            )
+            postgres_login_manager, postgres_login_lease = _acquire_control_lease(
+                postgres_login_transition,
+                controls.postgres,
+                phase="postgres_login_transition_provenance",
+                secondary_policy=persisted_intent_model.postgres_login_transition,
+                tertiary_policy=persisted_intent_model.ephemeral_postgres_connection,
             )
             secret_manager, secret_lease = _acquire_control_lease(
                 secret_material,
@@ -7667,10 +9258,25 @@ def _run_materialization_authorization(
             initial_executor_sha256, executor_expectation = _executor_control_commitment(
                 cast(ExecutorControlLease, executor_lease), controls.executor, recheck=False
             )
+            initial_postgres_login_sha256, postgres_login_expectation = (
+                _postgres_login_transition_commitment(
+                    cast(PostgreSQLLoginTransitionLease, postgres_login_lease),
+                    controls.postgres,
+                    persisted_intent_model.postgres_login_transition,
+                    persisted_intent_model.ephemeral_postgres_connection,
+                    recheck=False,
+                )
+            )
             initial_secret_sha256, secret_expectation = _secret_material_commitment(
                 cast(SecretMaterialLease, secret_lease),
                 controls.secret_capability,
                 controls.handling,
+                recheck=False,
+            )
+            initial_delivery_sha256 = _secret_delivery_commitment(
+                cast(SecretMaterialLease, secret_lease),
+                persisted_intent_model.secret_delivery_request,
+                controls.secret_capability,
                 recheck=False,
             )
             artifact_lease.assert_stable()
@@ -7706,6 +9312,7 @@ def _run_materialization_authorization(
                 intent=persisted_intent_model,
                 provider_material_attestation_sha256=provider_material_attestation_sha256,
                 signer=signer,
+                now=_system_utc_clock(),
                 reader=artifact_lease.reader(),
             )
             if (
@@ -7728,10 +9335,25 @@ def _run_materialization_authorization(
             final_executor_sha256, final_executor_expectation = _executor_control_commitment(
                 cast(ExecutorControlLease, executor_lease), controls.executor, recheck=True
             )
+            final_postgres_login_sha256, final_postgres_login_expectation = (
+                _postgres_login_transition_commitment(
+                    cast(PostgreSQLLoginTransitionLease, postgres_login_lease),
+                    controls.postgres,
+                    persisted_intent_model.postgres_login_transition,
+                    persisted_intent_model.ephemeral_postgres_connection,
+                    recheck=True,
+                )
+            )
             final_secret_sha256, final_secret_expectation = _secret_material_commitment(
                 cast(SecretMaterialLease, secret_lease),
                 controls.secret_capability,
                 controls.handling,
+                recheck=True,
+            )
+            final_delivery_sha256 = _secret_delivery_commitment(
+                cast(SecretMaterialLease, secret_lease),
+                persisted_intent_model.secret_delivery_request,
+                controls.secret_capability,
                 recheck=True,
             )
             if (
@@ -7739,8 +9361,11 @@ def _run_materialization_authorization(
                 or expectations != final_expectations
                 or initial_executor_sha256 != final_executor_sha256
                 or executor_expectation != final_executor_expectation
+                or initial_postgres_login_sha256 != final_postgres_login_sha256
+                or postgres_login_expectation != final_postgres_login_expectation
                 or initial_secret_sha256 != final_secret_sha256
                 or secret_expectation != final_secret_expectation
+                or initial_delivery_sha256 != final_delivery_sha256
             ):
                 raise AuthorizationError("materialization_control_race")
             authorized_at = _system_utc_clock().isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -7755,8 +9380,17 @@ def _run_materialization_authorization(
                 ),
                 provider_expectations=final_expectations,
                 executor_expectation=final_executor_expectation,
+                executor_attestation_key_id=controls.executor.executor.attestation_key_id,
+                executor_attestation_public_key_base64=(
+                    controls.executor.executor.attestation_public_key_base64
+                ),
+                executor_attestation_public_key_fingerprint_sha256=(
+                    controls.executor.executor.attestation_public_key_fingerprint_sha256
+                ),
+                postgres_login_expectation=final_postgres_login_expectation,
                 secret_material_expectation=final_secret_expectation,
                 secret_handling_policy_sha256=canonical_sha256(controls.handling),
+                secret_delivery_request=persisted_intent_model.secret_delivery_request,
                 materialization_intent_sha256=materialization_intent_sha256(persisted_intent_model),
                 idempotency_key=_materialization_idempotency_key(
                     materialization_operation_id=persisted_intent_model.materialization_operation_id,
@@ -7767,11 +9401,15 @@ def _run_materialization_authorization(
                     observed_allocation_attestation_sha256=persisted_intent_model.observed_allocation_attestation_sha256,
                     provider_sha256=final_provider_sha256,
                     executor_sha256=final_executor_sha256,
+                    postgres_login_sha256=final_postgres_login_sha256,
                     secret_capability_sha256=final_secret_sha256,
+                    secret_delivery_sha256=final_delivery_sha256,
                 ),
                 provider_provenance_sha256=final_provider_sha256,
                 executor_provenance_sha256=final_executor_sha256,
+                postgres_login_provenance_sha256=final_postgres_login_sha256,
                 secret_capability_provenance_sha256=final_secret_sha256,
+                secret_delivery_provenance_sha256=final_delivery_sha256,
             )
             verified = _VerifiedMaterialization(
                 context=context,
@@ -7804,6 +9442,7 @@ def _run_materialization_authorization(
                     lambda: executor.materialize_and_start(
                         context,
                         cast(ExecutorControlLease, executor_lease),
+                        cast(PostgreSQLLoginTransitionLease, postgres_login_lease),
                         cast(SecretMaterialLease, secret_lease),
                     )
                 )
@@ -7837,6 +9476,23 @@ def _run_materialization_authorization(
                         recheck=True,
                     )
                 )
+                post_postgres_login = _safe_call(
+                    lambda: _postgres_login_transition_commitment(
+                        cast(PostgreSQLLoginTransitionLease, postgres_login_lease),
+                        controls.postgres,
+                        persisted_intent_model.postgres_login_transition,
+                        persisted_intent_model.ephemeral_postgres_connection,
+                        recheck=True,
+                    )
+                )
+                post_delivery = _safe_call(
+                    lambda: _secret_delivery_commitment(
+                        cast(SecretMaterialLease, secret_lease),
+                        persisted_intent_model.secret_delivery_request,
+                        controls.secret_capability,
+                        recheck=True,
+                    )
+                )
                 post_controls = _safe_call(
                     lambda: _read_materialization_control_policies(
                         paths,
@@ -7844,6 +9500,7 @@ def _run_materialization_authorization(
                         intent=persisted_intent_model,
                         provider_material_attestation_sha256=provider_material_attestation_sha256,
                         signer=signer,
+                        now=_system_utc_clock(),
                         reader=artifact_lease.reader(),
                     )
                 )
@@ -7855,7 +9512,10 @@ def _run_materialization_authorization(
                 if (
                     post_provider != (final_provider_sha256, final_expectations)
                     or post_executor != (final_executor_sha256, final_executor_expectation)
+                    or post_postgres_login
+                    != (final_postgres_login_sha256, final_postgres_login_expectation)
                     or post_secret != (final_secret_sha256, final_secret_expectation)
+                    or post_delivery != final_delivery_sha256
                     or post_controls != (controls, control_snapshot)
                     or stable is _SAFE_CALL_FAILURE
                 ):
@@ -7904,8 +9564,15 @@ def _run_materialization_authorization(
                 secret_released = _release_control_lease(secret_manager)
             if executor_manager is not None:
                 executor_released = _release_control_lease(executor_manager)
+            if postgres_login_manager is not None:
+                postgres_login_released = _release_control_lease(postgres_login_manager)
             provider_released = _release_provider_lease(provider_manager)
-        if not provider_released or not executor_released or not secret_released:
+        if (
+            not provider_released
+            or not executor_released
+            or not postgres_login_released
+            or not secret_released
+        ):
             raise AuthorizationError("control_release")
         assert execution_receipt is not None
         return execution_receipt
@@ -7925,6 +9592,7 @@ def authorize_materialization_and_execute(
     journal: SQLiteAllocationJournal,
     executor: MaterializationExecutor,
     executor_control: ExecutorControlAdapter,
+    postgres_login_transition: PostgreSQLLoginTransitionCapability,
     secret_material: SecretMaterialCapability,
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
@@ -7944,7 +9612,598 @@ def authorize_materialization_and_execute(
         journal=journal,
         executor=executor,
         executor_control=executor_control,
+        postgres_login_transition=postgres_login_transition,
         secret_material=secret_material,
+        replay_authority=replay_authority,
+        replay_policy=replay_policy,
+    )
+
+
+def _run_start_runtime_authorization(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    allocation_intent: AllocationIntentV2,
+    start_runtime_intent: StartRuntimeIntentV2,
+    provider: ProviderProvenanceAdapter,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteAllocationJournal,
+    executor: StartRuntimeExecutor,
+    executor_control: ExecutorControlAdapter,
+    secret_material: SecretMaterialCapability,
+    remote_executor_session: RemoteExecutorSessionCapability,
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
+) -> StartRuntimeExecutionReceiptV2:
+    """Authorize one fresh opaque redelivery/start after observed materialization.
+
+    This is intentionally a separate operation from materialization.  It
+    cannot allocate resources, install an executor, mutate a PostgreSQL role,
+    seed data, restore data, or expose a value.  A successful earlier start is
+    never reusable: both its operation ID and delivery request nonce are
+    durably and externally claimed before the effect callback runs.
+    """
+
+    if (
+        type(paths) is not AuthorizationPaths
+        or type(signer) is not TrustedEd25519SignerV1
+        or type(allocation_intent) is not AllocationIntentV2
+        or type(start_runtime_intent) is not StartRuntimeIntentV2
+        or type(journal) is not SQLiteAllocationJournal
+        or type(replay_policy) is not ReplayAuthorityPolicyV1
+    ):
+        raise AuthorizationError("start_runtime_journal_effect")
+    allocation_intent = _require_signed_non_tls_allocation_intent(allocation_intent, signer=signer)
+    start_runtime_intent = _require_signed_non_tls_start_runtime_intent(
+        start_runtime_intent,
+        allocation_intent=allocation_intent,
+        signer=signer,
+    )
+    replay_policy = cast(
+        ReplayAuthorityPolicyV1,
+        _canonical_artifact_model(
+            replay_policy,
+            ReplayAuthorityPolicyV1,
+            phase="replay_authority_policy",
+        ),
+    )
+    _replay_claim_method(replay_authority)
+    with ArtifactRootLease(paths.root) as artifact_lease:
+        artifact_lease.assert_stable()
+        _require_current_allocation_journal(journal.migration_status())
+        artifact_lease.assert_absent(
+            paths.start_runtime_receipt_name(start_runtime_intent.start_operation_id),
+            phase="start_runtime_operation_replayed",
+        )
+        artifact_lease.write_once_or_require_exact(
+            paths.start_runtime_intent_name(start_runtime_intent.start_operation_id),
+            _signed_model_artifact_bytes(
+                start_runtime_intent,
+                phase="start_runtime_intent_artifact",
+            ),
+            phase="start_runtime_intent_artifact",
+        )
+
+        def verified_snapshot() -> tuple[
+            _ArtifactVerification,
+            dict[str, bytes],
+            _VerifiedAllocationIntent,
+            bytes,
+            _AllocationStageArtifacts,
+            dict[str, bytes],
+            _MaterializationStageArtifacts,
+            dict[str, bytes],
+            StartRuntimeIntentV2,
+            bytes,
+            dict[str, str],
+            tuple[str, str, str, str, str],
+            _MaterializationControlPolicies,
+            dict[str, bytes],
+            ReplayAuthorityPolicyArtifactV1,
+            bytes,
+        ]:
+            now = _system_utc_clock()
+            artifacts, artifact_snapshot = _verify_artifact_snapshot(
+                paths,
+                signer=signer,
+                expected_disposal_owner=expected_disposal_owner,
+                expected_approver_identity=expected_approver_identity,
+                now=now,
+                reader=artifact_lease.reader(),
+            )
+            verified_allocation, allocation_intent_raw = _read_verified_allocation_intent(
+                paths,
+                signer=signer,
+                expected_disposal_owner=expected_disposal_owner,
+                expected_approver_identity=expected_approver_identity,
+                now=now,
+                reader=artifact_lease.reader(),
+            )
+            if verified_allocation.intent != allocation_intent:
+                raise AuthorizationError("allocation_intent_binding")
+            _verify_allocation_intent_binding(
+                verified_allocation,
+                journal=journal,
+                replay_policy=replay_policy,
+            )
+            allocation, allocation_snapshot = _read_allocation_stage_artifacts(
+                paths,
+                signer=signer,
+                expected_disposal_owner=expected_disposal_owner,
+                expected_approver_identity=expected_approver_identity,
+                now=now,
+                reader=artifact_lease.reader(),
+            )
+            if allocation.intent != verified_allocation.intent:
+                raise AuthorizationError("allocation_intent_binding")
+            materialization, materialization_snapshot = _read_materialization_stage_artifacts(
+                paths,
+                signer=signer,
+                expected_disposal_owner=expected_disposal_owner,
+                expected_approver_identity=expected_approver_identity,
+                now=now,
+                reader=artifact_lease.reader(),
+                allocation=allocation,
+                proposal=artifacts.proposal,
+                contract=artifacts.final_contract,
+            )
+            persisted_start, start_raw = _read_canonical_signed_model(
+                artifact_lease.reader(),
+                name=paths.start_runtime_intent_name(start_runtime_intent.start_operation_id),
+                model_type=StartRuntimeIntentV2,
+                phase="start_runtime_intent_artifact",
+            )
+            if type(persisted_start) is not StartRuntimeIntentV2:
+                raise AuthorizationError("start_runtime_intent_artifact")
+            _verify_start_runtime_intent_signature(persisted_start, signer=signer)
+            fingerprints, material_snapshot = _trusted_provider_fingerprints(
+                signer=signer,
+                allocation_intent=verified_allocation.intent,
+                expected_disposal_owner=expected_disposal_owner,
+                expected_approver_identity=expected_approver_identity,
+                now=now,
+                reader=artifact_lease.reader(),
+            )
+            controls, control_snapshot = _read_materialization_control_policies(
+                paths,
+                allocation_intent=verified_allocation.intent,
+                intent=materialization.intent,
+                provider_material_attestation_sha256=material_snapshot[-1],
+                signer=signer,
+                now=now,
+                reader=artifact_lease.reader(),
+            )
+            _verify_start_runtime_intent_chain(
+                allocation=allocation,
+                materialization=materialization,
+                intent=persisted_start,
+                controls=controls,
+                provider_material_attestation_sha256=material_snapshot[-1],
+                replay_policy=replay_policy,
+                expected_disposal_owner=expected_disposal_owner,
+                expected_approver_identity=expected_approver_identity,
+                now=now,
+            )
+            replay_artifact, replay_raw = _read_replay_policy_artifact(
+                paths,
+                signer=signer,
+                allocation_intent=verified_allocation.intent,
+                replay_policy=replay_policy,
+                reader=artifact_lease.reader(),
+            )
+            return (
+                artifacts,
+                artifact_snapshot,
+                verified_allocation,
+                allocation_intent_raw,
+                allocation,
+                allocation_snapshot,
+                materialization,
+                materialization_snapshot,
+                persisted_start,
+                start_raw,
+                fingerprints,
+                material_snapshot,
+                controls,
+                control_snapshot,
+                replay_artifact,
+                replay_raw,
+            )
+
+        snapshot = verified_snapshot()
+        (
+            artifacts,
+            _artifact_snapshot,
+            verified_allocation,
+            _allocation_intent_raw,
+            allocation_stage,
+            _allocation_snapshot,
+            materialization_stage,
+            _materialization_snapshot,
+            persisted_start,
+            persisted_start_raw,
+            fingerprints,
+            _material_snapshot,
+            controls,
+            _control_snapshot,
+            _replay_artifact,
+            _replay_raw,
+        ) = snapshot
+        if persisted_start != start_runtime_intent or not hmac.compare_digest(
+            persisted_start_raw,
+            _signed_model_artifact_bytes(
+                start_runtime_intent, phase="start_runtime_intent_artifact"
+            ),
+        ):
+            raise AuthorizationError("start_runtime_intent_artifact")
+        journal.assert_intent(verified_allocation)
+        journal_pin = journal._pin_execution_identity()
+        _check_observed_stage_stability(journal, journal_pin, verified_allocation)
+        journal.assert_committed_allocation_stage(
+            verified_allocation,
+            allocation_stage.receipt,
+            allocation_stage.attestation,
+        )
+        journal.assert_committed_materialization_stage(
+            materialization_stage.intent,
+            materialization_stage.receipt,
+        )
+        references = verified_allocation.intent.provider_references.all()
+        provider_manager, provider_lease = _acquire_provider_lease(provider, references)
+        executor_manager: object | None = None
+        secret_manager: object | None = None
+        remote_manager: object | None = None
+        provider_released = True
+        executor_released = True
+        secret_released = True
+        remote_released = True
+        execution_receipt: StartRuntimeExecutionReceiptV2 | None = None
+        try:
+            executor_manager, executor_lease = _acquire_control_lease(
+                executor_control,
+                controls.executor,
+                phase="executor_control_provenance",
+            )
+            secret_manager, secret_lease = _acquire_control_lease(
+                secret_material,
+                controls.secret_capability,
+                phase="secret_material_provenance",
+                secondary_policy=controls.handling,
+            )
+            remote_manager, remote_lease = _acquire_control_lease(
+                remote_executor_session,
+                persisted_start,
+                phase="remote_executor_session_provenance",
+            )
+            initial_provider_sha256, expectations = _provider_commitment(
+                references=references,
+                lease=provider_lease,
+                fingerprints=fingerprints,
+                recheck=False,
+            )
+            initial_executor_sha256, executor_expectation = _executor_control_commitment(
+                cast(ExecutorControlLease, executor_lease), controls.executor, recheck=False
+            )
+            initial_secret_sha256, secret_expectation = _secret_material_commitment(
+                cast(SecretMaterialLease, secret_lease),
+                controls.secret_capability,
+                controls.handling,
+                recheck=False,
+            )
+            initial_delivery_sha256 = _secret_delivery_commitment(
+                cast(SecretMaterialLease, secret_lease),
+                persisted_start.delivery_request,
+                controls.secret_capability,
+                recheck=False,
+            )
+            initial_remote_sha256 = _remote_executor_session_commitment(
+                cast(RemoteExecutorSessionLease, remote_lease),
+                persisted_start,
+                controls.executor,
+                recheck=False,
+            )
+            artifact_lease.assert_stable()
+            journal._assert_pinned_execution_identity(journal_pin)
+            if verified_snapshot() != snapshot:
+                raise AuthorizationError("start_runtime_artifact_race")
+            final_provider_sha256, final_expectations = _provider_commitment(
+                references=references,
+                lease=provider_lease,
+                fingerprints=fingerprints,
+                recheck=True,
+            )
+            final_executor_sha256, final_executor_expectation = _executor_control_commitment(
+                cast(ExecutorControlLease, executor_lease), controls.executor, recheck=True
+            )
+            final_secret_sha256, final_secret_expectation = _secret_material_commitment(
+                cast(SecretMaterialLease, secret_lease),
+                controls.secret_capability,
+                controls.handling,
+                recheck=True,
+            )
+            final_delivery_sha256 = _secret_delivery_commitment(
+                cast(SecretMaterialLease, secret_lease),
+                persisted_start.delivery_request,
+                controls.secret_capability,
+                recheck=True,
+            )
+            final_remote_sha256 = _remote_executor_session_commitment(
+                cast(RemoteExecutorSessionLease, remote_lease),
+                persisted_start,
+                controls.executor,
+                recheck=True,
+            )
+            if (
+                initial_provider_sha256 != final_provider_sha256
+                or expectations != final_expectations
+                or initial_executor_sha256 != final_executor_sha256
+                or executor_expectation != final_executor_expectation
+                or initial_secret_sha256 != final_secret_sha256
+                or secret_expectation != final_secret_expectation
+                or initial_delivery_sha256 != final_delivery_sha256
+                or initial_remote_sha256 != final_remote_sha256
+            ):
+                raise AuthorizationError("start_runtime_control_race")
+            authorized_at = _system_utc_clock().isoformat(timespec="seconds").replace("+00:00", "Z")
+            context = StartRuntimeExecutionContext(
+                operation_kind=_START_RUNTIME_OPERATION_KIND,
+                operation_scope="start_runtime_v2",
+                start_operation_id=persisted_start.start_operation_id,
+                intent=persisted_start,
+                materialization_intent=materialization_stage.intent,
+                materialization_receipt=materialization_stage.receipt,
+                observed_runtime_attestation=materialization_stage.attestation,
+                provider_expectations=final_expectations,
+                executor_expectation=final_executor_expectation,
+                executor_attestation_key_id=controls.executor.executor.attestation_key_id,
+                executor_attestation_public_key_base64=(
+                    controls.executor.executor.attestation_public_key_base64
+                ),
+                executor_attestation_public_key_fingerprint_sha256=(
+                    controls.executor.executor.attestation_public_key_fingerprint_sha256
+                ),
+                secret_material_expectation=final_secret_expectation,
+                secret_handling_policy_sha256=canonical_sha256(controls.handling),
+                secret_delivery_request=persisted_start.delivery_request,
+                start_runtime_intent_sha256=start_runtime_intent_sha256(persisted_start),
+                idempotency_key=_start_runtime_idempotency_key(
+                    start_operation_id=persisted_start.start_operation_id,
+                    start_runtime_intent_sha256=start_runtime_intent_sha256(persisted_start),
+                    materialization_effect_receipt_sha256=(
+                        persisted_start.materialization_effect_receipt_sha256
+                    ),
+                    observed_runtime_attestation_sha256=(
+                        persisted_start.observed_runtime_attestation_sha256
+                    ),
+                    provider_sha256=final_provider_sha256,
+                    executor_sha256=final_executor_sha256,
+                    secret_capability_sha256=final_secret_sha256,
+                    secret_delivery_sha256=final_delivery_sha256,
+                    remote_session_sha256=final_remote_sha256,
+                ),
+                proposal_sha256=artifacts.receipt.proposal_sha256,
+                contract_sha256=artifacts.receipt.contract_sha256,
+                provider_provenance_sha256=final_provider_sha256,
+                executor_provenance_sha256=final_executor_sha256,
+                secret_capability_provenance_sha256=final_secret_sha256,
+                secret_delivery_provenance_sha256=final_delivery_sha256,
+                remote_session_provenance_sha256=final_remote_sha256,
+            )
+            verified = _VerifiedStartRuntime(
+                context=context,
+                nonce=secrets.token_hex(16),
+                authorized_at=authorized_at,
+                capability=_START_RUNTIME_VERIFIED_CAPABILITY,
+            )
+            with journal._start_runtime_operation_lease(
+                context.start_operation_id
+            ) as operation_lease:
+                _check_materialization_execution_stability(
+                    journal,
+                    journal_pin,
+                    verified_allocation,
+                    materialization_stage.intent,
+                    materialization_stage.receipt,
+                    artifact_lease,
+                    operation_lease,
+                )
+                _claim_replay_tombstone(
+                    replay_authority,
+                    _start_runtime_operation_tombstone(replay_policy, verified),
+                    phase="start_runtime_replay_authority_replayed",
+                )
+                _check_materialization_execution_stability(
+                    journal,
+                    journal_pin,
+                    verified_allocation,
+                    materialization_stage.intent,
+                    materialization_stage.receipt,
+                    artifact_lease,
+                    operation_lease,
+                )
+                journal._claim_start_runtime_verified(verified)
+                journal._begin_start_runtime_effect(verified)
+                outcome = _safe_call(
+                    lambda: executor.start_runtime(
+                        context,
+                        cast(RemoteExecutorSessionLease, remote_lease),
+                        cast(SecretMaterialLease, secret_lease),
+                    )
+                )
+                if outcome is _SAFE_CALL_FAILURE:
+                    _mark_start_runtime_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("start_runtime_effect_failed_recovery_required")
+                effect_receipt = _safe_call(
+                    lambda: _validate_start_runtime_effect_receipt(context, outcome)
+                )
+                if type(effect_receipt) is not StartRuntimeEffectReceiptV2:
+                    _mark_start_runtime_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("start_runtime_effect_failed_recovery_required")
+                post_provider = _safe_call(
+                    lambda: _provider_commitment(
+                        references=references,
+                        lease=provider_lease,
+                        fingerprints=fingerprints,
+                        recheck=True,
+                    )
+                )
+                post_executor = _safe_call(
+                    lambda: _executor_control_commitment(
+                        cast(ExecutorControlLease, executor_lease), controls.executor, recheck=True
+                    )
+                )
+                post_secret = _safe_call(
+                    lambda: _secret_material_commitment(
+                        cast(SecretMaterialLease, secret_lease),
+                        controls.secret_capability,
+                        controls.handling,
+                        recheck=True,
+                    )
+                )
+                post_delivery = _safe_call(
+                    lambda: _secret_delivery_commitment(
+                        cast(SecretMaterialLease, secret_lease),
+                        persisted_start.delivery_request,
+                        controls.secret_capability,
+                        recheck=True,
+                    )
+                )
+                post_remote = _safe_call(
+                    lambda: _remote_executor_session_commitment(
+                        cast(RemoteExecutorSessionLease, remote_lease),
+                        persisted_start,
+                        controls.executor,
+                        recheck=True,
+                    )
+                )
+                post_snapshot = _safe_call(verified_snapshot)
+                stable = _safe_call(
+                    lambda: _check_materialization_execution_stability(
+                        journal,
+                        journal_pin,
+                        verified_allocation,
+                        materialization_stage.intent,
+                        materialization_stage.receipt,
+                        artifact_lease,
+                        operation_lease,
+                    )
+                )
+                if (
+                    post_provider != (final_provider_sha256, final_expectations)
+                    or post_executor != (final_executor_sha256, final_executor_expectation)
+                    or post_secret != (final_secret_sha256, final_secret_expectation)
+                    or post_delivery != final_delivery_sha256
+                    or post_remote != final_remote_sha256
+                    or post_snapshot != snapshot
+                    or stable is _SAFE_CALL_FAILURE
+                ):
+                    _mark_start_runtime_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("start_runtime_effect_failed_recovery_required")
+                receipt_written = _safe_call(
+                    lambda: artifact_lease.write_once(
+                        paths.start_runtime_receipt_name(context.start_operation_id),
+                        _signed_model_artifact_bytes(
+                            effect_receipt,
+                            phase="start_runtime_effect_failed_recovery_required",
+                        ),
+                        phase="start_runtime_effect_failed_recovery_required",
+                    )
+                )
+                if receipt_written is _SAFE_CALL_FAILURE:
+                    _mark_start_runtime_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("start_runtime_effect_failed_recovery_required")
+                stable_before_commit = _safe_call(
+                    lambda: _check_materialization_execution_stability(
+                        journal,
+                        journal_pin,
+                        verified_allocation,
+                        materialization_stage.intent,
+                        materialization_stage.receipt,
+                        artifact_lease,
+                        operation_lease,
+                    )
+                )
+                if stable_before_commit is _SAFE_CALL_FAILURE:
+                    _mark_start_runtime_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("start_runtime_effect_failed_recovery_required")
+                committed = _safe_call(
+                    lambda: journal._commit_start_runtime_effect(verified, effect_receipt)
+                )
+                if committed is _SAFE_CALL_FAILURE:
+                    _mark_start_runtime_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("start_runtime_effect_failed_recovery_required")
+                execution_receipt = StartRuntimeExecutionReceiptV2(
+                    schema_version="rsd.start-runtime-execution-receipt.v2",
+                    status="started_runtime",
+                    operation_kind=_START_RUNTIME_OPERATION_KIND,
+                    operation_scope="start_runtime_v2",
+                    start_operation_id=context.start_operation_id,
+                    start_runtime_intent_sha256=context.start_runtime_intent_sha256,
+                    materialization_operation_id=(
+                        context.materialization_intent.materialization_operation_id
+                    ),
+                    materialization_effect_receipt_sha256=(
+                        materialization_effect_receipt_sha256(context.materialization_receipt)
+                    ),
+                    observed_runtime_attestation_sha256=(
+                        context.intent.observed_runtime_attestation_sha256
+                    ),
+                    idempotency_key=context.idempotency_key,
+                    effect_receipt_sha256=start_runtime_effect_receipt_sha256(effect_receipt),
+                    committed_at=authorized_at,
+                )
+        finally:
+            if remote_manager is not None:
+                remote_released = _release_control_lease(remote_manager)
+            if secret_manager is not None:
+                secret_released = _release_control_lease(secret_manager)
+            if executor_manager is not None:
+                executor_released = _release_control_lease(executor_manager)
+            provider_released = _release_provider_lease(provider_manager)
+        if (
+            not provider_released
+            or not executor_released
+            or not secret_released
+            or not remote_released
+        ):
+            raise AuthorizationError("control_release")
+        assert execution_receipt is not None
+        return execution_receipt
+
+
+def authorize_start_runtime_and_execute(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    allocation_intent: AllocationIntentV2,
+    start_runtime_intent: StartRuntimeIntentV2,
+    provider: ProviderProvenanceAdapter,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteAllocationJournal,
+    executor: StartRuntimeExecutor,
+    executor_control: ExecutorControlAdapter,
+    secret_material: SecretMaterialCapability,
+    remote_executor_session: RemoteExecutorSessionCapability,
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
+) -> StartRuntimeExecutionReceiptV2:
+    """Use the internal trusted UTC clock for one fresh opaque runtime start."""
+
+    return _run_start_runtime_authorization(
+        paths,
+        signer=signer,
+        allocation_intent=allocation_intent,
+        start_runtime_intent=start_runtime_intent,
+        provider=provider,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        journal=journal,
+        executor=executor,
+        executor_control=executor_control,
+        secret_material=secret_material,
+        remote_executor_session=remote_executor_session,
         replay_authority=replay_authority,
         replay_policy=replay_policy,
     )

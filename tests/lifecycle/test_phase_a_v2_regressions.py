@@ -31,7 +31,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     PreflightPaths,
     ProposalV1,
     ProviderDeclarationV1,
-    ProviderReferencesV1,
+    ProviderReferencesV2,
     ProviderReferenceV1,
     RegistryImageVerificationV1,
     RegistryVerificationV1,
@@ -81,14 +81,15 @@ def _reference(name: str, version: int = 1) -> ProviderReferenceV1:
     )
 
 
-def _references(*, tls: bool = False) -> ProviderReferencesV1:
-    return ProviderReferencesV1(
+def _references(*, tls: bool = False) -> ProviderReferencesV2:
+    return ProviderReferencesV2(
         commitment_hmac=_reference("commitment"),
         backup_encryption=_reference("backup"),
         encryption_key=_reference("encryption"),
         auth_secret=_reference("auth"),
         primary_valkey_password=_reference("primary-cache"),
         restore_valkey_password=_reference("restore-cache"),
+        postgres_application_password=_reference("postgres-application"),
         tls_trust_anchor=_reference("trust") if tls else None,
     )
 
@@ -456,7 +457,7 @@ def test_phase_a_proposal_rejects_loopback_claim_over_tls_candidate() -> None:
     raw = proposal.model_dump(mode="python")
     refs = proposal.provider_references.model_dump(mode="python")
     refs["tls_trust_anchor"] = None
-    raw["provider_references"] = ProviderReferencesV1.model_validate(refs)
+    raw["provider_references"] = ProviderReferencesV2.model_validate(refs)
     raw["transport"] = TransportContractV1(
         profile=DisposableTransportProfile.UNPUBLISHED_LOOPBACK_OR_NETWORK,
         authority="http://127.0.0.1:8080",
@@ -499,7 +500,7 @@ def test_phase_a_accepts_candidate_bound_internal_network_transport() -> None:
     refs["tls_trust_anchor"] = None
     raw = proposal.model_dump(mode="python")
     raw["candidate"] = CandidateCompositeV1.model_validate(candidate)
-    raw["provider_references"] = ProviderReferencesV1.model_validate(refs)
+    raw["provider_references"] = ProviderReferencesV2.model_validate(refs)
     raw["transport"] = TransportContractV1(
         profile=DisposableTransportProfile.UNPUBLISHED_LOOPBACK_OR_NETWORK,
         authority=authority,

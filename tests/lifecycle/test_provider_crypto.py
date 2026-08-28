@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import inspect
 import json
 import os
 from datetime import UTC, datetime
@@ -28,7 +29,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     ExecutorPlacementV1,
     IsolatedNetworkPlanV1,
     PostgreSQLGrantPlanV1,
-    ProviderReferencesV1,
+    ProviderReferencesV2,
     ProviderReferenceV1,
     TransportContractV1,
     allocation_intent_sha256,
@@ -37,19 +38,22 @@ from omninode_rsd.lifecycle.provider_crypto import (
     KeychainEd25519Signer,
     KeychainItemReferenceV1,
     MacOSKeychainProviderProvenanceAdapter,
+    MaterialGenerationReceiptV1,
     ProviderCryptoError,
-    ProviderFingerprintAttestationV1,
+    ProviderFingerprintAttestationV2,
     ProviderMaterialArtifactPaths,
     ProviderMaterialFingerprintV1,
     ProviderMaterialFormat,
     ProviderMaterialGenesisStatus,
-    ProviderMaterialGenesisV1,
-    ProviderMaterialPolicyV1,
+    ProviderMaterialGenesisV2,
+    ProviderMaterialPolicyV2,
     ProviderMaterialPurpose,
     ProviderMaterialSpecV1,
     SignerGenesisV1,
     load_keychain_ed25519_signer,
     load_verified_provider_material_bundle,
+    material_generation_receipt_message,
+    persist_material_generation_receipt,
     persist_provider_material_genesis,
     persist_provider_material_policy,
     persist_signer_genesis,
@@ -58,8 +62,10 @@ from omninode_rsd.lifecycle.provider_crypto import (
     provider_material_genesis_status,
     provider_material_policy_message,
     provision_keychain_ed25519_signer,
-    provision_keychain_materials,
     signer_genesis_message,
+)
+from omninode_rsd.lifecycle.provider_crypto import (
+    provision_keychain_materials as _production_provision_keychain_materials,
 )
 
 
@@ -82,7 +88,7 @@ def _reference(name: str, version: int = 1) -> ProviderReferenceV1:
     )
 
 
-def _policy() -> ProviderMaterialPolicyV1:
+def _policy() -> ProviderMaterialPolicyV2:
     definitions: tuple[
         tuple[ProviderMaterialPurpose, ProviderMaterialFormat, int, int, ProviderReferenceV1], ...
     ] = (
@@ -128,6 +134,13 @@ def _policy() -> ProviderMaterialPolicyV1:
             43,
             _reference("restore"),
         ),
+        (
+            ProviderMaterialPurpose.POSTGRES_APPLICATION_PASSWORD,
+            ProviderMaterialFormat.POSTGRES_APPLICATION_PASSWORD_BASE64URL_32_V1,
+            43,
+            43,
+            _reference("postgres-application"),
+        ),
     )
     signer_fields = {
         "account": "account-provider-signer.v1",
@@ -135,8 +148,8 @@ def _policy() -> ProviderMaterialPolicyV1:
         "service": "service-provider-signer",
         "version": 1,
     }
-    return ProviderMaterialPolicyV1(
-        schema_version="rsd.provider-crypto.material-policy.v1",
+    return ProviderMaterialPolicyV2(
+        schema_version="rsd.provider-crypto.material-policy.v2",
         allocation_intent_sha256="a" * 64,
         disposal_owner="owner",
         approver_identity="approver",
@@ -165,7 +178,7 @@ def _policy() -> ProviderMaterialPolicyV1:
     )
 
 
-def _values(policy: ProviderMaterialPolicyV1) -> dict[str, bytes]:
+def _values(policy: ProviderMaterialPolicyV2) -> dict[str, bytes]:
     values = (
         b"c" * 32,
         b"b" * 32,
@@ -173,6 +186,7 @@ def _values(policy: ProviderMaterialPolicyV1) -> dict[str, bytes]:
         base64.b64encode(b"a" * 32),
         base64.urlsafe_b64encode(b"p" * 32).rstrip(b"="),
         base64.urlsafe_b64encode(b"r" * 32).rstrip(b"="),
+        base64.urlsafe_b64encode(b"g" * 32).rstrip(b"="),
     )
     return {
         spec.reference.reference_sha256: value
@@ -201,14 +215,15 @@ class _Store:
 _BOOTSTRAP_CLOCK = datetime(2026, 8, 28, 12, 5, tzinfo=UTC)
 
 
-def _macos_references() -> ProviderReferencesV1:
-    return ProviderReferencesV1(
+def _macos_references() -> ProviderReferencesV2:
+    return ProviderReferencesV2(
         commitment_hmac=_reference("commitment"),
         backup_encryption=_reference("backup"),
         encryption_key=_reference("encryption"),
         auth_secret=_reference("auth"),
         primary_valkey_password=_reference("primary"),
         restore_valkey_password=_reference("restore"),
+        postgres_application_password=_reference("postgres-application"),
     )
 
 
@@ -225,6 +240,9 @@ def _provider_values() -> dict[ProviderMaterialPurpose, bytearray]:
         ),
         ProviderMaterialPurpose.RESTORE_VALKEY_PASSWORD: bytearray(
             base64.urlsafe_b64encode(b"r" * 32).rstrip(b"=")
+        ),
+        ProviderMaterialPurpose.POSTGRES_APPLICATION_PASSWORD: bytearray(
+            base64.urlsafe_b64encode(b"g" * 32).rstrip(b"=")
         ),
     }
 
@@ -310,11 +328,26 @@ def _signed_provider_allocation_intent(
             database_name="provider-database",
             schema_name="provider-schema",
             owner_role="provider-owner",
-            role_names=("provider-owner", "provider-reader"),
+            application_role="provider-application",
+            role_names=("provider-owner", "provider-application"),
+            allocation_role_states=(
+                {
+                    "role": "provider-owner",
+                    "role_kind": "database_owner",
+                    "can_login": False,
+                    "password_absent": True,
+                },
+                {
+                    "role": "provider-application",
+                    "role_kind": "application",
+                    "can_login": False,
+                    "password_absent": True,
+                },
+            ),
             grants=(
                 PostgreSQLGrantPlanV1(
                     role="provider-owner",
-                    grantee="provider-reader",
+                    grantee="provider-application",
                     privilege="SELECT",
                     schema_name="provider-schema",
                 ),
@@ -367,6 +400,41 @@ def _signed_provider_allocation_intent(
     return issuer, issuer_key, signed
 
 
+def _signed_generation_receipt(
+    *,
+    material_key: Ed25519PrivateKey,
+    signer: TrustedEd25519SignerV1,
+    intent: AllocationIntentV2,
+    policy: ProviderMaterialPolicyV2,
+    attestation: ProviderFingerprintAttestationV2,
+) -> MaterialGenerationReceiptV1:
+    """Create deterministic value-free generation evidence for the test fixture."""
+
+    unsigned = MaterialGenerationReceiptV1(
+        schema_version="rsd.provider-crypto.material-generation-receipt.v1",
+        generation_id="123e4567-e89b-42d3-a456-426614174014",
+        generator_id="macos_security_secrandom_v1",
+        allocation_intent_sha256=allocation_intent_sha256(intent),
+        provider_material_policy_sha256=policy.policy_sha256(),
+        provider_fingerprint_attestation_sha256=_sha256(
+            json.dumps(
+                attestation.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+            ).encode()
+        ),
+        generated_at="2026-08-28T12:02:30Z",
+        materials=attestation.materials,
+        signer_key_id=signer.key_id,
+        signature_base64=base64.b64encode(b"0" * 64).decode("ascii"),
+    )
+    return unsigned.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                material_key.sign(material_generation_receipt_message(unsigned))
+            ).decode("ascii")
+        }
+    )
+
+
 def _signed_v2_material_bundle(
     tmp_path: Path,
 ) -> tuple[
@@ -376,9 +444,9 @@ def _signed_v2_material_bundle(
     Ed25519PrivateKey,
     TrustedEd25519SignerV1,
     SignerGenesisV1,
-    ProviderMaterialPolicyV1,
-    ProviderFingerprintAttestationV1,
-    ProviderMaterialGenesisV1,
+    ProviderMaterialPolicyV2,
+    ProviderFingerprintAttestationV2,
+    ProviderMaterialGenesisV2,
 ]:
     """Build a signed V2 bootstrap fixture using only an injected memory store."""
 
@@ -436,6 +504,9 @@ def _signed_v2_material_bundle(
         ProviderMaterialPurpose.INFISICAL_AUTH_SECRET: references.auth_secret,
         ProviderMaterialPurpose.PRIMARY_VALKEY_PASSWORD: references.primary_valkey_password,
         ProviderMaterialPurpose.RESTORE_VALKEY_PASSWORD: references.restore_valkey_password,
+        ProviderMaterialPurpose.POSTGRES_APPLICATION_PASSWORD: (
+            references.postgres_application_password
+        ),
     }
     template = _policy()
     policy_specs = tuple(
@@ -464,8 +535,8 @@ def _signed_v2_material_bundle(
         }
     )
     values = _provider_values()
-    unsigned_attestation = ProviderFingerprintAttestationV1(
-        schema_version="rsd.provider-crypto.fingerprint-attestation.v1",
+    unsigned_attestation = ProviderFingerprintAttestationV2(
+        schema_version="rsd.provider-crypto.fingerprint-attestation.v2",
         allocation_intent_sha256=allocation_intent_sha256(allocation_intent),
         provider_material_policy_sha256=policy.policy_sha256(),
         attestation_id="123e4567-e89b-42d3-a456-426614174012",
@@ -488,8 +559,15 @@ def _signed_v2_material_bundle(
             ).decode("ascii")
         }
     )
-    unsigned_genesis = ProviderMaterialGenesisV1(
-        schema_version="rsd.provider-crypto.material-genesis.v1",
+    generation_receipt = _signed_generation_receipt(
+        material_key=material_key,
+        signer=material_signer,
+        intent=allocation_intent,
+        policy=policy,
+        attestation=attestation,
+    )
+    unsigned_genesis = ProviderMaterialGenesisV2(
+        schema_version="rsd.provider-crypto.material-genesis.v2",
         status="pending",
         genesis_id="123e4567-e89b-42d3-a456-426614174013",
         allocation_intent_sha256=allocation_intent_sha256(allocation_intent),
@@ -497,6 +575,13 @@ def _signed_v2_material_bundle(
         provider_fingerprint_attestation_sha256=_sha256(
             json.dumps(
                 attestation.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+            ).encode()
+        ),
+        material_generation_receipt_sha256=_sha256(
+            json.dumps(
+                generation_receipt.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
             ).encode()
         ),
         created_at="2026-08-28T12:03:00Z",
@@ -533,12 +618,12 @@ def _persist_v2_material_bundle(
         Ed25519PrivateKey,
         TrustedEd25519SignerV1,
         SignerGenesisV1,
-        ProviderMaterialPolicyV1,
-        ProviderFingerprintAttestationV1,
-        ProviderMaterialGenesisV1,
+        ProviderMaterialPolicyV2,
+        ProviderFingerprintAttestationV2,
+        ProviderMaterialGenesisV2,
     ],
 ) -> None:
-    paths, intent, issuer, _material_key, signer, signer_genesis, policy, attestation, genesis = (
+    paths, intent, issuer, material_key, signer, signer_genesis, policy, attestation, genesis = (
         bundle
     )
     persist_signer_genesis(paths, signer_genesis, issuer=issuer, allocation_intent=intent)
@@ -552,17 +637,76 @@ def _persist_v2_material_bundle(
         expected_disposal_owner=intent.disposal_owner,
         expected_approver_identity=intent.approver_identity,
     )
-    persist_provider_material_genesis(
+    generation_receipt = _signed_generation_receipt(
+        material_key=material_key,
+        signer=signer,
+        intent=intent,
+        policy=policy,
+        attestation=attestation,
+    )
+    persist_material_generation_receipt(
         paths,
-        genesis,
+        generation_receipt,
         policy=policy,
         attestation=attestation,
         signer=signer,
         signer_genesis=signer_genesis,
         issuer=issuer,
         allocation_intent=intent,
+    )
+    persist_provider_material_genesis(
+        paths,
+        genesis,
+        policy=policy,
+        attestation=attestation,
+        generation_receipt=generation_receipt,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        allocation_intent=intent,
         expected_disposal_owner=intent.disposal_owner,
         expected_approver_identity=intent.approver_identity,
+    )
+
+
+def provision_keychain_materials(
+    paths: ProviderMaterialArtifactPaths,
+    *,
+    policy: ProviderMaterialPolicyV2,
+    genesis: ProviderMaterialGenesisV2,
+    attestation: ProviderFingerprintAttestationV2,
+    signer: TrustedEd25519SignerV1,
+    signer_genesis: SignerGenesisV1,
+    issuer: TrustedEd25519SignerV1,
+    allocation_intent: AllocationIntentV2,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    materials: dict[ProviderMaterialPurpose, bytearray],
+    _store: _Store,
+) -> None:
+    """Internal test-only seam; production callers cannot choose material values."""
+
+    candidate = provider_crypto._load_model(
+        (paths.root / paths.generation_receipt_name()).read_bytes(),
+        MaterialGenerationReceiptV1,
+        phase="material_generation_receipt",
+    )
+    if type(candidate) is not MaterialGenerationReceiptV1:
+        raise AssertionError("test fixture has no generation receipt")
+    provider_crypto._provision_keychain_materials_for_test(
+        paths,
+        policy=policy,
+        genesis=genesis,
+        attestation=attestation,
+        generation_receipt=candidate,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        allocation_intent=allocation_intent,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        materials=materials,
+        _store=_store,
     )
 
 
@@ -640,7 +784,7 @@ def test_material_policy_rejects_duplicate_purpose_and_reference() -> None:
     raw["materials"] = tuple(materials)
 
     with pytest.raises(ValueError, match="provider material policy fields"):
-        ProviderMaterialPolicyV1.model_validate(raw)
+        ProviderMaterialPolicyV2.model_validate(raw)
 
 
 @pytest.mark.parametrize("material_index", range(6))
@@ -657,7 +801,7 @@ def test_material_policy_rejects_reusing_the_signer_keychain_item(
     raw["materials"] = tuple(materials)
 
     with pytest.raises(ValueError, match="provider material policy fields"):
-        ProviderMaterialPolicyV1.model_validate(raw)
+        ProviderMaterialPolicyV2.model_validate(raw)
 
 
 @pytest.mark.parametrize(
@@ -1153,3 +1297,445 @@ def test_v2_tls_drift_cannot_construct_or_load_provider_readiness(
         )
     assert list(paths.root.iterdir()) == []
     assert store.add_calls == []
+
+
+class _TrackingRandom:
+    """Internal deterministic source used only to exercise the internal seam."""
+
+    def __init__(
+        self,
+        *,
+        fail_after: int | None = None,
+        partial_failure: bool = False,
+    ) -> None:
+        self.buffers: list[bytearray] = []
+        self.calls = 0
+        self.fail_after = fail_after
+        self.partial_failure = partial_failure
+
+    def fill(self, destination: bytearray) -> None:
+        self.buffers.append(destination)
+        if self.fail_after is not None and self.calls >= self.fail_after:
+            if self.partial_failure:
+                destination[: min(3, len(destination))] = b"\xff\xfe\xfd"[: len(destination)]
+            raise RuntimeError("material-must-not-escape")
+        seed = self.calls + 1
+        for index in range(len(destination)):
+            destination[index] = (seed + index) % 256
+        self.calls += 1
+
+
+def _test_keychain_signer(
+    bundle: tuple[
+        ProviderMaterialArtifactPaths,
+        AllocationIntentV2,
+        TrustedEd25519SignerV1,
+        Ed25519PrivateKey,
+        TrustedEd25519SignerV1,
+        SignerGenesisV1,
+        ProviderMaterialPolicyV2,
+        ProviderFingerprintAttestationV2,
+        ProviderMaterialGenesisV2,
+    ],
+) -> tuple[KeychainEd25519Signer, _Store]:
+    _, intent, issuer, material_key, _, signer_genesis, _, _, _ = bundle
+    store = _Store()
+    seed = bytearray(
+        material_key.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+    )
+    try:
+        reference = signer_genesis.keychain_reference
+        store.records[(reference.service, reference.account)] = bytes(seed)
+    finally:
+        for index in range(len(seed)):
+            seed[index] = 0
+    return (
+        KeychainEd25519Signer(
+            signer_genesis,
+            issuer=issuer,
+            allocation_intent=intent,
+            _store=store,
+        ),
+        store,
+    )
+
+
+def test_material_generation_exact_formats_and_zeroizes_mutable_buffers() -> None:
+    random = _TrackingRandom()
+    policy = _policy()
+    values = provider_crypto._generate_material_values(policy, random)
+    try:
+        assert set(values) == {spec.purpose for spec in policy.materials}
+        for spec in policy.materials:
+            provider_crypto._validate_value(spec, values[spec.purpose])
+        assert len(values[ProviderMaterialPurpose.COMMITMENT_HMAC]) == 32
+        assert len(values[ProviderMaterialPurpose.BACKUP_ENCRYPTION]) == 32
+        assert len(values[ProviderMaterialPurpose.INFISICAL_ENCRYPTION_KEY]) == 32
+        assert values[ProviderMaterialPurpose.INFISICAL_ENCRYPTION_KEY].isalnum()
+        assert len(values[ProviderMaterialPurpose.INFISICAL_AUTH_SECRET]) == 44
+        assert values[ProviderMaterialPurpose.INFISICAL_AUTH_SECRET].endswith(b"=")
+        for purpose in (
+            ProviderMaterialPurpose.PRIMARY_VALKEY_PASSWORD,
+            ProviderMaterialPurpose.RESTORE_VALKEY_PASSWORD,
+            ProviderMaterialPurpose.POSTGRES_APPLICATION_PASSWORD,
+        ):
+            assert len(values[purpose]) == 43
+            assert b"=" not in values[purpose]
+        assert any(any(buffer) for buffer in random.buffers)
+    finally:
+        for value in values.values():
+            provider_crypto._zeroize(value)
+    assert all(not any(buffer) for buffer in random.buffers)
+
+
+def test_material_generation_failure_zeroizes_partial_buffers_without_value_leakage() -> None:
+    random = _TrackingRandom(fail_after=2, partial_failure=True)
+
+    with pytest.raises(ProviderCryptoError, match="material_generator") as caught:
+        provider_crypto._generate_material_values(_policy(), random)
+
+    assert "material-must-not-escape" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert all(not any(buffer) for buffer in random.buffers)
+
+
+def test_signed_material_generation_receipt_binds_domain_and_exact_purpose_fingerprints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(provider_crypto, "_system_utc_clock", lambda: _BOOTSTRAP_CLOCK)
+    bundle = _signed_v2_material_bundle(tmp_path)
+    _, intent, issuer, material_key, _, signer_genesis, policy, _, _ = bundle
+    signer, _store = _test_keychain_signer(bundle)
+    values, attestation, receipt, _genesis = provider_crypto._generated_material_artifacts(
+        policy=policy,
+        signer=signer,
+        allocation_intent=intent,
+        random_source=_TrackingRandom(),
+    )
+    try:
+        provider_crypto.verify_material_generation_receipt(
+            receipt,
+            policy=policy,
+            attestation=attestation,
+            signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            allocation_intent=intent,
+        )
+        serialized = json.dumps(receipt.model_dump(mode="json"), sort_keys=True)
+        assert "value" not in serialized
+        assert "fingerprint_sha256" in serialized
+
+        swapped = receipt.model_copy(
+            update={
+                "materials": (receipt.materials[1], receipt.materials[0], *receipt.materials[2:])
+            }
+        )
+        with pytest.raises(ProviderCryptoError, match="artifact_signature"):
+            provider_crypto.verify_material_generation_receipt(
+                swapped,
+                policy=policy,
+                attestation=attestation,
+                signer=signer,
+                signer_genesis=signer_genesis,
+                issuer=issuer,
+                allocation_intent=intent,
+            )
+
+        cross_domain = receipt.model_copy(
+            update={
+                "signature_base64": base64.b64encode(
+                    material_key.sign(provider_material_policy_message(policy))
+                ).decode("ascii")
+            }
+        )
+        with pytest.raises(ProviderCryptoError, match="artifact_signature"):
+            provider_crypto.verify_material_generation_receipt(
+                cross_domain,
+                policy=policy,
+                attestation=attestation,
+                signer=signer,
+                signer_genesis=signer_genesis,
+                issuer=issuer,
+                allocation_intent=intent,
+            )
+    finally:
+        for value in values.values():
+            provider_crypto._zeroize(value)
+
+
+def test_generation_receipt_precedes_genesis_and_partial_create_is_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(provider_crypto, "_system_utc_clock", lambda: _BOOTSTRAP_CLOCK)
+    bundle = _signed_v2_material_bundle(tmp_path)
+    paths, intent, issuer, _material_key, signer, signer_genesis, policy, _, _ = bundle
+    signer_store, store = _test_keychain_signer(bundle)
+    persist_signer_genesis(paths, signer_genesis, issuer=issuer, allocation_intent=intent)
+    persist_provider_material_policy(
+        paths,
+        policy,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        allocation_intent=intent,
+        expected_disposal_owner=intent.disposal_owner,
+        expected_approver_identity=intent.approver_identity,
+    )
+    random = _TrackingRandom()
+    values, attestation, receipt, genesis = provider_crypto._generated_material_artifacts(
+        policy=policy,
+        signer=signer_store,
+        allocation_intent=intent,
+        random_source=random,
+    )
+    try:
+        persist_material_generation_receipt(
+            paths,
+            receipt,
+            policy=policy,
+            attestation=attestation,
+            signer=signer_store,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            allocation_intent=intent,
+        )
+        assert (paths.root / paths.generation_receipt_name()).is_file()
+        assert not (paths.root / paths.genesis_name()).exists()
+        assert store.add_calls == []
+        persist_provider_material_genesis(
+            paths,
+            genesis,
+            policy=policy,
+            attestation=attestation,
+            generation_receipt=receipt,
+            signer=signer_store,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            allocation_intent=intent,
+            expected_disposal_owner=intent.disposal_owner,
+            expected_approver_identity=intent.approver_identity,
+        )
+
+        class FailingStore(_Store):
+            def __init__(self, records: dict[tuple[str, str], bytes]) -> None:
+                super().__init__()
+                self.records = records
+                self.remaining = 1
+
+            def add_if_absent(self, service: str, account: str, value: bytearray) -> bool:
+                if self.remaining == 0:
+                    raise RuntimeError("material-must-not-escape")
+                self.remaining -= 1
+                return super().add_if_absent(service, account, value)
+
+        failing_store = FailingStore(dict(store.records))
+        with pytest.raises(ProviderCryptoError, match="material_provider") as caught:
+            provider_crypto._provision_keychain_materials_for_test(
+                paths,
+                policy=policy,
+                genesis=genesis,
+                attestation=attestation,
+                generation_receipt=receipt,
+                signer=signer_store,
+                signer_genesis=signer_genesis,
+                issuer=issuer,
+                allocation_intent=intent,
+                expected_disposal_owner=intent.disposal_owner,
+                expected_approver_identity=intent.approver_identity,
+                materials=values,
+                _store=failing_store,
+            )
+        assert "material-must-not-escape" not in str(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert all(not any(buffer) for buffer in random.buffers)
+        assert provider_material_genesis_status(paths, _store=failing_store) is (
+            ProviderMaterialGenesisStatus.PARTIAL_OR_RECONCILIATION_REQUIRED
+        )
+    finally:
+        for value in values.values():
+            provider_crypto._zeroize(value)
+
+
+def test_generation_receipt_replacement_after_genesis_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A different signed receipt cannot be substituted after pending genesis exists."""
+
+    monkeypatch.setattr(provider_crypto, "_system_utc_clock", lambda: _BOOTSTRAP_CLOCK)
+    bundle = _signed_v2_material_bundle(tmp_path)
+    _persist_v2_material_bundle(bundle)
+    paths, intent, issuer, material_key, signer, signer_genesis, policy, attestation, genesis = (
+        bundle
+    )
+    provision_keychain_materials(
+        paths,
+        policy=policy,
+        genesis=genesis,
+        attestation=attestation,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        allocation_intent=intent,
+        expected_disposal_owner=intent.disposal_owner,
+        expected_approver_identity=intent.approver_identity,
+        materials=_provider_values(),
+        _store=_Store(),
+    )
+    original = _signed_generation_receipt(
+        material_key=material_key,
+        signer=signer,
+        intent=intent,
+        policy=policy,
+        attestation=attestation,
+    )
+    unsigned_replacement = original.model_copy(
+        update={
+            "generation_id": "123e4567-e89b-42d3-a456-426614174015",
+            "signature_base64": base64.b64encode(b"0" * 64).decode("ascii"),
+        }
+    )
+    replacement = unsigned_replacement.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                material_key.sign(material_generation_receipt_message(unsigned_replacement))
+            ).decode("ascii")
+        }
+    )
+    (paths.root / paths.generation_receipt_name()).write_bytes(
+        provider_crypto._yaml_bytes(replacement)
+    )
+
+    with pytest.raises(ProviderCryptoError, match="material_genesis_binding"):
+        load_verified_provider_material_bundle(
+            paths,
+            signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            allocation_intent=intent,
+            expected_disposal_owner=intent.disposal_owner,
+            expected_approver_identity=intent.approver_identity,
+        )
+
+
+def test_noncanonical_persisted_material_artifact_blocks_public_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Signature validity never makes reordered/alternate persisted bytes acceptable."""
+
+    monkeypatch.setattr(provider_crypto, "_system_utc_clock", lambda: _BOOTSTRAP_CLOCK)
+    bundle = _signed_v2_material_bundle(tmp_path)
+    _persist_v2_material_bundle(bundle)
+    paths, intent, issuer, _material_key, signer, signer_genesis, policy, attestation, genesis = (
+        bundle
+    )
+    values = _provider_values()
+    provision_keychain_materials(
+        paths,
+        policy=policy,
+        genesis=genesis,
+        attestation=attestation,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        allocation_intent=intent,
+        expected_disposal_owner=intent.disposal_owner,
+        expected_approver_identity=intent.approver_identity,
+        materials=values,
+        _store=_Store(),
+    )
+    # JSON is valid YAML and reconstructs the same signed model, but it is not
+    # the single canonical owner-only artifact spelling.
+    (paths.root / paths.policy_name()).write_text(
+        json.dumps(policy.model_dump(mode="json"), sort_keys=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProviderCryptoError, match="material_policy"):
+        load_verified_provider_material_bundle(
+            paths,
+            signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            allocation_intent=intent,
+            expected_disposal_owner=intent.disposal_owner,
+            expected_approver_identity=intent.approver_identity,
+        )
+
+
+def test_cross_purpose_material_substitution_is_rejected_before_a_keychain_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Equal lengths never permit HMAC/AEAD or application slot cross-use."""
+
+    monkeypatch.setattr(provider_crypto, "_system_utc_clock", lambda: _BOOTSTRAP_CLOCK)
+    bundle = _signed_v2_material_bundle(tmp_path)
+    _persist_v2_material_bundle(bundle)
+    paths, intent, issuer, _material_key, signer, signer_genesis, policy, attestation, genesis = (
+        bundle
+    )
+    values = _provider_values()
+    (
+        values[ProviderMaterialPurpose.COMMITMENT_HMAC],
+        values[ProviderMaterialPurpose.BACKUP_ENCRYPTION],
+    ) = (
+        values[ProviderMaterialPurpose.BACKUP_ENCRYPTION],
+        values[ProviderMaterialPurpose.COMMITMENT_HMAC],
+    )
+    store = _Store()
+
+    with pytest.raises(ProviderCryptoError, match="material_fingerprint"):
+        provision_keychain_materials(
+            paths,
+            policy=policy,
+            genesis=genesis,
+            attestation=attestation,
+            signer=signer,
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            allocation_intent=intent,
+            expected_disposal_owner=intent.disposal_owner,
+            expected_approver_identity=intent.approver_identity,
+            materials=values,
+            _store=store,
+        )
+    assert store.add_calls == []
+    assert all(not any(value) for value in values.values())
+
+
+def test_public_material_provisioning_exposes_no_material_or_test_generator_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = _signed_v2_material_bundle(tmp_path)
+    paths, intent, issuer, _material_key, _, signer_genesis, policy, _, _ = bundle
+    parameter_names = set(inspect.signature(_production_provision_keychain_materials).parameters)
+    assert {"materials", "_store", "_random", "now", "clock"}.isdisjoint(parameter_names)
+    monkeypatch.setattr(provider_crypto.sys, "platform", "unsupported")
+    with pytest.raises(ProviderCryptoError, match="material_generator"):
+        _production_provision_keychain_materials(
+            paths,
+            policy=policy,
+            signer=object(),  # type: ignore[arg-type]
+            signer_genesis=signer_genesis,
+            issuer=issuer,
+            allocation_intent=intent,
+            expected_disposal_owner=intent.disposal_owner,
+            expected_approver_identity=intent.approver_identity,
+        )
+    assert list(paths.root.iterdir()) == []
+
+
+def test_direct_security_random_adapter_fails_closed_off_macos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_crypto.sys, "platform", "unsupported")
+    with pytest.raises(ProviderCryptoError, match="material_generator") as caught:
+        provider_crypto._MacOSSecurityRandom()
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
