@@ -61,6 +61,15 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     initial_provisioning_intent_sha256,
     validate_observed_candidate_transition,
 )
+from omninode_rsd.lifecycle.provider_crypto import (
+    ProviderFingerprintAttestationV1,
+    ProviderMaterialGenesisV1,
+    ProviderMaterialPolicyV1,
+    ReplayAuthorityPolicyArtifactV1,
+    verify_provider_material_bundle,
+    verify_provider_material_genesis,
+    verify_replay_authority_policy_artifact,
+)
 
 _SHA256: Final = r"^[0-9a-f]{64}$"
 _IDENTIFIER: Final = r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$"
@@ -81,6 +90,7 @@ _JOURNAL_GENESIS_ARTIFACT_NAME: Final = "journal-genesis.yaml"
 _INITIAL_INTENT_ARTIFACT_NAME: Final = "initial-provisioning-intent.yaml"
 _INITIAL_RECEIPT_ARTIFACT_NAME: Final = "initial-provisioning-receipt.yaml"
 _OBSERVED_ATTESTATION_ARTIFACT_NAME: Final = "observed-candidate-attestation.yaml"
+_REPLAY_POLICY_ARTIFACT_NAME: Final = "replay-authority-policy.yaml"
 _MARKED_EVIDENCE_NAMES: Final[frozenset[str]] = frozenset(_ARTIFACT_NAMES[2:-1])
 _SIGNATURE_DOMAIN: Final = b"omninode-rsd.authorization.ed25519.v3\x00"
 _INITIAL_INTENT_SIGNATURE_DOMAIN: Final = b"omninode-rsd.initial-provisioning-intent.ed25519.v1\x00"
@@ -716,6 +726,12 @@ class AuthorizationPaths:
 
         return _OBSERVED_ATTESTATION_ARTIFACT_NAME
 
+    @staticmethod
+    def replay_policy_name() -> str:
+        """Fixed signed preimage for the external replay namespace."""
+
+        return _REPLAY_POLICY_ARTIFACT_NAME
+
 
 @dataclass(frozen=True, slots=True)
 class _ArtifactVerification:
@@ -1265,6 +1281,13 @@ def _journal_genesis_artifact_bytes(receipt: JournalGenesisReceiptV1) -> bytes:
         raise AuthorizationError("journal_genesis_artifact") from None
 
 
+def _replay_policy_artifact_bytes(artifact: ReplayAuthorityPolicyArtifactV1) -> bytes:
+    try:
+        return yaml.safe_dump(artifact.model_dump(mode="json"), sort_keys=True).encode("utf-8")
+    except (TypeError, ValueError, yaml.YAMLError):
+        raise AuthorizationError("replay_policy_artifact") from None
+
+
 def _verify_signature(
     *,
     sidecar: DetachedAuthorizationSignatureV1,
@@ -1605,6 +1628,81 @@ def _read_verified_initial_intent(
         ),
         raw,
     )
+
+
+def _read_replay_policy_artifact(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    initial_intent: InitialProvisioningIntentV1,
+    replay_policy: ReplayAuthorityPolicyV1,
+    reader: _OwnerOnlyReader,
+) -> tuple[ReplayAuthorityPolicyArtifactV1, bytes]:
+    """Verify the root-persisted replay policy before a tombstone is claimed."""
+
+    def read_and_verify() -> tuple[ReplayAuthorityPolicyArtifactV1, bytes]:
+        raw = reader.read(paths.replay_policy_name())
+        artifact = ReplayAuthorityPolicyArtifactV1.model_validate(
+            _parse_document(raw, phase="replay_policy_artifact")
+        )
+        verify_replay_authority_policy_artifact(
+            artifact,
+            signer=signer,
+            initial_intent=initial_intent,
+            expected_policy_sha256=replay_policy.sha256(),
+        )
+        return artifact, raw
+
+    result = _safe_call(read_and_verify)
+    if (
+        type(result) is not tuple
+        or len(result) != 2
+        or type(result[0]) is not ReplayAuthorityPolicyArtifactV1
+        or type(result[1]) is not bytes
+    ):
+        raise AuthorizationError("replay_policy_artifact")
+    return result[0], result[1]
+
+
+def _trusted_provider_fingerprints(
+    *,
+    policy: ProviderMaterialPolicyV1,
+    attestation: ProviderFingerprintAttestationV1,
+    genesis: ProviderMaterialGenesisV1,
+    signer: TrustedEd25519SignerV1,
+    initial_intent: InitialProvisioningIntentV1,
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    now: datetime,
+) -> dict[str, str]:
+    """Admit only a signed policy, pending genesis, and attestation bundle."""
+
+    def verify() -> dict[str, str]:
+        fingerprints = verify_provider_material_bundle(
+            policy,
+            attestation,
+            signer=signer,
+            initial_intent=initial_intent,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            now=now,
+        )
+        verify_provider_material_genesis(
+            genesis,
+            policy=policy,
+            attestation=attestation,
+            signer=signer,
+            initial_intent=initial_intent,
+        )
+        return fingerprints
+
+    fingerprints = _safe_call(verify)
+    if type(fingerprints) is not dict or not all(
+        type(reference) is str and type(fingerprint) is str
+        for reference, fingerprint in fingerprints.items()
+    ):
+        raise AuthorizationError("provider_material_attestation")
+    return fingerprints
 
 
 def _safe_call(call: Callable[[], object]) -> object:
@@ -4843,15 +4941,6 @@ def _release_provider_lease(manager: object) -> bool:
     return _safe_call(lambda: exit_method(None, None, None)) is not _SAFE_CALL_FAILURE
 
 
-def _normalized_fingerprints(fingerprints: Mapping[str, str]) -> dict[str, str]:
-    normalized = _safe_call(lambda: dict(fingerprints))
-    if type(normalized) is not dict or not all(
-        type(key) is str and type(value) is str for key, value in normalized.items()
-    ):
-        raise AuthorizationError("provider_policy")
-    return normalized
-
-
 def _mark_effect_ambiguous(
     journal: SQLiteAuthorizationJournal, verified: _VerifiedExecution
 ) -> None:
@@ -4947,6 +5036,7 @@ def _provision_initial_journal_with_clock(
     intent: InitialProvisioningIntentV1,
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
+    replay_policy_artifact: ReplayAuthorityPolicyArtifactV1,
     clock: Callable[[], datetime],
     _capability: object,
 ) -> InitialJournalProvisioningReceiptV1:
@@ -4960,11 +5050,22 @@ def _provision_initial_journal_with_clock(
         or type(journal) is not SQLiteInitialProvisioningJournal
         or type(intent) is not InitialProvisioningIntentV1
         or type(replay_policy) is not ReplayAuthorityPolicyV1
+        or type(replay_policy_artifact) is not ReplayAuthorityPolicyArtifactV1
     ):
         raise AuthorizationError("initial_journal_genesis")
     _replay_claim_method(replay_authority)
     now = _read_clock(clock)
     _verify_initial_intent_signature(intent, signer=signer)
+    replay_policy_verified = _safe_call(
+        lambda: verify_replay_authority_policy_artifact(
+            replay_policy_artifact,
+            signer=signer,
+            initial_intent=intent,
+            expected_policy_sha256=replay_policy.sha256(),
+        )
+    )
+    if replay_policy_verified is _SAFE_CALL_FAILURE:
+        raise AuthorizationError("replay_policy_artifact")
     try:
         created = datetime.fromisoformat(intent.created_at.removesuffix("Z") + "+00:00")
         retained = datetime.fromisoformat(intent.retention_expires_at.removesuffix("Z") + "+00:00")
@@ -4992,6 +5093,7 @@ def _provision_initial_journal_with_clock(
             raise AuthorizationError("initial_journal_replayed")
         artifact_lease.assert_absent(paths.initial_intent_name(), phase="initial_journal_replayed")
         artifact_lease.assert_absent(paths.initial_receipt_name(), phase="initial_journal_replayed")
+        artifact_lease.assert_absent(paths.replay_policy_name(), phase="initial_journal_replayed")
         journal._begin_verified_intent(verified)
         _claim_replay_tombstone(
             replay_authority,
@@ -5002,6 +5104,11 @@ def _provision_initial_journal_with_clock(
         artifact_lease.write_once(
             paths.initial_intent_name(),
             _initial_intent_artifact_bytes(intent),
+            phase="initial_journal_replayed",
+        )
+        artifact_lease.write_once(
+            paths.replay_policy_name(),
+            _replay_policy_artifact_bytes(replay_policy_artifact),
             phase="initial_journal_replayed",
         )
         journal._complete_verified_intent(verified)
@@ -5028,6 +5135,7 @@ def provision_initial_journal(
     intent: InitialProvisioningIntentV1,
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
+    replay_policy_artifact: ReplayAuthorityPolicyArtifactV1,
 ) -> InitialJournalProvisioningReceiptV1:
     """Provision the separate pre-creation journal exactly once."""
 
@@ -5040,6 +5148,7 @@ def provision_initial_journal(
         intent=intent,
         replay_authority=replay_authority,
         replay_policy=replay_policy,
+        replay_policy_artifact=replay_policy_artifact,
         clock=_system_utc_clock,
         _capability=_SYSTEM_CLOCK_CAPABILITY,
     )
@@ -5055,6 +5164,7 @@ def _provision_initial_journal_for_test(
     intent: InitialProvisioningIntentV1,
     replay_authority: ProtocolReplayAuthority,
     replay_policy: ReplayAuthorityPolicyV1,
+    replay_policy_artifact: ReplayAuthorityPolicyArtifactV1,
     _clock: Callable[[], datetime],
     _capability: object,
 ) -> InitialJournalProvisioningReceiptV1:
@@ -5071,6 +5181,7 @@ def _provision_initial_journal_for_test(
         intent=intent,
         replay_authority=replay_authority,
         replay_policy=replay_policy,
+        replay_policy_artifact=replay_policy_artifact,
         clock=_clock,
         _capability=_TEST_CLOCK_CAPABILITY,
     )
@@ -5088,7 +5199,9 @@ def _authorize_initial_provisioning_and_execute_with_clock(
     *,
     signer: TrustedEd25519SignerV1,
     provider: ProviderProvenanceAdapter,
-    provider_fingerprints: Mapping[str, str],
+    provider_material_policy: ProviderMaterialPolicyV1,
+    provider_fingerprint_attestation: ProviderFingerprintAttestationV1,
+    provider_material_genesis: ProviderMaterialGenesisV1,
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteInitialProvisioningJournal,
@@ -5104,11 +5217,13 @@ def _authorize_initial_provisioning_and_execute_with_clock(
         or type(signer) is not TrustedEd25519SignerV1
         or type(journal) is not SQLiteInitialProvisioningJournal
         or type(replay_policy) is not ReplayAuthorityPolicyV1
+        or type(provider_material_policy) is not ProviderMaterialPolicyV1
+        or type(provider_fingerprint_attestation) is not ProviderFingerprintAttestationV1
+        or type(provider_material_genesis) is not ProviderMaterialGenesisV1
         or not callable(effect)
     ):
         raise AuthorizationError("initial_journal_effect")
     _replay_claim_method(replay_authority)
-    fingerprints = _normalized_fingerprints(provider_fingerprints)
     with ArtifactRootLease(paths.root) as artifact_lease:
         artifact_lease.assert_stable()
         _require_current_initial_journal(journal.migration_status())
@@ -5122,6 +5237,23 @@ def _authorize_initial_provisioning_and_execute_with_clock(
         )
         _verify_initial_intent_binding(
             verified_intent, journal=journal, replay_policy=replay_policy
+        )
+        replay_artifact, replay_raw = _read_replay_policy_artifact(
+            paths,
+            signer=signer,
+            initial_intent=verified_intent.intent,
+            replay_policy=replay_policy,
+            reader=artifact_lease.reader(),
+        )
+        fingerprints = _trusted_provider_fingerprints(
+            policy=provider_material_policy,
+            attestation=provider_fingerprint_attestation,
+            genesis=provider_material_genesis,
+            signer=signer,
+            initial_intent=verified_intent.intent,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            now=_read_clock(clock),
         )
         journal.assert_intent(verified_intent)
         journal_pin = journal._pin_execution_identity()
@@ -5150,6 +5282,15 @@ def _authorize_initial_provisioning_and_execute_with_clock(
                 reader=artifact_lease.reader(),
             )
             if repeated_intent != verified_intent or repeated_raw != initial_raw:
+                raise AuthorizationError("initial_artifact_race")
+            repeated_replay_artifact, repeated_replay_raw = _read_replay_policy_artifact(
+                paths,
+                signer=signer,
+                initial_intent=repeated_intent.intent,
+                replay_policy=replay_policy,
+                reader=artifact_lease.reader(),
+            )
+            if repeated_replay_artifact != replay_artifact or repeated_replay_raw != replay_raw:
                 raise AuthorizationError("initial_artifact_race")
             final_provider_sha256, final_expectations = _provider_commitment(
                 references=references,
@@ -5281,7 +5422,9 @@ def authorize_initial_provisioning_and_execute(
     *,
     signer: TrustedEd25519SignerV1,
     provider: ProviderProvenanceAdapter,
-    provider_fingerprints: Mapping[str, str],
+    provider_material_policy: ProviderMaterialPolicyV1,
+    provider_fingerprint_attestation: ProviderFingerprintAttestationV1,
+    provider_material_genesis: ProviderMaterialGenesisV1,
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteInitialProvisioningJournal,
@@ -5295,7 +5438,9 @@ def authorize_initial_provisioning_and_execute(
         paths,
         signer=signer,
         provider=provider,
-        provider_fingerprints=provider_fingerprints,
+        provider_material_policy=provider_material_policy,
+        provider_fingerprint_attestation=provider_fingerprint_attestation,
+        provider_material_genesis=provider_material_genesis,
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
         journal=journal,
@@ -5311,7 +5456,9 @@ def _authorize_initial_provisioning_and_execute_for_test(
     *,
     signer: TrustedEd25519SignerV1,
     provider: ProviderProvenanceAdapter,
-    provider_fingerprints: Mapping[str, str],
+    provider_material_policy: ProviderMaterialPolicyV1,
+    provider_fingerprint_attestation: ProviderFingerprintAttestationV1,
+    provider_material_genesis: ProviderMaterialGenesisV1,
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteInitialProvisioningJournal,
@@ -5329,7 +5476,9 @@ def _authorize_initial_provisioning_and_execute_for_test(
         paths,
         signer=signer,
         provider=provider,
-        provider_fingerprints=provider_fingerprints,
+        provider_material_policy=provider_material_policy,
+        provider_fingerprint_attestation=provider_fingerprint_attestation,
+        provider_material_genesis=provider_material_genesis,
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
         journal=journal,
@@ -5534,7 +5683,9 @@ def _authorize_and_execute_with_clock(
     *,
     signer: TrustedEd25519SignerV1,
     provider: ProviderProvenanceAdapter,
-    provider_fingerprints: Mapping[str, str],
+    provider_material_policy: ProviderMaterialPolicyV1,
+    provider_fingerprint_attestation: ProviderFingerprintAttestationV1,
+    provider_material_genesis: ProviderMaterialGenesisV1,
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
@@ -5557,11 +5708,13 @@ def _authorize_and_execute_with_clock(
         or type(journal) is not SQLiteAuthorizationJournal
         or type(initial_journal) is not SQLiteInitialProvisioningJournal
         or type(replay_policy) is not ReplayAuthorityPolicyV1
+        or type(provider_material_policy) is not ProviderMaterialPolicyV1
+        or type(provider_fingerprint_attestation) is not ProviderFingerprintAttestationV1
+        or type(provider_material_genesis) is not ProviderMaterialGenesisV1
         or not callable(effect)
     ):
         raise AuthorizationError("journal_effect")
     _replay_claim_method(replay_authority)
-    fingerprints = _normalized_fingerprints(provider_fingerprints)
     with ArtifactRootLease(paths.root) as artifact_lease:
         artifact_lease.assert_stable()
         _require_current_journal(journal.migration_status())
@@ -5592,6 +5745,23 @@ def _authorize_and_execute_with_clock(
         )
         _verify_initial_intent_binding(
             verified_initial_intent, journal=initial_journal, replay_policy=replay_policy
+        )
+        replay_artifact, replay_raw = _read_replay_policy_artifact(
+            paths,
+            signer=signer,
+            initial_intent=initial_stage.intent,
+            replay_policy=replay_policy,
+            reader=artifact_lease.reader(),
+        )
+        fingerprints = _trusted_provider_fingerprints(
+            policy=provider_material_policy,
+            attestation=provider_fingerprint_attestation,
+            genesis=provider_material_genesis,
+            signer=signer,
+            initial_intent=initial_stage.intent,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            now=_read_clock(clock),
         )
         initial_journal.assert_intent(verified_initial_intent)
         if (
@@ -5653,6 +5823,13 @@ def _authorize_and_execute_with_clock(
                 now=_read_clock(clock),
                 reader=artifact_lease.reader(),
             )
+            repeated_replay_artifact, repeated_replay_raw = _read_replay_policy_artifact(
+                paths,
+                signer=signer,
+                initial_intent=repeated_stage.intent,
+                replay_policy=replay_policy,
+                reader=artifact_lease.reader(),
+            )
             try:
                 validate_observed_candidate_transition(
                     repeated_stage.intent,
@@ -5672,6 +5849,8 @@ def _authorize_and_execute_with_clock(
                 or genesis != repeated_genesis
                 or snapshot != repeated_snapshot
                 or initial_stage_snapshot != repeated_stage_snapshot
+                or replay_artifact != repeated_replay_artifact
+                or replay_raw != repeated_replay_raw
             ):
                 raise AuthorizationError("artifact_race")
             final_provider_sha256, final_expectations = _provider_commitment(
@@ -5711,6 +5890,13 @@ def _authorize_and_execute_with_clock(
                 now=authorization_clock,
                 reader=artifact_lease.reader(),
             )
+            terminal_replay_artifact, terminal_replay_raw = _read_replay_policy_artifact(
+                paths,
+                signer=signer,
+                initial_intent=terminal_stage.intent,
+                replay_policy=replay_policy,
+                reader=artifact_lease.reader(),
+            )
             try:
                 validate_observed_candidate_transition(
                     terminal_stage.intent,
@@ -5733,6 +5919,8 @@ def _authorize_and_execute_with_clock(
                 or snapshot != repeated_snapshot
                 or snapshot != terminal_snapshot
                 or initial_stage_snapshot != terminal_stage_snapshot
+                or replay_artifact != terminal_replay_artifact
+                or replay_raw != terminal_replay_raw
             ):
                 raise AuthorizationError("artifact_race")
             idempotency_key = _idempotency_key(
@@ -5847,7 +6035,9 @@ def _authorize_and_execute_for_test(
     *,
     signer: TrustedEd25519SignerV1,
     provider: ProviderProvenanceAdapter,
-    provider_fingerprints: Mapping[str, str],
+    provider_material_policy: ProviderMaterialPolicyV1,
+    provider_fingerprint_attestation: ProviderFingerprintAttestationV1,
+    provider_material_genesis: ProviderMaterialGenesisV1,
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
@@ -5866,7 +6056,9 @@ def _authorize_and_execute_for_test(
         paths,
         signer=signer,
         provider=provider,
-        provider_fingerprints=provider_fingerprints,
+        provider_material_policy=provider_material_policy,
+        provider_fingerprint_attestation=provider_fingerprint_attestation,
+        provider_material_genesis=provider_material_genesis,
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
         journal=journal,
@@ -5883,7 +6075,9 @@ def authorize_and_execute(
     *,
     signer: TrustedEd25519SignerV1,
     provider: ProviderProvenanceAdapter,
-    provider_fingerprints: Mapping[str, str],
+    provider_material_policy: ProviderMaterialPolicyV1,
+    provider_fingerprint_attestation: ProviderFingerprintAttestationV1,
+    provider_material_genesis: ProviderMaterialGenesisV1,
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
@@ -5898,7 +6092,9 @@ def authorize_and_execute(
         paths,
         signer=signer,
         provider=provider,
-        provider_fingerprints=provider_fingerprints,
+        provider_material_policy=provider_material_policy,
+        provider_fingerprint_attestation=provider_fingerprint_attestation,
+        provider_material_genesis=provider_material_genesis,
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
         journal=journal,

@@ -203,6 +203,57 @@ stored binding separately commits the journal identity and every applicable
 intent, proposal, contract, provider, and idempotency hash. Moving local files
 therefore cannot make a logical operation claimable again.
 
+### Provider-crypto bootstrap
+
+Provider material has a separate create-only bootstrap boundary. It is not a
+runtime secret-delivery API and it does not authorize an effect by itself.
+`SignerGenesisV1` is issuer-signed with its own Ed25519 domain and binds the
+initial-intent digest, Keychain service/account/version/reference hash, seed
+fingerprint, derived public key, and public-key fingerprint. The signer can
+only be provisioned or loaded after that signature and intent binding are
+verified; duplicate Keychain rows fail closed.
+
+`ReplayAuthorityPolicyArtifactV1` signs the exact replay service and account
+prefix plus the typed replay-policy digest. Initial journal provisioning writes
+that immutable artifact before it claims a tombstone, and both authorization
+stages re-read and verify it before they can claim an operation tombstone.
+
+`ProviderMaterialPolicyV1`, `ProviderFingerprintAttestationV1`, and the
+pending `ProviderMaterialGenesisV1` bind the exact intent, owner, approver,
+retention, purpose, provider reference, version, encoding, and value-free
+fingerprint for every material item. The material genesis is persisted only
+after the matching policy and before any Keychain write. A completed
+attestation is written only after all create-once rows succeed. Any duplicate,
+partial, missing, changed, malformed, or interrupted state is diagnostic-only
+and blocks automatic retry or replacement.
+
+For macOS Keychain material, the immutable account name carries its declared
+version as a `.v<version>` suffix, in addition to the signed reference hash.
+This makes a version transition a distinct create-once item rather than an
+interpretation of an older row.
+
+The public material policy has fixed purpose-to-format bindings: commitment
+HMAC and backup AES-256-GCM keys are each 32 raw bytes; the normal Infisical
+encryption key is 16 random bytes in 32 lower-case hex characters; Infisical
+auth secret is 32 random bytes in canonical standard Base64; each Valkey
+password is a distinct 32-random-byte unpadded Base64URL value; and the TLS
+trust anchor is exactly one canonical PEM X.509 CA certificate. Fingerprints
+must be pairwise distinct, so HMAC and AEAD key material cannot be
+cross-substituted. The FIPS-specific Infisical encryption-key spelling is not
+accepted by this policy version.
+
+The macOS implementation calls Security.framework directly with create-only
+generic-password operations; it does not invoke a Keychain command-line tool,
+update or delete an item, read configuration, or return a provider value to an
+authorization callback. Values are accepted only as bounded in-memory
+`bytearray` instances and overwritten best-effort after use. Adapter failures
+are surfaced only as generic value-redacted errors.
+
+This boundary intentionally represents a CA trust anchor only. TLS server
+certificate and associated signing-key generation, custody, installation, and
+runtime termination are not defined or authorized here; they require a separate
+signed intent and policy amendment before any provisioning work.
+
 The observed SQLite journal requires an owner-only directory and database file, uses
 `BEGIN IMMEDIATE`, `DELETE` journaling, and `FULL` synchronous durability. A
 one-time, `O_EXCL` anchor in that directory binds a random journal ID, canonical
