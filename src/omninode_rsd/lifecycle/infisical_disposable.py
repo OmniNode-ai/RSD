@@ -33,6 +33,7 @@ _SHA256: Final = r"^[0-9a-f]{64}$"
 _COMMIT: Final = r"^[0-9a-f]{40}$"
 _UUID: Final = r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 _IDENTIFIER: Final = r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$"
+_OWNER_IDENTITY: Final = r"^[A-Za-z0-9][A-Za-z0-9@._+-]{0,254}$"
 _TIMESTAMP: Final = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:[.][0-9]{1,6})?Z\Z"
 )
@@ -551,7 +552,7 @@ class ProposalV1(_Model):
     restore_image: ImageReferenceV1
     provider_references: ProviderReferencesV1
     retention_expires_at: str
-    disposal_owner: str = Field(pattern=_IDENTIFIER)
+    disposal_owner: str = Field(pattern=_OWNER_IDENTITY)
     approval_reference_sha256: str = Field(pattern=_SHA256)
 
     @field_validator("retention_expires_at")
@@ -729,7 +730,7 @@ class ApprovalEvidenceV1(_Model):
     source_commit: str = Field(pattern=_COMMIT)
     issued_at: str
     expires_at: str
-    approver_identity: str = Field(pattern=_IDENTIFIER)
+    approver_identity: str = Field(pattern=_OWNER_IDENTITY)
     proposal_authorized: Literal[True]
     execution_authorized: Literal[False]
     signature: DetachedSignatureV1
@@ -756,7 +757,7 @@ class PreflightReceiptV1(_Model):
     proposal_sha256: str = Field(pattern=_SHA256)
     candidate_composite_sha256: str = Field(pattern=_SHA256)
     retention_expires_at: str
-    disposal_owner: str = Field(pattern=_IDENTIFIER)
+    disposal_owner: str = Field(pattern=_OWNER_IDENTITY)
     emitted_at: str
     evidence_sha256: tuple[str, str, str, str, str, str]
 
@@ -1030,7 +1031,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     preflight = commands.add_parser("preflight", help="compile value-free Phase-A artifacts")
     preflight.add_argument("--root", type=Path, required=True)
+    authorize = commands.add_parser("authorize", help="verify Phase-B authorization read-only")
+    authorize.add_argument("--root", type=Path, required=True)
     arguments = parser.parse_args(argv)
+    if arguments.command == "authorize":
+        from omninode_rsd.lifecycle.authorization import main as authorization_main
+
+        return authorization_main(["authorize", "--root", str(arguments.root)])
     try:
         receipt = compile_preflight(PreflightPaths(root=arguments.root))
     except DisposablePreflightError as error:

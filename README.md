@@ -93,6 +93,28 @@ database.
 The bundled YAML file documents the states and transitions supported by the
 library.
 
+## Phase-B authorization
+
+`omninode_rsd.lifecycle.authorize()` is a separate, read-only trust boundary
+for a disposable acceptance workflow. It accepts an injected Ed25519 trust
+anchor, provider-provenance adapter, and provider fingerprint policy. It
+requires actual detached-signature sidecars for the proposal, final contract,
+and evidence artifacts; Phase-A signature markers alone never authorize.
+
+The verifier reads bounded owner-only artifact files, runs Phase-A before and
+after provider inspection, and rejects changed content, sidecars, unsafe file
+metadata, stale evidence, expired retention, signer mismatch, provider
+mismatch, and replayed journal claims. A positive `AuthorizationDecisionV1`
+contains a nonce and receipt hash. A mutating runtime must first call
+`consume_authorization()` with its durable atomic journal; this package has no
+such runtime and performs no mutation.
+
+The `rsd-infisical-disposable-lifecycle authorize --root <directory>` and
+`rsd-lifecycle-authorize authorize --root <directory>` commands are
+deliberately read-only. They have no trust-anchor or provider-value command
+line arguments and therefore block until an embedding runtime injects those
+trusted boundaries.
+
 ## Event ingestion
 
 Use `InMemoryEventLog.ingest(intent, LifecycleEventIngress())` for in-memory

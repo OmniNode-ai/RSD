@@ -2,13 +2,28 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 import yaml
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from omninode_rsd.lifecycle.authorization import (
+    AuthorizationError,
+    AuthorizationPaths,
+    ProviderProvenance,
+    TrustedEd25519SignerV1,
+    _signature_message,
+    authorize,
+    consume_authorization,
+)
+from omninode_rsd.lifecycle.authorization import (
+    main as authorization_main,
+)
 from omninode_rsd.lifecycle.infisical_disposable import (
     ApprovalEvidenceV1,
     CandidateCompositeV1,
@@ -572,3 +587,199 @@ def test_cli_blocks_without_creating_artifacts(
     output = capsys.readouterr().out
     assert '"status":"blocked"' in output
     assert list(root.iterdir()) == []
+
+
+class _Provider:
+    def __init__(self, fingerprints: Mapping[str, str], *, mutate: Path | None = None) -> None:
+        self._fingerprints = fingerprints
+        self._mutate = mutate
+        self._mutated = False
+
+    def inspect(self, reference: ProviderReferenceV1) -> ProviderProvenance | None:
+        if self._mutate is not None and not self._mutated:
+            self._mutate.write_text(
+                self._mutate.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+            )
+            self._mutate.chmod(0o600)
+            self._mutated = True
+        return ProviderProvenance(
+            provider=reference.provider,
+            service=reference.service,
+            account=reference.account,
+            version=reference.version,
+            reference_sha256=reference.reference_sha256,
+            fingerprint_sha256=self._fingerprints[reference.reference_sha256],
+        )
+
+
+class _Journal:
+    def __init__(self) -> None:
+        self.claims: set[tuple[str, str, str]] = set()
+
+    def claim(self, *, operation_id: str, nonce: str, receipt_sha256: str) -> bool:
+        item = (operation_id, nonce, receipt_sha256)
+        if item in self.claims:
+            return False
+        self.claims.add(item)
+        return True
+
+
+def _authorize_materials(root: Path) -> tuple[TrustedEd25519SignerV1, dict[str, str]]:
+    """Create value-free sidecars after Phase-A materials have been compiled."""
+
+    _materials(root)
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes_raw()
+    signer = TrustedEd25519SignerV1(
+        key_id="test-signer",
+        public_key_base64=base64.b64encode(public).decode(),
+        public_key_fingerprint_sha256=_digest(public),
+    )
+    evidence_names = (
+        "approval.yaml",
+        "governed-baseline.yaml",
+        "target-attestation.yaml",
+        "provider-declaration.yaml",
+        "registry-verification.yaml",
+    )
+    for name in evidence_names:
+        raw = yaml.safe_load((root / name).read_text(encoding="utf-8"))
+        assert type(raw) is dict
+        signature = raw["signature"]
+        assert type(signature) is dict
+        signature["signer_key_id"] = signer.key_id
+        signature["signer_public_key_fingerprint_sha256"] = signer.public_key_fingerprint_sha256
+        (root / name).write_bytes(yaml.safe_dump(raw, sort_keys=True).encode())
+        (root / name).chmod(0o600)
+    contract = yaml.safe_load((root / "runtime-contract.yaml").read_text(encoding="utf-8"))
+    assert type(contract) is dict
+    evidence = contract["evidence"]
+    assert type(evidence) is dict
+    for name, field in (
+        ("approval.yaml", "approval_sha256"),
+        ("governed-baseline.yaml", "governed_baseline_sha256"),
+        ("target-attestation.yaml", "target_attestation_sha256"),
+        ("provider-declaration.yaml", "provider_declaration_sha256"),
+        ("registry-verification.yaml", "registry_verification_sha256"),
+        ("postgres-overlay.yaml", "postgres_overlay_sha256"),
+    ):
+        evidence[field] = _digest((root / name).read_bytes())
+    (root / "runtime-contract.yaml").write_bytes(yaml.safe_dump(contract, sort_keys=True).encode())
+    (root / "runtime-contract.yaml").chmod(0o600)
+    for name in (
+        "proposal.yaml",
+        "runtime-contract.yaml",
+        "approval.yaml",
+        "governed-baseline.yaml",
+        "target-attestation.yaml",
+        "provider-declaration.yaml",
+        "registry-verification.yaml",
+        "postgres-overlay.yaml",
+    ):
+        artifact_sha256 = _digest((root / name).read_bytes())
+        sidecar = {
+            "algorithm": "ed25519",
+            "artifact_name": name,
+            "artifact_sha256": artifact_sha256,
+            "schema_version": "rsd.authorization-signature.v1",
+            "signature_base64": base64.b64encode(
+                key.sign(_signature_message(name, artifact_sha256))
+            ).decode(),
+            "signer_key_id": signer.key_id,
+        }
+        target = root / AuthorizationPaths.signature_name(name)
+        target.write_bytes(yaml.safe_dump(sidecar, sort_keys=True).encode())
+        target.chmod(0o600)
+    fingerprints = {
+        reference.reference_sha256: _digest(f"fingerprint:{index}".encode())
+        for index, reference in enumerate(_proposal().provider_references.all())
+    }
+    return signer, fingerprints
+
+
+def test_phase_b_authorizes_real_signatures_and_consumes_one_nonce(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints = _authorize_materials(root)
+
+    decision = authorize(
+        AuthorizationPaths(root),
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        now=_NOW,
+        nonce_factory=lambda: "a" * 32,
+    )
+
+    assert decision.status == "authorized"
+    journal = _Journal()
+    consume_authorization(decision, journal)
+    with pytest.raises(AuthorizationError, match="nonce_replayed"):
+        consume_authorization(decision, journal)
+
+
+def test_phase_b_rejects_sidecar_race_and_provider_mismatch(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints = _authorize_materials(root)
+    raced_sidecar = root / AuthorizationPaths.signature_name("proposal.yaml")
+
+    with pytest.raises(AuthorizationError, match="artifact_race"):
+        authorize(
+            AuthorizationPaths(root),
+            signer=signer,
+            provider=_Provider(fingerprints, mutate=raced_sidecar),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            now=_NOW,
+        )
+
+    wrong = dict(fingerprints)
+    first = next(iter(wrong))
+    wrong[first] = "0" * 64
+    with pytest.raises(AuthorizationError, match="provider_provenance"):
+        authorize(
+            AuthorizationPaths(root),
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=wrong,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            now=_NOW,
+        )
+
+
+def test_phase_b_rejects_marker_only_signature_and_cli_is_read_only(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints = _authorize_materials(root)
+    (root / AuthorizationPaths.signature_name("approval.yaml")).unlink()
+
+    with pytest.raises(AuthorizationError, match="artifact_snapshot"):
+        authorize(
+            AuthorizationPaths(root),
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            now=_NOW,
+        )
+    assert authorization_main(["authorize", "--root", str(root)]) == 2
+    assert main(["authorize", "--root", str(root)]) == 2
+
+
+def test_phase_b_rejects_disposal_owner_or_approval_mismatch(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints = _authorize_materials(root)
+
+    with pytest.raises(AuthorizationError, match="owner_approval"):
+        authorize(
+            AuthorizationPaths(root),
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="wrong-owner",
+            expected_approver_identity="approval-owner",
+            now=_NOW,
+        )
