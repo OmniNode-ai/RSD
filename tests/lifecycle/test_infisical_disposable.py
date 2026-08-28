@@ -32,7 +32,12 @@ from omninode_rsd.lifecycle.authorization import (
     JournalGenesisReceiptV1,
     JournalGenesisReconciliationReceiptV1,
     JournalMigrationStatus,
+    MacOSKeychainReplayAuthority,
+    ProtocolReplayAuthority,
     ProviderProvenance,
+    ReplayAuthorityClaimResult,
+    ReplayAuthorityPolicyV1,
+    ReplayTombstoneV1,
     SQLiteAuthorizationJournal,
     TrustedEd25519SignerV1,
     VerifiedExecutionContext,
@@ -88,10 +93,97 @@ _IMAGE = ImageReferenceV1(reference=f"registry.example.test/infisical@sha256:{'c
 _CACHE_IMAGE = ImageReferenceV1(reference=f"registry.example.test/valkey@sha256:{'d' * 64}")
 _TEST_SIGNING_KEYS: dict[str, Ed25519PrivateKey] = {}
 _TEST_PROVISION_LOCK = Lock()
+_TEST_REPLAY_POLICY = ReplayAuthorityPolicyV1(
+    schema_version="rsd.replay-authority-policy.v1",
+    service="omninode-rsd-test-replay",
+    account_prefix="rsd-test-tombstone",
+)
+_TEST_REPLAY_AUTHORITIES: dict[str, _AtomicReplayAuthority] = {}
+_TEST_REPLAY_AUTHORITIES_LOCK = Lock()
 
 
 class _StringQueue(Protocol):
     def put(self, value: str) -> None: ...
+
+
+class _AtomicReplayAuthority:
+    """Test-only atomic store; production APIs never supply a fallback."""
+
+    def __init__(self) -> None:
+        self._claims: dict[tuple[str, str], bytes] = {}
+        self.tombstones: list[ReplayTombstoneV1] = []
+        self._lock = Lock()
+
+    def claim_once(self, tombstone: ReplayTombstoneV1) -> ReplayAuthorityClaimResult:
+        value = tombstone.value_bytes()
+        key = (tombstone.service, tombstone.account)
+        with self._lock:
+            existing = self._claims.get(key)
+            if existing is None:
+                self._claims[key] = value
+                self.tombstones.append(tombstone)
+                return ReplayAuthorityClaimResult.CREATED
+            if existing == value:
+                return ReplayAuthorityClaimResult.DUPLICATE_SAME
+            return ReplayAuthorityClaimResult.DUPLICATE_CONFLICT
+
+
+def _test_replay_authority(journal: SQLiteAuthorizationJournal) -> _AtomicReplayAuthority:
+    key = str(journal._path)
+    with _TEST_REPLAY_AUTHORITIES_LOCK:
+        authority = _TEST_REPLAY_AUTHORITIES.get(key)
+        if authority is None:
+            authority = _AtomicReplayAuthority()
+            _TEST_REPLAY_AUTHORITIES[key] = authority
+        return authority
+
+
+class _FilesystemAtomicReplayAuthority:
+    """Spawn-safe test fake for the authority's create-once contract."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    def claim_once(self, tombstone: ReplayTombstoneV1) -> ReplayAuthorityClaimResult:
+        name = _digest(f"{tombstone.service}\x00{tombstone.account}".encode())
+        path = self._root / name
+        value = tombstone.value_bytes()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileExistsError:
+            return (
+                ReplayAuthorityClaimResult.DUPLICATE_SAME
+                if path.read_bytes() == value
+                else ReplayAuthorityClaimResult.DUPLICATE_CONFLICT
+            )
+        try:
+            os.write(descriptor, value)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return ReplayAuthorityClaimResult.CREATED
+
+
+def _process_replay_authority_worker(root: str, queue: _StringQueue) -> None:
+    policy = ReplayAuthorityPolicyV1(
+        schema_version="rsd.replay-authority-policy.v1",
+        service="omninode-rsd-test-replay",
+        account_prefix="rsd-test-tombstone",
+    )
+    tombstone = ReplayTombstoneV1(
+        schema_version="rsd.replay-tombstone.v1",
+        kind="operation",
+        service=policy.service,
+        account=f"{policy.account_prefix}.o.process-claim",
+        journal_genesis_id="00000000-0000-4000-8000-000000000001",
+        operation_id="process-claim",
+        proposal_sha256="a" * 64,
+        contract_sha256="b" * 64,
+        provider_provenance_sha256="c" * 64,
+        idempotency_key="d" * 64,
+    )
+    queue.put(_FilesystemAtomicReplayAuthority(Path(root)).claim_once(tombstone).value)
 
 
 def _artifact_lock_worker(root: str, queue: _StringQueue) -> None:
@@ -860,6 +952,7 @@ def _journal_genesis_receipt(
         journal_path_sha256=journal._path_sha256(),
         journal_uuid=str(uuid.uuid4()),
         journal_schema_sha256=journal.journal_schema_sha256(),
+        replay_policy_sha256=_TEST_REPLAY_POLICY.sha256(),
         created_at=created.isoformat(timespec="seconds").replace("+00:00", "Z"),
         signer_key_id=signer.key_id,
         signature_base64=base64.b64encode(b"0" * 64).decode(),
@@ -880,9 +973,11 @@ def _ensure_test_journal_provisioned(
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
+    replay_authority: ProtocolReplayAuthority | None = None,
 ) -> None:
     """Use the explicit public provisioning boundary; authorization never does this."""
 
+    authority = _test_replay_authority(journal) if replay_authority is None else replay_authority
     with _TEST_PROVISION_LOCK:
         if journal.migration_status() is not JournalMigrationStatus.ABSENT:
             return
@@ -900,6 +995,8 @@ def _ensure_test_journal_provisioned(
             expected_approver_identity=expected_approver_identity,
             journal=journal,
             receipt=receipt,
+            replay_authority=authority,
+            replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
             _capability=_TEST_CLOCK_CAPABILITY,
         )
@@ -946,7 +1043,9 @@ def _execute_for_test(
     effect: Callable[[VerifiedExecutionContext], EffectReceiptV1],
     now: datetime = _NOW,
     provision: bool = True,
+    replay_authority: ProtocolReplayAuthority | None = None,
 ) -> ExecutionReceiptV1:
+    authority = _test_replay_authority(journal) if replay_authority is None else replay_authority
     if provision:
         _ensure_test_journal_provisioned(
             paths,
@@ -954,6 +1053,7 @@ def _execute_for_test(
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
             journal=journal,
+            replay_authority=authority,
         )
     return _authorize_and_execute_for_test(
         paths,
@@ -964,6 +1064,8 @@ def _execute_for_test(
         expected_approver_identity=expected_approver_identity,
         journal=journal,
         effect=effect,
+        replay_authority=authority,
+        replay_policy=_TEST_REPLAY_POLICY,
         _clock=lambda: now,
         _capability=_TEST_CLOCK_CAPABILITY,
     )
@@ -992,10 +1094,23 @@ def test_phase_b_executes_only_after_durable_claim(tmp_path: Path) -> None:
 def test_public_execution_has_no_caller_controlled_clock(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     signer, fingerprints, _ = _authorize_materials(root)
+    journal = _journal(tmp_path)
 
     assert "now" not in inspect.signature(authorize_and_execute).parameters
     assert "now" not in inspect.signature(provision_journal).parameters
     assert "_clock" not in inspect.signature(provision_journal).parameters
+    assert (
+        inspect.signature(authorize_and_execute).parameters["replay_authority"].default
+        is inspect.Parameter.empty
+    )
+    assert (
+        inspect.signature(provision_journal).parameters["replay_authority"].default
+        is inspect.Parameter.empty
+    )
+    assert (
+        inspect.signature(authorize_and_execute).parameters["replay_policy"].default
+        is inspect.Parameter.empty
+    )
     with pytest.raises(TypeError, match="unexpected keyword argument 'now'"):
         authorize_and_execute(
             AuthorizationPaths(root),
@@ -1004,8 +1119,10 @@ def test_public_execution_has_no_caller_controlled_clock(tmp_path: Path) -> None
             provider_fingerprints=fingerprints,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
-            journal=_journal(tmp_path),
+            journal=journal,
             effect=_effect,
+            replay_authority=_test_replay_authority(journal),
+            replay_policy=_TEST_REPLAY_POLICY,
             now=_NOW,  # type: ignore[call-arg]
         )
     with pytest.raises(AuthorizationError, match="test_clock"):
@@ -1016,8 +1133,10 @@ def test_public_execution_has_no_caller_controlled_clock(tmp_path: Path) -> None
             provider_fingerprints=fingerprints,
             expected_disposal_owner="acceptance-owner",
             expected_approver_identity="approval-owner",
-            journal=_journal(tmp_path),
+            journal=journal,
             effect=_effect,
+            replay_authority=_test_replay_authority(journal),
+            replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
             _capability=object(),
         )
@@ -1056,6 +1175,169 @@ def test_phase_b_absent_journal_never_initializes_or_provisions(tmp_path: Path) 
     assert not (root / AuthorizationPaths.journal_genesis_name()).exists()
 
 
+def test_missing_replay_authority_fails_before_journal_provisioning(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, _, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    journal = _journal(tmp_path)
+    receipt = _journal_genesis_receipt(
+        paths,
+        signer=signer,
+        journal=journal,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+    )
+    with pytest.raises(AuthorizationError, match="replay_authority_failure"):
+        _provision_journal_for_test(
+            paths,
+            signer=signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            receipt=receipt,
+            replay_authority=None,  # type: ignore[arg-type]
+            replay_policy=_TEST_REPLAY_POLICY,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+    assert journal.migration_status() is JournalMigrationStatus.ABSENT
+    assert not (root / AuthorizationPaths.journal_genesis_name()).exists()
+
+
+def test_external_tombstone_blocks_local_rollback_and_deleted_operation_row(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints, _ = _authorize_materials(root)
+    paths = AuthorizationPaths(root)
+    journal = _journal(tmp_path)
+    authority = _test_replay_authority(journal)
+    genesis = _journal_genesis_receipt(
+        paths,
+        signer=signer,
+        journal=journal,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+    )
+    _provision_journal_for_test(
+        paths,
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        receipt=genesis,
+        replay_authority=authority,
+        replay_policy=_TEST_REPLAY_POLICY,
+        _clock=lambda: _NOW,
+        _capability=_TEST_CLOCK_CAPABILITY,
+    )
+    effects: list[VerifiedExecutionContext] = []
+
+    def effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
+        effects.append(context)
+        return _effect(context)
+
+    _execute_for_test(
+        paths,
+        signer=signer,
+        provider=_Provider(fingerprints),
+        provider_fingerprints=fingerprints,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+        effect=effect,
+        provision=False,
+        replay_authority=authority,
+    )
+    assert len(effects) == 1
+    genesis_claim, operation_claim = authority.tombstones
+    assert genesis_claim.kind == "genesis"
+    assert genesis_claim.journal_genesis_id == genesis.journal_uuid
+    assert operation_claim.kind == "operation"
+    assert operation_claim.journal_genesis_id == genesis.journal_uuid
+    assert operation_claim.operation_id == effects[0].operation_id
+    assert operation_claim.proposal_sha256 == effects[0].proposal_sha256
+    assert operation_claim.contract_sha256 == effects[0].contract_sha256
+    assert operation_claim.provider_provenance_sha256 == effects[0].provider_provenance_sha256
+    assert operation_claim.idempotency_key == effects[0].idempotency_key
+    assert all(
+        len(value) == 64 and value.decode("ascii").isalnum() for value in authority._claims.values()
+    )
+
+    connection = sqlite3.connect(journal._path)
+    try:
+        connection.execute("DELETE FROM authorization_operation_journal")
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(AuthorizationError, match="replay_authority_replayed"):
+        _execute_for_test(
+            paths,
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            effect=effect,
+            provision=False,
+            replay_authority=authority,
+        )
+    assert len(effects) == 1
+
+    journal._path.unlink()
+    journal._anchor_path().unlink()
+    journal._genesis_marker_path().unlink()
+    (root / AuthorizationPaths.journal_genesis_name()).unlink()
+    assert journal.migration_status() is JournalMigrationStatus.ABSENT
+    replacement = _journal_genesis_receipt(
+        paths,
+        signer=signer,
+        journal=journal,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+    )
+    with pytest.raises(AuthorizationError, match="journal_genesis_replayed"):
+        _provision_journal_for_test(
+            paths,
+            signer=signer,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            receipt=replacement,
+            replay_authority=authority,
+            replay_policy=_TEST_REPLAY_POLICY,
+            _clock=lambda: _NOW,
+            _capability=_TEST_CLOCK_CAPABILITY,
+        )
+    assert journal.migration_status() is JournalMigrationStatus.PROVISIONING_INCOMPLETE
+    assert not journal._path.exists()
+    assert not journal._anchor_path().exists()
+    assert len(effects) == 1
+
+
+def test_test_replay_authority_claim_is_atomic_across_processes(tmp_path: Path) -> None:
+    root = tmp_path / "replay-authority"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    workers = [
+        context.Process(target=_process_replay_authority_worker, args=(str(root), queue))
+        for _ in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    outcomes = [queue.get(timeout=10) for _ in workers]
+    for worker in workers:
+        worker.join(timeout=10)
+        assert worker.exitcode == 0
+    assert sorted(outcomes) == [
+        ReplayAuthorityClaimResult.CREATED.value,
+        ReplayAuthorityClaimResult.DUPLICATE_SAME.value,
+    ]
+
+
 def test_genesis_blocks_pair_removal_replay_and_identity_file_removal(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     signer, fingerprints, _ = _authorize_materials(root)
@@ -1075,6 +1357,8 @@ def test_genesis_blocks_pair_removal_replay_and_identity_file_removal(tmp_path: 
         expected_approver_identity="approval-owner",
         journal=journal,
         receipt=genesis,
+        replay_authority=_test_replay_authority(journal),
+        replay_policy=_TEST_REPLAY_POLICY,
         _clock=lambda: _NOW,
         _capability=_TEST_CLOCK_CAPABILITY,
     )
@@ -1142,6 +1426,8 @@ def test_genesis_blocks_pair_removal_replay_and_identity_file_removal(tmp_path: 
             expected_approver_identity="approval-owner",
             journal=journal,
             receipt=genesis,
+            replay_authority=_test_replay_authority(journal),
+            replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
             _capability=_TEST_CLOCK_CAPABILITY,
         )
@@ -1170,6 +1456,8 @@ def test_genesis_copy_or_removal_blocks_effect_before_claim(tmp_path: Path) -> N
                 expected_disposal_owner="acceptance-owner",
                 expected_approver_identity="approval-owner",
             ),
+            replay_authority=_test_replay_authority(journal),
+            replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
             _capability=_TEST_CLOCK_CAPABILITY,
         )
@@ -1234,6 +1522,8 @@ def test_genesis_rejects_second_provision_and_signed_mismatch(tmp_path: Path) ->
         expected_approver_identity="approval-owner",
         journal=journal,
         receipt=receipt,
+        replay_authority=_test_replay_authority(journal),
+        replay_policy=_TEST_REPLAY_POLICY,
         _clock=lambda: _NOW,
         _capability=_TEST_CLOCK_CAPABILITY,
     )
@@ -1245,6 +1535,8 @@ def test_genesis_rejects_second_provision_and_signed_mismatch(tmp_path: Path) ->
             expected_approver_identity="approval-owner",
             journal=journal,
             receipt=receipt,
+            replay_authority=_test_replay_authority(journal),
+            replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
             _capability=_TEST_CLOCK_CAPABILITY,
         )
@@ -1271,6 +1563,8 @@ def test_genesis_rejects_second_provision_and_signed_mismatch(tmp_path: Path) ->
             expected_approver_identity="approval-owner",
             journal=mismatch_journal,
             receipt=invalid_signature,
+            replay_authority=_test_replay_authority(mismatch_journal),
+            replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
             _capability=_TEST_CLOCK_CAPABILITY,
         )
@@ -1292,6 +1586,8 @@ def test_genesis_rejects_second_provision_and_signed_mismatch(tmp_path: Path) ->
             expected_approver_identity="approval-owner",
             journal=mismatch_journal,
             receipt=wrong_owner,
+            replay_authority=_test_replay_authority(mismatch_journal),
+            replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
             _capability=_TEST_CLOCK_CAPABILITY,
         )
@@ -1329,6 +1625,8 @@ def test_genesis_crash_windows_require_signed_reconciliation(
             expected_approver_identity="approval-owner",
             journal=journal,
             receipt=receipt,
+            replay_authority=_test_replay_authority(journal),
+            replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
             _capability=_TEST_CLOCK_CAPABILITY,
         )
@@ -1343,6 +1641,8 @@ def test_genesis_crash_windows_require_signed_reconciliation(
             expected_approver_identity="approval-owner",
             journal=journal,
             receipt=receipt,
+            replay_authority=_test_replay_authority(journal),
+            replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
             _capability=_TEST_CLOCK_CAPABILITY,
         )
@@ -1383,6 +1683,8 @@ def test_genesis_crash_windows_require_signed_reconciliation(
             expected_approver_identity="approval-owner",
             journal=completed_journal,
             receipt=completed_receipt,
+            replay_authority=_test_replay_authority(completed_journal),
+            replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
             _capability=_TEST_CLOCK_CAPABILITY,
         )
@@ -1398,6 +1700,8 @@ def test_genesis_crash_windows_require_signed_reconciliation(
             expected_approver_identity="approval-owner",
             journal=completed_journal,
             receipt=completed_receipt,
+            replay_authority=_test_replay_authority(completed_journal),
+            replay_policy=_TEST_REPLAY_POLICY,
             _clock=lambda: _NOW,
             _capability=_TEST_CLOCK_CAPABILITY,
         )
@@ -1519,6 +1823,50 @@ def test_phase_b_blocks_replaced_journal_before_effect(tmp_path: Path) -> None:
     assert not called
 
 
+def test_phase_b_pins_journal_anchor_before_provider_and_effect(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    signer, fingerprints, _ = _authorize_materials(root)
+    journal = _journal(tmp_path)
+    _ensure_test_journal_provisioned(
+        AuthorizationPaths(root),
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+    )
+
+    class ReplacingProvider(_Provider):
+        def inspect(self, reference: ProviderReferenceV1) -> ProviderProvenance | None:
+            if not self._mutated:
+                replacement = journal._anchor_path().with_name("replacement-anchor.json")
+                shutil.copy2(journal._anchor_path(), replacement)
+                replacement.chmod(0o600)
+                os.replace(replacement, journal._anchor_path())
+                self._mutated = True
+            return super().inspect(reference)
+
+    called = False
+
+    def effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
+        nonlocal called
+        called = True
+        return _effect(context)
+
+    with pytest.raises(AuthorizationError, match="journal_identity_pinned"):
+        _execute_for_test(
+            AuthorizationPaths(root),
+            signer=signer,
+            provider=ReplacingProvider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            effect=effect,
+            provision=False,
+        )
+    assert not called
+
+
 def test_same_operation_with_fresh_nonce_executes_effect_once(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     signer, fingerprints, _ = _authorize_materials(root)
@@ -1551,7 +1899,7 @@ def test_same_operation_with_fresh_nonce_executes_effect_once(tmp_path: Path) ->
 
     assert sorted(outcomes) == ["artifact_lock_busy", "committed"]
     assert len(effects) == 1
-    assert execute() == "operation_replayed"
+    assert execute() == "replay_authority_replayed"
 
 
 def test_effect_failure_requires_recovery_and_never_replays(tmp_path: Path) -> None:
@@ -1576,7 +1924,7 @@ def test_effect_failure_requires_recovery_and_never_replays(tmp_path: Path) -> N
             now=_NOW,
         )
     assert journal.operation_state(_proposal().operation_id).value == "failed_recovery_required"
-    with pytest.raises(AuthorizationError, match="operation_replayed"):
+    with pytest.raises(AuthorizationError, match="replay_authority_replayed"):
         _execute_for_test(
             AuthorizationPaths(root),
             signer=signer,
@@ -1597,6 +1945,97 @@ def _assert_value_safe_error(error: AuthorizationError, secret: str) -> None:
     assert error.__cause__ is None
     assert error.__context__ is None
     assert secret not in "".join(traceback.format_exception(error))
+
+
+def test_keychain_replay_authority_is_create_only_and_stores_hashes() -> None:
+    policy = ReplayAuthorityPolicyV1(
+        schema_version="rsd.replay-authority-policy.v1",
+        service="omninode-rsd-keychain-test",
+        account_prefix="rsd-keychain-tombstone",
+    )
+
+    class Store:
+        def __init__(self) -> None:
+            self.records: dict[tuple[str, str], bytes] = {}
+            self.calls: list[tuple[str, str, bytes]] = []
+
+        def add_if_absent(self, service: str, account: str, value: bytes) -> bytes | None:
+            self.calls.append((service, account, value))
+            existing = self.records.get((service, account))
+            if existing is not None:
+                return existing
+            self.records[(service, account)] = value
+            return None
+
+    tombstone = ReplayTombstoneV1(
+        schema_version="rsd.replay-tombstone.v1",
+        kind="operation",
+        service=policy.service,
+        account=f"{policy.account_prefix}.o.hash-only",
+        journal_genesis_id="00000000-0000-4000-8000-000000000001",
+        operation_id="hash-only-operation",
+        proposal_sha256="a" * 64,
+        contract_sha256="b" * 64,
+        provider_provenance_sha256="c" * 64,
+        idempotency_key="d" * 64,
+    )
+    store = Store()
+    authority = MacOSKeychainReplayAuthority(policy, _store=store)
+    assert authority.claim_once(tombstone) is ReplayAuthorityClaimResult.CREATED
+    assert authority.claim_once(tombstone) is ReplayAuthorityClaimResult.DUPLICATE_SAME
+    assert len(store.calls) == 2
+    assert all(
+        service == policy.service
+        and account == tombstone.account
+        and value == tombstone.binding_sha256().encode("ascii")
+        and len(value) == 64
+        for service, account, value in store.calls
+    )
+    store.records[(policy.service, tombstone.account)] = b"x" * 64
+    assert authority.claim_once(tombstone) is ReplayAuthorityClaimResult.DUPLICATE_CONFLICT
+
+
+def test_replay_authority_failure_is_value_redacted_and_prevents_effect(tmp_path: Path) -> None:
+    secret = "external-authority-value-must-not-escape"
+    root = tmp_path / "artifacts"
+    signer, fingerprints, _ = _authorize_materials(root)
+    journal = _journal(tmp_path)
+    _ensure_test_journal_provisioned(
+        AuthorizationPaths(root),
+        signer=signer,
+        expected_disposal_owner="acceptance-owner",
+        expected_approver_identity="approval-owner",
+        journal=journal,
+    )
+
+    class FailingAuthority:
+        def claim_once(self, tombstone: ReplayTombstoneV1) -> ReplayAuthorityClaimResult:
+            del tombstone
+            raise RuntimeError(secret) from ValueError(secret)
+
+    called = False
+
+    def effect(context: VerifiedExecutionContext) -> EffectReceiptV1:
+        nonlocal called
+        called = True
+        return _effect(context)
+
+    with pytest.raises(AuthorizationError) as failure:
+        _execute_for_test(
+            AuthorizationPaths(root),
+            signer=signer,
+            provider=_Provider(fingerprints),
+            provider_fingerprints=fingerprints,
+            expected_disposal_owner="acceptance-owner",
+            expected_approver_identity="approval-owner",
+            journal=journal,
+            effect=effect,
+            provision=False,
+            replay_authority=FailingAuthority(),
+        )
+    assert failure.value.phase == "replay_authority_failure"
+    _assert_value_safe_error(failure.value, secret)
+    assert not called
 
 
 def test_provider_and_effect_failures_do_not_expose_adapter_values(tmp_path: Path) -> None:

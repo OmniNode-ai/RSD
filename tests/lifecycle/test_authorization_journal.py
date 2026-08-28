@@ -86,6 +86,7 @@ def _seed_current_journal(journal: SQLiteAuthorizationJournal) -> None:
         journal_path_sha256=journal._path_sha256(),
         journal_uuid=str(uuid.uuid4()),
         journal_schema_sha256=journal.journal_schema_sha256(),
+        replay_policy_sha256="e" * 64,
         created_at="2026-08-27T12:00:00Z",
         signer_key_id=signer.key_id,
         signature_base64=base64.b64encode(b"0" * 64).decode(),
@@ -413,6 +414,56 @@ def test_journal_rejects_byte_identical_anchor_replacement(tmp_path: Path) -> No
     assert journal.migration_status() is JournalMigrationStatus.IDENTITY_MISMATCH
     with pytest.raises(AuthorizationError, match="journal_identity_mismatch"):
         SQLiteAuthorizationJournal(journal._path)._claim_verified(_verified("a" * 32))
+
+
+@pytest.mark.parametrize("target", ("database", "anchor", "marker"))
+def test_execution_pin_rejects_exact_pre_effect_object_replacement(
+    tmp_path: Path, target: str
+) -> None:
+    journal = _journal(tmp_path)
+    pin = journal._pin_execution_identity()
+    source = {
+        "database": journal._path,
+        "anchor": journal._anchor_path(),
+        "marker": journal._genesis_marker_path(),
+    }[target]
+    replacement = tmp_path / f"replacement-{target}"
+    shutil.copy2(source, replacement)
+    replacement.chmod(0o600)
+    os.replace(replacement, source)
+
+    with pytest.raises(AuthorizationError, match="journal_identity_pinned"):
+        journal._assert_pinned_execution_identity(pin)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "CREATE VIEW authorization_unexpected_view AS SELECT operation_id "
+        "FROM authorization_operation_journal",
+        """
+        CREATE TRIGGER authorization_unexpected_trigger
+        AFTER INSERT ON authorization_operation_journal
+        BEGIN
+            SELECT 1;
+        END
+        """,
+    ),
+)
+def test_journal_rejects_unexpected_sqlite_views_or_triggers(
+    tmp_path: Path, statement: str
+) -> None:
+    journal = _journal(tmp_path)
+    connection = sqlite3.connect(journal._path)
+    try:
+        connection.execute(statement)
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert journal.migration_status() is JournalMigrationStatus.IDENTITY_MISMATCH
+    with pytest.raises(AuthorizationError, match="journal_schema"):
+        journal._claim_verified(_verified("a" * 32, "schema-object-operation"))
 
 
 def test_journal_rejects_anchor_swap_and_copied_journal(tmp_path: Path) -> None:

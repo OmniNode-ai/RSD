@@ -13,15 +13,18 @@ import argparse
 import base64
 import binascii
 import copy
+import ctypes
 import errno
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
 import secrets
 import sqlite3
 import stat
+import sys
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, suppress
@@ -30,7 +33,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from threading import Lock, get_ident
-from typing import Final, Literal, Protocol, cast
+from typing import Any, Final, Literal, Protocol, cast
 
 import yaml
 from cryptography.exceptions import InvalidSignature
@@ -75,6 +78,8 @@ _JOURNAL_GENESIS_DOMAIN: Final = b"omninode-rsd.authorization.journal-genesis.v1
 _JOURNAL_GENESIS_RECONCILIATION_DOMAIN: Final = (
     b"omninode-rsd.authorization.journal-genesis-reconciliation.v1\x00"
 )
+_REPLAY_TOMBSTONE_DOMAIN: Final = b"omninode-rsd.authorization.replay-tombstone.v1\x00"
+_REPLAY_ACCOUNT_DOMAIN: Final = b"omninode-rsd.authorization.replay-account.v1\x00"
 _ARTIFACT_LOCK_PREFIX: Final = ".rsd-authorization-root-"
 _OPERATION_LEASE_PREFIX: Final = ".rsd-authorization-operation-"
 _JOURNAL_IDENTITY_LEASE_PREFIX: Final = ".rsd-authorization-journal-identity-"
@@ -82,6 +87,7 @@ _JOURNAL_ANCHOR_PREFIX: Final = ".rsd-authorization-journal-anchor-"
 _JOURNAL_GENESIS_MARKER_PREFIX: Final = ".rsd-authorization-journal-genesis-"
 _VERIFIED_CAPABILITY: Final = object()
 _GENESIS_CAPABILITY: Final = object()
+_JOURNAL_PIN_CAPABILITY: Final = object()
 _TEST_CLOCK_CAPABILITY: Final = object()
 _SYSTEM_CLOCK_CAPABILITY: Final = object()
 _SAFE_CALL_FAILURE: Final = object()
@@ -200,6 +206,123 @@ class TrustedEd25519SignerV1(_Model):
         return Ed25519PublicKey.from_public_bytes(_canonical_base64(self.public_key_base64))
 
 
+class ReplayAuthorityClaimResult(StrEnum):
+    """The only valid outcomes of one external create-once attempt."""
+
+    CREATED = "created"
+    DUPLICATE_SAME = "duplicate_same"
+    DUPLICATE_CONFLICT = "duplicate_conflict"
+    UNAVAILABLE = "unavailable"
+
+
+class ReplayAuthorityPolicyV1(_Model):
+    """Typed, injected namespace for governed external replay tombstones."""
+
+    schema_version: Literal["rsd.replay-authority-policy.v1"]
+    service: str = Field(pattern=_IDENTIFIER, min_length=1, max_length=128)
+    account_prefix: str = Field(pattern=_IDENTIFIER, min_length=1, max_length=48)
+
+    def sha256(self) -> str:
+        material = self.model_dump(mode="json")
+        return _digest(json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+class ReplayTombstoneV1(_Model):
+    """Value-free, immutable binding written once by an external authority."""
+
+    schema_version: Literal["rsd.replay-tombstone.v1"]
+    kind: Literal["genesis", "operation"]
+    service: str = Field(pattern=_IDENTIFIER, min_length=1, max_length=128)
+    account: str = Field(pattern=_IDENTIFIER, min_length=1, max_length=128)
+    journal_genesis_id: str = Field(min_length=36, max_length=36)
+    operation_id: str = Field(min_length=1, max_length=256)
+    proposal_sha256: str = Field(pattern=_SHA256)
+    contract_sha256: str = Field(pattern=_SHA256)
+    provider_provenance_sha256: str | None = None
+    idempotency_key: str | None = None
+
+    @model_validator(mode="after")
+    def canonical_binding(self) -> ReplayTombstoneV1:
+        try:
+            parsed_uuid = uuid.UUID(self.journal_genesis_id)
+        except ValueError:
+            raise ValueError("replay tombstone binding is invalid") from None
+        if str(parsed_uuid) != self.journal_genesis_id:
+            raise ValueError("replay tombstone binding is invalid")
+        if self.kind == "genesis":
+            if self.provider_provenance_sha256 is not None or self.idempotency_key is not None:
+                raise ValueError("replay tombstone binding is invalid")
+            return self
+        if (
+            type(self.provider_provenance_sha256) is not str
+            or re.fullmatch(_SHA256, self.provider_provenance_sha256) is None
+            or type(self.idempotency_key) is not str
+            or re.fullmatch(_SHA256, self.idempotency_key) is None
+        ):
+            raise ValueError("replay tombstone binding is invalid")
+        return self
+
+    def binding_sha256(self) -> str:
+        return _replay_tombstone_sha256(self)
+
+    def value_bytes(self) -> bytes:
+        return self.binding_sha256().encode("ascii")
+
+
+class ProtocolReplayAuthority(Protocol):
+    """External, atomic, create-once replay authority with no permissive mode."""
+
+    def claim_once(self, tombstone: ReplayTombstoneV1) -> ReplayAuthorityClaimResult: ...
+
+
+class _KeychainGenericPasswordStore(Protocol):
+    """Narrow testable transport for Security.framework generic-password calls."""
+
+    def add_if_absent(self, service: str, account: str, value: bytes) -> bytes | None: ...
+
+
+class MacOSKeychainReplayAuthority:
+    """Security.framework-backed external replay tombstones for macOS runtimes.
+
+    The stored value is only the SHA-256 binding of public identifiers. Neither
+    the adapter nor its caller accepts a secret value, and it never overwrites
+    an existing keychain item.
+    """
+
+    def __init__(
+        self,
+        policy: ReplayAuthorityPolicyV1,
+        *,
+        _store: _KeychainGenericPasswordStore | None = None,
+    ) -> None:
+        if type(policy) is not ReplayAuthorityPolicyV1:
+            raise ValueError("replay authority policy is invalid")
+        self._policy = policy
+        self._store = _SecurityFrameworkGenericPasswordStore() if _store is None else _store
+
+    def claim_once(self, tombstone: ReplayTombstoneV1) -> ReplayAuthorityClaimResult:
+        if (
+            type(tombstone) is not ReplayTombstoneV1
+            or tombstone.service != self._policy.service
+            or not tombstone.account.startswith(f"{self._policy.account_prefix}.")
+        ):
+            return ReplayAuthorityClaimResult.DUPLICATE_CONFLICT
+        value = tombstone.value_bytes()
+        try:
+            existing = self._store.add_if_absent(tombstone.service, tombstone.account, value)
+        except Exception:
+            return ReplayAuthorityClaimResult.UNAVAILABLE
+        if existing is None:
+            return ReplayAuthorityClaimResult.CREATED
+        if type(existing) is not bytes:
+            return ReplayAuthorityClaimResult.UNAVAILABLE
+        return (
+            ReplayAuthorityClaimResult.DUPLICATE_SAME
+            if hmac.compare_digest(existing, value)
+            else ReplayAuthorityClaimResult.DUPLICATE_CONFLICT
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderProvenance:
     """Value-free metadata supplied by one provider snapshot lease."""
@@ -300,6 +423,7 @@ class JournalGenesisReceiptV1(_Model):
     journal_path_sha256: str = Field(pattern=_SHA256)
     journal_uuid: str = Field(min_length=36, max_length=36)
     journal_schema_sha256: str = Field(pattern=_SHA256)
+    replay_policy_sha256: str = Field(pattern=_SHA256)
     created_at: str = Field(min_length=20, max_length=40)
     signer_key_id: str = Field(pattern=_IDENTIFIER)
     signature_base64: str = Field(min_length=4, max_length=256)
@@ -424,6 +548,266 @@ class _VerifiedGenesis:
 
 def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _canonical_json_bytes(value: Mapping[str, object]) -> bytes:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError):
+        raise AuthorizationError("replay_authority_binding") from None
+
+
+def _replay_tombstone_sha256(tombstone: ReplayTombstoneV1) -> str:
+    if type(tombstone) is not ReplayTombstoneV1:
+        raise AuthorizationError("replay_authority_binding")
+    return _digest(
+        _REPLAY_TOMBSTONE_DOMAIN + _canonical_json_bytes(tombstone.model_dump(mode="json"))
+    )
+
+
+def _replay_account(
+    policy: ReplayAuthorityPolicyV1,
+    *,
+    kind: Literal["genesis", "operation"],
+    journal_path_sha256: str,
+    operation_id: str,
+) -> str:
+    if (
+        type(policy) is not ReplayAuthorityPolicyV1
+        or re.fullmatch(_SHA256, journal_path_sha256) is None
+        or type(operation_id) is not str
+        or not operation_id
+    ):
+        raise AuthorizationError("replay_authority_binding")
+    scope = {
+        "journal_path_sha256": journal_path_sha256,
+        "kind": kind,
+        "operation_id": operation_id,
+        "policy_sha256": policy.sha256(),
+    }
+    account_digest = _digest(_REPLAY_ACCOUNT_DOMAIN + _canonical_json_bytes(scope))
+    return f"{policy.account_prefix}.{kind[0]}.{account_digest}"
+
+
+def _genesis_tombstone(
+    policy: ReplayAuthorityPolicyV1,
+    verified: _VerifiedGenesis,
+) -> ReplayTombstoneV1:
+    if type(verified) is not _VerifiedGenesis or verified.capability is not _GENESIS_CAPABILITY:
+        raise AuthorizationError("replay_authority_binding")
+    receipt = verified.receipt
+    return ReplayTombstoneV1(
+        schema_version="rsd.replay-tombstone.v1",
+        kind="genesis",
+        service=policy.service,
+        account=_replay_account(
+            policy,
+            kind="genesis",
+            journal_path_sha256=receipt.journal_path_sha256,
+            operation_id=receipt.operation_id,
+        ),
+        journal_genesis_id=receipt.journal_uuid,
+        operation_id=receipt.operation_id,
+        proposal_sha256=receipt.proposal_sha256,
+        contract_sha256=receipt.contract_sha256,
+    )
+
+
+def _operation_tombstone(
+    policy: ReplayAuthorityPolicyV1,
+    genesis: _VerifiedGenesis,
+    context: VerifiedExecutionContext,
+) -> ReplayTombstoneV1:
+    if (
+        type(genesis) is not _VerifiedGenesis
+        or genesis.capability is not _GENESIS_CAPABILITY
+        or type(context) is not VerifiedExecutionContext
+    ):
+        raise AuthorizationError("replay_authority_binding")
+    receipt = genesis.receipt
+    return ReplayTombstoneV1(
+        schema_version="rsd.replay-tombstone.v1",
+        kind="operation",
+        service=policy.service,
+        account=_replay_account(
+            policy,
+            kind="operation",
+            journal_path_sha256=receipt.journal_path_sha256,
+            operation_id=context.operation_id,
+        ),
+        journal_genesis_id=receipt.journal_uuid,
+        operation_id=context.operation_id,
+        proposal_sha256=context.proposal_sha256,
+        contract_sha256=context.contract_sha256,
+        provider_provenance_sha256=context.provider_provenance_sha256,
+        idempotency_key=context.idempotency_key,
+    )
+
+
+def _claim_replay_tombstone(
+    authority: ProtocolReplayAuthority,
+    tombstone: ReplayTombstoneV1,
+    *,
+    phase: str,
+) -> None:
+    method = _replay_claim_method(authority)
+    result = _safe_call(lambda: method(tombstone))
+    if result is ReplayAuthorityClaimResult.CREATED:
+        return
+    if result in {
+        ReplayAuthorityClaimResult.DUPLICATE_SAME,
+        ReplayAuthorityClaimResult.DUPLICATE_CONFLICT,
+    }:
+        raise AuthorizationError(phase)
+    raise AuthorizationError("replay_authority_failure")
+
+
+def _replay_claim_method(
+    authority: ProtocolReplayAuthority,
+) -> Callable[[ReplayTombstoneV1], object]:
+    """Validate the required injected boundary without invoking a claim."""
+
+    method = _safe_call(lambda: authority.claim_once)
+    if method is _SAFE_CALL_FAILURE or not callable(method):
+        raise AuthorizationError("replay_authority_failure")
+    return cast(Callable[[ReplayTombstoneV1], object], method)
+
+
+class _SecurityFrameworkGenericPasswordStore:
+    """Minimal Security.framework bridge with create-only generic-password writes."""
+
+    _ERR_SEC_SUCCESS: Final = 0
+    _ERR_SEC_DUPLICATE_ITEM: Final = -25299
+    _UTF8: Final = 0x08000100
+
+    def __init__(self) -> None:
+        if sys.platform != "darwin":
+            raise RuntimeError("Security.framework is unavailable")
+        self._security: Any = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
+        self._core: Any = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        self._configure_symbols()
+        self._class = self._symbol(self._security, "kSecClass")
+        self._generic_password = self._symbol(self._security, "kSecClassGenericPassword")
+        self._service = self._symbol(self._security, "kSecAttrService")
+        self._account = self._symbol(self._security, "kSecAttrAccount")
+        self._value_data = self._symbol(self._security, "kSecValueData")
+        self._return_data = self._symbol(self._security, "kSecReturnData")
+        self._match_limit = self._symbol(self._security, "kSecMatchLimit")
+        self._match_limit_one = self._symbol(self._security, "kSecMatchLimitOne")
+        self._boolean_true = self._symbol(self._core, "kCFBooleanTrue")
+
+    def _configure_symbols(self) -> None:
+        pointer = ctypes.c_void_p
+        self._security.SecItemAdd.argtypes = [pointer, pointer]
+        self._security.SecItemAdd.restype = ctypes.c_int32
+        self._security.SecItemCopyMatching.argtypes = [pointer, ctypes.POINTER(pointer)]
+        self._security.SecItemCopyMatching.restype = ctypes.c_int32
+        self._core.CFStringCreateWithCString.argtypes = [pointer, ctypes.c_char_p, ctypes.c_uint32]
+        self._core.CFStringCreateWithCString.restype = pointer
+        self._core.CFDataCreate.argtypes = [pointer, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_long]
+        self._core.CFDataCreate.restype = pointer
+        self._core.CFDataGetLength.argtypes = [pointer]
+        self._core.CFDataGetLength.restype = ctypes.c_long
+        self._core.CFDataGetBytePtr.argtypes = [pointer]
+        self._core.CFDataGetBytePtr.restype = ctypes.POINTER(ctypes.c_ubyte)
+        self._core.CFDictionaryCreateMutable.argtypes = [pointer, ctypes.c_long, pointer, pointer]
+        self._core.CFDictionaryCreateMutable.restype = pointer
+        self._core.CFDictionarySetValue.argtypes = [pointer, pointer, pointer]
+        self._core.CFDictionarySetValue.restype = None
+        self._core.CFRelease.argtypes = [pointer]
+        self._core.CFRelease.restype = None
+
+    @staticmethod
+    def _symbol(library: Any, name: str) -> int:
+        pointer = ctypes.c_void_p.in_dll(library, name).value
+        if pointer is None:
+            raise RuntimeError("Security.framework symbol is unavailable")
+        return int(pointer)
+
+    def _release(self, value: Any) -> None:
+        if value:
+            self._core.CFRelease(ctypes.c_void_p(value))
+
+    def _string(self, value: str) -> Any:
+        result = self._core.CFStringCreateWithCString(None, value.encode("utf-8"), self._UTF8)
+        if not result:
+            raise RuntimeError("Security.framework allocation failed")
+        return result
+
+    def _data(self, value: bytes) -> Any:
+        buffer = (ctypes.c_ubyte * len(value)).from_buffer_copy(value)
+        result = self._core.CFDataCreate(None, buffer, len(value))
+        if not result:
+            raise RuntimeError("Security.framework allocation failed")
+        return result
+
+    def _dictionary(self, entries: list[tuple[int, Any]]) -> Any:
+        result = self._core.CFDictionaryCreateMutable(None, 0, None, None)
+        if not result:
+            raise RuntimeError("Security.framework allocation failed")
+        for key, value in entries:
+            self._core.CFDictionarySetValue(result, ctypes.c_void_p(key), ctypes.c_void_p(value))
+        return result
+
+    def _existing_value(self, service: str, account: str) -> bytes:
+        service_value = self._string(service)
+        account_value = self._string(account)
+        query: Any = None
+        result = ctypes.c_void_p()
+        try:
+            query = self._dictionary(
+                [
+                    (self._class, self._generic_password),
+                    (self._service, service_value),
+                    (self._account, account_value),
+                    (self._return_data, self._boolean_true),
+                    (self._match_limit, self._match_limit_one),
+                ]
+            )
+            status = self._security.SecItemCopyMatching(query, ctypes.byref(result))
+            if status != self._ERR_SEC_SUCCESS or not result.value:
+                raise RuntimeError("Security.framework lookup failed")
+            length = self._core.CFDataGetLength(result)
+            pointer = self._core.CFDataGetBytePtr(result)
+            if length < 0 or not pointer:
+                raise RuntimeError("Security.framework lookup failed")
+            return ctypes.string_at(pointer, length)
+        finally:
+            if result.value:
+                self._release(result.value)
+            if query:
+                self._release(query)
+            self._release(account_value)
+            self._release(service_value)
+
+    def add_if_absent(self, service: str, account: str, value: bytes) -> bytes | None:
+        service_value = self._string(service)
+        account_value = self._string(account)
+        data_value = self._data(value)
+        attributes: Any = None
+        try:
+            attributes = self._dictionary(
+                [
+                    (self._class, self._generic_password),
+                    (self._service, service_value),
+                    (self._account, account_value),
+                    (self._value_data, data_value),
+                ]
+            )
+            status = self._security.SecItemAdd(attributes, None)
+            if status == self._ERR_SEC_SUCCESS:
+                return None
+            if status == self._ERR_SEC_DUPLICATE_ITEM:
+                return self._existing_value(service, account)
+            raise RuntimeError("Security.framework create failed")
+        finally:
+            if attributes:
+                self._release(attributes)
+            self._release(data_value)
+            self._release(account_value)
+            self._release(service_value)
 
 
 def _canonical_base64(value: str) -> bytes:
@@ -659,6 +1043,7 @@ def _verify_journal_genesis_artifact(
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
+    replay_policy: ReplayAuthorityPolicyV1,
     now: datetime,
     reader: _OwnerOnlyReader,
 ) -> tuple[_VerifiedGenesis, bytes]:
@@ -681,6 +1066,7 @@ def _verify_journal_genesis_artifact(
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
         journal=journal,
+        replay_policy=replay_policy,
         now=now,
     )
     return (
@@ -701,8 +1087,11 @@ def _verify_journal_genesis_binding(
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
+    replay_policy: ReplayAuthorityPolicyV1,
     now: datetime,
 ) -> None:
+    if type(replay_policy) is not ReplayAuthorityPolicyV1:
+        raise AuthorizationError("replay_authority_policy")
     _verify_journal_genesis_signature(receipt, signer=signer)
     try:
         created = datetime.fromisoformat(receipt.created_at.removesuffix("Z") + "+00:00")
@@ -721,6 +1110,7 @@ def _verify_journal_genesis_binding(
         or receipt.journal_path != str(journal._path)
         or receipt.journal_path_sha256 != journal._path_sha256()
         or receipt.journal_schema_sha256 != journal.journal_schema_sha256()
+        or receipt.replay_policy_sha256 != replay_policy.sha256()
     ):
         raise AuthorizationError("journal_genesis_binding")
 
@@ -732,6 +1122,7 @@ def _verify_authorization_artifact_snapshot(
     expected_disposal_owner: str,
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
+    replay_policy: ReplayAuthorityPolicyV1,
     now: datetime,
     reader: _OwnerOnlyReader,
 ) -> tuple[_ArtifactVerification, _VerifiedGenesis, dict[str, bytes]]:
@@ -750,6 +1141,7 @@ def _verify_authorization_artifact_snapshot(
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
         journal=journal,
+        replay_policy=replay_policy,
         now=now,
         reader=reader,
     )
@@ -1435,6 +1827,22 @@ class _JournalIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class _JournalExecutionPin:
+    """Exact local journal objects observed before provider/effect admission.
+
+    This is intentionally internal and capability-bound.  It is not an
+    authorization grant; it only lets the executor detect replacement of the
+    database, anchor, or signed-genesis marker after its first local snapshot.
+    """
+
+    identity: _JournalIdentity
+    database_details: tuple[int, int, int]
+    anchor_details: tuple[int, int, int]
+    marker_details: tuple[int, int, int]
+    capability: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
 class _JournalGenesisMarker:
     """Owner-only durable state for one signed journal genesis receipt."""
 
@@ -1537,6 +1945,16 @@ class SQLiteAuthorizationJournal:
         if _LEGACY_OPERATION_TABLE in names:
             raise AuthorizationError("journal_legacy_detected")
         if names - {_OPERATION_TABLE, _JOURNAL_METADATA_TABLE}:
+            raise AuthorizationError("journal_schema")
+
+    @staticmethod
+    def _reject_executable_schema_objects(connection: sqlite3.Connection) -> None:
+        """Forbid persistent SQLite code paths outside the exact table schema."""
+
+        rows = connection.execute(
+            "SELECT type, name FROM sqlite_master WHERE type IN ('trigger', 'view')"
+        ).fetchall()
+        if rows:
             raise AuthorizationError("journal_schema")
 
     def migration_status(self) -> JournalMigrationStatus:
@@ -2338,6 +2756,65 @@ class SQLiteAuthorizationJournal:
 
         self._established_identity()
 
+    def _pin_execution_identity(self) -> _JournalExecutionPin:
+        """Capture exact local identities before provider inspection/effect work."""
+
+        identity = self._established_identity()
+        database_details = self._owner_file_details(self._path, "journal_identity_pinned")
+        anchor_details = self._owner_file_details(self._anchor_path(), "journal_identity_pinned")
+        marker_details = self._owner_file_details(
+            self._genesis_marker_path(), "journal_identity_pinned"
+        )
+        if database_details != (
+            identity.database_dev,
+            identity.database_ino,
+            identity.database_nlink,
+        ) or anchor_details != (identity.anchor_dev, identity.anchor_ino, identity.anchor_nlink):
+            raise AuthorizationError("journal_identity_pinned")
+        # A replacement can race the first reads.  A second complete identity
+        # check makes a changing path fail closed before provider acquisition.
+        if self._established_identity() != identity:
+            raise AuthorizationError("journal_identity_pinned")
+        if (
+            self._owner_file_details(self._path, "journal_identity_pinned") != database_details
+            or self._owner_file_details(self._anchor_path(), "journal_identity_pinned")
+            != anchor_details
+            or self._owner_file_details(self._genesis_marker_path(), "journal_identity_pinned")
+            != marker_details
+        ):
+            raise AuthorizationError("journal_identity_pinned")
+        return _JournalExecutionPin(
+            identity=identity,
+            database_details=database_details,
+            anchor_details=anchor_details,
+            marker_details=marker_details,
+            capability=_JOURNAL_PIN_CAPABILITY,
+        )
+
+    def _assert_pinned_execution_identity(self, pin: _JournalExecutionPin) -> None:
+        """Fail closed if any pre-effect local object was replaced or removed."""
+
+        if type(pin) is not _JournalExecutionPin or pin.capability is not _JOURNAL_PIN_CAPABILITY:
+            raise AuthorizationError("journal_identity_pinned")
+        try:
+            current = self._established_identity()
+            database_details = self._owner_file_details(self._path, "journal_identity_pinned")
+            anchor_details = self._owner_file_details(
+                self._anchor_path(), "journal_identity_pinned"
+            )
+            marker_details = self._owner_file_details(
+                self._genesis_marker_path(), "journal_identity_pinned"
+            )
+        except AuthorizationError:
+            raise AuthorizationError("journal_identity_pinned") from None
+        if (
+            current != pin.identity
+            or database_details != pin.database_details
+            or anchor_details != pin.anchor_details
+            or marker_details != pin.marker_details
+        ):
+            raise AuthorizationError("journal_identity_pinned")
+
     def assert_genesis(self, verified: _VerifiedGenesis) -> None:
         """Require the signed root artifact to match the durable current identity."""
 
@@ -2423,6 +2900,7 @@ class SQLiteAuthorizationJournal:
 
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
+        SQLiteAuthorizationJournal._reject_executable_schema_objects(connection)
         rows = connection.execute(f"PRAGMA table_info({_OPERATION_TABLE})").fetchall()
         expected = [
             (0, "operation_id", "TEXT", 1, None, 1),
@@ -2924,12 +3402,13 @@ def _mark_effect_ambiguous(
 
 def _check_execution_stability(
     journal: SQLiteAuthorizationJournal,
+    journal_pin: _JournalExecutionPin,
     artifact_lease: ArtifactRootLease,
     operation_lease: _OperationLease,
 ) -> None:
     artifact_lease.assert_stable()
     operation_lease.assert_stable()
-    journal.assert_identity()
+    journal._assert_pinned_execution_identity(journal_pin)
 
 
 def _provision_journal_with_clock(
@@ -2940,6 +3419,8 @@ def _provision_journal_with_clock(
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
     receipt: JournalGenesisReceiptV1,
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
     clock: Callable[[], datetime],
     _capability: object,
 ) -> JournalProvisioningReceiptV1:
@@ -2952,8 +3433,10 @@ def _provision_journal_with_clock(
         or type(signer) is not TrustedEd25519SignerV1
         or type(journal) is not SQLiteAuthorizationJournal
         or type(receipt) is not JournalGenesisReceiptV1
+        or type(replay_policy) is not ReplayAuthorityPolicyV1
     ):
         raise AuthorizationError("journal_genesis")
+    _replay_claim_method(replay_authority)
     now = _read_clock(clock)
     with ArtifactRootLease(paths.root) as artifact_lease:
         artifacts, _ = _verify_artifact_snapshot(
@@ -2971,6 +3454,7 @@ def _provision_journal_with_clock(
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
             journal=journal,
+            replay_policy=replay_policy,
             now=now,
         )
         raw = _journal_genesis_artifact_bytes(receipt)
@@ -2986,6 +3470,12 @@ def _provision_journal_with_clock(
             raise AuthorizationError("journal_genesis_replayed")
         artifact_lease.assert_absent(paths.journal_genesis_name(), phase="journal_genesis_replayed")
         journal._begin_verified_genesis(verified)
+        _claim_replay_tombstone(
+            replay_authority,
+            _genesis_tombstone(replay_policy, verified),
+            phase="journal_genesis_replayed",
+        )
+        artifact_lease.assert_stable()
         artifact_lease.write_once(
             paths.journal_genesis_name(), raw, phase="journal_genesis_replayed"
         )
@@ -3008,6 +3498,8 @@ def provision_journal(
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
     receipt: JournalGenesisReceiptV1,
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
 ) -> JournalProvisioningReceiptV1:
     """Provision exactly one signed journal identity for the supplied artifacts."""
 
@@ -3018,6 +3510,8 @@ def provision_journal(
         expected_approver_identity=expected_approver_identity,
         journal=journal,
         receipt=receipt,
+        replay_authority=replay_authority,
+        replay_policy=replay_policy,
         clock=_system_utc_clock,
         _capability=_SYSTEM_CLOCK_CAPABILITY,
     )
@@ -3031,6 +3525,8 @@ def _provision_journal_for_test(
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
     receipt: JournalGenesisReceiptV1,
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
     _clock: Callable[[], datetime],
     _capability: object,
 ) -> JournalProvisioningReceiptV1:
@@ -3045,6 +3541,8 @@ def _provision_journal_for_test(
         expected_approver_identity=expected_approver_identity,
         journal=journal,
         receipt=receipt,
+        replay_authority=replay_authority,
+        replay_policy=replay_policy,
         clock=_clock,
         _capability=_TEST_CLOCK_CAPABILITY,
     )
@@ -3094,6 +3592,8 @@ def _authorize_and_execute_with_clock(
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
     effect: Callable[[VerifiedExecutionContext], EffectReceiptV1],
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
     clock: Callable[[], datetime],
 ) -> ExecutionReceiptV1:
     """Internal implementation with a capability-hidden test clock.
@@ -3107,24 +3607,29 @@ def _authorize_and_execute_with_clock(
         type(paths) is not AuthorizationPaths
         or type(signer) is not TrustedEd25519SignerV1
         or type(journal) is not SQLiteAuthorizationJournal
+        or type(replay_policy) is not ReplayAuthorityPolicyV1
         or not callable(effect)
     ):
         raise AuthorizationError("journal_effect")
+    _replay_claim_method(replay_authority)
     fingerprints = _normalized_fingerprints(provider_fingerprints)
     with ArtifactRootLease(paths.root) as artifact_lease:
         artifact_lease.assert_stable()
         _require_current_journal(journal.migration_status())
+        journal_pin = journal._pin_execution_identity()
         artifacts, genesis, snapshot = _verify_authorization_artifact_snapshot(
             paths,
             signer=signer,
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
             journal=journal,
+            replay_policy=replay_policy,
             now=_read_clock(clock),
             reader=artifact_lease.reader(),
         )
         artifact_lease.assert_stable()
         journal.assert_genesis(genesis)
+        journal._assert_pinned_execution_identity(journal_pin)
         artifact_lease.assert_stable()
         references = artifacts.proposal.provider_references.all()
         manager, provider_lease = _acquire_provider_lease(provider, references)
@@ -3145,6 +3650,7 @@ def _authorize_and_execute_with_clock(
                     expected_disposal_owner=expected_disposal_owner,
                     expected_approver_identity=expected_approver_identity,
                     journal=journal,
+                    replay_policy=replay_policy,
                     now=_read_clock(clock),
                     reader=artifact_lease.reader(),
                 )
@@ -3176,6 +3682,7 @@ def _authorize_and_execute_with_clock(
                     expected_disposal_owner=expected_disposal_owner,
                     expected_approver_identity=expected_approver_identity,
                     journal=journal,
+                    replay_policy=replay_policy,
                     now=authorization_clock,
                     reader=artifact_lease.reader(),
                 )
@@ -3214,11 +3721,16 @@ def _authorize_and_execute_with_clock(
                 capability=_VERIFIED_CAPABILITY,
             )
             with journal._operation_lease(context.operation_id) as operation_lease:
-                artifact_lease.assert_stable()
-                operation_lease.assert_stable()
+                _check_execution_stability(journal, journal_pin, artifact_lease, operation_lease)
+                _claim_replay_tombstone(
+                    replay_authority,
+                    _operation_tombstone(replay_policy, genesis, context),
+                    phase="replay_authority_replayed",
+                )
+                _check_execution_stability(journal, journal_pin, artifact_lease, operation_lease)
                 journal._claim_verified(verified)
                 journal._begin_effect(verified)
-                _check_execution_stability(journal, artifact_lease, operation_lease)
+                _check_execution_stability(journal, journal_pin, artifact_lease, operation_lease)
                 outcome = _safe_call(lambda: effect(context))
                 if outcome is _SAFE_CALL_FAILURE:
                     _mark_effect_ambiguous(journal, verified)
@@ -3228,7 +3740,9 @@ def _authorize_and_execute_with_clock(
                     _mark_effect_ambiguous(journal, verified)
                     raise AuthorizationError("effect_failed_recovery_required")
                 post_effect_stable = _safe_call(
-                    lambda: _check_execution_stability(journal, artifact_lease, operation_lease)
+                    lambda: _check_execution_stability(
+                        journal, journal_pin, artifact_lease, operation_lease
+                    )
                 )
                 if post_effect_stable is _SAFE_CALL_FAILURE:
                     _mark_effect_ambiguous(journal, verified)
@@ -3238,7 +3752,9 @@ def _authorize_and_execute_with_clock(
                     _mark_effect_ambiguous(journal, verified)
                     raise AuthorizationError("effect_failed_recovery_required")
                 terminal_stable = _safe_call(
-                    lambda: _check_execution_stability(journal, artifact_lease, operation_lease)
+                    lambda: _check_execution_stability(
+                        journal, journal_pin, artifact_lease, operation_lease
+                    )
                 )
                 if terminal_stable is _SAFE_CALL_FAILURE:
                     raise AuthorizationError("terminal_stability")
@@ -3271,6 +3787,8 @@ def _authorize_and_execute_for_test(
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
     effect: Callable[[VerifiedExecutionContext], EffectReceiptV1],
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
     _clock: Callable[[], datetime],
     _capability: object,
 ) -> ExecutionReceiptV1:
@@ -3287,6 +3805,8 @@ def _authorize_and_execute_for_test(
         expected_approver_identity=expected_approver_identity,
         journal=journal,
         effect=effect,
+        replay_authority=replay_authority,
+        replay_policy=replay_policy,
         clock=_clock,
     )
 
@@ -3301,6 +3821,8 @@ def authorize_and_execute(
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
     effect: Callable[[VerifiedExecutionContext], EffectReceiptV1],
+    replay_authority: ProtocolReplayAuthority,
+    replay_policy: ReplayAuthorityPolicyV1,
 ) -> ExecutionReceiptV1:
     """Verify, lease, execute once, and commit using the trusted UTC clock."""
 
@@ -3313,6 +3835,8 @@ def authorize_and_execute(
         expected_approver_identity=expected_approver_identity,
         journal=journal,
         effect=effect,
+        replay_authority=replay_authority,
+        replay_policy=replay_policy,
         clock=_system_utc_clock,
     )
 

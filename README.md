@@ -98,7 +98,8 @@ library.
 `omninode_rsd.lifecycle.authorize_and_execute()` is the single
 mutation-admission boundary for a disposable acceptance workflow. It accepts
 an injected Ed25519 trust anchor, leased provider-provenance adapter, provider
-fingerprint policy, owner-only `SQLiteAuthorizationJournal`, and one effect
+fingerprint policy, owner-only `SQLiteAuthorizationJournal`, mandatory
+`ProtocolReplayAuthority` plus typed `ReplayAuthorityPolicyV1`, and one effect
 callback. It requires actual detached-signature sidecars for the proposal,
 final contract, and evidence artifacts; Phase-A signature markers alone never
 authorize.
@@ -124,13 +125,30 @@ Before any effect can be admitted, a separate caller must explicitly invoke
 `provision_journal()` once with a trusted Ed25519-signed
 `JournalGenesisReceiptV1`. That receipt commits to the operation/proposal/final
 hashes, expected owner and approver, canonical journal path, fresh journal ID,
-and journal schema digest. Provisioning writes a signed `journal-genesis.yaml`
-artifact and an owner-only pending marker before it creates the database. The
-authorization path never provisions or recreates a journal: an absent journal,
-missing genesis artifact, moved database/anchor, or incomplete genesis blocks
-before an effect. A pending genesis can become current only through signed
+and journal schema digest, including the exact replay-policy digest.
+Provisioning writes an owner-only pending marker before it claims a
+create-once external genesis tombstone and creates the database. The
+authorization path claims a second, operation tombstone before its local
+journal claim or effect. That operation tombstone binds the signed journal ID,
+operation, proposal, contract, final provider provenance, and derived
+idempotency hashes. Local journal failure, deletion, rollback, or row removal
+cannot release either tombstone. The authorization path never provisions or
+recreates a journal: an absent journal, missing genesis artifact, moved
+database/anchor, or incomplete genesis blocks before an effect. A pending
+genesis can become current only through signed
 `JournalGenesisReconciliationReceiptV1` recovery evidence; abandoned and
 rotated identities remain blocked.
+
+The replay authority is an explicit external trust boundary, not a convenience
+cache: callers must inject a durable atomic create-once implementation and
+there is no in-memory or default production adapter. `MacOSKeychainReplayAuthority`
+uses Security.framework generic-password creation only. Its typed policy
+supplies service and account namespace; neither is read from process
+configuration or environment files. It stores only a public tombstone binding hash, never overwrites an
+existing item, and treats duplicate/conflicting items as replay. The Keychain
+tombstone is the governed external record that survives local file rollback;
+deleting it is an explicit out-of-band governed destructive action, never an
+authorization recovery step.
 
 The SQLite journal requires an owner-only directory and database file, uses
 `BEGIN IMMEDIATE`, `DELETE` journaling, and `FULL` synchronous durability. A
@@ -151,7 +169,11 @@ only reconcile that ambiguity with a typed Ed25519-signed
 `ReconciliationReceiptV1` stating the effect committed; otherwise it remains
 recovery-required. Provider and callback failures are returned as generic,
 value-redacted authorization errors, and the journal records only fixed failure
-codes.
+codes. Immediately before provider leasing, the executor pins the exact
+database, anchor, and genesis-marker device/inode/link-count; every pre-effect,
+post-effect, and terminal check rejects replacement. The journal additionally
+rejects all persistent SQLite views and triggers, so the validated schema has
+no hidden executable database paths.
 
 Detached sidecars use canonical standard base64 and Ed25519 domain-separated
 bytes containing the artifact name and SHA-256 of canonical signed content.
