@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import multiprocessing
 import os
 import sqlite3
@@ -10,13 +12,18 @@ from pathlib import Path
 from typing import Protocol
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from omninode_rsd.lifecycle.authorization import (
     _VERIFIED_CAPABILITY,
     AuthorizationError,
     AuthorizationOperationState,
+    JournalMigrationStatus,
+    ReconciliationReceiptV1,
     SQLiteAuthorizationJournal,
+    TrustedEd25519SignerV1,
     VerifiedExecutionContext,
+    _reconciliation_message,
     _VerifiedExecution,
 )
 from omninode_rsd.lifecycle.infisical_disposable import ProposalV1, RuntimeContractV1
@@ -56,6 +63,41 @@ def _journal(tmp_path: Path) -> SQLiteAuthorizationJournal:
     return SQLiteAuthorizationJournal(root / "authorization.sqlite3")
 
 
+def _digest(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _signed_reconciliation(
+    operation_id: str, *, idempotency_key: str = "a" * 64
+) -> tuple[TrustedEd25519SignerV1, ReconciliationReceiptV1]:
+    key = Ed25519PrivateKey.generate()
+    public = key.public_key().public_bytes_raw()
+    signer = TrustedEd25519SignerV1(
+        key_id="reconciliation-signer",
+        public_key_base64=base64.b64encode(public).decode(),
+        public_key_fingerprint_sha256=_digest(public),
+    )
+    unsigned = ReconciliationReceiptV1(
+        schema_version="rsd.lifecycle-effect-reconciliation.v1",
+        outcome="effect_committed",
+        operation_id=operation_id,
+        idempotency_key=idempotency_key,
+        effect_receipt_sha256="e" * 64,
+        signer_key_id=signer.key_id,
+        signature_base64=base64.b64encode(b"0" * 64).decode(),
+    )
+    return (
+        signer,
+        unsigned.model_copy(
+            update={
+                "signature_base64": base64.b64encode(
+                    key.sign(_reconciliation_message(unsigned))
+                ).decode()
+            }
+        ),
+    )
+
+
 def _claim_worker(
     path: str,
     nonce: str,
@@ -75,9 +117,10 @@ def _claim_worker(
 def _crash_worker(path: str, nonce: str, operation_id: str) -> None:
     journal = SQLiteAuthorizationJournal(Path(path))
     verified = _verified(nonce, operation_id)
-    journal._claim_verified(verified)
-    journal._begin_effect(verified)
-    os._exit(0)
+    with journal._operation_lease(operation_id):
+        journal._claim_verified(verified)
+        journal._begin_effect(verified)
+        os._exit(0)
 
 
 def test_claim_is_durable_and_same_operation_rejects_fresh_nonce(tmp_path: Path) -> None:
@@ -86,6 +129,15 @@ def test_claim_is_durable_and_same_operation_rejects_fresh_nonce(tmp_path: Path)
 
     with pytest.raises(AuthorizationError, match="operation_replayed"):
         SQLiteAuthorizationJournal(journal._path)._claim_verified(_verified("b" * 32))
+
+
+def test_migration_status_is_read_only_and_classifies_current_journal(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+
+    assert journal.migration_status() is JournalMigrationStatus.ABSENT
+    assert not journal._path.exists()
+    journal._claim_verified(_verified("a" * 32))
+    assert journal.migration_status() is JournalMigrationStatus.CURRENT
 
 
 def test_journal_rejects_a_caller_constructed_verified_shape(tmp_path: Path) -> None:
@@ -165,6 +217,46 @@ def test_crash_restart_leaves_in_progress_and_requires_explicit_recovery(tmp_pat
         restarted.operation_state("crash-operation")
         is AuthorizationOperationState.FAILED_RECOVERY_REQUIRED
     )
+
+
+def test_signed_reconciliation_is_the_only_ambiguous_effect_resolution(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+    verified = _verified("c" * 32, "ambiguous-operation")
+    with journal._operation_lease(verified.context.operation_id):
+        journal._claim_verified(verified)
+        journal._begin_effect(verified)
+    assert (
+        journal.require_recovery(verified.context.operation_id)
+        is AuthorizationOperationState.FAILED_RECOVERY_REQUIRED
+    )
+    signer, receipt = _signed_reconciliation(verified.context.operation_id)
+
+    assert (
+        journal.reconcile_ambiguous_effect(receipt, signer=signer)
+        is AuthorizationOperationState.COMMITTED
+    )
+    assert (
+        journal.operation_state(verified.context.operation_id)
+        is AuthorizationOperationState.COMMITTED
+    )
+    with pytest.raises(AuthorizationError, match="operation_state"):
+        journal.reconcile_ambiguous_effect(receipt, signer=signer)
+
+
+def test_reconciliation_rejects_unsigned_or_live_operations(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+    verified = _verified("f" * 32, "live-ambiguous-operation")
+    signer, receipt = _signed_reconciliation(verified.context.operation_id)
+    invalid = receipt.model_copy(update={"signature_base64": base64.b64encode(b"1" * 64).decode()})
+
+    with pytest.raises(AuthorizationError, match="reconciliation_signature"):
+        journal.reconcile_ambiguous_effect(invalid, signer=signer)
+
+    with journal._operation_lease(verified.context.operation_id):
+        journal._claim_verified(verified)
+        journal._begin_effect(verified)
+        with pytest.raises(AuthorizationError, match="operation_live"):
+            journal.reconcile_ambiguous_effect(receipt, signer=signer)
 
 
 def test_journal_rejects_non_owner_mode_symlink_and_wrong_schema(tmp_path: Path) -> None:

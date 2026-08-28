@@ -103,14 +103,16 @@ callback. It requires actual detached-signature sidecars for the proposal,
 final contract, and evidence artifacts; Phase-A signature markers alone never
 authorize.
 
-The verifier reads bounded owner-only artifact files, runs Phase-A before and
-after provider inspection, and rejects changed content, sidecars, unsafe file
-metadata, stale evidence, expired retention, signer mismatch, provider
-mismatch, and replayed journal claims. It first acquires a strict owner-only
-artifact-root advisory lock and holds it through provider leasing, journal
-claim, effect execution, and terminal journal transition. Cooperating writers
-use the same lock; noncooperating file changes are rejected by the final
-snapshot check before an effect starts.
+The verifier uses its trusted UTC clock rather than a caller-provided time. It
+reads bounded owner-only artifact files through one open root-directory
+descriptor, runs Phase-A before and after provider inspection, and rejects
+changed content, sidecars, unsafe file metadata, stale evidence, expired
+retention, signer mismatch, provider mismatch, and replayed journal claims.
+It first acquires a strict canonical-parent advisory lock keyed to that root
+and holds the root descriptor through provider leasing, journal claim, effect
+execution, and terminal journal transition. Root replacement, rename, or lock
+replacement is checked before and after each boundary; cooperating writers use
+the same lock, while noncooperating changes fail closed.
 
 The callback receives only immutable `VerifiedExecutionContext`: parsed
 proposal/final-contract models, exact provider expectations, and a derived
@@ -118,10 +120,18 @@ idempotency key. It receives no artifact path, nonce, or journal handle. It
 must return an `EffectReceiptV1` bound to that operation and idempotency key.
 The SQLite journal requires an owner-only directory and database file, uses
 `BEGIN IMMEDIATE`, `DELETE` journaling, and `FULL` synchronous durability. Its
-operation ID is unique and binds the proposal/final hashes. It records
-`claimed`, `in_progress`, `committed`, or `failed_recovery_required`; a fresh
-nonce cannot retry an existing operation. A crash after an effect starts is
-never retried automatically and must be explicitly marked for recovery.
+operation ID is unique and binds the proposal/final hashes. Legacy nonce-ledger
+tables are detected by the read-only `migration_status()` diagnostic and block
+all effects; they are never silently replaced. A durable per-operation OS lease
+is held through the effect and commit, so recovery rejects a live executor. It
+records `claimed`, `in_progress`, `committed`, or
+`failed_recovery_required`; a fresh nonce cannot retry an existing operation.
+A crash after an effect starts is never retried automatically. An operator may
+only reconcile that ambiguity with a typed Ed25519-signed
+`ReconciliationReceiptV1` stating the effect committed; otherwise it remains
+recovery-required. Provider and callback failures are returned as generic,
+value-redacted authorization errors, and the journal records only fixed failure
+codes.
 
 Detached sidecars use canonical standard base64 and Ed25519 domain-separated
 bytes containing the artifact name and SHA-256 of canonical signed content.

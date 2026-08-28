@@ -797,13 +797,43 @@ class PreflightPaths:
 
 
 class _OwnerOnlyReader:
-    """Descriptor-relative reader for bounded, owner-only regular files."""
+    """Descriptor-relative reader for bounded, owner-only regular files.
 
-    def __init__(self, root: Path) -> None:
+    A caller that already owns a checked directory descriptor can pass it in.
+    This keeps every read attached to that same directory inode instead of
+    resolving the root path again between reads.
+    """
+
+    def __init__(self, root: Path, *, root_fd: int | None = None) -> None:
         self._root = root
         self._uid = os.getuid()
+        self._source_root_fd = root_fd
+        self._root_identity: tuple[int, int] | None = None
+        if root_fd is not None:
+            try:
+                details = os.fstat(root_fd)
+            except OSError:
+                raise DisposablePreflightError("owner_only_root") from None
+            if (
+                not stat.S_ISDIR(details.st_mode)
+                or details.st_uid != self._uid
+                or stat.S_IMODE(details.st_mode) != 0o700
+            ):
+                raise DisposablePreflightError("owner_only_root")
+            self._root_identity = (details.st_dev, details.st_ino)
 
     def _root_fd(self) -> int:
+        if self._source_root_fd is not None and self._root_identity is not None:
+            try:
+                fd = os.dup(self._source_root_fd)
+                details = os.fstat(fd)
+            except OSError:
+                raise DisposablePreflightError("owner_only_root") from None
+            if (details.st_dev, details.st_ino) != self._root_identity:
+                with suppress(OSError):
+                    os.close(fd)
+                raise DisposablePreflightError("owner_only_root")
+            return fd
         try:
             before = os.lstat(self._root)
             if (
@@ -895,13 +925,18 @@ def _fresh(value: str, *, now: datetime, phase: str) -> None:
         raise DisposablePreflightError(phase)
 
 
-def compile_preflight(paths: PreflightPaths, *, now: datetime | None = None) -> PreflightReceiptV1:
+def compile_preflight(
+    paths: PreflightPaths,
+    *,
+    now: datetime | None = None,
+    _reader: _OwnerOnlyReader | None = None,
+) -> PreflightReceiptV1:
     """Compile Phase-A artifacts and return a non-authorizing receipt in memory."""
 
     clock = datetime.now(UTC) if now is None else now
     if clock.tzinfo is None or clock.utcoffset() is None:
         raise DisposablePreflightError("clock")
-    reader = _OwnerOnlyReader(paths.root)
+    reader = _OwnerOnlyReader(paths.root) if _reader is None else _reader
     proposal_raw, proposal_file_hash = _read_model(
         reader, paths.proposal_name, ProposalV1, phase="proposal"
     )

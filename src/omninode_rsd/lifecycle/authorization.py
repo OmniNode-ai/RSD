@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, Literal, Protocol
+from typing import Final, Literal, Protocol, cast
 
 import yaml
 from cryptography.exceptions import InvalidSignature
@@ -66,9 +66,14 @@ _ARTIFACT_NAMES: Final[tuple[str, ...]] = (
 _MARKED_EVIDENCE_NAMES: Final[frozenset[str]] = frozenset(_ARTIFACT_NAMES[2:-1])
 _SIGNATURE_DOMAIN: Final = b"omninode-rsd.authorization.ed25519.v3\x00"
 _IDEMPOTENCY_DOMAIN: Final = b"omninode-rsd.authorization.effect.v1\x00"
-_ARTIFACT_LOCK_NAME: Final = ".rsd-authorization.lock"
+_RECONCILIATION_DOMAIN: Final = b"omninode-rsd.authorization.reconciliation.v1\x00"
+_ARTIFACT_LOCK_PREFIX: Final = ".rsd-authorization-root-"
+_OPERATION_LEASE_PREFIX: Final = ".rsd-authorization-operation-"
 _VERIFIED_CAPABILITY: Final = object()
+_TEST_CLOCK_CAPABILITY: Final = object()
+_SAFE_CALL_FAILURE: Final = object()
 _OPERATION_TABLE: Final = "authorization_operation_journal"
+_LEGACY_OPERATION_TABLE: Final = "authorization_nonce_journal"
 _OPERATION_SCHEMA: Final = f"""
 CREATE TABLE IF NOT EXISTS {_OPERATION_TABLE} (
     operation_id TEXT PRIMARY KEY NOT NULL,
@@ -106,6 +111,16 @@ class AuthorizationOperationState(StrEnum):
     IN_PROGRESS = "in_progress"
     COMMITTED = "committed"
     FAILED_RECOVERY_REQUIRED = "failed_recovery_required"
+
+
+class JournalMigrationStatus(StrEnum):
+    """Read-only classification of a journal before it is used for an effect."""
+
+    ABSENT = "absent"
+    EMPTY = "empty"
+    CURRENT = "current"
+    LEGACY_DETECTED = "legacy_detected"
+    UNKNOWN = "unknown"
 
 
 class DetachedAuthorizationSignatureV1(_Model):
@@ -212,6 +227,24 @@ class EffectReceiptV1(_Model):
     operation_id: str
     idempotency_key: str = Field(pattern=_SHA256)
     effect_receipt_sha256: str = Field(pattern=_SHA256)
+
+
+class ReconciliationReceiptV1(_Model):
+    """Signed operator evidence that an ambiguous effect committed exactly once."""
+
+    schema_version: Literal["rsd.lifecycle-effect-reconciliation.v1"]
+    outcome: Literal["effect_committed"]
+    operation_id: str
+    idempotency_key: str = Field(pattern=_SHA256)
+    effect_receipt_sha256: str = Field(pattern=_SHA256)
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @model_validator(mode="after")
+    def canonical_signature(self) -> ReconciliationReceiptV1:
+        if len(_canonical_base64(self.signature_base64)) != 64:
+            raise ValueError("Ed25519 signature has wrong length")
+        return self
 
 
 class ExecutionReceiptV1(_Model):
@@ -373,13 +406,15 @@ def _verify_embedded_marker(
 
 
 def _receipt_snapshot(
-    paths: AuthorizationPaths, *, now: datetime
+    paths: AuthorizationPaths,
+    *,
+    now: datetime,
+    reader: _OwnerOnlyReader,
 ) -> tuple[PreflightReceiptV1, dict[str, bytes]]:
     try:
-        receipt = compile_preflight(paths.preflight(), now=now)
+        receipt = compile_preflight(paths.preflight(), now=now, _reader=reader)
     except DisposablePreflightError as error:
         raise AuthorizationError(f"phase_a_{error.phase}") from None
-    reader = _OwnerOnlyReader(paths.root)
     snapshot: dict[str, bytes] = {}
     try:
         for name in _ARTIFACT_NAMES:
@@ -392,6 +427,12 @@ def _receipt_snapshot(
     return receipt, snapshot
 
 
+def _same_artifact_receipt(first: PreflightReceiptV1, second: PreflightReceiptV1) -> bool:
+    """Compare Phase-A commitments without its local compilation timestamp."""
+
+    return first.model_dump(exclude={"emitted_at"}) == second.model_dump(exclude={"emitted_at"})
+
+
 def _verify_artifact_snapshot(
     paths: AuthorizationPaths,
     *,
@@ -399,8 +440,9 @@ def _verify_artifact_snapshot(
     expected_disposal_owner: str,
     expected_approver_identity: str,
     now: datetime,
+    reader: _OwnerOnlyReader,
 ) -> tuple[_ArtifactVerification, dict[str, bytes]]:
-    first, snapshot = _receipt_snapshot(paths, now=now)
+    first, snapshot = _receipt_snapshot(paths, now=now, reader=reader)
     evidence_models: dict[str, BaseModel] = {}
     model_types: Mapping[str, type[BaseModel] | None] = {
         "approval.yaml": ApprovalEvidenceV1,
@@ -449,6 +491,76 @@ def _verify_artifact_snapshot(
     return _ArtifactVerification(first, proposal, final_contract), snapshot
 
 
+def _safe_call(call: Callable[[], object]) -> object:
+    """Discard arbitrary adapter or callback failures before they escape a boundary."""
+
+    try:
+        return call()
+    except Exception:
+        return _SAFE_CALL_FAILURE
+
+
+def _provider_item(
+    lease: ProviderSnapshotLease, reference: ProviderReferenceV1, *, recheck: bool
+) -> ProviderProvenance | None:
+    method_name = "recheck" if recheck else "inspect"
+    method = _safe_call(lambda: getattr(lease, method_name))
+    if method is _SAFE_CALL_FAILURE or not callable(method):
+        raise AuthorizationError("provider_failure")
+    item = _safe_call(lambda: method(reference))
+    if item is _SAFE_CALL_FAILURE:
+        raise AuthorizationError("provider_failure")
+    if item is None:
+        return None
+    candidate = cast(ProviderProvenance, item)
+    fields = _safe_call(
+        lambda: (
+            candidate.provider,
+            candidate.service,
+            candidate.account,
+            candidate.version,
+            candidate.reference_sha256,
+            candidate.fingerprint_sha256,
+        )
+    )
+    if fields is _SAFE_CALL_FAILURE or type(fields) is not tuple or len(fields) != 6:
+        raise AuthorizationError("provider_failure")
+    provider, service, account, version, reference_sha256, fingerprint_sha256 = fields
+    if (
+        type(provider) is not str
+        or type(service) is not str
+        or type(account) is not str
+        or type(version) is not int
+        or type(reference_sha256) is not str
+        or type(fingerprint_sha256) is not str
+    ):
+        raise AuthorizationError("provider_provenance")
+    return ProviderProvenance(
+        provider=provider,
+        service=service,
+        account=account,
+        version=version,
+        reference_sha256=reference_sha256,
+        fingerprint_sha256=fingerprint_sha256,
+    )
+
+
+def _provider_expectation(item: ProviderProvenance) -> ProviderExpectationV1:
+    expected = _safe_call(
+        lambda: ProviderExpectationV1(
+            provider=item.provider,
+            service=item.service,
+            account=item.account,
+            version=item.version,
+            reference_sha256=item.reference_sha256,
+            fingerprint_sha256=item.fingerprint_sha256,
+        )
+    )
+    if type(expected) is not ProviderExpectationV1:
+        raise AuthorizationError("provider_provenance")
+    return expected
+
+
 def _provider_commitment(
     *,
     references: tuple[ProviderReferenceV1, ...],
@@ -465,9 +577,8 @@ def _provider_commitment(
         raise AuthorizationError("provider_policy")
     expected: list[ProviderExpectationV1] = []
     observed: list[dict[str, object]] = []
-    inspect = lease.recheck if recheck else lease.inspect
     for reference in references:
-        item = inspect(reference)
+        item = _provider_item(lease, reference, recheck=recheck)
         expected_fingerprint = fingerprints[reference.reference_sha256]
         if item is None or (
             item.provider != reference.provider
@@ -478,16 +589,7 @@ def _provider_commitment(
             or item.fingerprint_sha256 != expected_fingerprint
         ):
             raise AuthorizationError("provider_provenance")
-        expected.append(
-            ProviderExpectationV1(
-                provider=item.provider,
-                service=item.service,
-                account=item.account,
-                version=item.version,
-                reference_sha256=item.reference_sha256,
-                fingerprint_sha256=item.fingerprint_sha256,
-            )
-        )
+        expected.append(_provider_expectation(item))
         observed.append(expected[-1].model_dump(mode="json"))
     return (
         _digest(json.dumps(observed, sort_keys=True, separators=(",", ":")).encode()),
@@ -505,38 +607,38 @@ def _idempotency_key(
 
 
 class ArtifactRootLease:
-    """Exclusive advisory lock for an owner-only artifact root.
+    """A canonical-parent lock and stable directory descriptor for artifacts.
 
-    Cooperating artifact writers use the same lease. Noncooperating changes are
-    still fail-closed by the locked before/after artifact snapshots.
+    The lock is placed beside the canonical root rather than inside it.  That
+    makes root replacement, renaming, and lock-file replacement observable
+    while the original directory descriptor remains the only read capability.
     """
 
     def __init__(self, root: Path) -> None:
-        self._root = root
-        self._lock_path = root / _ARTIFACT_LOCK_NAME
-        self._file_descriptor: int | None = None
+        self._requested_root = root
+        self._canonical_root: Path | None = None
+        self._parent: Path | None = None
+        self._lock_name: str | None = None
+        self._parent_identity: tuple[int, int] | None = None
+        self._root_identity: tuple[int, int] | None = None
+        self._lock_identity: tuple[int, int] | None = None
+        self._parent_descriptor: int | None = None
+        self._root_descriptor: int | None = None
+        self._lock_descriptor: int | None = None
 
     @staticmethod
-    def _validate_root(root: Path) -> tuple[int, int]:
-        try:
-            details = os.lstat(root)
-        except OSError:
-            raise AuthorizationError("artifact_lock_root") from None
+    def _validate_directory_details(details: os.stat_result, phase: str) -> tuple[int, int]:
         if (
             not stat.S_ISDIR(details.st_mode)
             or stat.S_ISLNK(details.st_mode)
             or details.st_uid != os.getuid()
             or stat.S_IMODE(details.st_mode) != 0o700
         ):
-            raise AuthorizationError("artifact_lock_root")
+            raise AuthorizationError(phase)
         return (details.st_dev, details.st_ino)
 
     @staticmethod
-    def _validate_file(path: Path) -> tuple[int, int]:
-        try:
-            details = os.lstat(path)
-        except OSError:
-            raise AuthorizationError("artifact_lock_file") from None
+    def _validate_file_details(details: os.stat_result, phase: str) -> tuple[int, int]:
         if (
             not stat.S_ISREG(details.st_mode)
             or stat.S_ISLNK(details.st_mode)
@@ -544,72 +646,398 @@ class ArtifactRootLease:
             or stat.S_IMODE(details.st_mode) != 0o600
             or details.st_nlink != 1
         ):
-            raise AuthorizationError("artifact_lock_file")
+            raise AuthorizationError(phase)
         return (details.st_dev, details.st_ino)
 
-    def _open_file(self) -> int:
-        self._validate_root(self._root)
+    @classmethod
+    def _directory_identity(cls, path: Path, phase: str) -> tuple[int, int]:
         try:
-            before = self._validate_file(self._lock_path)
+            return cls._validate_directory_details(os.lstat(path), phase)
         except AuthorizationError:
-            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-            try:
-                file_descriptor = os.open(self._lock_path, flags, 0o600)
-            except FileExistsError:
-                before = self._validate_file(self._lock_path)
-            except OSError:
-                raise AuthorizationError("artifact_lock_file") from None
-            else:
-                with suppress(OSError):
-                    os.close(file_descriptor)
-                before = self._validate_file(self._lock_path)
-        try:
-            file_descriptor = os.open(
-                self._lock_path,
-                os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-            )
-            after = os.fstat(file_descriptor)
-        except OSError:
-            raise AuthorizationError("artifact_lock_file") from None
-        if before != (after.st_dev, after.st_ino):
-            with suppress(OSError):
-                os.close(file_descriptor)
-            raise AuthorizationError("artifact_lock_file")
-        return file_descriptor
-
-    def __enter__(self) -> ArtifactRootLease:
-        file_descriptor = self._open_file()
-        try:
-            fcntl.flock(file_descriptor, fcntl.LOCK_EX)
-            self._validate_root(self._root)
-            locked = os.fstat(file_descriptor)
-            if (locked.st_dev, locked.st_ino) != self._validate_file(self._lock_path):
-                raise AuthorizationError("artifact_lock_file")
-        except AuthorizationError:
-            with suppress(OSError):
-                fcntl.flock(file_descriptor, fcntl.LOCK_UN)
-            with suppress(OSError):
-                os.close(file_descriptor)
             raise
         except OSError:
+            raise AuthorizationError(phase) from None
+
+    @classmethod
+    def _file_identity_at(cls, descriptor: int, name: str, phase: str) -> tuple[int, int]:
+        try:
+            return cls._validate_file_details(os.lstat(name, dir_fd=descriptor), phase)
+        except AuthorizationError:
+            raise
+        except OSError:
+            raise AuthorizationError(phase) from None
+
+    @classmethod
+    def _open_directory(cls, path: Path, phase: str) -> tuple[int, tuple[int, int]]:
+        before = cls._directory_identity(path, phase)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            after = cls._validate_directory_details(os.fstat(descriptor), phase)
+        except AuthorizationError:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+            raise
+        except OSError:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+            raise AuthorizationError(phase) from None
+        if before != after:
             with suppress(OSError):
-                fcntl.flock(file_descriptor, fcntl.LOCK_UN)
-            with suppress(OSError):
-                os.close(file_descriptor)
+                os.close(descriptor)
+            raise AuthorizationError(phase)
+        return descriptor, after
+
+    @classmethod
+    def _open_lock_file(cls, parent_descriptor: int, name: str) -> tuple[int, tuple[int, int]]:
+        try:
+            before = cls._file_identity_at(parent_descriptor, name, "artifact_lock_file")
+        except AuthorizationError:
+            try:
+                os.lstat(name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                flags = (
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                try:
+                    created = os.open(name, flags, 0o600, dir_fd=parent_descriptor)
+                except FileExistsError:
+                    pass
+                except OSError:
+                    raise AuthorizationError("artifact_lock_file") from None
+                else:
+                    try:
+                        cls._validate_file_details(os.fstat(created), "artifact_lock_file")
+                    finally:
+                        with suppress(OSError):
+                            os.close(created)
+            except OSError:
+                raise AuthorizationError("artifact_lock_file") from None
+            before = cls._file_identity_at(parent_descriptor, name, "artifact_lock_file")
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_descriptor,
+            )
+            after = cls._validate_file_details(os.fstat(descriptor), "artifact_lock_file")
+        except AuthorizationError:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+            raise
+        except OSError:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
             raise AuthorizationError("artifact_lock_file") from None
-        self._file_descriptor = file_descriptor
-        return self
+        assert descriptor is not None
+        if before != after or before != cls._file_identity_at(
+            parent_descriptor, name, "artifact_lock_file"
+        ):
+            with suppress(OSError):
+                os.close(descriptor)
+            raise AuthorizationError("artifact_lock_file")
+        return descriptor, after
+
+    @staticmethod
+    def _canonicalize_root(root: Path) -> Path:
+        try:
+            details = os.lstat(root)
+        except OSError:
+            raise AuthorizationError("artifact_lock_root") from None
+        if stat.S_ISLNK(details.st_mode):
+            raise AuthorizationError("artifact_lock_root")
+        canonical = Path(os.path.realpath(root))
+        ArtifactRootLease._directory_identity(canonical, "artifact_lock_root")
+        return canonical
+
+    def __enter__(self) -> ArtifactRootLease:
+        canonical = self._canonicalize_root(self._requested_root)
+        parent = canonical.parent
+        parent_descriptor: int | None = None
+        root_descriptor: int | None = None
+        lock_descriptor: int | None = None
+        try:
+            parent_descriptor, parent_identity = self._open_directory(parent, "artifact_lock_root")
+            root_descriptor, root_identity = self._open_directory(canonical, "artifact_lock_root")
+            lock_name = f"{_ARTIFACT_LOCK_PREFIX}{_digest(os.fsencode(str(canonical)))}.lock"
+            lock_descriptor, lock_identity = self._open_lock_file(parent_descriptor, lock_name)
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            self._canonical_root = canonical
+            self._parent = parent
+            self._lock_name = lock_name
+            self._parent_identity = parent_identity
+            self._root_identity = root_identity
+            self._lock_identity = lock_identity
+            self._parent_descriptor = parent_descriptor
+            self._root_descriptor = root_descriptor
+            self._lock_descriptor = lock_descriptor
+            self.assert_stable()
+            return self
+        except AuthorizationError:
+            self._close_descriptors(lock_descriptor, root_descriptor, parent_descriptor)
+            raise
+        except OSError:
+            self._close_descriptors(lock_descriptor, root_descriptor, parent_descriptor)
+            raise AuthorizationError("artifact_lock_file") from None
+
+    @staticmethod
+    def _close_descriptors(
+        lock_descriptor: int | None,
+        root_descriptor: int | None,
+        parent_descriptor: int | None,
+    ) -> None:
+        if lock_descriptor is not None:
+            with suppress(OSError):
+                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+            with suppress(OSError):
+                os.close(lock_descriptor)
+        for descriptor in (root_descriptor, parent_descriptor):
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+
+    def assert_stable(self) -> None:
+        """Fail closed if any locked path or descriptor identity changed."""
+
+        if (
+            self._canonical_root is None
+            or self._parent is None
+            or self._lock_name is None
+            or self._parent_identity is None
+            or self._root_identity is None
+            or self._lock_identity is None
+            or self._parent_descriptor is None
+            or self._root_descriptor is None
+            or self._lock_descriptor is None
+        ):
+            raise AuthorizationError("artifact_lock_state")
+        if self._directory_identity(self._parent, "artifact_lock_root") != self._parent_identity:
+            raise AuthorizationError("artifact_lock_root")
+        if (
+            self._directory_identity(self._canonical_root, "artifact_lock_root")
+            != self._root_identity
+        ):
+            raise AuthorizationError("artifact_lock_root")
+        try:
+            parent_identity = self._validate_directory_details(
+                os.fstat(self._parent_descriptor), "artifact_lock_root"
+            )
+            root_identity = self._validate_directory_details(
+                os.fstat(self._root_descriptor), "artifact_lock_root"
+            )
+            lock_identity = self._validate_file_details(
+                os.fstat(self._lock_descriptor), "artifact_lock_file"
+            )
+        except AuthorizationError:
+            raise
+        except OSError:
+            raise AuthorizationError("artifact_lock_state") from None
+        if (
+            parent_identity != self._parent_identity
+            or root_identity != self._root_identity
+            or lock_identity != self._lock_identity
+            or self._file_identity_at(
+                self._parent_descriptor, self._lock_name, "artifact_lock_file"
+            )
+            != self._lock_identity
+        ):
+            raise AuthorizationError("artifact_lock_state")
+
+    def reader(self) -> _OwnerOnlyReader:
+        """Return a reader bound to the locked root descriptor."""
+
+        self.assert_stable()
+        assert self._canonical_root is not None
+        assert self._root_descriptor is not None
+        return _OwnerOnlyReader(self._canonical_root, root_fd=self._root_descriptor)
 
     def __exit__(self, exception_type: object, exception: object, traceback: object) -> None:
         del exception_type, exception, traceback
-        if self._file_descriptor is None:
-            return
-        with suppress(OSError):
-            fcntl.flock(self._file_descriptor, fcntl.LOCK_UN)
-        with suppress(OSError):
-            os.close(self._file_descriptor)
+        self._close_descriptors(
+            self._lock_descriptor, self._root_descriptor, self._parent_descriptor
+        )
+        self._canonical_root = None
+        self._parent = None
+        self._lock_name = None
+        self._parent_identity = None
+        self._root_identity = None
+        self._lock_identity = None
+        self._parent_descriptor = None
+        self._root_descriptor = None
+        self._lock_descriptor = None
+
+
+class _OperationLease:
+    """One durable, owner-only advisory lease file per operation identifier."""
+
+    def __init__(
+        self, journal: SQLiteAuthorizationJournal, operation_id: str, *, nonblocking: bool
+    ) -> None:
+        self._journal = journal
+        self._operation_id = operation_id
+        self._nonblocking = nonblocking
+        self._parent_descriptor: int | None = None
+        self._file_descriptor: int | None = None
+        self._parent_identity: tuple[int, int] | None = None
+        self._file_identity: tuple[int, int] | None = None
+        self._name = f"{_OPERATION_LEASE_PREFIX}{_digest(operation_id.encode())}.lock"
+
+    @staticmethod
+    def _open_file(parent_descriptor: int, name: str) -> tuple[int, tuple[int, int]]:
+        try:
+            before = ArtifactRootLease._file_identity_at(parent_descriptor, name, "operation_lease")
+        except AuthorizationError:
+            try:
+                os.lstat(name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                flags = (
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                try:
+                    created = os.open(name, flags, 0o600, dir_fd=parent_descriptor)
+                except FileExistsError:
+                    pass
+                except OSError:
+                    raise AuthorizationError("operation_lease") from None
+                else:
+                    try:
+                        ArtifactRootLease._validate_file_details(
+                            os.fstat(created), "operation_lease"
+                        )
+                    finally:
+                        with suppress(OSError):
+                            os.close(created)
+            except OSError:
+                raise AuthorizationError("operation_lease") from None
+            before = ArtifactRootLease._file_identity_at(parent_descriptor, name, "operation_lease")
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_descriptor,
+            )
+            after = ArtifactRootLease._validate_file_details(
+                os.fstat(descriptor), "operation_lease"
+            )
+        except AuthorizationError:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+            raise
+        except OSError:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+            raise AuthorizationError("operation_lease") from None
+        assert descriptor is not None
+        if before != after or before != ArtifactRootLease._file_identity_at(
+            parent_descriptor, name, "operation_lease"
+        ):
+            with suppress(OSError):
+                os.close(descriptor)
+            raise AuthorizationError("operation_lease")
+        return descriptor, after
+
+    def __enter__(self) -> _OperationLease:
+        if not self._journal._path.is_absolute():
+            raise AuthorizationError("journal_path")
+        parent_descriptor: int | None = None
+        file_descriptor: int | None = None
+        try:
+            parent_descriptor, parent_identity = ArtifactRootLease._open_directory(
+                self._journal._path.parent, "journal_directory"
+            )
+            file_descriptor, file_identity = self._open_file(parent_descriptor, self._name)
+            lock_flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if self._nonblocking else 0)
+            try:
+                fcntl.flock(file_descriptor, lock_flags)
+            except BlockingIOError:
+                raise AuthorizationError("operation_live") from None
+            self._parent_descriptor = parent_descriptor
+            self._file_descriptor = file_descriptor
+            self._parent_identity = parent_identity
+            self._file_identity = file_identity
+            self.assert_stable()
+            return self
+        except AuthorizationError:
+            self._close(file_descriptor, parent_descriptor)
+            raise
+        except OSError:
+            self._close(file_descriptor, parent_descriptor)
+            raise AuthorizationError("operation_lease") from None
+
+    @staticmethod
+    def _close(file_descriptor: int | None, parent_descriptor: int | None) -> None:
+        if file_descriptor is not None:
+            with suppress(OSError):
+                fcntl.flock(file_descriptor, fcntl.LOCK_UN)
+            with suppress(OSError):
+                os.close(file_descriptor)
+        if parent_descriptor is not None:
+            with suppress(OSError):
+                os.close(parent_descriptor)
+
+    def assert_stable(self) -> None:
+        if (
+            self._parent_descriptor is None
+            or self._file_descriptor is None
+            or self._parent_identity is None
+            or self._file_identity is None
+        ):
+            raise AuthorizationError("operation_lease")
+        if (
+            ArtifactRootLease._directory_identity(self._journal._path.parent, "journal_directory")
+            != self._parent_identity
+        ):
+            raise AuthorizationError("operation_lease")
+        try:
+            parent_identity = ArtifactRootLease._validate_directory_details(
+                os.fstat(self._parent_descriptor), "journal_directory"
+            )
+            file_identity = ArtifactRootLease._validate_file_details(
+                os.fstat(self._file_descriptor), "operation_lease"
+            )
+        except AuthorizationError:
+            raise
+        except OSError:
+            raise AuthorizationError("operation_lease") from None
+        if (
+            parent_identity != self._parent_identity
+            or file_identity != self._file_identity
+            or ArtifactRootLease._file_identity_at(
+                self._parent_descriptor, self._name, "operation_lease"
+            )
+            != self._file_identity
+        ):
+            raise AuthorizationError("operation_lease")
+
+    def __exit__(self, exception_type: object, exception: object, traceback: object) -> None:
+        del exception_type, exception, traceback
+        self._close(self._file_descriptor, self._parent_descriptor)
+        self._parent_descriptor = None
         self._file_descriptor = None
+        self._parent_identity = None
+        self._file_identity = None
 
 
 class SQLiteAuthorizationJournal:
@@ -617,6 +1045,67 @@ class SQLiteAuthorizationJournal:
 
     def __init__(self, path: Path) -> None:
         self._path = path
+
+    @staticmethod
+    def _table_names(connection: sqlite3.Connection) -> set[str]:
+        rows = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+        ).fetchall()
+        if not all(type(row[0]) is str for row in rows):
+            raise AuthorizationError("journal_schema")
+        return {row[0] for row in rows}
+
+    @classmethod
+    def _reject_incompatible_tables(cls, connection: sqlite3.Connection) -> None:
+        names = cls._table_names(connection)
+        if _LEGACY_OPERATION_TABLE in names:
+            raise AuthorizationError("journal_legacy_detected")
+        if names - {_OPERATION_TABLE}:
+            raise AuthorizationError("journal_schema")
+
+    def migration_status(self) -> JournalMigrationStatus:
+        """Inspect journal format without creating or changing any file."""
+
+        if not self._path.is_absolute() or not self._path.name or self._path.name in {".", ".."}:
+            raise AuthorizationError("journal_path")
+        self._validate_owner_directory(self._path.parent)
+        try:
+            os.lstat(self._path)
+        except FileNotFoundError:
+            return JournalMigrationStatus.ABSENT
+        except OSError:
+            raise AuthorizationError("journal_path") from None
+        self._validate_owner_file(self._path)
+        self._validate_companions()
+        try:
+            connection = sqlite3.connect(
+                f"{self._path.as_uri()}?mode=ro",
+                uri=True,
+                isolation_level=None,
+                timeout=5.0,
+            )
+        except sqlite3.Error:
+            raise AuthorizationError("journal_open") from None
+        try:
+            connection.execute("PRAGMA trusted_schema = OFF")
+            names = self._table_names(connection)
+            if _LEGACY_OPERATION_TABLE in names:
+                return JournalMigrationStatus.LEGACY_DETECTED
+            if names == set():
+                return JournalMigrationStatus.EMPTY
+            if names != {_OPERATION_TABLE}:
+                return JournalMigrationStatus.UNKNOWN
+            try:
+                self._validate_schema(connection)
+            except AuthorizationError:
+                return JournalMigrationStatus.UNKNOWN
+            return JournalMigrationStatus.CURRENT
+        except AuthorizationError:
+            raise
+        except sqlite3.Error:
+            raise AuthorizationError("journal_open") from None
+        finally:
+            connection.close()
 
     @staticmethod
     def _validate_owner_directory(path: Path) -> tuple[int, int]:
@@ -700,6 +1189,7 @@ class SQLiteAuthorizationJournal:
             if before != self._validate_owner_file(self._path):
                 raise AuthorizationError("journal_path")
             connection.execute("PRAGMA trusted_schema = OFF")
+            self._reject_incompatible_tables(connection)
             row = connection.execute("PRAGMA journal_mode = DELETE").fetchone()
             if row != ("delete",):
                 raise AuthorizationError("journal_durability")
@@ -760,6 +1250,7 @@ class SQLiteAuthorizationJournal:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._reject_incompatible_tables(connection)
             connection.execute(_OPERATION_SCHEMA)
             self._validate_schema(connection)
             result = action(connection)
@@ -795,6 +1286,11 @@ class SQLiteAuthorizationJournal:
             context.provider_provenance_sha256,
             context.idempotency_key,
         )
+
+    def _operation_lease(self, operation_id: str, *, nonblocking: bool = False) -> _OperationLease:
+        if type(operation_id) is not str or not operation_id:
+            raise AuthorizationError("operation_id")
+        return _OperationLease(self, operation_id, nonblocking=nonblocking)
 
     def _claim_verified(self, verified: _VerifiedExecution) -> None:
         self._require_verified(verified)
@@ -936,6 +1432,7 @@ class SQLiteAuthorizationJournal:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._reject_incompatible_tables(connection)
             connection.execute(_OPERATION_SCHEMA)
             self._validate_schema(connection)
             row = connection.execute(
@@ -960,7 +1457,7 @@ class SQLiteAuthorizationJournal:
             raise AuthorizationError("journal_schema") from None
 
     def require_recovery(self, operation_id: str) -> AuthorizationOperationState:
-        """Explicitly mark a stranded claimed/in-progress operation unretryable."""
+        """Mark a released, ambiguous operation unretryable without retrying it."""
 
         if type(operation_id) is not str or not operation_id:
             raise AuthorizationError("operation_id")
@@ -985,7 +1482,69 @@ class SQLiteAuthorizationJournal:
                 raise AuthorizationError("operation_state")
             return AuthorizationOperationState.FAILED_RECOVERY_REQUIRED.value
 
-        result = self._transaction(recover)
+        with self._operation_lease(operation_id, nonblocking=True) as lease:
+            lease.assert_stable()
+            result = self._transaction(recover)
+            lease.assert_stable()
+        assert result is not None
+        return AuthorizationOperationState(result)
+
+    def reconcile_ambiguous_effect(
+        self,
+        receipt: ReconciliationReceiptV1,
+        *,
+        signer: TrustedEd25519SignerV1,
+    ) -> AuthorizationOperationState:
+        """Commit only a released ambiguous operation with signed outcome evidence.
+
+        This operation never invokes an effect.  Without a verified typed
+        receipt, callers must leave the journal in ``failed_recovery_required``
+        and perform no automatic retry.
+        """
+
+        _verify_reconciliation_receipt(receipt, signer=signer)
+
+        def reconcile(connection: sqlite3.Connection) -> str:
+            row = connection.execute(
+                f"""
+                SELECT idempotency_key, state FROM {_OPERATION_TABLE}
+                WHERE operation_id = ?
+                """,
+                (receipt.operation_id,),
+            ).fetchone()
+            if row is None or type(row[0]) is not str or type(row[1]) is not str:
+                raise AuthorizationError("operation_state")
+            if row[0] != receipt.idempotency_key or row[1] not in {
+                AuthorizationOperationState.IN_PROGRESS.value,
+                AuthorizationOperationState.FAILED_RECOVERY_REQUIRED.value,
+            }:
+                raise AuthorizationError("operation_state")
+            result = connection.execute(
+                f"""
+                UPDATE {_OPERATION_TABLE}
+                SET state = ?, effect_receipt_sha256 = ?, failure_phase = ?, updated_at = ?
+                WHERE operation_id = ? AND idempotency_key = ?
+                  AND state IN (?, ?)
+                """,
+                (
+                    AuthorizationOperationState.COMMITTED.value,
+                    receipt.effect_receipt_sha256,
+                    "reconciled",
+                    datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                    receipt.operation_id,
+                    receipt.idempotency_key,
+                    AuthorizationOperationState.IN_PROGRESS.value,
+                    AuthorizationOperationState.FAILED_RECOVERY_REQUIRED.value,
+                ),
+            )
+            if result.rowcount != 1:
+                raise AuthorizationError("operation_state")
+            return AuthorizationOperationState.COMMITTED.value
+
+        with self._operation_lease(receipt.operation_id, nonblocking=True) as lease:
+            lease.assert_stable()
+            result = self._transaction(reconcile)
+            lease.assert_stable()
         assert result is not None
         return AuthorizationOperationState(result)
 
@@ -1002,7 +1561,103 @@ def _validate_effect_receipt(context: VerifiedExecutionContext, value: object) -
     return receipt
 
 
-def authorize_and_execute(
+def _reconciliation_message(receipt: ReconciliationReceiptV1) -> bytes:
+    material = {
+        "effect_receipt_sha256": receipt.effect_receipt_sha256,
+        "idempotency_key": receipt.idempotency_key,
+        "operation_id": receipt.operation_id,
+        "outcome": receipt.outcome,
+        "schema_version": receipt.schema_version,
+        "signer_key_id": receipt.signer_key_id,
+    }
+    return _RECONCILIATION_DOMAIN + json.dumps(
+        material, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+
+
+def _verify_reconciliation_receipt(
+    receipt: ReconciliationReceiptV1, *, signer: TrustedEd25519SignerV1
+) -> None:
+    if (
+        type(receipt) is not ReconciliationReceiptV1
+        or type(signer) is not TrustedEd25519SignerV1
+        or receipt.signer_key_id != signer.key_id
+    ):
+        raise AuthorizationError("reconciliation_signature")
+    signature = _safe_call(lambda: _canonical_base64(receipt.signature_base64))
+    if signature is _SAFE_CALL_FAILURE or type(signature) is not bytes:
+        raise AuthorizationError("reconciliation_signature")
+    verified = _safe_call(lambda: signer.key().verify(signature, _reconciliation_message(receipt)))
+    if verified is _SAFE_CALL_FAILURE:
+        raise AuthorizationError("reconciliation_signature")
+
+
+def _read_clock(clock: Callable[[], datetime]) -> datetime:
+    observed = _safe_call(clock)
+    if type(observed) is not datetime or observed.tzinfo is None or observed.utcoffset() is None:
+        raise AuthorizationError("clock")
+    return observed.astimezone(UTC)
+
+
+def _system_utc_clock() -> datetime:
+    return datetime.now(UTC)
+
+
+def _acquire_provider_lease(
+    provider: ProviderProvenanceAdapter, references: tuple[ProviderReferenceV1, ...]
+) -> tuple[object, ProviderSnapshotLease]:
+    manager = _safe_call(lambda: provider.acquire(references))
+    if manager is _SAFE_CALL_FAILURE:
+        raise AuthorizationError("provider_failure")
+    context_manager = cast(AbstractContextManager[ProviderSnapshotLease], manager)
+    enter = _safe_call(lambda: context_manager.__enter__)
+    exit_method = _safe_call(lambda: context_manager.__exit__)
+    if (
+        enter is _SAFE_CALL_FAILURE
+        or exit_method is _SAFE_CALL_FAILURE
+        or not callable(enter)
+        or not callable(exit_method)
+    ):
+        raise AuthorizationError("provider_failure")
+    lease = _safe_call(enter)
+    if lease is _SAFE_CALL_FAILURE:
+        raise AuthorizationError("provider_failure")
+    return manager, cast(ProviderSnapshotLease, lease)
+
+
+def _release_provider_lease(manager: object) -> bool:
+    context_manager = cast(AbstractContextManager[ProviderSnapshotLease], manager)
+    exit_method = _safe_call(lambda: context_manager.__exit__)
+    if exit_method is _SAFE_CALL_FAILURE or not callable(exit_method):
+        return False
+    return _safe_call(lambda: exit_method(None, None, None)) is not _SAFE_CALL_FAILURE
+
+
+def _normalized_fingerprints(fingerprints: Mapping[str, str]) -> dict[str, str]:
+    normalized = _safe_call(lambda: dict(fingerprints))
+    if type(normalized) is not dict or not all(
+        type(key) is str and type(value) is str for key, value in normalized.items()
+    ):
+        raise AuthorizationError("provider_policy")
+    return normalized
+
+
+def _mark_effect_ambiguous(
+    journal: SQLiteAuthorizationJournal, verified: _VerifiedExecution
+) -> None:
+    result = _safe_call(lambda: journal._fail_effect(verified))
+    if result is _SAFE_CALL_FAILURE:
+        raise AuthorizationError("effect_failed_recovery_required")
+
+
+def _check_execution_stability(
+    artifact_lease: ArtifactRootLease, operation_lease: _OperationLease
+) -> None:
+    artifact_lease.assert_stable()
+    operation_lease.assert_stable()
+
+
+def _authorize_and_execute_with_clock(
     paths: AuthorizationPaths,
     *,
     signer: TrustedEd25519SignerV1,
@@ -1012,51 +1667,88 @@ def authorize_and_execute(
     expected_approver_identity: str,
     journal: SQLiteAuthorizationJournal,
     effect: Callable[[VerifiedExecutionContext], EffectReceiptV1],
-    now: datetime | None = None,
+    clock: Callable[[], datetime],
 ) -> ExecutionReceiptV1:
-    """Lock, verify, claim, execute once, and commit an effect receipt.
+    """Internal implementation with a capability-hidden test clock.
 
-    A failed callback and any process interruption after ``_begin_effect`` leave
-    the operation in a non-retryable recovery-required state. The callback gets
-    only immutable verified material and must use ``idempotency_key`` for its
-    own side effect.
+    The public entry point always supplies the system UTC clock.  A failed
+    callback and any process interruption after ``_begin_effect`` leave an
+    ambiguous operation that cannot be retried automatically.
     """
 
-    if type(journal) is not SQLiteAuthorizationJournal or not callable(effect):
+    if (
+        type(paths) is not AuthorizationPaths
+        or type(signer) is not TrustedEd25519SignerV1
+        or type(journal) is not SQLiteAuthorizationJournal
+        or not callable(effect)
+    ):
         raise AuthorizationError("journal_effect")
-    clock = datetime.now(UTC) if now is None else now
-    if clock.tzinfo is None or clock.utcoffset() is None:
-        raise AuthorizationError("clock")
-    with ArtifactRootLease(paths.root):
+    journal_status = journal.migration_status()
+    if journal_status is JournalMigrationStatus.LEGACY_DETECTED:
+        raise AuthorizationError("journal_legacy_detected")
+    if journal_status is JournalMigrationStatus.UNKNOWN:
+        raise AuthorizationError("journal_schema")
+    fingerprints = _normalized_fingerprints(provider_fingerprints)
+    with ArtifactRootLease(paths.root) as artifact_lease:
+        artifact_lease.assert_stable()
         artifacts, snapshot = _verify_artifact_snapshot(
             paths,
             signer=signer,
             expected_disposal_owner=expected_disposal_owner,
             expected_approver_identity=expected_approver_identity,
-            now=clock,
+            now=_read_clock(clock),
+            reader=artifact_lease.reader(),
         )
+        artifact_lease.assert_stable()
         references = artifacts.proposal.provider_references.all()
-        with provider.acquire(references) as lease:
+        manager, provider_lease = _acquire_provider_lease(provider, references)
+        execution_receipt: ExecutionReceiptV1 | None = None
+        provider_released = True
+        try:
             initial_provider_sha256, expectations = _provider_commitment(
                 references=references,
-                lease=lease,
-                fingerprints=provider_fingerprints,
+                lease=provider_lease,
+                fingerprints=fingerprints,
                 recheck=False,
             )
-            repeated_receipt, repeated_snapshot = _receipt_snapshot(paths, now=clock)
-            if artifacts.receipt != repeated_receipt or snapshot != repeated_snapshot:
+            artifact_lease.assert_stable()
+            repeated_receipt, repeated_snapshot = _receipt_snapshot(
+                paths,
+                now=_read_clock(clock),
+                reader=artifact_lease.reader(),
+            )
+            artifact_lease.assert_stable()
+            if (
+                not _same_artifact_receipt(artifacts.receipt, repeated_receipt)
+                or snapshot != repeated_snapshot
+            ):
                 raise AuthorizationError("artifact_race")
             final_provider_sha256, final_expectations = _provider_commitment(
                 references=references,
-                lease=lease,
-                fingerprints=provider_fingerprints,
+                lease=provider_lease,
+                fingerprints=fingerprints,
                 recheck=True,
             )
+            artifact_lease.assert_stable()
             if (
                 initial_provider_sha256 != final_provider_sha256
                 or expectations != final_expectations
             ):
                 raise AuthorizationError("provider_race")
+            authorization_clock = _read_clock(clock)
+            terminal_receipt, terminal_snapshot = _receipt_snapshot(
+                paths,
+                now=authorization_clock,
+                reader=artifact_lease.reader(),
+            )
+            artifact_lease.assert_stable()
+            if (
+                not _same_artifact_receipt(artifacts.receipt, repeated_receipt)
+                or not _same_artifact_receipt(artifacts.receipt, terminal_receipt)
+                or snapshot != repeated_snapshot
+                or snapshot != terminal_snapshot
+            ):
+                raise AuthorizationError("artifact_race")
             idempotency_key = _idempotency_key(
                 operation_id=artifacts.receipt.operation_id,
                 proposal_sha256=artifacts.receipt.proposal_sha256,
@@ -1073,37 +1765,116 @@ def authorize_and_execute(
                 contract_sha256=artifacts.receipt.contract_sha256,
                 provider_provenance_sha256=final_provider_sha256,
             )
-            authorized_at = (
-                clock.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-            )
+            authorized_at = authorization_clock.isoformat(timespec="seconds").replace("+00:00", "Z")
             verified = _VerifiedExecution(
                 context=context,
                 nonce=secrets.token_hex(16),
                 authorized_at=authorized_at,
                 capability=_VERIFIED_CAPABILITY,
             )
-            journal._claim_verified(verified)
-            journal._begin_effect(verified)
-            try:
-                effect_receipt = _validate_effect_receipt(context, effect(context))
-            except Exception as error:
-                try:
-                    journal._fail_effect(verified)
-                except AuthorizationError:
-                    raise AuthorizationError("effect_failed_recovery_required") from error
-                raise AuthorizationError("effect_failed_recovery_required") from error
-            journal._commit_effect(verified, effect_receipt)
-            return ExecutionReceiptV1(
-                schema_version="rsd.lifecycle-execution-receipt.v1",
-                status="committed",
-                operation_id=context.operation_id,
-                idempotency_key=context.idempotency_key,
-                effect_receipt_sha256=effect_receipt.effect_receipt_sha256,
-                proposal_sha256=context.proposal_sha256,
-                contract_sha256=context.contract_sha256,
-                provider_provenance_sha256=context.provider_provenance_sha256,
-                committed_at=authorized_at,
-            )
+            with journal._operation_lease(context.operation_id) as operation_lease:
+                artifact_lease.assert_stable()
+                operation_lease.assert_stable()
+                journal._claim_verified(verified)
+                journal._begin_effect(verified)
+                artifact_lease.assert_stable()
+                operation_lease.assert_stable()
+                outcome = _safe_call(lambda: effect(context))
+                if outcome is _SAFE_CALL_FAILURE:
+                    _mark_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("effect_failed_recovery_required")
+                effect_receipt = _safe_call(lambda: _validate_effect_receipt(context, outcome))
+                if type(effect_receipt) is not EffectReceiptV1:
+                    _mark_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("effect_failed_recovery_required")
+                post_effect_stable = _safe_call(
+                    lambda: _check_execution_stability(artifact_lease, operation_lease)
+                )
+                if post_effect_stable is _SAFE_CALL_FAILURE:
+                    _mark_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("effect_failed_recovery_required")
+                committed = _safe_call(lambda: journal._commit_effect(verified, effect_receipt))
+                if committed is _SAFE_CALL_FAILURE:
+                    _mark_effect_ambiguous(journal, verified)
+                    raise AuthorizationError("effect_failed_recovery_required")
+                terminal_stable = _safe_call(
+                    lambda: _check_execution_stability(artifact_lease, operation_lease)
+                )
+                if terminal_stable is _SAFE_CALL_FAILURE:
+                    raise AuthorizationError("terminal_stability")
+                execution_receipt = ExecutionReceiptV1(
+                    schema_version="rsd.lifecycle-execution-receipt.v1",
+                    status="committed",
+                    operation_id=context.operation_id,
+                    idempotency_key=context.idempotency_key,
+                    effect_receipt_sha256=effect_receipt.effect_receipt_sha256,
+                    proposal_sha256=context.proposal_sha256,
+                    contract_sha256=context.contract_sha256,
+                    provider_provenance_sha256=context.provider_provenance_sha256,
+                    committed_at=authorized_at,
+                )
+        finally:
+            provider_released = _release_provider_lease(manager)
+        assert execution_receipt is not None
+        if not provider_released:
+            raise AuthorizationError("provider_release")
+        return execution_receipt
+
+
+def _authorize_and_execute_for_test(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    provider: ProviderProvenanceAdapter,
+    provider_fingerprints: Mapping[str, str],
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteAuthorizationJournal,
+    effect: Callable[[VerifiedExecutionContext], EffectReceiptV1],
+    _clock: Callable[[], datetime],
+    _capability: object,
+) -> ExecutionReceiptV1:
+    """Test-only clock seam, inaccessible from the exported entry point."""
+
+    if _capability is not _TEST_CLOCK_CAPABILITY:
+        raise AuthorizationError("test_clock")
+    return _authorize_and_execute_with_clock(
+        paths,
+        signer=signer,
+        provider=provider,
+        provider_fingerprints=provider_fingerprints,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        journal=journal,
+        effect=effect,
+        clock=_clock,
+    )
+
+
+def authorize_and_execute(
+    paths: AuthorizationPaths,
+    *,
+    signer: TrustedEd25519SignerV1,
+    provider: ProviderProvenanceAdapter,
+    provider_fingerprints: Mapping[str, str],
+    expected_disposal_owner: str,
+    expected_approver_identity: str,
+    journal: SQLiteAuthorizationJournal,
+    effect: Callable[[VerifiedExecutionContext], EffectReceiptV1],
+) -> ExecutionReceiptV1:
+    """Verify, lease, execute once, and commit using the trusted UTC clock."""
+
+    return _authorize_and_execute_with_clock(
+        paths,
+        signer=signer,
+        provider=provider,
+        provider_fingerprints=provider_fingerprints,
+        expected_disposal_owner=expected_disposal_owner,
+        expected_approver_identity=expected_approver_identity,
+        journal=journal,
+        effect=effect,
+        clock=_system_utc_clock,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
