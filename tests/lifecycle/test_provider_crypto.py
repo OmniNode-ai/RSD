@@ -882,7 +882,7 @@ def test_v2_signer_genesis_is_durable_before_create_only_seed_write(
     assert not any(duplicate)
 
 
-def test_v2_provider_artifact_orphan_and_forged_attestation_never_authorize(
+def test_v2_forged_provider_attestation_never_authorizes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(provider_crypto, "_system_utc_clock", lambda: _BOOTSTRAP_CLOCK)
@@ -921,6 +921,34 @@ def test_v2_provider_artifact_orphan_and_forged_attestation_never_authorize(
             expected_disposal_owner=intent.disposal_owner,
             expected_approver_identity=intent.approver_identity,
         )
+
+
+def test_v2_signer_genesis_orphan_blocks_verified_provider_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleting the persisted signer genesis blocks a completed provider bundle."""
+
+    monkeypatch.setattr(provider_crypto, "_system_utc_clock", lambda: _BOOTSTRAP_CLOCK)
+    bundle = _signed_v2_material_bundle(tmp_path)
+    _persist_v2_material_bundle(bundle)
+    paths, intent, issuer, _material_key, signer, signer_genesis, policy, attestation, genesis = (
+        bundle
+    )
+    store = _Store()
+    provision_keychain_materials(
+        paths,
+        policy=policy,
+        genesis=genesis,
+        attestation=attestation,
+        signer=signer,
+        signer_genesis=signer_genesis,
+        issuer=issuer,
+        allocation_intent=intent,
+        expected_disposal_owner=intent.disposal_owner,
+        expected_approver_identity=intent.approver_identity,
+        materials=_provider_values(),
+        _store=store,
+    )
     (paths.root / paths.signer_genesis_name()).unlink()
     with pytest.raises(ProviderCryptoError, match="artifact_read"):
         load_verified_provider_material_bundle(
