@@ -2559,6 +2559,22 @@ class PostgreSQLLoginTransitionReceiptV1(_Model):
         return self
 
 
+def _canonical_uri_authority_suffix_utf8_byte_count(*, authority: str, scheme: str) -> int:
+    """Return the exact canonical authority suffix width for one URI grammar.
+
+    ``urlsplit().hostname`` deliberately removes brackets from IPv6 literals;
+    a rendered URI must retain those brackets.  Revalidate the authority and
+    count the canonical suffix as it will appear on the wire instead of
+    reconstructing a secret-bearing URI or relying on parsed host internals.
+    """
+
+    prefix = scheme + ":" + "//"
+    canonical = _authority(authority, schemes=frozenset({scheme}))
+    if not canonical.startswith(prefix):
+        raise ValueError("URI grammar authority is invalid")
+    return len(canonical.removeprefix(prefix).encode("utf-8"))
+
+
 def postgresql_connection_uri_rendered_byte_count(
     *, authority: str, application_role: str, database_name: str
 ) -> int:
@@ -2569,41 +2585,37 @@ def postgresql_connection_uri_rendered_byte_count(
     not a URI and not a value-derived fingerprint.
     """
 
-    parsed = urlsplit(authority)
-    if parsed.scheme != "postgresql" or parsed.hostname is None or parsed.port is None:
-        raise ValueError("PostgreSQL URI grammar is invalid")
+    authority_bytes = _canonical_uri_authority_suffix_utf8_byte_count(
+        authority=authority, scheme="postgresql"
+    )
     return (
-        len("postgresql:")
-        + len("//")
-        + len(application_role)
+        len(b"postgresql:")
+        + len(b"//")
+        + len(application_role.encode("utf-8"))
         + 1  # credential delimiter
         + 43  # canonical unpadded Base64URL application-password width
         + 1  # authority delimiter
-        + len(parsed.hostname)
-        + 1  # port delimiter
-        + len(str(parsed.port))
+        + authority_bytes
         + 1  # database path delimiter
-        + len(database_name)
+        + len(database_name.encode("utf-8"))
     )
 
 
 def valkey_connection_uri_rendered_byte_count(*, authority: str, database_index: int) -> int:
     """Return the exact Valkey URI size without constructing its password."""
 
-    parsed = urlsplit(authority)
-    if parsed.scheme != "redis" or parsed.hostname is None or parsed.port is None:
-        raise ValueError("Valkey URI grammar is invalid")
+    authority_bytes = _canonical_uri_authority_suffix_utf8_byte_count(
+        authority=authority, scheme="redis"
+    )
     return (
-        len("redis:")
-        + len("//")
+        len(b"redis:")
+        + len(b"//")
         + 1  # empty username delimiter
         + 43  # canonical unpadded Base64URL Valkey password width
         + 1  # authority delimiter
-        + len(parsed.hostname)
-        + 1  # port delimiter
-        + len(str(parsed.port))
+        + authority_bytes
         + 1  # database path delimiter
-        + len(str(database_index))
+        + len(str(database_index).encode("ascii"))
     )
 
 

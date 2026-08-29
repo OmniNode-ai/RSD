@@ -25,6 +25,7 @@ from typing import Any, cast
 import pytest
 import yaml
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from pydantic import ValidationError
 
 import omninode_rsd.lifecycle.authorization as authorization
 from omninode_rsd.lifecycle.authorization import (
@@ -178,6 +179,7 @@ _JOURNAL_ID = "123e4567-e89b-42d3-a456-426614174001"
 _NOW = "2026-08-28T12:00:00Z"
 _RETAINS = "2026-08-28T12:20:00Z"
 _SIGNATURE = base64.b64encode(b"s" * 64).decode("ascii")
+_POSTGRES_SCHEME = "postgresql:" + "//"
 _REDIS_SCHEME = "redis:" + "//"
 _TEST_CLOCK = datetime(2026, 8, 28, 12, 5, tzinfo=UTC)
 _EXECUTOR_ATTESTATION_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(b"e" * 32)
@@ -195,6 +197,155 @@ class _TLSProfileAlias(str):
 
 def _hash(label: str) -> str:
     return hashlib.sha256(label.encode("ascii")).hexdigest()
+
+
+def _postgres_uri_grammar(
+    *, authority: str, rendered_uri_byte_count: int
+) -> PostgreSQLConnectionUriGrammarV1:
+    return PostgreSQLConnectionUriGrammarV1(
+        schema_version="rsd.postgresql-connection-uri-grammar.v1",
+        database_identity="primary_database",
+        authority=authority,
+        database_name="runtime-db",
+        application_role="application-role",
+        application_password_reference_sha256=_hash("postgres-application-password"),
+        prepared_operation_id=_MATERIALIZATION_ID,
+        target_process="primary_infisical",
+        environment_variable="DB_CONNECTION_URI",
+        uri_grammar="postgresql_user_password_authority_database_v1",
+        application_password_format="postgres_application_password_base64url_32_v1",
+        application_password_encoded_byte_count=43,
+        rendered_uri_byte_count=rendered_uri_byte_count,
+        return_uri_allowed=False,
+        persistent_storage_allowed=False,
+        logging_allowed=False,
+        public_artifact_allowed=False,
+    )
+
+
+def _valkey_uri_grammar(
+    *, authority: str, rendered_uri_byte_count: int
+) -> ValkeyConnectionUriGrammarV1:
+    return ValkeyConnectionUriGrammarV1(
+        schema_version="rsd.valkey-connection-uri-grammar.v1",
+        cache_identity="primary_valkey",
+        authority=authority,
+        database_index=0,
+        password_reference_sha256=_hash("primary-valkey-password"),
+        target_process="primary_infisical",
+        environment_variable="REDIS_URL",
+        uri_grammar="redis_password_authority_database_v1",
+        password_format="valkey_password_base64url_32_v1",
+        password_encoded_byte_count=43,
+        rendered_uri_byte_count=rendered_uri_byte_count,
+        return_uri_allowed=False,
+        persistent_storage_allowed=False,
+        logging_allowed=False,
+        public_artifact_allowed=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("postgres_authority", "valkey_authority"),
+    (
+        (
+            _POSTGRES_SCHEME + "192.0.2.40:5432",
+            _REDIS_SCHEME + "198.51.100.3:6379",
+        ),
+        (
+            _POSTGRES_SCHEME + "[2001:db8::40]:5432",
+            _REDIS_SCHEME + "[2001:db8::3]:6379",
+        ),
+    ),
+)
+def test_uri_grammar_byte_counts_preserve_canonical_ipv4_and_ipv6_authorities(
+    postgres_authority: str, valkey_authority: str
+) -> None:
+    """Rendered byte commitments retain IPv6 brackets and all URI delimiters."""
+
+    application_role = "application-role"
+    database_name = "runtime-db"
+    postgres_expected = len(
+        (
+            _POSTGRES_SCHEME
+            + application_role
+            + ":"
+            + ("A" * 43)
+            + "@"
+            + postgres_authority.removeprefix(_POSTGRES_SCHEME)
+            + "/"
+            + database_name
+        ).encode("utf-8")
+    )
+    valkey_expected = len(
+        (
+            _REDIS_SCHEME
+            + ":"
+            + ("A" * 43)
+            + "@"
+            + valkey_authority.removeprefix(_REDIS_SCHEME)
+            + "/0"
+        ).encode("utf-8")
+    )
+
+    assert (
+        postgresql_connection_uri_rendered_byte_count(
+            authority=postgres_authority,
+            application_role=application_role,
+            database_name=database_name,
+        )
+        == postgres_expected
+    )
+    assert (
+        valkey_connection_uri_rendered_byte_count(authority=valkey_authority, database_index=0)
+        == valkey_expected
+    )
+    assert (
+        _postgres_uri_grammar(
+            authority=postgres_authority, rendered_uri_byte_count=postgres_expected
+        ).rendered_uri_byte_count
+        == postgres_expected
+    )
+    assert (
+        _valkey_uri_grammar(
+            authority=valkey_authority, rendered_uri_byte_count=valkey_expected
+        ).rendered_uri_byte_count
+        == valkey_expected
+    )
+
+
+def test_uri_grammar_rejects_dns_and_enforces_the_signed_count_cap() -> None:
+    """This profile is IP-literal-only; DNS and count overflow stay fail-closed."""
+
+    postgres_dns = _POSTGRES_SCHEME + "database.example.test:5432"
+    valkey_dns = _REDIS_SCHEME + "cache.example.test:6379"
+    with pytest.raises(ValueError, match="IP literal"):
+        postgresql_connection_uri_rendered_byte_count(
+            authority=postgres_dns,
+            application_role="application-role",
+            database_name="runtime-db",
+        )
+    with pytest.raises(ValueError, match="IP literal"):
+        valkey_connection_uri_rendered_byte_count(authority=valkey_dns, database_index=0)
+    with pytest.raises(ValueError, match="IP literal"):
+        _postgres_uri_grammar(authority=postgres_dns, rendered_uri_byte_count=1)
+    with pytest.raises(ValueError, match="IP literal"):
+        _valkey_uri_grammar(authority=valkey_dns, rendered_uri_byte_count=1)
+
+    postgres_authority = _POSTGRES_SCHEME + "[2001:db8::40]:5432"
+    valkey_authority = _REDIS_SCHEME + "[2001:db8::3]:6379"
+    with pytest.raises(ValidationError) as postgres_error:
+        _postgres_uri_grammar(authority=postgres_authority, rendered_uri_byte_count=1025)
+    with pytest.raises(ValidationError) as valkey_error:
+        _valkey_uri_grammar(authority=valkey_authority, rendered_uri_byte_count=1025)
+    assert any(
+        error["loc"] == ("rendered_uri_byte_count",) and error["type"] == "less_than_equal"
+        for error in postgres_error.value.errors()
+    )
+    assert any(
+        error["loc"] == ("rendered_uri_byte_count",) and error["type"] == "less_than_equal"
+        for error in valkey_error.value.errors()
+    )
 
 
 def test_executor_ssh_policy_rejects_malformed_host_key_pin() -> None:
