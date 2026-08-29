@@ -135,6 +135,29 @@ profile root, and caller-pinned worker policy before using its hashes; Phase B
 will wrap and repeat that validation rather than treating the acceptance as a
 transferable authority.
 
+## Phase-B1 map-to-projection binding
+
+`target_delivery_map_projection_binding` is a pure offline validator for a
+complete signed `TargetDeliveryMapV1`, its output-independent V4 delivery
+projection, a separately signed downstream relation, and a verified V4 profile
+envelope. It reprojects the complete map structurally and requires exact
+equality with both supplied projection and profile projection. Each signed B1
+relation is also bound to one exact verified profile hash, profile-envelope
+hash, profile-root fingerprint, component/role, and selected-route hash plus
+ordinal. The shared projection is therefore not a profile selector: Phase B2
+must carry four distinct per-role B1 bindings and acceptances, one for each
+profile route. Its acceptance is non-portable: build, materialization, attach,
+and effect permissions are all false.
+
+This is signature-and-structural-relation validation only. It does **not**
+validate map freshness, current source, allocation, topology, prepared
+operation, provider, materialization, or runtime state. Existing Phase-B
+authorization remains mandatory and still compares every complete-map field
+before admitting any effect. The signed map hash is always the fully signed V1
+map hash; no draft or body-only map hash is accepted. The V4 profile remains
+output independent: B1 never adds a relation, map hash, artifact, or output
+field to it.
+
 ## Phase-B authorization
 
 Phase-B has two non-interchangeable authorization stages. Phase-A remains a

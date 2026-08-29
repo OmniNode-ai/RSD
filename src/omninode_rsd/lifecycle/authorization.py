@@ -131,6 +131,12 @@ from omninode_rsd.lifecycle.provider_crypto import (
     _load_verified_signer_genesis_from_reader,
     verify_replay_authority_policy_artifact,
 )
+from omninode_rsd.lifecycle.target_delivery_map_signing import (
+    TargetDeliveryMapSignerTrustAnchorV1,
+    TargetDeliveryMapSigningError,
+    target_delivery_map_v1_canonical_message,
+    verify_target_delivery_map_v1_signature,
+)
 
 _SHA256: Final = r"^[0-9a-f]{64}$"
 _IDENTIFIER: Final = r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$"
@@ -208,7 +214,6 @@ _SECRET_HANDLING_POLICY_SIGNATURE_DOMAIN: Final = (
 _CONTAINER_WRAPPER_MANIFEST_SIGNATURE_DOMAIN: Final = (
     b"omninode-rsd.container-wrapper-manifest.ed25519.v1\x00"
 )
-_TARGET_DELIVERY_MAP_SIGNATURE_DOMAIN: Final = b"omninode-rsd.target-delivery-map.ed25519.v1\x00"
 _CONTAINER_ATTACH_PROTOCOL_SIGNATURE_DOMAIN: Final = (
     b"omninode-rsd.container-attach-protocol.ed25519.v1\x00"
 )
@@ -2266,9 +2271,10 @@ def _container_wrapper_manifest_message(manifest: ContainerBootstrapWrapperManif
 
 
 def _target_delivery_map_message(delivery_map: TargetDeliveryMapV1) -> bytes:
-    if type(delivery_map) is not TargetDeliveryMapV1:
-        raise AuthorizationError("target_delivery_map_signature")
-    return _direct_signature_message(_TARGET_DELIVERY_MAP_SIGNATURE_DOMAIN, delivery_map)
+    try:
+        return target_delivery_map_v1_canonical_message(delivery_map)
+    except TargetDeliveryMapSigningError:
+        raise AuthorizationError("target_delivery_map_signature") from None
 
 
 def _container_attach_protocol_message(protocol: ContainerBootstrapAttachProtocolV1) -> bytes:
@@ -2616,18 +2622,27 @@ def _verify_container_wrapper_manifest_signature(
 def _verify_target_delivery_map_signature(
     delivery_map: TargetDeliveryMapV1, *, signer: TrustedEd25519SignerV1
 ) -> None:
-    delivery_map = cast(
-        TargetDeliveryMapV1,
-        _canonical_artifact_model(
-            delivery_map, TargetDeliveryMapV1, phase="target_delivery_map_signature"
-        ),
-    )
-    _verify_direct_signature(
-        delivery_map,
-        signer=signer,
-        message=lambda model: _target_delivery_map_message(cast(TargetDeliveryMapV1, model)),
-        phase="target_delivery_map_signature",
-    )
+    try:
+        canonical = cast(
+            TargetDeliveryMapV1,
+            _canonical_artifact_model(
+                delivery_map, TargetDeliveryMapV1, phase="target_delivery_map_signature"
+            ),
+        )
+        if type(signer) is not TrustedEd25519SignerV1:
+            raise ValueError("signer is invalid")
+        verify_target_delivery_map_v1_signature(
+            delivery_map=canonical,
+            signer_trust_anchor=TargetDeliveryMapSignerTrustAnchorV1(
+                schema_version="rsd.target-delivery-map-signer-trust-anchor.v1",
+                key_id=signer.key_id,
+                public_key_base64=signer.public_key_base64,
+                public_key_fingerprint_sha256=signer.public_key_fingerprint_sha256,
+                algorithm="ed25519",
+            ),
+        )
+    except (TargetDeliveryMapSigningError, TypeError, ValueError):
+        raise AuthorizationError("target_delivery_map_signature") from None
 
 
 def _verify_container_attach_protocol_signature(
