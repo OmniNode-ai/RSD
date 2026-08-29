@@ -1461,6 +1461,110 @@ def test_static_launch_plan_rejects_argv_drift_and_commits_exact_merge(tmp_path:
     assert changed_profile.profile_sha256 != profile.profile_sha256
 
 
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/usr/local/libexec/./wrapper",
+        "/usr/local/libexec/wrapper/.",
+        "/usr/local/libexec/wrapper/",
+        "/usr/local/libexec/a//wrapper",
+        "/usr/local/libexec/a/../wrapper",
+        "/usr/local/libexec/wrapper\\ghost",
+        "/usr/local/libexec/wrapper%2fghost",
+        "/usr/local/libexec/wrapper\x00ghost",
+        "/usr/local/libexec/wrapper\nghost",
+        "/usr/local/libexec/wrapper\tghost",
+        "/usr/local/libexec/wrapper\x7fghost",
+    ),
+)
+def test_static_phase_a_fed_paths_have_one_canonical_ascii_spelling(
+    tmp_path: Path, path: str
+) -> None:
+    """Static wrapper paths cannot carry aliases into Phase A evidence."""
+
+    launch = cast(Any, _bundle(tmp_path)["profile"]).static_launch_plan
+    with pytest.raises(ValueError):
+        ContainerBootstrapStaticLaunchPlanV4(
+            **_updated_fields(launch, wrapper_executable_path=path)
+        )
+    assert (
+        static_v4._canonical_static_absolute_path("/usr/local/libexec/valid-wrapper")
+        == "/usr/local/libexec/valid-wrapper"
+    )
+
+
+def test_static_launch_argv_limits_are_explicit_and_parser_closed(tmp_path: Path) -> None:
+    """Every legal 64 x 256 upstream vector has one parser-safe spelling."""
+
+    launch = cast(Any, _bundle(tmp_path)["profile"]).static_launch_plan
+    wrapper_prefix = (launch.wrapper_executable_path, *("p" * 256 for _ in range(63)))
+    base_entrypoint = tuple("e" * 256 for _ in range(64))
+    base_command = tuple("c" * 256 for _ in range(64))
+    maximum = ContainerBootstrapStaticLaunchPlanV4(
+        **_updated_fields(
+            launch,
+            wrapper_argv_prefix=wrapper_prefix,
+            base_entrypoint=base_entrypoint,
+            base_command=base_command,
+            merged_argv_sha256=static_v4._merged_argv_sha256(
+                wrapper_argv_prefix=wrapper_prefix,
+                base_entrypoint=base_entrypoint,
+                base_command=base_command,
+            ),
+        )
+    )
+    canonical = static_v4.container_bootstrap_static_launch_plan_v4_canonical_json(maximum)
+    assert len(maximum.wrapper_argv_prefix) == 64
+    assert len(maximum.base_entrypoint) == 64
+    assert len(maximum.base_command) == 64
+    assert all(
+        sum(len(item.encode("ascii")) for item in argv) <= 16_384
+        for argv in (maximum.wrapper_argv_prefix, maximum.base_entrypoint, maximum.base_command)
+    )
+    assert (
+        static_v4.parse_container_bootstrap_static_launch_plan_v4_canonical_json(canonical)
+        == maximum
+    )
+    with pytest.raises(ValueError):
+        ContainerBootstrapStaticLaunchPlanV4(
+            **_updated_fields(launch, base_command=tuple("c" * 256 for _ in range(65)))
+        )
+    with pytest.raises(ValueError):
+        ContainerBootstrapStaticLaunchPlanV4(**_updated_fields(launch, base_command=("c" * 257,)))
+
+
+def test_fixed_static_v4_profile_vector_remains_signed_and_byte_exact() -> None:
+    """Validation-only grammar hardening leaves the fixed static vector unchanged."""
+
+    raw = _VECTOR_PATH.read_bytes()
+    vector = yaml.load(raw, Loader=_StrictVectorLoader)
+    assert type(vector) is dict
+    values = cast(dict[str, object], vector)
+    envelope_payload = _canonical_vector_base64(
+        values["profile_envelope_canonical_json_utf8_base64"]
+    )
+    root_payload = _canonical_vector_base64(values["profile_root_canonical_json_utf8_base64"])
+    envelope = static_v4.parse_container_bootstrap_static_role_profile_envelope_v4_canonical_json(
+        envelope_payload
+    )
+    root = static_v4.parse_container_bootstrap_static_profile_trust_anchor_v4_canonical_json(
+        root_payload
+    )
+    profile = static_v4.verify_container_bootstrap_static_role_profile_envelope_v4(
+        envelope=envelope,
+        profile_trust_anchor=root,
+    )
+    assert (
+        static_v4.container_bootstrap_static_role_profile_envelope_v4_canonical_json(envelope)
+        == envelope_payload
+    )
+    assert (
+        static_v4.container_bootstrap_static_role_profile_envelope_v4_sha256(envelope)
+        == values["profile_envelope_sha256"]
+    )
+    assert profile.profile_sha256 == values["profile_sha256"]
+
+
 def test_static_v4_rejects_topology_fields_and_invalid_protocol_states(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     protocol = _protocol()

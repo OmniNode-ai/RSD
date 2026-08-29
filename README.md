@@ -93,6 +93,48 @@ database.
 The bundled YAML file documents the states and transitions supported by the
 library.
 
+## V4 artifact-evidence contract
+
+`container_bootstrap_artifact_evidence_v4` is a pure offline validator for two
+independently signed build-worker attestations and their immutable OCI output
+claims. It does not collect Git state, build artifacts, inspect files or OCI
+images, resolve registries, or authorize effects. Source/commit/tree claims
+remain signed worker statements rather than locally recomputed proof. A
+successful reproducibility closure leaves build, materialization, attach, and
+effect permissions false. The supplied canonical OCI index, manifest, and
+config JSON sidecars are parsed and rehashed locally to validate the
+index→manifest→config/layer/rootfs/argv relations. Layer blobs and archive
+inspection fields remain signed worker assertions: this package does not fetch
+or inspect OCI layers, tar archives, source control, or the filesystem.
+That signed archive claim explicitly covers regular `.wh.<name>` and opaque
+`.wh..wh..opq` whiteout entries, plus setuid/setgid/sticky bits on every
+archive member, as absent; without supplied layer/tar bytes it is an
+attestation boundary, not locally recomputed archive proof.
+Validation also requires a caller-pinned two-root worker trust policy. That
+policy is an external trust input, distinct from the profile, ticket, and
+receipt roots; it is committed into the returned verification context and is
+not asserted by generated evidence.
+Worker leaf identities, their authority identities, the policy independence
+identity, worker-key fingerprints, profile/ticket/receipt root fingerprints,
+and physical build-execution identities form one collision-free identity set.
+Recipe, toolchain, lock, vendor, and builder-recipe inputs intentionally remain
+the shared reproducibility inputs rather than worker authority identities.
+
+Its canonical APIs use separate finite bounds: OCI index and manifest sidecars
+are capped at 8 KiB, a config sidecar at 64 KiB, a complete OCI claim and one
+worker attestation at 192 KiB, and a two-worker closure at 384 KiB. The static
+launch domain remains complete within those bounds: each source vector permits
+64 ASCII arguments of up to 256 bytes, so the derived OCI entrypoint permits
+128 arguments and the command permits 64. A serializer rejects a value outside
+its own documented cap, so a constructible public document always fits its
+paired parser.
+
+An artifact-evidence acceptance is deliberately non-portable and
+non-authorizing. A later phase must revalidate the original profile envelope,
+profile root, and caller-pinned worker policy before using its hashes; Phase B
+will wrap and repeat that validation rather than treating the acceptance as a
+transferable authority.
+
 ## Phase-B authorization
 
 Phase-B has two non-interchangeable authorization stages. Phase-A remains a

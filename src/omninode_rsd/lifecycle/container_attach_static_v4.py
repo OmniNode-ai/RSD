@@ -90,6 +90,13 @@ _MAX_CLAIM_INTENT_BYTES = 524_288
 _MAX_ATTACH_METADATA_BYTES = 16_384
 _MAX_CANONICAL_JSON_DEPTH = 32
 _MAX_CANONICAL_JSON_NODES = 4_096
+# The launch plan is an upstream input to the isolated artifact-evidence
+# verifier.  Keep these limits explicit here so direct construction and the
+# canonical parser share one closed domain.  The byte total is deliberately
+# the full 64 * 256 legal vector, not a narrower downstream eligibility rule.
+_MAX_STATIC_ARG_ITEMS = 64
+_MAX_STATIC_ARG_BYTES = 256
+_MAX_STATIC_ARG_VECTOR_BYTES = _MAX_STATIC_ARG_ITEMS * _MAX_STATIC_ARG_BYTES
 
 _STATIC_PROJECTION_DOMAIN = (
     b"omninode-rsd.container-bootstrap-static-delivery-projection.sha256.v4\x00"
@@ -1258,11 +1265,38 @@ def project_target_delivery_map_v1_structurally(
 
 def _static_argument_items(value: object, *, field: str) -> tuple[str, ...]:
     items = _items(value, field=field)
-    if not items or any(
-        type(item) is not str or re.fullmatch(_STATIC_ARG, item) is None for item in items
+    if (
+        not 1 <= len(items) <= _MAX_STATIC_ARG_ITEMS
+        or any(type(item) is not str or re.fullmatch(_STATIC_ARG, item) is None for item in items)
+        or sum(len(cast(str, item).encode("ascii")) for item in items)
+        > _MAX_STATIC_ARG_VECTOR_BYTES
     ):
         raise ValueError("container bootstrap V4 static argv is invalid")
     return tuple(cast(str, item) for item in items)
+
+
+def _canonical_static_absolute_path(value: str) -> str:
+    """Return one exact V4 path spelling that can flow into Phase A.
+
+    ``_STATIC_PATH`` already limits this to printable ASCII grammar.  The
+    explicit segment checks close its otherwise ambiguous dot, duplicate- and
+    trailing-slash spellings without changing any static V4 output field.
+    """
+
+    if (
+        type(value) is not str
+        or not value.isascii()
+        or re.fullmatch(_STATIC_PATH, value) is None
+        or not value.startswith("/usr/local/libexec/")
+        or "\\" in value
+        or "%" in value
+        or "//" in value
+        or value.endswith("/")
+    ):
+        raise ValueError("container bootstrap V4 static launch path is invalid")
+    if any(part in ("", ".", "..") for part in value.split("/")[1:]):
+        raise ValueError("container bootstrap V4 static launch path is invalid")
+    return value
 
 
 def _merged_argv_sha256(
@@ -1292,9 +1326,9 @@ class ContainerBootstrapStaticLaunchPlanV4(_Model):
     base_linux_amd64_manifest_digest_sha256: str = Field(pattern=_SHA256)
     base_config_digest_sha256: str = Field(pattern=_SHA256)
     wrapper_executable_path: str = Field(pattern=_STATIC_PATH)
-    wrapper_argv_prefix: tuple[str, ...] = Field(max_length=64)
-    base_entrypoint: tuple[str, ...] = Field(max_length=64)
-    base_command: tuple[str, ...] = Field(max_length=64)
+    wrapper_argv_prefix: tuple[str, ...] = Field(max_length=_MAX_STATIC_ARG_ITEMS)
+    base_entrypoint: tuple[str, ...] = Field(max_length=_MAX_STATIC_ARG_ITEMS)
+    base_command: tuple[str, ...] = Field(max_length=_MAX_STATIC_ARG_ITEMS)
     entrypoint_command_merge: Literal["exec_wrapper_then_base_entrypoint_and_cmd_v4"]
     merged_argv_sha256: str = Field(pattern=_SHA256)
 
@@ -1307,16 +1341,7 @@ class ContainerBootstrapStaticLaunchPlanV4(_Model):
     @field_validator("wrapper_executable_path")
     @classmethod
     def canonical_wrapper_path(cls, value: str) -> str:
-        if (
-            type(value) is not str
-            or re.fullmatch(_STATIC_PATH, value) is None
-            or "//" in value
-            or "/../" in value
-            or value.endswith("/..")
-            or not value.startswith("/usr/local/libexec/")
-        ):
-            raise ValueError("container bootstrap V4 static launch path is invalid")
-        return value
+        return _canonical_static_absolute_path(value)
 
     @model_validator(mode="after")
     def exact_static_launch(self) -> Self:
@@ -1712,16 +1737,7 @@ class ContainerBootstrapStaticRoleProfileV4(_Model):
     @field_validator("wrapper_executable_path")
     @classmethod
     def canonical_wrapper_path(cls, value: str) -> str:
-        if (
-            type(value) is not str
-            or re.fullmatch(_STATIC_PATH, value) is None
-            or "//" in value
-            or "/../" in value
-            or value.endswith("/..")
-            or not value.startswith("/usr/local/libexec/")
-        ):
-            raise ValueError("container bootstrap V4 executable path is invalid")
-        return value
+        return _canonical_static_absolute_path(value)
 
     @model_validator(mode="after")
     def exact_static_role_profile(self) -> Self:
