@@ -402,6 +402,48 @@ side accepts a secret chunk. That local claim is independent of outer replay
 tombstones; a codec replay is rejected even if an unsafe caller bypasses an
 outer boundary.
 
+### Attach/Bootstrap V2 contract amendment
+
+The additive `ContainerBootstrapAttachProtocolV2` is a contract-only successor
+for the future daemon-to-container boundary; V1 remains available and is not
+reinterpreted. Its first bounded canonical-JSON frame is a signed ticket
+envelope, verified against a pinned Ed25519 trust anchor and the directly
+verified signed `MaterializationIntentV1`, V1 predecessor chain, V2 wrapper
+manifest, exact target-delivery map, filtered container inspection, and closed
+Docker attach policy. The ticket binds the operation, component, full container
+ID, runtime hostname, wrapper/OCI chain, nonce, channel, session, and ordered
+value-free delivery descriptors. Expiry, canonical encoding, type drift, route
+swaps, primary/restore substitution, and stale or mismatched predecessor
+commitments fail closed before a `ready` response or local replay claim.
+
+Each V2 profile commits the exact Docker create/inspection projection: empty
+create-time environment, separately pinned static image environment, explicit
+child-`envp` construction with no ambient host/env-file/Docker-config input,
+numeric user/workdir, entrypoint/command merge, non-TTY one-shot stdin,
+disabled healthcheck/logging/restart, namespace/capability restrictions, and
+runtime network/alias/static-address binding. A profile also commits wrapper
+FD topology, PID-1 signal/reaping behavior, readiness distinctions, and honest
+wrapper-owned buffer/`mlock`/core-dump policy. The Valkey profile additionally
+requires `valkey-server -`, its sole `/data` named-volume form, stdin-only
+configuration, disabled persistence/logging/daemonization, static isolated
+listener settings, and a pinned ACL deny/negative-test commitment. These are
+signed declarations, not a claim that wrapper bytes, image evidence, or a live
+service exist in this release.
+
+The V2 codec requires an atomic durable claim of both its ticket and the full
+container ID for that container lifetime before its `claim` frame, exact chunk
+order/count/aggregate bounds, a real write-side half-close, terminal
+acknowledgement only after input EOF, and protocol-output EOF after the
+acknowledgement. Errors, checkpoints, and receipts are value-free; mutable
+buffers are best-effort zeroized and any uncertain post-claim step is terminal
+ambiguous. The pure-fake Unix Docker mux seam validates the signed non-TTY
+attach upgrade and rejects stderr, unknown/zero-length mux frames, oversized
+output, and deadline failures. Production pathname opening is fail-closed until
+a separately reviewed descriptor-bound installation adapter exists. It is not
+wired to an executor backend. Materialization and start continue to use
+`NoMutationBackend`; there is no V2 wrapper implementation, Docker mutation,
+provider read, or runtime effect in this contract amendment.
+
 ### Remote executor transport boundary
 
 The library now supplies an offline-testable transport boundary for a separately

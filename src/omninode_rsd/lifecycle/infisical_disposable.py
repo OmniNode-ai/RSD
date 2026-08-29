@@ -59,6 +59,31 @@ _LOCAL_ATTACH_CHUNK_DESCRIPTORS_DOMAIN: Final = (
     b"omninode-rsd.container-attach-chunk-descriptors.sha256.v1\x00"
 )
 _LOCAL_ATTACH_RECEIPT_DOMAIN: Final = b"omninode-rsd.container-attach-receipt.sha256.v1\x00"
+_LOCAL_ATTACH_V2_PROTOCOL_DOMAIN: Final = b"omninode-rsd.container-attach-protocol.sha256.v2\x00"
+_LOCAL_ATTACH_V2_REQUEST_DOMAIN: Final = b"omninode-rsd.container-attach-request.sha256.v2\x00"
+_LOCAL_ATTACH_V2_TICKET_DOMAIN: Final = b"omninode-rsd.container-attach-ticket.ed25519.v1\x00"
+_LOCAL_ATTACH_V2_POLICY_DOMAIN: Final = b"omninode-rsd.container-attach-v2-policy.sha256.v1\x00"
+_LOCAL_ATTACH_V2_CHECKPOINT_DOMAIN: Final = (
+    b"omninode-rsd.container-attach-v2-checkpoint.sha256.v1\x00"
+)
+_LOCAL_ATTACH_V2_ACK_DOMAIN: Final = b"omninode-rsd.container-attach-ack.sha256.v2\x00"
+_LOCAL_ATTACH_V2_RECEIPT_DOMAIN: Final = b"omninode-rsd.container-attach-receipt.sha256.v2\x00"
+_LOCAL_ATTACH_V2_RUNTIME_INSTANCE_DOMAIN: Final = (
+    b"omninode-rsd.container-attach-runtime-instance.sha256.v2\x00"
+)
+_CONTAINER_WRAPPER_ARTIFACT_V2_DOMAIN: Final = (
+    b"omninode-rsd.container-wrapper-artifact.sha256.v2\x00"
+)
+_CONTAINER_WRAPPER_MANIFEST_V2_DOMAIN: Final = (
+    b"omninode-rsd.container-wrapper-manifest.sha256.v2\x00"
+)
+_CONTAINER_CREATE_TEMPLATE_V2_DOMAIN: Final = b"omninode-rsd.docker-create-template.sha256.v2\x00"
+_CONTAINER_ENVIRONMENT_CONSTRUCTION_V2_DOMAIN: Final = (
+    b"omninode-rsd.container-environment-construction.sha256.v2\x00"
+)
+_VALKEY_STATIC_CONFIGURATION_V2_DOMAIN: Final = (
+    b"omninode-rsd.valkey-static-configuration.sha256.v2\x00"
+)
 _OBSERVED_RESTORE_DATABASE_ATTESTATION_DOMAIN: Final = (
     b"omninode-rsd.observed-restore-database-attestation.sha256.v1\x00"
 )
@@ -4571,6 +4596,1479 @@ def container_attach_receipt_sha256(receipt: ContainerAttachReceiptV1) -> str:
     if type(receipt) is not ContainerAttachReceiptV1:
         raise ValueError("container attach receipt is invalid")
     return _domain_sha256(_LOCAL_ATTACH_RECEIPT_DOMAIN, receipt)
+
+
+class ContainerBootstrapAttachProtocolV2(_Model):
+    """Signed duplex attach contract for the future immutable wrapper.
+
+    This is deliberately additive to :class:`ContainerBootstrapAttachProtocolV1`.
+    It describes a real write-half-close and a one-attach-per-container
+    boundary, but it does not create an Engine connection, a container, a
+    wrapper image, or a secret-bearing frame.
+    """
+
+    schema_version: Literal["rsd.container-bootstrap-attach-protocol.v2"]
+    protocol_name: Literal["rsd_container_bootstrap_attach_v2"]
+    frame_magic: Literal["ONC2"]
+    frame_version: Literal[2]
+    metadata_encoding: Literal["canonical_json_utf8_v1"]
+    allowed_operation_scopes: tuple[
+        Literal["materialize_and_start_runtime_v1"], Literal["start_runtime_v2"]
+    ]
+    first_frame: Literal["ticket_envelope_v2"]
+    ready_state: Literal["ready_v2"]
+    claim_state: Literal["claimed_v2"]
+    write_closed_state: Literal["write_closed_v2"]
+    terminal_ack_state: Literal["terminal_ack_v2"]
+    ambiguous_state: Literal["attach_ambiguous_v2"]
+    max_metadata_bytes: int = Field(ge=512, le=16_384)
+    max_chunk_bytes: int = Field(ge=1, le=65_536)
+    max_chunks_per_target: int = Field(ge=1, le=4)
+    max_total_secret_bytes: int = Field(ge=1, le=262_144)
+    max_stdout_bytes: int = Field(ge=512, le=1_048_576)
+    max_stdout_frames: int = Field(ge=1, le=1024)
+    ready_timeout_seconds: int = Field(ge=1, le=60)
+    claim_timeout_seconds: int = Field(ge=1, le=60)
+    terminal_ack_timeout_seconds: int = Field(ge=1, le=60)
+    absolute_timeout_seconds: int = Field(ge=1, le=300)
+    docker_non_tty_required: Literal[True]
+    docker_stdout_only_required: Literal[True]
+    docker_stderr_rejected: Literal[True]
+    actual_write_half_close_required: Literal[True]
+    eof_required_before_terminal_ack: Literal[True]
+    protocol_output_eof_required_after_terminal_ack: Literal[True]
+    one_attach_per_container_lifetime: Literal[True]
+    replay_allowed: Literal[False]
+    auto_retry_after_secret_delivery_allowed: Literal[False]
+    secret_persistence_allowed: Literal[False]
+    secret_logging_allowed: Literal[False]
+    secret_receipt_allowed: Literal[False]
+    created_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("allowed_operation_scopes", mode="before")
+    @classmethod
+    def declared_scopes(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="container attach V2 operation scopes")
+
+    @field_validator("created_at")
+    @classmethod
+    def canonical_created_at(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def exact_bounded_protocol(self) -> Self:
+        if (
+            self.allowed_operation_scopes
+            != ("materialize_and_start_runtime_v1", "start_runtime_v2")
+            or self.max_total_secret_bytes < self.max_chunk_bytes
+            or self.max_stdout_bytes < self.max_metadata_bytes
+            or self.absolute_timeout_seconds
+            < max(
+                self.ready_timeout_seconds,
+                self.claim_timeout_seconds,
+                self.terminal_ack_timeout_seconds,
+            )
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("container bootstrap attach V2 protocol is invalid")
+        return self
+
+
+def container_bootstrap_attach_v2_protocol_sha256(
+    protocol: ContainerBootstrapAttachProtocolV2,
+) -> str:
+    """Return the V2 local attach contract commitment."""
+
+    if type(protocol) is not ContainerBootstrapAttachProtocolV2:
+        raise ValueError("container bootstrap attach V2 protocol is invalid")
+    return _domain_sha256(_LOCAL_ATTACH_V2_PROTOCOL_DOMAIN, protocol)
+
+
+class ContainerAttachTicketTrustAnchorV1(_Model):
+    """Pinned public verification key embedded in one V2 wrapper profile."""
+
+    schema_version: Literal["rsd.container-attach-ticket-trust-anchor.v1"]
+    key_id: str = Field(pattern=_IDENTIFIER)
+    public_key_base64: str = Field(min_length=4, max_length=128)
+    public_key_fingerprint_sha256: str = Field(pattern=_SHA256)
+    algorithm: Literal["ed25519"]
+
+    @model_validator(mode="after")
+    def exact_public_key(self) -> Self:
+        public_key = _canonical_base64_bytes(self.public_key_base64)
+        if len(public_key) != 32 or _digest(public_key) != self.public_key_fingerprint_sha256:
+            raise ValueError("container attach ticket trust anchor is invalid")
+        return self
+
+
+class ContainerAttachAuthorizationTicketV1(_Model):
+    """Signed, value-free dynamic authority delivered as the first V2 frame.
+
+    The ticket binds every runtime-selected field that cannot live in Docker
+    Config.Env, an argv, a label, a mount, or a secret-bearing file.  It is
+    consumed once by a future durable executor journal; the model itself is
+    only the canonical public preimage for that journal and wrapper verifier.
+    """
+
+    schema_version: Literal["rsd.container-attach-authorization-ticket.v1"]
+    protocol_sha256: str = Field(pattern=_SHA256)
+    request_sha256: str = Field(pattern=_SHA256)
+    allocation_operation_id: str = Field(pattern=_UUID)
+    operation_scope: Literal["materialize_and_start_runtime_v1", "start_runtime_v2"]
+    operation_id: str = Field(pattern=_UUID)
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    component_role: Literal["infisical", "valkey"]
+    container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    runtime_hostname: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{14,61}[a-z0-9]$")
+    runtime_instance_binding_sha256: str = Field(pattern=_SHA256)
+    request_nonce_sha256: str = Field(pattern=_SHA256)
+    channel_binding_sha256: str = Field(pattern=_SHA256)
+    session_binding_sha256: str = Field(pattern=_SHA256)
+    wrapper_profile_sha256: str = Field(pattern=_SHA256)
+    wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    wrapper_artifact_binding_sha256: str = Field(pattern=_SHA256)
+    target_delivery_map_sha256: str = Field(pattern=_SHA256)
+    base_registry_index_digest_sha256: str = Field(pattern=_SHA256)
+    base_linux_amd64_manifest_digest_sha256: str = Field(pattern=_SHA256)
+    base_config_digest_sha256: str = Field(pattern=_SHA256)
+    derived_registry_index_digest_sha256: str = Field(pattern=_SHA256)
+    derived_linux_amd64_manifest_digest_sha256: str = Field(pattern=_SHA256)
+    derived_config_digest_sha256: str = Field(pattern=_SHA256)
+    issued_at: str
+    expires_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("issued_at", "expires_at")
+    @classmethod
+    def canonical_time(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def exact_dynamic_authority(self) -> Self:
+        identities = (
+            self.protocol_sha256,
+            self.request_sha256,
+            self.runtime_instance_binding_sha256,
+            self.request_nonce_sha256,
+            self.channel_binding_sha256,
+            self.session_binding_sha256,
+            self.wrapper_profile_sha256,
+            self.wrapper_manifest_sha256,
+            self.wrapper_artifact_binding_sha256,
+            self.target_delivery_map_sha256,
+            self.base_registry_index_digest_sha256,
+            self.base_linux_amd64_manifest_digest_sha256,
+            self.base_config_digest_sha256,
+            self.derived_registry_index_digest_sha256,
+            self.derived_linux_amd64_manifest_digest_sha256,
+            self.derived_config_digest_sha256,
+        )
+        role = "valkey" if self.component.endswith("valkey") else "infisical"
+        lifetime = _timestamp(self.expires_at) - _timestamp(self.issued_at)
+        if (
+            self.component_role != role
+            or len(set(identities)) != len(identities)
+            or lifetime <= timedelta(0)
+            or lifetime > _FRESHNESS
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("container attach authorization ticket is invalid")
+        return self
+
+
+def container_attach_authorization_ticket_message(
+    ticket: ContainerAttachAuthorizationTicketV1,
+) -> bytes:
+    """Return the exact Ed25519 preimage for one V2 dynamic ticket."""
+
+    ticket = _strict_canonical_model(ticket, ContainerAttachAuthorizationTicketV1)
+    material = ticket.model_dump(mode="json", exclude={"signature_base64"}, warnings="error")
+    return _LOCAL_ATTACH_V2_TICKET_DOMAIN + json.dumps(
+        material, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def container_attach_authorization_ticket_sha256(
+    ticket: ContainerAttachAuthorizationTicketV1,
+) -> str:
+    """Return a receipt-safe commitment to a signed V2 ticket."""
+
+    if type(ticket) is not ContainerAttachAuthorizationTicketV1:
+        raise ValueError("container attach authorization ticket is invalid")
+    return _domain_sha256(_LOCAL_ATTACH_V2_TICKET_DOMAIN, ticket)
+
+
+def container_attach_runtime_instance_binding_sha256(
+    *, container_id: str, runtime_hostname: str
+) -> str:
+    """Bind the full Engine ID to the wrapper's nonsecret runtime hostname."""
+
+    if (
+        type(container_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+        or type(runtime_hostname) is not str
+        or re.fullmatch(r"[a-z0-9][a-z0-9-]{14,61}[a-z0-9]", runtime_hostname) is None
+    ):
+        raise ValueError("container attach V2 runtime instance binding is invalid")
+    return _digest(
+        _LOCAL_ATTACH_V2_RUNTIME_INSTANCE_DOMAIN
+        + container_id.encode("ascii")
+        + b"\x00"
+        + runtime_hostname.encode("ascii")
+    )
+
+
+class ContainerAttachRequestV2(_Model):
+    """Value-free V2 metadata whose hash is signed by a ticket.
+
+    A request intentionally has no ticket field.  The enclosing first frame
+    carries the request and ticket side by side, avoiding a self-referential
+    signature/hash cycle while still binding the exact canonical request.
+    """
+
+    schema_version: Literal["rsd.container-attach-request.v2"]
+    allocation_operation_id: str = Field(pattern=_UUID)
+    operation_scope: Literal["materialize_and_start_runtime_v1", "start_runtime_v2"]
+    operation_id: str = Field(pattern=_UUID)
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    component_role: Literal["infisical", "valkey"]
+    container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    runtime_hostname: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{14,61}[a-z0-9]$")
+    runtime_instance_binding_sha256: str = Field(pattern=_SHA256)
+    derived_image_policy_sha256: str = Field(pattern=_SHA256)
+    wrapper_profile_sha256: str = Field(pattern=_SHA256)
+    wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    wrapper_artifact_binding_sha256: str = Field(pattern=_SHA256)
+    attach_protocol_sha256: str = Field(pattern=_SHA256)
+    target_delivery_map_sha256: str = Field(pattern=_SHA256)
+    request_nonce_sha256: str = Field(pattern=_SHA256)
+    channel_binding_sha256: str = Field(pattern=_SHA256)
+    session_binding_sha256: str = Field(pattern=_SHA256)
+    expected_ready_state: Literal["ready_v2"]
+    expected_claim_state: Literal["claimed_v2"]
+    expected_terminal_ack_state: Literal["terminal_ack_v2"]
+    fields: tuple[TargetDeliveryFieldV1, ...] = Field(min_length=1, max_length=4)
+
+    @field_validator("fields", mode="before")
+    @classmethod
+    def declared_fields(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="container attach V2 fields")
+
+    @model_validator(mode="after")
+    def bounded_nonsecret_request(self) -> Self:
+        role = "valkey" if self.component.endswith("valkey") else "infisical"
+        expected_fields = (
+            ("requirepass",)
+            if role == "valkey"
+            else ("ENCRYPTION_KEY", "AUTH_SECRET", "DB_CONNECTION_URI", "REDIS_URL")
+        )
+        identities = (
+            self.runtime_instance_binding_sha256,
+            self.derived_image_policy_sha256,
+            self.wrapper_profile_sha256,
+            self.wrapper_manifest_sha256,
+            self.wrapper_artifact_binding_sha256,
+            self.attach_protocol_sha256,
+            self.target_delivery_map_sha256,
+            self.request_nonce_sha256,
+            self.channel_binding_sha256,
+            self.session_binding_sha256,
+        )
+        if (
+            self.component_role != role
+            or tuple(field.ordinal for field in self.fields)
+            != tuple(range(1, len(self.fields) + 1))
+            or tuple(field.target_field for field in self.fields) != expected_fields
+            or len(set(identities)) != len(identities)
+        ):
+            raise ValueError("container attach V2 request is invalid")
+        return self
+
+
+def strict_canonical_container_attach_request_v2(
+    request: ContainerAttachRequestV2,
+) -> ContainerAttachRequestV2:
+    """Round-trip one V2 request before its dynamic fields reach a boundary."""
+
+    return _strict_canonical_model(request, ContainerAttachRequestV2)
+
+
+def container_attach_v2_request_sha256(request: ContainerAttachRequestV2) -> str:
+    """Commit a V2 request independently of its separately signed ticket."""
+
+    if type(request) is not ContainerAttachRequestV2:
+        raise ValueError("container attach V2 request is invalid")
+    return _domain_sha256(_LOCAL_ATTACH_V2_REQUEST_DOMAIN, request)
+
+
+class ContainerAttachTicketEnvelopeV2(_Model):
+    """The canonical first V2 frame: request plus its signed authority."""
+
+    schema_version: Literal["rsd.container-attach-ticket-envelope.v2"]
+    request: ContainerAttachRequestV2
+    ticket: ContainerAttachAuthorizationTicketV1
+
+    @model_validator(mode="after")
+    def exact_request_ticket_binding(self) -> Self:
+        request = self.request
+        ticket = self.ticket
+        if (
+            ticket.request_sha256 != container_attach_v2_request_sha256(request)
+            or ticket.protocol_sha256 != request.attach_protocol_sha256
+            or ticket.allocation_operation_id != request.allocation_operation_id
+            or ticket.operation_scope != request.operation_scope
+            or ticket.operation_id != request.operation_id
+            or ticket.component != request.component
+            or ticket.component_role != request.component_role
+            or ticket.container_id != request.container_id
+            or ticket.runtime_hostname != request.runtime_hostname
+            or ticket.runtime_instance_binding_sha256 != request.runtime_instance_binding_sha256
+            or ticket.request_nonce_sha256 != request.request_nonce_sha256
+            or ticket.channel_binding_sha256 != request.channel_binding_sha256
+            or ticket.session_binding_sha256 != request.session_binding_sha256
+            or ticket.wrapper_profile_sha256 != request.wrapper_profile_sha256
+            or ticket.wrapper_manifest_sha256 != request.wrapper_manifest_sha256
+            or ticket.wrapper_artifact_binding_sha256 != request.wrapper_artifact_binding_sha256
+            or ticket.target_delivery_map_sha256 != request.target_delivery_map_sha256
+        ):
+            raise ValueError("container attach V2 ticket envelope is invalid")
+        return self
+
+
+class ContainerAttachReadyV2(_Model):
+    """Wrapper acknowledgement before secret chunks may cross V2."""
+
+    schema_version: Literal["rsd.container-attach-ready.v2"]
+    request_sha256: str = Field(pattern=_SHA256)
+    ticket_sha256: str = Field(pattern=_SHA256)
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    runtime_hostname: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{14,61}[a-z0-9]$")
+    state: Literal["ready_v2"]
+    wrapper_profile_sha256: str = Field(pattern=_SHA256)
+    wrapper_artifact_binding_sha256: str = Field(pattern=_SHA256)
+    attach_protocol_sha256: str = Field(pattern=_SHA256)
+    fields_sha256: str = Field(pattern=_SHA256)
+
+
+class ContainerAttachClaimV2(_Model):
+    """One value-free claim immediately before V2 chunk delivery."""
+
+    schema_version: Literal["rsd.container-attach-claim.v2"]
+    request_sha256: str = Field(pattern=_SHA256)
+    ticket_sha256: str = Field(pattern=_SHA256)
+    state: Literal["claimed_v2"]
+    chunk_count: int = Field(ge=1, le=4)
+    chunk_descriptors_sha256: str = Field(pattern=_SHA256)
+    actual_write_half_close_required: Literal[True]
+    one_attach_per_container_lifetime: Literal[True]
+
+
+class ContainerAttachTerminalAckV2(_Model):
+    """Value-free terminal acknowledgement after a real input EOF."""
+
+    schema_version: Literal["rsd.container-attach-terminal-ack.v2"]
+    request_sha256: str = Field(pattern=_SHA256)
+    ticket_sha256: str = Field(pattern=_SHA256)
+    state: Literal["terminal_ack_v2"]
+    chunk_count: int = Field(ge=1, le=4)
+    chunk_descriptors_sha256: str = Field(pattern=_SHA256)
+    input_eof_observed: Literal[True]
+    child_handoff_complete: Literal[True]
+    staging_buffers_zeroized: Literal[True]
+    protocol_output_close_required: Literal[True]
+    child_process_readiness_claimed: Literal[False]
+    service_readiness_claimed: Literal[False]
+    persistence_allowed: Literal[False]
+    logging_allowed: Literal[False]
+    receipt_contains_secret: Literal[False]
+
+
+def container_attach_v2_ack_sha256(ack: ContainerAttachTerminalAckV2) -> str:
+    """Return a receipt-safe V2 terminal-ack commitment."""
+
+    if type(ack) is not ContainerAttachTerminalAckV2:
+        raise ValueError("container attach V2 terminal acknowledgement is invalid")
+    return _domain_sha256(_LOCAL_ATTACH_V2_ACK_DOMAIN, ack)
+
+
+class ContainerAttachCheckpointV2(_Model):
+    """Durable value-free checkpoint that a future executor journal records."""
+
+    schema_version: Literal["rsd.container-attach-checkpoint.v2"]
+    checkpoint_state: Literal[
+        "ticket_verified_v2",
+        "ticket_consumed_v2",
+        "ready_v2",
+        "claimed_v2",
+        "write_closed_v2",
+        "terminal_ack_v2",
+        "attach_ambiguous_v2",
+        "attach_rejected_v2",
+    ]
+    request_sha256: str = Field(pattern=_SHA256)
+    ticket_sha256: str = Field(pattern=_SHA256)
+    allocation_operation_id: str = Field(pattern=_UUID)
+    operation_id: str = Field(pattern=_UUID)
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    request_nonce_sha256: str = Field(pattern=_SHA256)
+    journal_sequence: int = Field(ge=1)
+    terminal: bool
+    secret_persistence_allowed: Literal[False]
+    secret_logging_allowed: Literal[False]
+
+    @model_validator(mode="after")
+    def terminal_state_is_truthful(self) -> Self:
+        terminal_states = {
+            "terminal_ack_v2",
+            "attach_ambiguous_v2",
+            "attach_rejected_v2",
+        }
+        if self.terminal != (self.checkpoint_state in terminal_states):
+            raise ValueError("container attach V2 checkpoint is invalid")
+        return self
+
+
+def container_attach_v2_checkpoint_sha256(checkpoint: ContainerAttachCheckpointV2) -> str:
+    """Return the durable journal commitment for one V2 checkpoint."""
+
+    if type(checkpoint) is not ContainerAttachCheckpointV2:
+        raise ValueError("container attach V2 checkpoint is invalid")
+    return _domain_sha256(_LOCAL_ATTACH_V2_CHECKPOINT_DOMAIN, checkpoint)
+
+
+class ContainerAttachReceiptV2(_Model):
+    """Completed V2 attach evidence with no secret-bearing representation."""
+
+    schema_version: Literal["rsd.container-attach-receipt.v2"]
+    request_sha256: str = Field(pattern=_SHA256)
+    ticket_sha256: str = Field(pattern=_SHA256)
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    runtime_hostname: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{14,61}[a-z0-9]$")
+    ready_state: Literal["ready_v2"]
+    claim_state: Literal["claimed_v2"]
+    write_closed_state: Literal["write_closed_v2"]
+    chunk_count: int = Field(ge=1, le=4)
+    chunk_descriptors_sha256: str = Field(pattern=_SHA256)
+    terminal_ack_state: Literal["terminal_ack_v2"]
+    terminal_ack_sha256: str = Field(pattern=_SHA256)
+    input_eof_observed: Literal[True]
+    protocol_output_eof_observed: Literal[True]
+    chunks_zeroized: Literal[True]
+    persistence_allowed: Literal[False]
+    logging_allowed: Literal[False]
+    receipt_contains_secret: Literal[False]
+    child_process_readiness_claimed: Literal[False]
+    service_readiness_claimed: Literal[False]
+
+    @model_validator(mode="after")
+    def exact_completed_attach_state(self) -> Self:
+        if (
+            self.input_eof_observed is not True
+            or self.protocol_output_eof_observed is not True
+            or self.chunks_zeroized is not True
+            or self.persistence_allowed is not False
+            or self.logging_allowed is not False
+            or self.receipt_contains_secret is not False
+            or self.child_process_readiness_claimed is not False
+            or self.service_readiness_claimed is not False
+        ):
+            raise ValueError("container attach V2 receipt is invalid")
+        ack = ContainerAttachTerminalAckV2(
+            schema_version="rsd.container-attach-terminal-ack.v2",
+            request_sha256=self.request_sha256,
+            ticket_sha256=self.ticket_sha256,
+            state="terminal_ack_v2",
+            chunk_count=self.chunk_count,
+            chunk_descriptors_sha256=self.chunk_descriptors_sha256,
+            input_eof_observed=True,
+            child_handoff_complete=True,
+            staging_buffers_zeroized=True,
+            protocol_output_close_required=True,
+            child_process_readiness_claimed=False,
+            service_readiness_claimed=False,
+            persistence_allowed=False,
+            logging_allowed=False,
+            receipt_contains_secret=False,
+        )
+        if self.terminal_ack_sha256 != container_attach_v2_ack_sha256(ack):
+            raise ValueError("container attach V2 receipt is invalid")
+        return self
+
+
+def container_attach_v2_receipt_sha256(receipt: ContainerAttachReceiptV2) -> str:
+    """Return the receipt-safe V2 local attach completion commitment."""
+
+    if type(receipt) is not ContainerAttachReceiptV2:
+        raise ValueError("container attach V2 receipt is invalid")
+    return _domain_sha256(_LOCAL_ATTACH_V2_RECEIPT_DOMAIN, receipt)
+
+
+class ContainerBootstrapStaticEnvironmentEntryV2(_Model):
+    """One exact non-secret image environment entry allowed after create."""
+
+    name: str = Field(pattern=r"^[A-Z][A-Z0-9_]{0,127}$")
+    value: str = Field(min_length=0, max_length=1024)
+
+    @field_validator("value")
+    @classmethod
+    def safe_static_value(cls, value: str) -> str:
+        if (
+            type(value) is not str
+            or "\x00" in value
+            or any(character in value for character in "\r\n")
+        ):
+            raise ValueError("container static environment value is invalid")
+        return value
+
+    @property
+    def rendered(self) -> str:
+        """Render the only Docker image-env spelling for this non-secret entry."""
+
+        return f"{self.name}={self.value}"
+
+
+class ContainerBootstrapStaticEnvironmentV2(_Model):
+    """Sealed exact image environment; create-time ``Config.Env`` stays empty."""
+
+    schema_version: Literal["rsd.container-bootstrap-static-environment.v2"]
+    entries: tuple[ContainerBootstrapStaticEnvironmentEntryV2, ...] = Field(max_length=64)
+    environment_sha256: str = Field(pattern=_SHA256)
+    target_delivery_fields_forbidden: Literal[True]
+    inherited_environment_allowed: Literal[False]
+
+    @field_validator("entries", mode="before")
+    @classmethod
+    def declared_entries(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="container static environment entries")
+
+    @model_validator(mode="after")
+    def exact_nonsecret_environment(self) -> Self:
+        forbidden = {
+            "ENCRYPTION_KEY",
+            "AUTH_SECRET",
+            "DB_CONNECTION_URI",
+            "REDIS_URL",
+            "requirepass",
+        }
+        rendered = tuple(item.rendered for item in self.entries)
+        if (
+            tuple(sorted(item.name for item in self.entries))
+            != tuple(item.name for item in self.entries)
+            or len({item.name for item in self.entries}) != len(self.entries)
+            or any(item.name in forbidden for item in self.entries)
+            or self.environment_sha256
+            != _digest(json.dumps(rendered, separators=(",", ":")).encode("utf-8"))
+        ):
+            raise ValueError("container static environment is invalid")
+        return self
+
+
+class ContainerBootstrapEnvironmentConstructionPolicyV2(_Model):
+    """Exact wrapper-to-child environment boundary for one V2 target.
+
+    Docker's create-time ``Config.Env`` and a base image's static environment
+    are not a child-process authorization channel.  The future wrapper must
+    clear its ambient process environment and construct one new ``envp`` from
+    this signed non-secret allowlist plus the exact V1 target-delivery fields.
+    This model deliberately carries no delivered value or URI.
+    """
+
+    schema_version: Literal["rsd.container-bootstrap-environment-construction-policy.v2"]
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    host_environment_allowed: Literal[False]
+    env_file_allowed: Literal[False]
+    docker_config_environment_allowed: Literal[False]
+    inherited_environment_cleared_before_child_exec: Literal[True]
+    inherited_environment_read_allowed: Literal[False]
+    inherited_environment_pass_through_allowed: Literal[False]
+    explicit_child_envp_required: Literal[True]
+    global_setenv_for_target_values_allowed: Literal[False]
+    static_entries: tuple[ContainerBootstrapStaticEnvironmentEntryV2, ...] = Field(max_length=32)
+    static_environment_sha256: str = Field(pattern=_SHA256)
+    image_static_environment_sha256: str = Field(pattern=_SHA256)
+    dynamic_target_field_names: tuple[str, ...] = Field(max_length=4)
+    wrapper_network_client_allowed: Literal[False]
+    telemetry_environment_allowed: Literal[False]
+    target_value_in_argv_allowed: Literal[False]
+    target_value_in_file_allowed: Literal[False]
+    target_value_in_logs_allowed: Literal[False]
+
+    @field_validator("static_entries", "dynamic_target_field_names", mode="before")
+    @classmethod
+    def declared_sequences(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="container child environment V2 sequence")
+
+    @model_validator(mode="after")
+    def exact_child_environment_boundary(self) -> Self:
+        expected_dynamic: dict[str, tuple[str, ...]] = {
+            "primary_infisical": (
+                "ENCRYPTION_KEY",
+                "AUTH_SECRET",
+                "DB_CONNECTION_URI",
+                "REDIS_URL",
+            ),
+            "restore_infisical": (
+                "ENCRYPTION_KEY",
+                "AUTH_SECRET",
+                "DB_CONNECTION_URI",
+                "REDIS_URL",
+            ),
+            "primary_valkey": (),
+            "restore_valkey": (),
+        }
+        forbidden_static_names = {
+            "AUTH_SECRET",
+            "DB_CONNECTION_URI",
+            "DOCKER_HOST",
+            "ENCRYPTION_KEY",
+            "ENV_FILE",
+            "HOME",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "NODE_OPTIONS",
+            "PATH",
+            "REDIS_URL",
+            "requirepass",
+        }
+        rendered = tuple(item.rendered for item in self.static_entries)
+        if (
+            tuple(sorted(item.name for item in self.static_entries))
+            != tuple(item.name for item in self.static_entries)
+            or len({item.name for item in self.static_entries}) != len(self.static_entries)
+            or any(item.name in forbidden_static_names for item in self.static_entries)
+            or self.static_environment_sha256
+            != _digest(json.dumps(rendered, separators=(",", ":")).encode("utf-8"))
+            or self.dynamic_target_field_names != expected_dynamic[self.component]
+        ):
+            raise ValueError("container child environment V2 policy is invalid")
+        return self
+
+
+def container_bootstrap_environment_construction_policy_sha256(
+    policy: ContainerBootstrapEnvironmentConstructionPolicyV2,
+) -> str:
+    """Return the signed-profile commitment for a child ``envp`` boundary."""
+
+    if type(policy) is not ContainerBootstrapEnvironmentConstructionPolicyV2:
+        raise ValueError("container child environment V2 policy is invalid")
+    return _domain_sha256(_CONTAINER_ENVIRONMENT_CONSTRUCTION_V2_DOMAIN, policy)
+
+
+class ContainerBootstrapFdPolicyV2(_Model):
+    """Fixed wrapper/child file-descriptor topology; no output carrier exists."""
+
+    schema_version: Literal["rsd.container-bootstrap-fd-policy.v2"]
+    wrapper_stdin: Literal["engine_attach_stdin_v2"]
+    wrapper_stdout: Literal["engine_attach_stdout_protocol_only_v2"]
+    wrapper_stderr: Literal["dev_null"]
+    infisical_child_stdin: Literal["dev_null"]
+    valkey_child_stdin: Literal["private_wrapper_config_pipe"]
+    child_stdout: Literal["dev_null"]
+    child_stderr: Literal["dev_null"]
+    exec_status_pipe: Literal["private_cloexec_status_pipe"]
+    output_fd_secret_allowed: Literal[False]
+    logging_allowed: Literal[False]
+
+
+class ContainerBootstrapPid1PolicyV2(_Model):
+    """Exact future PID-1 behavior, distinct from application readiness."""
+
+    schema_version: Literal["rsd.container-bootstrap-pid1-policy.v2"]
+    signal_order: tuple[Literal["SIGTERM"], Literal["SIGINT"]]
+    target_process_group_required: Literal[True]
+    forwards_signals_to_process_group: Literal[True]
+    reaps_all_children: Literal[True]
+    propagates_target_leader_exit_status: Literal[True]
+    terminal_ack_before_exit_required: Literal[True]
+    child_process_readiness_distinct: Literal[True]
+    service_readiness_distinct: Literal[True]
+    shutdown_timeout_seconds: int = Field(ge=1, le=300)
+
+    @field_validator("signal_order", mode="before")
+    @classmethod
+    def declared_signals(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="container wrapper V2 signals")
+
+    @model_validator(mode="after")
+    def exact_pid1_policy(self) -> Self:
+        if self.signal_order != ("SIGTERM", "SIGINT"):
+            raise ValueError("container wrapper V2 PID1 policy is invalid")
+        return self
+
+
+class ContainerBootstrapMemorySafetyPolicyV2(_Model):
+    """Honest wrapper-owned memory controls, without impossible erase claims."""
+
+    schema_version: Literal["rsd.container-bootstrap-memory-safety-policy.v2"]
+    wrapper_owned_mutable_buffers_only: Literal[True]
+    mlock_required_before_secret_delivery: Literal[True]
+    core_dumps_disabled: Literal[True]
+    dumpable_disabled: Literal[True]
+    panic_or_backtrace_logging_allowed: Literal[False]
+    wrapper_staging_buffers_zeroized: Literal[True]
+    kernel_socket_buffer_zeroization_claimed: Literal[False]
+    kernel_pipe_buffer_zeroization_claimed: Literal[False]
+    swap_zeroization_claimed: Literal[False]
+    target_process_memory_zeroization_claimed: Literal[False]
+
+
+class ContainerBootstrapValkeyLaunchPolicyV2(_Model):
+    """Complete static Valkey profile; only ``requirepass`` remains dynamic.
+
+    The exact command allowlist itself is represented by a pinned digest and
+    mandatory negative-test evidence because this public contract does not
+    invent a version-specific Infisical command subset.  A future wrapper must
+    refuse delivery unless that sealed allowlist has separately been proven for
+    the pinned Valkey build.
+    """
+
+    schema_version: Literal["rsd.container-bootstrap-valkey-launch-policy.v2"]
+    command: tuple[Literal["valkey-server"], Literal["-"]]
+    stdin_configuration_required: Literal[True]
+    dynamic_environment_allowed: Literal[False]
+    dynamic_argv_allowed: Literal[False]
+    data_mount_target: Literal["/data"]
+    data_mount_read_only: Literal[True]
+    persistence_disabled: Literal[True]
+    config_file_allowed: Literal[False]
+    wrapper_only_password_assembly: Literal[True]
+    isolated_bind_address: str
+    listener_port: Literal[6379]
+    protected_mode: Literal["yes"]
+    daemonize: Literal["no"]
+    save_schedule: Literal[""]
+    appendonly: Literal["no"]
+    shutdown_on_sigint: Literal["nosave"]
+    shutdown_on_sigterm: Literal["nosave"]
+    logfile: Literal["/dev/null"]
+    loglevel: Literal["nothing"]
+    syslog_enabled: Literal["no"]
+    crash_log_enabled: Literal["no"]
+    set_proc_title: Literal["no"]
+    requirepass_directive_count: Literal[1]
+    requirepass_raw_byte_count: Literal[32]
+    requirepass_canonical_base64url_unpadded: Literal[True]
+    requirepass_dynamic_directive: Literal["requirepass"]
+    requirepass_grammar: Literal[
+        "ascii_base64url_32_no_whitespace_controls_quotes_config_delimiters_v2"
+    ]
+    acl_profile_sha256: str = Field(pattern=_SHA256)
+    acl_pinned_version_sha256: str = Field(pattern=_SHA256)
+    acl_command_allowlist_sha256: str = Field(pattern=_SHA256)
+    acl_negative_test_evidence_sha256: str = Field(pattern=_SHA256)
+    acl_denied_command_categories: tuple[str, ...]
+    static_directive_order: tuple[str, ...]
+    static_configuration_sha256: str = Field(pattern=_SHA256)
+
+    @field_validator("command", mode="before")
+    @classmethod
+    def declared_command(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="Valkey V2 command")
+
+    @field_validator("acl_denied_command_categories", "static_directive_order", mode="before")
+    @classmethod
+    def declared_static_sequences(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="Valkey V2 static configuration sequence")
+
+    @field_validator("isolated_bind_address")
+    @classmethod
+    def isolated_address(cls, value: str) -> str:
+        return _isolated_ipv4(value, field="Valkey V2 isolated bind address")
+
+    @model_validator(mode="after")
+    def exact_valkey_command(self) -> Self:
+        expected_denials = (
+            "acl_administration",
+            "configuration",
+            "debug_and_module_administration",
+            "persistence",
+            "replication_configuration",
+            "shutdown",
+        )
+        expected_directives = (
+            "bind",
+            "port",
+            "protected-mode",
+            "daemonize",
+            "save",
+            "appendonly",
+            "shutdown-on-sigint",
+            "shutdown-on-sigterm",
+            "logfile",
+            "loglevel",
+            "syslog-enabled",
+            "crash-log-enabled",
+            "set-proc-title",
+            "acl-profile",
+            "requirepass",
+        )
+        if (
+            self.command != ("valkey-server", "-")
+            or self.acl_denied_command_categories != expected_denials
+            or self.static_directive_order != expected_directives
+            or len(
+                {
+                    self.acl_profile_sha256,
+                    self.acl_pinned_version_sha256,
+                    self.acl_command_allowlist_sha256,
+                    self.acl_negative_test_evidence_sha256,
+                }
+            )
+            != 4
+            or self.static_configuration_sha256
+            != container_bootstrap_valkey_static_configuration_sha256(self)
+        ):
+            raise ValueError("Valkey V2 launch policy is invalid")
+        return self
+
+
+def container_bootstrap_valkey_static_configuration_sha256(
+    policy: ContainerBootstrapValkeyLaunchPolicyV2,
+) -> str:
+    """Commit the ordered public Valkey stdin configuration without its password."""
+
+    if type(policy) is not ContainerBootstrapValkeyLaunchPolicyV2:
+        raise ValueError("Valkey V2 launch policy is invalid")
+    return _domain_sha256(
+        _VALKEY_STATIC_CONFIGURATION_V2_DOMAIN,
+        policy.model_copy(update={"static_configuration_sha256": "0" * 64}),
+    )
+
+
+class DockerNamedVolumeMountV2(_Model):
+    """The V2 Valkey-only `/data` mount, read-only as a persistence barrier."""
+
+    mount_type: Literal["volume"]
+    source_volume_name: str = Field(pattern=_IDENTIFIER)
+    target_path: Literal["/data"]
+    read_only: Literal[True]
+    bind_allowed: Literal[False]
+    tmpfs_allowed: Literal[False]
+    propagation: Literal["none"]
+
+
+def _merged_container_v2_argv_sha256(
+    *,
+    wrapper_argv_prefix: tuple[str, ...],
+    base_entrypoint: tuple[str, ...],
+    base_command: tuple[str, ...],
+) -> str:
+    return _digest(
+        json.dumps(
+            wrapper_argv_prefix + base_entrypoint + base_command,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+class ContainerBootstrapWrapperArtifactV2(_Model):
+    """Future immutable wrapper declaration, not proof that bytes exist."""
+
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    artifact_sha256: str = Field(pattern=_SHA256)
+    artifact_byte_count: int = Field(ge=1, le=16_777_216)
+    executable_path: str = Field(pattern=r"^/[A-Za-z0-9._/-]{1,255}$")
+    executable_mode: Literal["0755"]
+    architecture: Literal["linux/amd64"]
+    build_provenance_sha256: str = Field(pattern=_SHA256)
+    build_recipe_sha256: str = Field(pattern=_SHA256)
+    static_patch_sha256: str = Field(pattern=_SHA256)
+    v1_wrapper_artifact_binding_sha256: str = Field(pattern=_SHA256)
+    base_image_policy: DockerImagePolicyV1
+    derived_image_policy: DockerImagePolicyV1
+    wrapper_argv_prefix: tuple[str, ...] = Field(min_length=1, max_length=16)
+    base_entrypoint: tuple[str, ...] = Field(default=(), max_length=16)
+    base_command: tuple[str, ...] = Field(default=(), max_length=32)
+    entrypoint_command_merge: Literal["exec_wrapper_then_base_entrypoint_and_cmd_v2"]
+    merged_argv_sha256: str = Field(pattern=_SHA256)
+    static_environment: ContainerBootstrapStaticEnvironmentV2
+    child_environment_policy: ContainerBootstrapEnvironmentConstructionPolicyV2
+    fd_policy: ContainerBootstrapFdPolicyV2
+    pid1_policy: ContainerBootstrapPid1PolicyV2
+    memory_safety_policy: ContainerBootstrapMemorySafetyPolicyV2
+    valkey_launch_policy: ContainerBootstrapValkeyLaunchPolicyV2 | None = None
+    attach_protocol_v2_sha256: str = Field(pattern=_SHA256)
+    artifact_binding_sha256: str = Field(pattern=_SHA256)
+
+    @field_validator("wrapper_argv_prefix", "base_entrypoint", "base_command", mode="before")
+    @classmethod
+    def declared_argv(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="container wrapper V2 argv")
+
+    @model_validator(mode="after")
+    def exact_wrapper_binding(self) -> Self:
+        is_valkey = self.component.endswith("valkey")
+        if (
+            self.base_image_policy == self.derived_image_policy
+            or self.base_image_policy.image == self.derived_image_policy.image
+            or self.wrapper_argv_prefix[0] != self.executable_path
+            or not self.base_entrypoint + self.base_command
+            or self.merged_argv_sha256
+            != _merged_container_v2_argv_sha256(
+                wrapper_argv_prefix=self.wrapper_argv_prefix,
+                base_entrypoint=self.base_entrypoint,
+                base_command=self.base_command,
+            )
+            or self.child_environment_policy.component != self.component
+            or self.child_environment_policy.image_static_environment_sha256
+            != self.static_environment.environment_sha256
+            or (self.valkey_launch_policy is None) != (not is_valkey)
+            or self.artifact_binding_sha256 != container_bootstrap_wrapper_v2_artifact_sha256(self)
+        ):
+            raise ValueError("container bootstrap V2 wrapper artifact is invalid")
+        return self
+
+
+def container_bootstrap_wrapper_v2_artifact_sha256(
+    artifact: ContainerBootstrapWrapperArtifactV2,
+) -> str:
+    """Commit a V2 wrapper artifact without a self-referential field."""
+
+    if type(artifact) is not ContainerBootstrapWrapperArtifactV2:
+        raise ValueError("container bootstrap V2 wrapper artifact is invalid")
+    return _domain_sha256(
+        _CONTAINER_WRAPPER_ARTIFACT_V2_DOMAIN,
+        artifact.model_copy(update={"artifact_binding_sha256": "0" * 64}),
+    )
+
+
+class ContainerBootstrapWrapperManifestV2(_Model):
+    """Signed complete V2 wrapper/profile set for all future runtime targets."""
+
+    schema_version: Literal["rsd.container-bootstrap-wrapper-manifest.v2"]
+    source_commit: str = Field(pattern=_COMMIT)
+    allocation_intent_sha256: str = Field(pattern=_SHA256)
+    v1_wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    v1_target_delivery_map_sha256: str = Field(pattern=_SHA256)
+    v1_attach_protocol_sha256: str = Field(pattern=_SHA256)
+    attach_protocol_v2_sha256: str = Field(pattern=_SHA256)
+    primary_infisical: ContainerBootstrapWrapperArtifactV2
+    primary_valkey: ContainerBootstrapWrapperArtifactV2
+    restore_infisical: ContainerBootstrapWrapperArtifactV2
+    restore_valkey: ContainerBootstrapWrapperArtifactV2
+    created_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("created_at")
+    @classmethod
+    def canonical_created_at(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def complete_manifest(self) -> Self:
+        artifacts = (
+            self.primary_infisical,
+            self.primary_valkey,
+            self.restore_infisical,
+            self.restore_valkey,
+        )
+        if (
+            tuple(item.component for item in artifacts)
+            != ("primary_infisical", "primary_valkey", "restore_infisical", "restore_valkey")
+            or any(
+                item.attach_protocol_v2_sha256 != self.attach_protocol_v2_sha256
+                for item in artifacts
+            )
+            or len({item.artifact_binding_sha256 for item in artifacts}) != 4
+            or len(
+                {
+                    self.allocation_intent_sha256,
+                    self.v1_wrapper_manifest_sha256,
+                    self.v1_target_delivery_map_sha256,
+                    self.v1_attach_protocol_sha256,
+                    self.attach_protocol_v2_sha256,
+                }
+            )
+            != 5
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("container bootstrap V2 wrapper manifest is invalid")
+        return self
+
+
+def container_bootstrap_wrapper_v2_manifest_sha256(
+    manifest: ContainerBootstrapWrapperManifestV2,
+) -> str:
+    """Return the V2 signed wrapper/profile manifest commitment."""
+
+    if type(manifest) is not ContainerBootstrapWrapperManifestV2:
+        raise ValueError("container bootstrap V2 wrapper manifest is invalid")
+    return _domain_sha256(_CONTAINER_WRAPPER_MANIFEST_V2_DOMAIN, manifest)
+
+
+class ContainerBootstrapTemplateV2(_Model):
+    """V2 create/inspection contract with no create-time secret carrier."""
+
+    schema_version: Literal["rsd.container-bootstrap-template.v2"]
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    image: ImageReferenceV1
+    image_policy: DockerImagePolicyV1
+    wrapper_manifest_v2_sha256: str = Field(pattern=_SHA256)
+    wrapper_artifact_binding_sha256: str = Field(pattern=_SHA256)
+    attach_protocol_v2_sha256: str = Field(pattern=_SHA256)
+    entrypoint: tuple[str, ...] = Field(min_length=1, max_length=16)
+    command: tuple[str, ...] = Field(default=(), max_length=32)
+    merged_argv_sha256: str = Field(pattern=_SHA256)
+    numeric_user: str = Field(pattern=r"^[1-9][0-9]{0,8}:[1-9][0-9]{0,8}$")
+    working_directory: str = Field(pattern=r"^/[A-Za-z0-9._/-]{0,255}$")
+    create_environment: tuple[str, ...] = Field(default=(), max_length=0)
+    static_image_environment: ContainerBootstrapStaticEnvironmentV2
+    child_environment_policy: ContainerBootstrapEnvironmentConstructionPolicyV2
+    hostname_required: Literal[True]
+    open_stdin: Literal[True]
+    stdin_once: Literal[True]
+    attach_stdin: Literal[True]
+    tty: Literal[False]
+    healthcheck: Literal["none"]
+    run_as_non_root: Literal[True]
+    read_only_root_filesystem: Literal[True]
+    cap_drop_all: Literal[True]
+    cap_add: tuple[str, ...] = Field(default=(), max_length=0)
+    no_new_privileges: Literal[True]
+    security_options: tuple[Literal["no-new-privileges:true"],]
+    private_pid: Literal[True]
+    docker_init: Literal[False]
+    log_driver: Literal["none"]
+    restart_policy: Literal["no"]
+    mounts: tuple[DockerNamedVolumeMountV2, ...] = Field(default=(), max_length=1)
+    valkey_launch_policy: ContainerBootstrapValkeyLaunchPolicyV2 | None = None
+    docker_socket_mounted: Literal[False]
+    host_network: Literal[False]
+    publish_all_ports: Literal[False]
+    port_bindings: tuple[str, ...] = Field(default=(), max_length=0)
+    labels: tuple[str, ...] = Field(default=(), max_length=0)
+    network_name: str = Field(pattern=_IDENTIFIER)
+    network_alias: str = Field(pattern=_IDENTIFIER)
+    static_ipv4: str
+    accepted_secret_sink: ContainerSecretSinkV1
+    create_request_sha256: str = Field(pattern=_SHA256)
+
+    @field_validator("static_ipv4")
+    @classmethod
+    def canonical_address(cls, value: str) -> str:
+        return _isolated_ipv4(value, field="container bootstrap V2 static IPv4")
+
+    @field_validator(
+        "entrypoint",
+        "command",
+        "create_environment",
+        "cap_add",
+        "security_options",
+        "mounts",
+        "port_bindings",
+        "labels",
+        mode="before",
+    )
+    @classmethod
+    def declared_sequence(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="container bootstrap V2 sequence")
+
+    @field_validator("accepted_secret_sink", mode="before")
+    @classmethod
+    def canonical_sink(cls, value: object) -> ContainerSecretSinkV1:
+        return ContainerBootstrapTemplateV1.canonical_sink(value)
+
+    @model_validator(mode="after")
+    def exact_hardened_runtime(self) -> Self:
+        is_valkey = self.component.endswith("valkey")
+        expected_sink = (
+            ContainerSecretSinkV1.VALKEY_STDIN_CONFIGURATION
+            if is_valkey
+            else ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT
+        )
+        if (
+            type(self.accepted_secret_sink) is not ContainerSecretSinkV1
+            or self.accepted_secret_sink is not expected_sink
+            or self.image_policy.image != self.image
+            or self.create_environment != ()
+            or self.child_environment_policy.component != self.component
+            or self.child_environment_policy.image_static_environment_sha256
+            != self.static_image_environment.environment_sha256
+            or self.cap_add != ()
+            or self.security_options != ("no-new-privileges:true",)
+            or self.labels != ()
+            or self.port_bindings != ()
+            or (is_valkey and len(self.mounts) != 1)
+            or (not is_valkey and self.mounts != ())
+            or (self.valkey_launch_policy is None) != (not is_valkey)
+            or (
+                is_valkey
+                and self.valkey_launch_policy is not None
+                and self.valkey_launch_policy.isolated_bind_address != self.static_ipv4
+            )
+            or self.create_request_sha256 != container_create_v2_template_sha256(self)
+        ):
+            raise ValueError("container bootstrap V2 template is invalid")
+        return self
+
+
+def container_create_v2_template_sha256(template: ContainerBootstrapTemplateV2) -> str:
+    """Commit every explicit V2 Docker create field without a cycle."""
+
+    if type(template) is not ContainerBootstrapTemplateV2:
+        raise ValueError("container bootstrap V2 template is invalid")
+    payload = json.dumps(
+        template.model_dump(mode="json", exclude={"create_request_sha256"}, warnings="error"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _digest(_CONTAINER_CREATE_TEMPLATE_V2_DOMAIN + payload)
+
+
+class ContainerBootstrapInspectionV2(_Model):
+    """Filtered post-create evidence required before a V2 ticket is usable."""
+
+    schema_version: Literal["rsd.container-bootstrap-inspection.v2"]
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    runtime_hostname: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{14,61}[a-z0-9]$")
+    image_policy_binding: DockerImagePolicyBindingV1
+    create_environment: tuple[str, ...] = Field(default=(), max_length=0)
+    static_image_environment: ContainerBootstrapStaticEnvironmentV2
+    entrypoint: tuple[str, ...] = Field(min_length=1, max_length=16)
+    command: tuple[str, ...] = Field(default=(), max_length=32)
+    merged_argv_sha256: str = Field(pattern=_SHA256)
+    numeric_user: str = Field(pattern=r"^[1-9][0-9]{0,8}:[1-9][0-9]{0,8}$")
+    working_directory: str = Field(pattern=r"^/[A-Za-z0-9._/-]{0,255}$")
+    open_stdin: Literal[True]
+    stdin_once: Literal[True]
+    attach_stdin: Literal[True]
+    tty: Literal[False]
+    healthcheck: Literal["none"]
+    run_as_non_root: Literal[True]
+    read_only_root_filesystem: Literal[True]
+    cap_drop_all: Literal[True]
+    cap_add: tuple[str, ...] = Field(default=(), max_length=0)
+    no_new_privileges: Literal[True]
+    security_options: tuple[Literal["no-new-privileges:true"],]
+    private_pid: Literal[True]
+    docker_init: Literal[False]
+    log_driver: Literal["none"]
+    restart_policy: Literal["no"]
+    mounts: tuple[DockerNamedVolumeMountV2, ...] = Field(default=(), max_length=1)
+    child_environment_policy: ContainerBootstrapEnvironmentConstructionPolicyV2
+    valkey_launch_policy: ContainerBootstrapValkeyLaunchPolicyV2 | None = None
+    docker_socket_mounted: Literal[False]
+    host_network: Literal[False]
+    publish_all_ports: Literal[False]
+    port_bindings: tuple[str, ...] = Field(default=(), max_length=0)
+    labels: tuple[str, ...] = Field(default=(), max_length=0)
+    network_name: str = Field(pattern=_IDENTIFIER)
+    network_alias: str = Field(pattern=_IDENTIFIER)
+    static_ipv4: str
+    running: Literal[True]
+
+    @field_validator("static_ipv4")
+    @classmethod
+    def canonical_address(cls, value: str) -> str:
+        return _isolated_ipv4(value, field="container bootstrap V2 inspection static IPv4")
+
+    @field_validator(
+        "create_environment",
+        "entrypoint",
+        "command",
+        "cap_add",
+        "security_options",
+        "mounts",
+        "port_bindings",
+        "labels",
+        mode="before",
+    )
+    @classmethod
+    def declared_sequence(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="container bootstrap V2 inspection sequence")
+
+
+def container_bootstrap_v2_inspection_matches(
+    inspection: ContainerBootstrapInspectionV2,
+    template: ContainerBootstrapTemplateV2,
+) -> bool:
+    """Compare every V2 Engine projection; hashes alone never authorize use."""
+
+    if (
+        type(inspection) is not ContainerBootstrapInspectionV2
+        or type(template) is not ContainerBootstrapTemplateV2
+    ):
+        return False
+    return (
+        inspection.component == template.component
+        and inspection.image_policy_binding == docker_image_policy_binding(template.image_policy)
+        and inspection.create_environment == ()
+        and inspection.static_image_environment == template.static_image_environment
+        and inspection.child_environment_policy == template.child_environment_policy
+        and inspection.entrypoint == template.entrypoint
+        and inspection.command == template.command
+        and inspection.merged_argv_sha256 == template.merged_argv_sha256
+        and inspection.numeric_user == template.numeric_user
+        and inspection.working_directory == template.working_directory
+        and inspection.open_stdin is True
+        and inspection.stdin_once is True
+        and inspection.attach_stdin is True
+        and inspection.tty is False
+        and inspection.healthcheck == "none"
+        and inspection.run_as_non_root is True
+        and inspection.read_only_root_filesystem is True
+        and inspection.cap_drop_all is True
+        and inspection.cap_add == ()
+        and inspection.no_new_privileges is True
+        and inspection.security_options == ("no-new-privileges:true",)
+        and inspection.private_pid is True
+        and inspection.docker_init is False
+        and inspection.log_driver == "none"
+        and inspection.restart_policy == "no"
+        and inspection.mounts == template.mounts
+        and inspection.valkey_launch_policy == template.valkey_launch_policy
+        and inspection.docker_socket_mounted is False
+        and inspection.host_network is False
+        and inspection.publish_all_ports is False
+        and inspection.port_bindings == ()
+        and inspection.labels == ()
+        and inspection.network_name == template.network_name
+        and inspection.network_alias == template.network_alias
+        and inspection.static_ipv4 == template.static_ipv4
+        and inspection.running is True
+    )
+
+
+class ContainerAttachV2AuthorizationPolicyV1(_Model):
+    """Signed V2 amendment policy; it grants no Docker/runtime effect itself."""
+
+    schema_version: Literal["rsd.container-attach-v2-authorization-policy.v1"]
+    source_commit: str = Field(pattern=_COMMIT)
+    allocation_intent_sha256: str = Field(pattern=_SHA256)
+    allocation_effect_receipt_sha256: str = Field(pattern=_SHA256)
+    observed_allocation_attestation_sha256: str = Field(pattern=_SHA256)
+    observed_restore_database_attestation_sha256: str = Field(pattern=_SHA256)
+    materialization_intent_sha256: str = Field(pattern=_SHA256)
+    v1_wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    v1_target_delivery_map_sha256: str = Field(pattern=_SHA256)
+    v1_attach_protocol_sha256: str = Field(pattern=_SHA256)
+    wrapper_manifest_v2_sha256: str = Field(pattern=_SHA256)
+    attach_protocol_v2_sha256: str = Field(pattern=_SHA256)
+    docker_attach_control_policy_sha256: str = Field(pattern=_SHA256)
+    ticket_trust_anchor: ContainerAttachTicketTrustAnchorV1
+    ticket_max_lifetime_seconds: int = Field(ge=1, le=900)
+    materialization_effect_allowed: Literal[False]
+    start_effect_allowed: Literal[False]
+    created_at: str
+    expires_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("created_at", "expires_at")
+    @classmethod
+    def canonical_time(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def bounded_non_effect_policy(self) -> Self:
+        hashes = (
+            self.allocation_intent_sha256,
+            self.allocation_effect_receipt_sha256,
+            self.observed_allocation_attestation_sha256,
+            self.observed_restore_database_attestation_sha256,
+            self.materialization_intent_sha256,
+            self.v1_wrapper_manifest_sha256,
+            self.v1_target_delivery_map_sha256,
+            self.v1_attach_protocol_sha256,
+            self.wrapper_manifest_v2_sha256,
+            self.attach_protocol_v2_sha256,
+            self.docker_attach_control_policy_sha256,
+        )
+        if (
+            len(set(hashes)) != len(hashes)
+            or _timestamp(self.expires_at) <= _timestamp(self.created_at)
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("container attach V2 authorization policy is invalid")
+        return self
+
+
+def container_attach_v2_authorization_policy_sha256(
+    policy: ContainerAttachV2AuthorizationPolicyV1,
+) -> str:
+    """Return the signed V2 amendment-policy commitment."""
+
+    if type(policy) is not ContainerAttachV2AuthorizationPolicyV1:
+        raise ValueError("container attach V2 authorization policy is invalid")
+    return _domain_sha256(_LOCAL_ATTACH_V2_POLICY_DOMAIN, policy)
+
+
+def _container_attach_v2_signed_message(domain: bytes, model: BaseModel) -> bytes:
+    """Render one V2 direct-signature preimage without a signature cycle."""
+
+    if type(domain) is not bytes or not domain.endswith(b"\x00"):
+        raise ValueError("container attach V2 signature domain is invalid")
+    try:
+        material = model.model_dump(mode="json", exclude={"signature_base64"}, warnings="error")
+        return domain + json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    except Exception:
+        raise ValueError("container attach V2 signed artifact is invalid") from None
+
+
+def container_bootstrap_attach_v2_protocol_message(
+    protocol: ContainerBootstrapAttachProtocolV2,
+) -> bytes:
+    """Return the direct-signature bytes for a V2 framing policy."""
+
+    protocol = _strict_canonical_model(protocol, ContainerBootstrapAttachProtocolV2)
+    return _container_attach_v2_signed_message(
+        b"omninode-rsd.container-attach-protocol.ed25519.v2\x00", protocol
+    )
+
+
+def container_bootstrap_wrapper_v2_manifest_message(
+    manifest: ContainerBootstrapWrapperManifestV2,
+) -> bytes:
+    """Return the direct-signature bytes for a V2 wrapper manifest."""
+
+    manifest = _strict_canonical_model(manifest, ContainerBootstrapWrapperManifestV2)
+    return _container_attach_v2_signed_message(
+        b"omninode-rsd.container-wrapper-manifest.ed25519.v2\x00", manifest
+    )
+
+
+def container_attach_v2_authorization_policy_message(
+    policy: ContainerAttachV2AuthorizationPolicyV1,
+) -> bytes:
+    """Return the direct-signature bytes for the V2 amendment policy."""
+
+    policy = _strict_canonical_model(policy, ContainerAttachV2AuthorizationPolicyV1)
+    return _container_attach_v2_signed_message(
+        b"omninode-rsd.container-attach-v2-authorization-policy.ed25519.v1\x00", policy
+    )
+
+
+class DockerContainerAttachControlPolicyV2(_Model):
+    """Separate signed Engine policy for non-TTY attach only.
+
+    It is intentionally not interchangeable with the allocation-only Engine
+    policy.  The model admits exactly the upgrade endpoint needed by V2 and
+    excludes create/start/logs/exec/shell/network mutation and every general
+    Engine transport escape hatch.
+    """
+
+    schema_version: Literal["rsd.docker-container-attach-control-policy.v2"]
+    source_commit: str = Field(pattern=_COMMIT)
+    executor_control_policy_sha256: str = Field(pattern=_SHA256)
+    unix_socket: DockerUnixSocketPolicyV1
+    api_version: str = Field(pattern=r"^[0-9]{1,3}\.[0-9]{1,3}$")
+    allowed_operation: Literal["container_attach_non_tty_v2"]
+    request_method: Literal["POST"]
+    endpoint_shape: Literal[
+        "/v{api}/containers/{container_id}/attach?stdin=1&stdout=1&stderr=1&stream=1&logs=0"
+    ]
+    stdin_required: Literal[True]
+    stdout_required: Literal[True]
+    stderr_required: Literal[True]
+    stream_required: Literal[True]
+    tty_required: Literal[False]
+    logs_allowed: Literal[False]
+    max_request_bytes: int = Field(ge=128, le=16_384)
+    max_response_header_bytes: int = Field(ge=128, le=16_384)
+    max_stdout_bytes: int = Field(ge=512, le=1_048_576)
+    max_stdout_frames: int = Field(ge=1, le=1024)
+    request_timeout_seconds: int = Field(ge=1, le=60)
+    idle_timeout_seconds: int = Field(ge=1, le=60)
+    absolute_timeout_seconds: int = Field(ge=1, le=300)
+    created_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("created_at")
+    @classmethod
+    def canonical_created_at(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def closed_attach_policy(self) -> Self:
+        if (
+            self.max_response_header_bytes > self.max_stdout_bytes
+            or self.absolute_timeout_seconds < self.idle_timeout_seconds
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("Docker container attach V2 policy is invalid")
+        return self
+
+
+def docker_container_attach_v2_control_policy_sha256(
+    policy: DockerContainerAttachControlPolicyV2,
+) -> str:
+    """Return the V2 closed Engine-attach policy commitment."""
+
+    if type(policy) is not DockerContainerAttachControlPolicyV2:
+        raise ValueError("Docker container attach V2 policy is invalid")
+    return canonical_sha256(policy)
+
+
+def docker_container_attach_v2_control_policy_message(
+    policy: DockerContainerAttachControlPolicyV2,
+) -> bytes:
+    """Return direct-signature bytes for the closed V2 Engine attach policy."""
+
+    policy = _strict_canonical_model(policy, DockerContainerAttachControlPolicyV2)
+    return _container_attach_v2_signed_message(
+        b"omninode-rsd.docker-container-attach-control-policy.ed25519.v2\x00", policy
+    )
 
 
 class MaterializationEvidenceBindingsV1(_Model):
