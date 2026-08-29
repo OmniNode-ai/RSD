@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import inspect
+import json
 import multiprocessing
 import os
 import shutil
@@ -68,10 +69,19 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     AllocationTopologyV2,
     AllocationVolumePlanV1,
     ComponentPlacementV1,
+    ContainerAttachReceiptV1,
+    ContainerAttachRequestV1,
+    ContainerAttachTerminalAckV1,
+    ContainerBootstrapAttachProtocolV1,
     ContainerBootstrapInspectionV1,
     ContainerBootstrapTemplatesV1,
     ContainerBootstrapTemplateV1,
+    ContainerBootstrapWrapperArtifactV1,
+    ContainerBootstrapWrapperManifestV1,
     ContainerSecretSinkV1,
+    ContainerTargetDeliveryV1,
+    ContainerWrapperPid1PolicyV1,
+    ContainerWrapperRuntimeRequirementsV1,
     DetachedSignatureV1,
     DisposableTransportProfile,
     DockerEngineControlPolicyV1,
@@ -80,7 +90,6 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     DockerNamedVolumeMountV1,
     DockerUnixSocketPolicyV1,
     EngineIdentityObservationV1,
-    EphemeralPostgreSQLConnectionPolicyV1,
     ExecutorContainerInspectionV1,
     ExecutorControlPolicyV1,
     ExecutorIdentityV1,
@@ -99,15 +108,22 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     NoHostPublicationGroundworkV1,
     ObservedAllocationAttestationV1,
     PostgreSQLAllocationRoleStateV1,
+    PostgreSQLConnectionUriGrammarV1,
     PostgreSQLControlPolicyV1,
     PostgreSQLGrantObservationV1,
     PostgreSQLGrantPlanV1,
+    PostgreSQLLoginTransitionIntentsV1,
     PostgreSQLLoginTransitionIntentV1,
+    PostgreSQLLoginTransitionReceiptsV1,
     PostgreSQLLoginTransitionReceiptV1,
     PostgreSQLPreparedControlPolicyV2,
     PostgreSQLPreparedOperationV1,
     PostgreSQLRoleObservationV1,
+    PostgreSQLRuntimeDatabaseIdentitiesV1,
+    PostgreSQLRuntimeDatabaseIdentityV1,
+    PostgreSQLScramVerifierInstallsV1,
     PostgreSQLScramVerifierInstallV1,
+    ProviderMaterialFingerprintBindingV1,
     ProviderReferencesV2,
     ProviderReferenceV1,
     RuntimeContainerObservationV1,
@@ -120,18 +136,33 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     SecretDeliverySlotV1,
     SecretHandlingPolicyV1,
     SSHConnectionPolicyV1,
+    TargetDeliveryFieldV1,
+    TargetDeliveryMapV1,
+    TargetDeliveryValueKindV1,
     TransportContractV1,
+    ValkeyConnectionUriGrammarV1,
     allocation_effect_receipt_sha256,
     allocation_intent_sha256,
     canonical_sha256,
+    container_attach_ack_sha256,
+    container_attach_chunk_descriptors_sha256,
+    container_attach_receipt_sha256,
+    container_attach_request_sha256,
+    container_bootstrap_attach_protocol_sha256,
+    container_bootstrap_wrapper_artifact_sha256,
+    container_bootstrap_wrapper_manifest_sha256,
     container_create_template_sha256,
     docker_engine_fingerprint_sha256,
     docker_unix_socket_identity_sha256,
     docker_volume_instance_fingerprint_sha256,
     materialization_intent_sha256,
     observed_allocation_attestation_sha256,
+    postgresql_connection_uri_rendered_byte_count,
+    runtime_connection_uri_grammar_sha256,
     strict_canonical_allocation_intent,
+    target_delivery_map_sha256,
     validate_observed_allocation_transition,
+    valkey_connection_uri_rendered_byte_count,
 )
 from omninode_rsd.lifecycle.provider_crypto import (
     ReplayAuthorityPolicyArtifactV1,
@@ -147,6 +178,7 @@ _JOURNAL_ID = "123e4567-e89b-42d3-a456-426614174001"
 _NOW = "2026-08-28T12:00:00Z"
 _RETAINS = "2026-08-28T12:20:00Z"
 _SIGNATURE = base64.b64encode(b"s" * 64).decode("ascii")
+_REDIS_SCHEME = "redis:" + "//"
 _TEST_CLOCK = datetime(2026, 8, 28, 12, 5, tzinfo=UTC)
 _EXECUTOR_ATTESTATION_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(b"e" * 32)
 _EXECUTOR_ATTESTATION_PUBLIC_BYTES = (
@@ -452,8 +484,9 @@ def _docker_policy(executor: ExecutorControlPolicyV1) -> DockerEngineControlPoli
 def _postgres_prepared_policy(
     executor: ExecutorControlPolicyV1,
 ) -> PostgreSQLPreparedControlPolicyV2:
-    verifier = PostgreSQLScramVerifierInstallV1(
+    primary_verifier = PostgreSQLScramVerifierInstallV1(
         schema_version="rsd.postgresql-scram-verifier-install.v1",
+        database_identity="primary_database",
         prepared_operation_id="123e4567-e89b-42d3-a456-426614174003",
         application_password_reference_sha256=(
             _references().postgres_application_password.reference_sha256
@@ -468,7 +501,26 @@ def _postgres_prepared_policy(
         sql_in_receipt_allowed=False,
         output_in_receipt_allowed=False,
         logs_allowed=False,
-        template_sha256=_hash("postgres-verifier-template"),
+        template_sha256=_hash("primary-postgres-verifier-template"),
+    )
+    restore_verifier = PostgreSQLScramVerifierInstallV1(
+        schema_version="rsd.postgresql-scram-verifier-install.v1",
+        database_identity="restore_database",
+        prepared_operation_id="123e4567-e89b-42d3-a456-426614174006",
+        application_password_reference_sha256=(
+            _references().postgres_application_password.reference_sha256
+        ),
+        algorithm="scram-sha-256",
+        iterations=4096,
+        salt_bytes=16,
+        derivation_scope="executor_bounded_memory_v1",
+        sink="postgresql_prepared_psql_stdin_verifier_v1",
+        plaintext_to_psql_allowed=False,
+        verifier_in_receipt_allowed=False,
+        sql_in_receipt_allowed=False,
+        output_in_receipt_allowed=False,
+        logs_allowed=False,
+        template_sha256=_hash("restore-postgres-verifier-template"),
     )
     return PostgreSQLPreparedControlPolicyV2(
         schema_version="rsd.postgresql-prepared-control-policy.v2",
@@ -515,15 +567,26 @@ def _postgres_prepared_policy(
                 secret_input=False,
             ),
             PostgreSQLPreparedOperationV1(
-                operation_id=verifier.prepared_operation_id,
-                kind="install_scram_verifier_v1",
-                psql_template_sha256=verifier.template_sha256,
-                result_projection_sha256=_hash("postgres-verifier-result"),
+                operation_id=primary_verifier.prepared_operation_id,
+                kind="install_primary_scram_verifier_v1",
+                psql_template_sha256=primary_verifier.template_sha256,
+                result_projection_sha256=_hash("primary-postgres-verifier-result"),
+                stdin_protocol="postgresql_prepared_psql_stdin_v1",
+                secret_input=True,
+            ),
+            PostgreSQLPreparedOperationV1(
+                operation_id=restore_verifier.prepared_operation_id,
+                kind="install_restore_scram_verifier_v1",
+                psql_template_sha256=restore_verifier.template_sha256,
+                result_projection_sha256=_hash("restore-postgres-verifier-result"),
                 stdin_protocol="postgresql_prepared_psql_stdin_v1",
                 secret_input=True,
             ),
         ),
-        scram_verifier_install=verifier,
+        scram_verifier_installs=PostgreSQLScramVerifierInstallsV1(
+            primary_database=primary_verifier,
+            restore_database=restore_verifier,
+        ),
         created_at=_NOW,
         signer_key_id="test-signer",
         signature_base64=_SIGNATURE,
@@ -1029,11 +1092,15 @@ def _secret_policies(
         capability_fingerprint_sha256=_hash("secret-capability"),
         infisical_target_processes=("primary_infisical", "restore_infisical"),
         valkey_stdin_config_processes=("primary_valkey", "restore_valkey"),
-        postgres_application_target_processes=("postgres_application_target",),
+        postgres_uri_target_processes=("primary_infisical", "restore_infisical"),
+        valkey_uri_target_processes=("primary_infisical", "restore_infisical"),
         infisical_target_process_environment_allowed=True,
         valkey_stdin_config_allowed=True,
-        postgres_application_target_process_environment_allowed=True,
+        postgres_uri_target_process_environment_allowed=True,
+        valkey_uri_target_process_environment_allowed=True,
         postgres_connection_uri_environment_variable="DB_CONNECTION_URI",
+        valkey_connection_uri_environment_variable="REDIS_URL",
+        valkey_stdin_configuration_directive="requirepass",
         environment_file_allowed=False,
         host_environment_allowed=False,
         docker_config_environment_allowed=False,
@@ -1085,13 +1152,30 @@ def _materialization_intent(
     executor: ExecutorControlPolicyV1,
     receipt: AllocationEffectReceiptV2,
     attestation: ObservedAllocationAttestationV1,
-) -> tuple[MaterializationIntentV1, SecretCapabilityPolicyV1, SecretHandlingPolicyV1]:
+) -> tuple[
+    MaterializationIntentV1,
+    SecretCapabilityPolicyV1,
+    SecretHandlingPolicyV1,
+    ContainerBootstrapWrapperManifestV1,
+    TargetDeliveryMapV1,
+    ContainerBootstrapAttachProtocolV1,
+]:
     capability, handling = _secret_policies(allocation, executor)
     topology = allocation.plan.topology
     requirements: dict[str, tuple[str, ...]] = {
-        "primary_infisical": ("encryption_key", "auth_secret", "primary_valkey_password"),
+        "primary_infisical": (
+            "encryption_key",
+            "auth_secret",
+            "primary_valkey_password",
+            "postgres_application_password",
+        ),
         "primary_valkey": ("primary_valkey_password",),
-        "restore_infisical": ("encryption_key", "auth_secret", "restore_valkey_password"),
+        "restore_infisical": (
+            "encryption_key",
+            "auth_secret",
+            "restore_valkey_password",
+            "postgres_application_password",
+        ),
         "restore_valkey": ("restore_valkey_password",),
     }
 
@@ -1123,11 +1207,118 @@ def _materialization_intent(
         restore_infisical=component("restore_infisical", None, None),
         restore_valkey=component("restore_valkey", "restore-volume", "restore-cache"),
     )
+    attach_protocol = ContainerBootstrapAttachProtocolV1(
+        schema_version="rsd.container-bootstrap-attach-protocol.v1",
+        protocol_name="rsd_container_bootstrap_attach_v1",
+        frame_magic="ONCA",
+        frame_version=1,
+        metadata_encoding="canonical_json_utf8_v1",
+        allowed_operation_scopes=("materialize_and_start_runtime_v1", "start_runtime_v2"),
+        ready_state="ready_v1",
+        claim_state="claimed_v1",
+        terminal_ack_state="terminal_ack_v1",
+        ambiguous_state="attach_ambiguous_v1",
+        max_metadata_bytes=4096,
+        max_chunk_bytes=4096,
+        max_chunks_per_target=4,
+        max_total_secret_bytes=8192,
+        ready_timeout_seconds=10,
+        claim_timeout_seconds=10,
+        terminal_ack_timeout_seconds=10,
+        eof_required_after_terminal_ack=True,
+        chunk_order_required=True,
+        replay_allowed=False,
+        auto_retry_after_secret_delivery_allowed=False,
+        secret_persistence_allowed=False,
+        secret_logging_allowed=False,
+        secret_receipt_allowed=False,
+        created_at=_NOW,
+        signer_key_id="test-signer",
+        signature_base64=_SIGNATURE,
+    )
+    attach_protocol_hash = container_bootstrap_attach_protocol_sha256(attach_protocol)
+
+    def wrapper_artifact(name: str) -> ContainerBootstrapWrapperArtifactV1:
+        component_plan = getattr(plan, name)
+        base = _image_policy(
+            f"base-{name}",
+            "c" if name.endswith("infisical") else "d",
+            config_sha256=_hash(f"{name}-base-config"),
+        )
+        derived = _image_policy(
+            "valkey" if name.endswith("valkey") else "infisical",
+            "b" if name.endswith("valkey") else "a",
+            config_sha256=component_plan.config_sha256,
+        )
+        argv_prefix = ("/usr/local/bin/rsd-bootstrap", name)
+        base_entrypoint = ("/usr/bin/target-process",)
+        base_command = ("--serve",)
+        fields: dict[str, Any] = {
+            "component": name,
+            "artifact_sha256": _hash(f"{name}-wrapper-bytes"),
+            "artifact_byte_count": 1024,
+            "build_provenance_sha256": _hash(f"{name}-wrapper-provenance"),
+            "build_recipe_sha256": _hash(f"{name}-wrapper-recipe"),
+            "base_image_policy": base,
+            "derived_image_policy": derived,
+            "executable_path": "/usr/local/bin/rsd-bootstrap",
+            "wrapper_argv_prefix": argv_prefix,
+            "base_entrypoint": base_entrypoint,
+            "base_command": base_command,
+            "entrypoint_command_merge": "exec_wrapper_then_base_entrypoint_and_cmd_v1",
+            "merged_argv_sha256": hashlib.sha256(
+                json.dumps(
+                    argv_prefix + base_entrypoint + base_command, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest(),
+            "runtime_requirements": ContainerWrapperRuntimeRequirementsV1(
+                architecture="linux/amd64",
+                executable_mode="0755",
+                requires_exec_form=True,
+                requires_private_pid_namespace=True,
+                requires_read_only_root_filesystem=True,
+                requires_log_driver_none=True,
+                requires_restart_policy_no=True,
+                writable_disk_allowed=False,
+                secret_file_allowed=False,
+                secret_log_allowed=False,
+            ),
+            "pid1_policy": ContainerWrapperPid1PolicyV1(
+                schema_version="rsd.container-wrapper-pid1-policy.v1",
+                signal_order=("SIGTERM", "SIGINT"),
+                forwards_signals_to_child=True,
+                reaps_children=True,
+                propagates_child_exit_status=True,
+                terminal_ack_before_exit_required=True,
+                shutdown_timeout_seconds=10,
+            ),
+            "attach_protocol_sha256": attach_protocol_hash,
+            "artifact_binding_sha256": "0" * 64,
+        }
+        draft = ContainerBootstrapWrapperArtifactV1.model_construct(**fields)
+        fields["artifact_binding_sha256"] = container_bootstrap_wrapper_artifact_sha256(draft)
+        return ContainerBootstrapWrapperArtifactV1(**fields)
+
+    wrapper_manifest = ContainerBootstrapWrapperManifestV1(
+        schema_version="rsd.container-bootstrap-wrapper-manifest.v1",
+        source_commit=_COMMIT,
+        allocation_intent_sha256=allocation_intent_sha256(allocation),
+        attach_protocol_sha256=attach_protocol_hash,
+        primary_infisical=wrapper_artifact("primary_infisical"),
+        primary_valkey=wrapper_artifact("primary_valkey"),
+        restore_infisical=wrapper_artifact("restore_infisical"),
+        restore_valkey=wrapper_artifact("restore_valkey"),
+        created_at=_NOW,
+        signer_key_id="test-signer",
+        signature_base64=_SIGNATURE,
+    )
+    wrapper_manifest_hash = container_bootstrap_wrapper_manifest_sha256(wrapper_manifest)
 
     def template(name: str) -> ContainerBootstrapTemplateV1:
         component_plan = getattr(plan, name)
         placement = getattr(topology, name)
-        entrypoint = ("/usr/local/bin/rsd-bootstrap", name)
+        artifact = getattr(wrapper_manifest, name)
+        entrypoint = artifact.wrapper_argv_prefix
         mounts: tuple[DockerNamedVolumeMountV1, ...] = (
             (
                 DockerNamedVolumeMountV1(
@@ -1147,19 +1338,16 @@ def _materialization_intent(
             "schema_version": "rsd.container-bootstrap-template.v1",
             "component": name,
             "image": component_plan.image,
-            "image_policy": _image_policy(
-                "valkey" if name.endswith("valkey") else "infisical",
-                "b" if name.endswith("valkey") else "a",
-                config_sha256=component_plan.config_sha256,
-            ),
+            "image_policy": artifact.derived_image_policy,
             "entrypoint": entrypoint,
-            "command": (),
+            "command": artifact.base_entrypoint + artifact.base_command,
             "entrypoint_sha256": hashlib.sha256(
-                b'["/usr/local/bin/rsd-bootstrap","' + name.encode("ascii") + b'"]'
+                json.dumps(entrypoint, separators=(",", ":")).encode("utf-8")
             ).hexdigest(),
             "template_sha256": _hash(f"{name}-template"),
-            "bootstrap_wrapper_sha256": _hash(f"{name}-bootstrap-wrapper"),
-            "ingress_protocol_sha256": _hash(f"{name}-ingress-protocol"),
+            "wrapper_manifest_sha256": wrapper_manifest_hash,
+            "wrapper_artifact_binding_sha256": artifact.artifact_binding_sha256,
+            "attach_protocol_sha256": attach_protocol_hash,
             "create_request_sha256": _hash(f"{name}-placeholder-create-request"),
             "numeric_user": "1000:1000",
             "working_directory": "/work",
@@ -1205,38 +1393,170 @@ def _materialization_intent(
     )
     observed_postgres = attestation.allocated_resources.postgres
     postgres_prepared = _postgres_prepared_policy(executor)
-    login_transition = PostgreSQLLoginTransitionIntentV1(
-        schema_version="rsd.postgresql-login-transition-intent.v1",
-        transition_kind="enable_application_login_with_provider_verifier_v1",
-        prepared_operation_id="123e4567-e89b-42d3-a456-426614174003",
-        system_identifier=observed_postgres.system_identifier,
+    application_password_reference = (
+        allocation.provider_references.postgres_application_password.reference_sha256
+    )
+
+    def login_transition(
+        *,
+        database_identity: str,
+        prepared_operation_id: str,
+        database_name: str,
+        database_oid: int,
+        owner_role: str,
+        owner_role_oid: int,
+        application_role: str,
+        application_role_oid: int,
+    ) -> PostgreSQLLoginTransitionIntentV1:
+        install = (
+            postgres_prepared.scram_verifier_installs.primary_database
+            if database_identity == "primary_database"
+            else postgres_prepared.scram_verifier_installs.restore_database
+        )
+        return PostgreSQLLoginTransitionIntentV1(
+            schema_version="rsd.postgresql-login-transition-intent.v1",
+            transition_kind="enable_application_login_with_provider_verifier_v1",
+            database_identity=cast(Any, database_identity),
+            prepared_operation_id=prepared_operation_id,
+            system_identifier=observed_postgres.system_identifier,
+            database_name=database_name,
+            database_oid=database_oid,
+            owner_role=owner_role,
+            owner_role_oid=owner_role_oid,
+            application_role=application_role,
+            application_role_oid=application_role_oid,
+            application_password_reference_sha256=application_password_reference,
+            prepared_control_policy_sha256=canonical_sha256(postgres_prepared),
+            scram_verifier_install=install,
+            owner_can_login=False,
+            owner_password_absent=True,
+            application_can_login=True,
+            application_password_verifier_installed=True,
+        )
+
+    primary_transition = login_transition(
+        database_identity="primary_database",
+        prepared_operation_id=postgres_prepared.scram_verifier_installs.primary_database.prepared_operation_id,
         database_name=observed_postgres.database_name,
         database_oid=observed_postgres.database_oid,
         owner_role=observed_postgres.owner_role,
         owner_role_oid=observed_postgres.owner_role_oid,
         application_role=observed_postgres.application_role,
         application_role_oid=observed_postgres.application_role_oid,
-        application_password_reference_sha256=(
-            allocation.provider_references.postgres_application_password.reference_sha256
-        ),
-        prepared_control_policy_sha256=canonical_sha256(postgres_prepared),
-        scram_verifier_install=postgres_prepared.scram_verifier_install,
-        owner_can_login=False,
-        owner_password_absent=True,
-        application_can_login=True,
-        application_password_verifier_installed=True,
     )
-    ephemeral_connection = EphemeralPostgreSQLConnectionPolicyV1(
-        schema_version="rsd.postgresql-ephemeral-connection-policy.v1",
+    restore_transition = login_transition(
+        database_identity="restore_database",
+        prepared_operation_id=postgres_prepared.scram_verifier_installs.restore_database.prepared_operation_id,
+        database_name="restore-stage-db",
+        database_oid=202,
+        owner_role="restore-owner",
+        owner_role_oid=203,
+        application_role="restore-app",
+        application_role_oid=204,
+    )
+    postgres_login_transitions = PostgreSQLLoginTransitionIntentsV1(
+        primary_database=primary_transition,
+        restore_database=restore_transition,
+    )
+    primary_uri = PostgreSQLConnectionUriGrammarV1(
+        schema_version="rsd.postgresql-connection-uri-grammar.v1",
+        database_identity="primary_database",
         authority=allocation.plan.postgres.authority,
-        database_name=observed_postgres.database_name,
-        application_role=observed_postgres.application_role,
-        application_password_reference_sha256=(
-            allocation.provider_references.postgres_application_password.reference_sha256
-        ),
-        prepared_operation_id=login_transition.prepared_operation_id,
-        target_process="postgres_application_target",
+        database_name=primary_transition.database_name,
+        application_role=primary_transition.application_role,
+        application_password_reference_sha256=application_password_reference,
+        prepared_operation_id=primary_transition.prepared_operation_id,
+        target_process="primary_infisical",
         environment_variable="DB_CONNECTION_URI",
+        uri_grammar="postgresql_user_password_authority_database_v1",
+        application_password_format="postgres_application_password_base64url_32_v1",
+        application_password_encoded_byte_count=43,
+        rendered_uri_byte_count=postgresql_connection_uri_rendered_byte_count(
+            authority=allocation.plan.postgres.authority,
+            application_role=primary_transition.application_role,
+            database_name=primary_transition.database_name,
+        ),
+        return_uri_allowed=False,
+        persistent_storage_allowed=False,
+        logging_allowed=False,
+        public_artifact_allowed=False,
+    )
+    restore_uri = PostgreSQLConnectionUriGrammarV1(
+        schema_version="rsd.postgresql-connection-uri-grammar.v1",
+        database_identity="restore_database",
+        authority=allocation.plan.postgres.authority,
+        database_name=restore_transition.database_name,
+        application_role=restore_transition.application_role,
+        application_password_reference_sha256=application_password_reference,
+        prepared_operation_id=restore_transition.prepared_operation_id,
+        target_process="restore_infisical",
+        environment_variable="DB_CONNECTION_URI",
+        uri_grammar="postgresql_user_password_authority_database_v1",
+        application_password_format="postgres_application_password_base64url_32_v1",
+        application_password_encoded_byte_count=43,
+        rendered_uri_byte_count=postgresql_connection_uri_rendered_byte_count(
+            authority=allocation.plan.postgres.authority,
+            application_role=restore_transition.application_role,
+            database_name=restore_transition.database_name,
+        ),
+        return_uri_allowed=False,
+        persistent_storage_allowed=False,
+        logging_allowed=False,
+        public_artifact_allowed=False,
+    )
+    database_identities = PostgreSQLRuntimeDatabaseIdentitiesV1(
+        primary_database=PostgreSQLRuntimeDatabaseIdentityV1(
+            database_identity="primary_database",
+            observation_binding_sha256=canonical_sha256(observed_postgres),
+            login_transition=primary_transition,
+            connection_uri=primary_uri,
+        ),
+        restore_database=PostgreSQLRuntimeDatabaseIdentityV1(
+            database_identity="restore_database",
+            observation_binding_sha256=_hash("restore-database-observation"),
+            login_transition=restore_transition,
+            connection_uri=restore_uri,
+        ),
+    )
+    primary_valkey_uri = ValkeyConnectionUriGrammarV1(
+        schema_version="rsd.valkey-connection-uri-grammar.v1",
+        cache_identity="primary_valkey",
+        authority=f"{_REDIS_SCHEME}{topology.primary_valkey.static_ipv4}:6379",
+        database_index=0,
+        password_reference_sha256=(
+            allocation.provider_references.primary_valkey_password.reference_sha256
+        ),
+        target_process="primary_infisical",
+        environment_variable="REDIS_URL",
+        uri_grammar="redis_password_authority_database_v1",
+        password_format="valkey_password_base64url_32_v1",
+        password_encoded_byte_count=43,
+        rendered_uri_byte_count=valkey_connection_uri_rendered_byte_count(
+            authority=f"{_REDIS_SCHEME}{topology.primary_valkey.static_ipv4}:6379",
+            database_index=0,
+        ),
+        return_uri_allowed=False,
+        persistent_storage_allowed=False,
+        logging_allowed=False,
+        public_artifact_allowed=False,
+    )
+    restore_valkey_uri = ValkeyConnectionUriGrammarV1(
+        schema_version="rsd.valkey-connection-uri-grammar.v1",
+        cache_identity="restore_valkey",
+        authority=f"{_REDIS_SCHEME}{topology.restore_valkey.static_ipv4}:6379",
+        database_index=0,
+        password_reference_sha256=(
+            allocation.provider_references.restore_valkey_password.reference_sha256
+        ),
+        target_process="restore_infisical",
+        environment_variable="REDIS_URL",
+        uri_grammar="redis_password_authority_database_v1",
+        password_format="valkey_password_base64url_32_v1",
+        password_encoded_byte_count=43,
+        rendered_uri_byte_count=valkey_connection_uri_rendered_byte_count(
+            authority=f"{_REDIS_SCHEME}{topology.restore_valkey.static_ipv4}:6379",
+            database_index=0,
+        ),
         return_uri_allowed=False,
         persistent_storage_allowed=False,
         logging_allowed=False,
@@ -1257,16 +1577,16 @@ def _materialization_intent(
                 reference_sha256=allocation.provider_references.encryption_key.reference_sha256,
                 format="infisical_hex_16_v1",
                 encoded_byte_count=32,
-                sink=SecretDeliverySinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
-                target_processes=("primary_infisical", "restore_infisical"),
+                sink=SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+                target_identities=("primary_infisical", "restore_infisical"),
             ),
             SecretDeliverySlotV1(
                 purpose="auth_secret",
                 reference_sha256=allocation.provider_references.auth_secret.reference_sha256,
                 format="infisical_auth_secret_base64_32_v1",
                 encoded_byte_count=44,
-                sink=SecretDeliverySinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
-                target_processes=("primary_infisical", "restore_infisical"),
+                sink=SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+                target_identities=("primary_infisical", "restore_infisical"),
             ),
             SecretDeliverySlotV1(
                 purpose="primary_valkey_password",
@@ -1275,8 +1595,8 @@ def _materialization_intent(
                 ),
                 format="valkey_password_base64url_32_v1",
                 encoded_byte_count=43,
-                sink=SecretDeliverySinkV1.VALKEY_STDIN_CONFIGURATION,
-                target_processes=("primary_valkey",),
+                sink=SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+                target_identities=("primary_infisical", "primary_valkey"),
             ),
             SecretDeliverySlotV1(
                 purpose="restore_valkey_password",
@@ -1285,8 +1605,8 @@ def _materialization_intent(
                 ),
                 format="valkey_password_base64url_32_v1",
                 encoded_byte_count=43,
-                sink=SecretDeliverySinkV1.VALKEY_STDIN_CONFIGURATION,
-                target_processes=("restore_valkey",),
+                sink=SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+                target_identities=("restore_infisical", "restore_valkey"),
             ),
             SecretDeliverySlotV1(
                 purpose="postgres_application_password",
@@ -1295,10 +1615,228 @@ def _materialization_intent(
                 ),
                 format="postgres_application_password_base64url_32_v1",
                 encoded_byte_count=43,
-                sink=SecretDeliverySinkV1.POSTGRES_APPLICATION_TARGET_ENVIRONMENT,
-                target_processes=("postgres_application_target",),
+                sink=SecretDeliverySinkV1.POSTGRESQL_SCRAM_VERIFIER_DERIVATION,
+                target_identities=(
+                    "primary_database",
+                    "restore_database",
+                    "primary_infisical",
+                    "restore_infisical",
+                ),
             ),
         ),
+    )
+    fingerprint_bindings = (
+        ProviderMaterialFingerprintBindingV1(
+            purpose="encryption_key",
+            reference_sha256=allocation.provider_references.encryption_key.reference_sha256,
+            fingerprint_sha256=_hash("encryption-material-fingerprint"),
+        ),
+        ProviderMaterialFingerprintBindingV1(
+            purpose="auth_secret",
+            reference_sha256=allocation.provider_references.auth_secret.reference_sha256,
+            fingerprint_sha256=_hash("auth-material-fingerprint"),
+        ),
+        ProviderMaterialFingerprintBindingV1(
+            purpose="primary_valkey_password",
+            reference_sha256=(
+                allocation.provider_references.primary_valkey_password.reference_sha256
+            ),
+            fingerprint_sha256=_hash("primary-valkey-material-fingerprint"),
+        ),
+        ProviderMaterialFingerprintBindingV1(
+            purpose="restore_valkey_password",
+            reference_sha256=(
+                allocation.provider_references.restore_valkey_password.reference_sha256
+            ),
+            fingerprint_sha256=_hash("restore-valkey-material-fingerprint"),
+        ),
+        ProviderMaterialFingerprintBindingV1(
+            purpose="postgres_application_password",
+            reference_sha256=application_password_reference,
+            fingerprint_sha256=_hash("postgres-application-material-fingerprint"),
+        ),
+    )
+    fingerprints = {item.purpose: item for item in fingerprint_bindings}
+
+    def field(
+        ordinal: int,
+        purpose: str,
+        target_field: str,
+        value_kind: TargetDeliveryValueKindV1,
+        field_format: str,
+        encoded_byte_count: int,
+        sink: ContainerSecretSinkV1,
+        derivation_binding_sha256: str,
+    ) -> TargetDeliveryFieldV1:
+        binding = fingerprints[purpose]
+        return TargetDeliveryFieldV1(
+            ordinal=ordinal,
+            source_purpose=cast(Any, purpose),
+            source_reference_sha256=binding.reference_sha256,
+            source_fingerprint_sha256=binding.fingerprint_sha256,
+            value_kind=value_kind,
+            target_field=cast(Any, target_field),
+            format=cast(Any, field_format),
+            encoded_byte_count=encoded_byte_count,
+            sink=sink,
+            derivation_binding_sha256=derivation_binding_sha256,
+            persistence_allowed=False,
+            logging_allowed=False,
+            receipt_allowed=False,
+        )
+
+    def target(
+        name: str, sink: ContainerSecretSinkV1, fields: tuple[TargetDeliveryFieldV1, ...]
+    ) -> ContainerTargetDeliveryV1:
+        artifact = getattr(wrapper_manifest, name)
+        return ContainerTargetDeliveryV1(
+            component=cast(Any, name),
+            derived_image_policy_sha256=canonical_sha256(artifact.derived_image_policy),
+            wrapper_artifact_binding_sha256=artifact.artifact_binding_sha256,
+            attach_protocol_sha256=attach_protocol_hash,
+            sink=sink,
+            fields=fields,
+        )
+
+    target_delivery_map = TargetDeliveryMapV1(
+        schema_version="rsd.target-delivery-map.v1",
+        source_commit=_COMMIT,
+        allocation_intent_sha256=allocation_intent_sha256(allocation),
+        wrapper_manifest_sha256=wrapper_manifest_hash,
+        attach_protocol_sha256=attach_protocol_hash,
+        secret_handling_policy_sha256=canonical_sha256(handling),
+        provider_references=allocation.provider_references,
+        material_fingerprints=fingerprint_bindings,
+        database_identities=database_identities,
+        primary_valkey_connection_uri=primary_valkey_uri,
+        restore_valkey_connection_uri=restore_valkey_uri,
+        primary_infisical=target(
+            "primary_infisical",
+            ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+            (
+                field(
+                    1,
+                    "encryption_key",
+                    "ENCRYPTION_KEY",
+                    TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                    "infisical_hex_16_v1",
+                    32,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    fingerprints["encryption_key"].fingerprint_sha256,
+                ),
+                field(
+                    2,
+                    "auth_secret",
+                    "AUTH_SECRET",
+                    TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                    "infisical_auth_secret_base64_32_v1",
+                    44,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    fingerprints["auth_secret"].fingerprint_sha256,
+                ),
+                field(
+                    3,
+                    "postgres_application_password",
+                    "DB_CONNECTION_URI",
+                    TargetDeliveryValueKindV1.DERIVED_POSTGRESQL_URI,
+                    "derived_postgresql_uri_v1",
+                    primary_uri.rendered_uri_byte_count,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    runtime_connection_uri_grammar_sha256(primary_uri),
+                ),
+                field(
+                    4,
+                    "primary_valkey_password",
+                    "REDIS_URL",
+                    TargetDeliveryValueKindV1.DERIVED_VALKEY_URI,
+                    "derived_valkey_uri_v1",
+                    primary_valkey_uri.rendered_uri_byte_count,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    runtime_connection_uri_grammar_sha256(primary_valkey_uri),
+                ),
+            ),
+        ),
+        primary_valkey=target(
+            "primary_valkey",
+            ContainerSecretSinkV1.VALKEY_STDIN_CONFIGURATION,
+            (
+                field(
+                    1,
+                    "primary_valkey_password",
+                    "requirepass",
+                    TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                    "valkey_password_base64url_32_v1",
+                    43,
+                    ContainerSecretSinkV1.VALKEY_STDIN_CONFIGURATION,
+                    fingerprints["primary_valkey_password"].fingerprint_sha256,
+                ),
+            ),
+        ),
+        restore_infisical=target(
+            "restore_infisical",
+            ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+            (
+                field(
+                    1,
+                    "encryption_key",
+                    "ENCRYPTION_KEY",
+                    TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                    "infisical_hex_16_v1",
+                    32,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    fingerprints["encryption_key"].fingerprint_sha256,
+                ),
+                field(
+                    2,
+                    "auth_secret",
+                    "AUTH_SECRET",
+                    TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                    "infisical_auth_secret_base64_32_v1",
+                    44,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    fingerprints["auth_secret"].fingerprint_sha256,
+                ),
+                field(
+                    3,
+                    "postgres_application_password",
+                    "DB_CONNECTION_URI",
+                    TargetDeliveryValueKindV1.DERIVED_POSTGRESQL_URI,
+                    "derived_postgresql_uri_v1",
+                    restore_uri.rendered_uri_byte_count,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    runtime_connection_uri_grammar_sha256(restore_uri),
+                ),
+                field(
+                    4,
+                    "restore_valkey_password",
+                    "REDIS_URL",
+                    TargetDeliveryValueKindV1.DERIVED_VALKEY_URI,
+                    "derived_valkey_uri_v1",
+                    restore_valkey_uri.rendered_uri_byte_count,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    runtime_connection_uri_grammar_sha256(restore_valkey_uri),
+                ),
+            ),
+        ),
+        restore_valkey=target(
+            "restore_valkey",
+            ContainerSecretSinkV1.VALKEY_STDIN_CONFIGURATION,
+            (
+                field(
+                    1,
+                    "restore_valkey_password",
+                    "requirepass",
+                    TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                    "valkey_password_base64url_32_v1",
+                    43,
+                    ContainerSecretSinkV1.VALKEY_STDIN_CONFIGURATION,
+                    fingerprints["restore_valkey_password"].fingerprint_sha256,
+                ),
+            ),
+        ),
+        created_at=_NOW,
+        signer_key_id="test-signer",
+        signature_base64=_SIGNATURE,
     )
     return (
         MaterializationIntentV1(
@@ -1318,8 +1856,10 @@ def _materialization_intent(
             topology=topology,
             plan=plan,
             bootstrap_templates=templates,
-            postgres_login_transition=login_transition,
-            ephemeral_postgres_connection=ephemeral_connection,
+            wrapper_manifest_sha256=wrapper_manifest_hash,
+            target_delivery_map_sha256=target_delivery_map_sha256(target_delivery_map),
+            container_attach_protocol_sha256=attach_protocol_hash,
+            postgres_login_transitions=postgres_login_transitions,
             secret_delivery_request=delivery_request,
             provider_references=allocation.provider_references,
             evidence=MaterializationEvidenceBindingsV1(
@@ -1337,6 +1877,9 @@ def _materialization_intent(
                 secret_capability_policy_sha256=canonical_sha256(capability),
                 secret_handling_policy_sha256=canonical_sha256(handling),
                 provider_material_attestation_sha256=_hash("provider-material-attestation"),
+                wrapper_manifest_sha256=wrapper_manifest_hash,
+                target_delivery_map_sha256=target_delivery_map_sha256(target_delivery_map),
+                container_attach_protocol_sha256=attach_protocol_hash,
             ),
             retention_expires_at=_RETAINS,
             disposal_owner=_OWNER,
@@ -1350,12 +1893,36 @@ def _materialization_intent(
         ),
         capability,
         handling,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
     )
 
 
 def _materialization_context(
-    intent: MaterializationIntentV1, allocation: ObservedAllocationAttestationV1
+    intent: MaterializationIntentV1,
+    allocation: ObservedAllocationAttestationV1,
+    wrapper_manifest: ContainerBootstrapWrapperManifestV1,
+    target_delivery_map: TargetDeliveryMapV1,
+    attach_protocol: ContainerBootstrapAttachProtocolV1,
 ) -> MaterializationExecutionContext:
+    def expectation(database_identity: str) -> PostgreSQLLoginTransitionExpectationV1:
+        database = getattr(target_delivery_map.database_identities, database_identity)
+        transition = database.login_transition
+        return PostgreSQLLoginTransitionExpectationV1(
+            database_identity=cast(Any, database_identity),
+            authority=database.connection_uri.authority,
+            system_identifier=transition.system_identifier,
+            database_oid=transition.database_oid,
+            owner_role_oid=transition.owner_role_oid,
+            application_role_oid=transition.application_role_oid,
+            prepared_operation_id=transition.prepared_operation_id,
+            application_password_reference_sha256=(
+                transition.application_password_reference_sha256
+            ),
+            capability_fingerprint_sha256=_hash(f"{database_identity}-postgres-login-capability"),
+        )
+
     return MaterializationExecutionContext(
         operation_kind="materialization_v1",
         operation_scope="materialize_and_start_runtime_v1",
@@ -1377,28 +1944,26 @@ def _materialization_context(
             _EXECUTOR_ATTESTATION_PUBLIC_BYTES
         ).hexdigest(),
         docker_engine_control_policy_sha256=(intent.evidence.docker_engine_control_policy_sha256),
-        postgres_login_expectation=PostgreSQLLoginTransitionExpectationV1(
-            authority=intent.ephemeral_postgres_connection.authority,
-            system_identifier=intent.postgres_login_transition.system_identifier,
-            database_oid=intent.postgres_login_transition.database_oid,
-            owner_role_oid=intent.postgres_login_transition.owner_role_oid,
-            application_role_oid=intent.postgres_login_transition.application_role_oid,
-            prepared_operation_id=intent.postgres_login_transition.prepared_operation_id,
-            application_password_reference_sha256=(
-                intent.postgres_login_transition.application_password_reference_sha256
-            ),
-            capability_fingerprint_sha256=_hash("postgres-login-capability"),
+        postgres_login_expectations=(
+            expectation("primary_database"),
+            expectation("restore_database"),
         ),
         postgres_prepared_control_policy_sha256=(
-            intent.postgres_login_transition.prepared_control_policy_sha256
+            intent.postgres_login_transitions.primary_database.prepared_control_policy_sha256
         ),
-        postgres_verifier_result_projection_sha256=_hash("postgres-verifier-result"),
+        postgres_verifier_result_projection_sha256s=(
+            _hash("primary-postgres-verifier-result"),
+            _hash("restore-postgres-verifier-result"),
+        ),
         secret_material_expectation=SecretMaterialExpectationV1(
             provider_identity_sha256=_hash("provider-material-attestation"),
             capability_fingerprint_sha256=_hash("secret-capability"),
-            secret_handling_policy_sha256=_hash("secret-handling"),
+            secret_handling_policy_sha256=intent.evidence.secret_handling_policy_sha256,
         ),
-        secret_handling_policy_sha256=_hash("secret-handling"),
+        secret_handling_policy_sha256=intent.evidence.secret_handling_policy_sha256,
+        wrapper_manifest=wrapper_manifest,
+        target_delivery_map=target_delivery_map,
+        container_attach_protocol=attach_protocol,
         secret_delivery_request=intent.secret_delivery_request,
         materialization_intent_sha256=materialization_intent_sha256(intent),
         idempotency_key=_hash("materialization-idempotency"),
@@ -1465,8 +2030,9 @@ def _materialization_receipt(
             command=template.command,
             entrypoint_sha256=template.entrypoint_sha256,
             template_sha256=template.template_sha256,
-            bootstrap_wrapper_sha256=template.bootstrap_wrapper_sha256,
-            ingress_protocol_sha256=template.ingress_protocol_sha256,
+            wrapper_manifest_sha256=template.wrapper_manifest_sha256,
+            wrapper_artifact_binding_sha256=template.wrapper_artifact_binding_sha256,
+            attach_protocol_sha256=template.attach_protocol_sha256,
             create_request_sha256=template.create_request_sha256,
             numeric_user=template.numeric_user,
             working_directory=template.working_directory,
@@ -1523,32 +2089,85 @@ def _materialization_receipt(
             inspection=inspection(name),
         )
 
+    def attach_receipt(
+        name: str, marker: str, inspected: ContainerBootstrapInspectionV1
+    ) -> ContainerAttachReceiptV1:
+        target = getattr(context.target_delivery_map, name)
+        request = ContainerAttachRequestV1(
+            schema_version="rsd.container-attach-request.v1",
+            operation_scope=context.operation_scope,
+            operation_id=context.materialization_operation_id,
+            component=cast(Any, name),
+            container_id=_hash(f"container-{marker}"),
+            derived_image_policy_sha256=target.derived_image_policy_sha256,
+            wrapper_manifest_sha256=context.intent.wrapper_manifest_sha256,
+            wrapper_artifact_binding_sha256=target.wrapper_artifact_binding_sha256,
+            attach_protocol_sha256=context.intent.container_attach_protocol_sha256,
+            target_delivery_map_sha256=context.intent.target_delivery_map_sha256,
+            request_nonce_sha256=context.secret_delivery_request.request_nonce_sha256,
+            channel_binding_sha256=context.secret_delivery_request.channel_binding_sha256,
+            session_binding_sha256=context.secret_delivery_request.session_binding_sha256,
+            expected_ready_state="ready_v1",
+            expected_claim_state="claimed_v1",
+            expected_terminal_ack_state="terminal_ack_v1",
+            fields=target.fields,
+        )
+        request_sha256 = container_attach_request_sha256(request)
+        descriptor_sha256 = container_attach_chunk_descriptors_sha256(request.fields)
+        ack = ContainerAttachTerminalAckV1(
+            schema_version="rsd.container-attach-terminal-ack.v1",
+            request_sha256=request_sha256,
+            state="terminal_ack_v1",
+            chunk_count=len(request.fields),
+            chunk_descriptors_sha256=descriptor_sha256,
+            chunks_zeroized=True,
+            persistence_allowed=False,
+            logging_allowed=False,
+            receipt_contains_secret=False,
+            eof_observed=True,
+        )
+        return ContainerAttachReceiptV1(
+            schema_version="rsd.container-attach-receipt.v1",
+            request_sha256=request_sha256,
+            component=cast(Any, name),
+            container_id=request.container_id,
+            ready_state="ready_v1",
+            claim_state="claimed_v1",
+            chunk_count=len(request.fields),
+            chunk_descriptors_sha256=descriptor_sha256,
+            terminal_ack_state="terminal_ack_v1",
+            terminal_ack_sha256=container_attach_ack_sha256(ack),
+            chunks_zeroized=True,
+            persistence_allowed=False,
+            logging_allowed=False,
+            receipt_contains_secret=False,
+            eof_observed=True,
+        )
+
+    def executor_inspection(name: str, marker: str) -> ExecutorContainerInspectionV1:
+        inspected = inspection(name)
+        completed_attach = attach_receipt(name, marker, inspected)
+        return ExecutorContainerInspectionV1(
+            component=cast(Any, name),
+            container_id=_hash(f"container-{marker}"),
+            inspection=inspected,
+            attach_receipt=completed_attach,
+            attach_receipt_sha256=container_attach_receipt_sha256(completed_attach),
+        )
+
     inspections = (
-        ExecutorContainerInspectionV1(
-            component="primary_infisical",
-            container_id=_hash("container-a"),
-            inspection=inspection("primary_infisical"),
-        ),
-        ExecutorContainerInspectionV1(
-            component="primary_valkey",
-            container_id=_hash("container-b"),
-            inspection=inspection("primary_valkey"),
-        ),
-        ExecutorContainerInspectionV1(
-            component="restore_infisical",
-            container_id=_hash("container-c"),
-            inspection=inspection("restore_infisical"),
-        ),
-        ExecutorContainerInspectionV1(
-            component="restore_valkey",
-            container_id=_hash("container-d"),
-            inspection=inspection("restore_valkey"),
-        ),
+        executor_inspection("primary_infisical", "a"),
+        executor_inspection("primary_valkey", "b"),
+        executor_inspection("restore_infisical", "c"),
+        executor_inspection("restore_valkey", "d"),
     )
     unsigned_executor_receipt = MaterializationExecutorReceiptV1(
         schema_version="rsd.materialization-executor-receipt.v1",
         executor_id=context.executor_expectation.executor_id,
         installation_receipt_sha256=_hash("executor-installation-receipt"),
+        wrapper_manifest_sha256=context.intent.wrapper_manifest_sha256,
+        target_delivery_map_sha256=context.intent.target_delivery_map_sha256,
+        container_attach_protocol_sha256=context.intent.container_attach_protocol_sha256,
         operation_scope="materialize_and_start_runtime_v1",
         operation_id=context.materialization_operation_id,
         idempotency_key=context.idempotency_key,
@@ -1566,24 +2185,41 @@ def _materialization_receipt(
         signer_key_id="executor-attestation",
         signature_base64=_SIGNATURE,
     )
-    transition = context.intent.postgres_login_transition
-    login_receipt = PostgreSQLLoginTransitionReceiptV1(
-        schema_version="rsd.postgresql-login-transition-receipt.v1",
-        prepared_operation_id=transition.prepared_operation_id,
-        system_identifier=transition.system_identifier,
-        database_name=transition.database_name,
-        database_oid=transition.database_oid,
-        owner_role=transition.owner_role,
-        owner_role_oid=transition.owner_role_oid,
-        application_role=transition.application_role,
-        application_role_oid=transition.application_role_oid,
-        application_password_reference_sha256=(transition.application_password_reference_sha256),
-        prepared_control_policy_sha256=transition.prepared_control_policy_sha256,
-        prepared_operation_result_sha256=context.postgres_verifier_result_projection_sha256,
-        owner_can_login=False,
-        owner_password_absent=True,
-        application_can_login=True,
-        application_password_verifier_installed=True,
+
+    def login_receipt(
+        transition: PostgreSQLLoginTransitionIntentV1, result_projection_sha256: str
+    ) -> PostgreSQLLoginTransitionReceiptV1:
+        return PostgreSQLLoginTransitionReceiptV1(
+            schema_version="rsd.postgresql-login-transition-receipt.v1",
+            database_identity=transition.database_identity,
+            prepared_operation_id=transition.prepared_operation_id,
+            system_identifier=transition.system_identifier,
+            database_name=transition.database_name,
+            database_oid=transition.database_oid,
+            owner_role=transition.owner_role,
+            owner_role_oid=transition.owner_role_oid,
+            application_role=transition.application_role,
+            application_role_oid=transition.application_role_oid,
+            application_password_reference_sha256=(
+                transition.application_password_reference_sha256
+            ),
+            prepared_control_policy_sha256=transition.prepared_control_policy_sha256,
+            prepared_operation_result_sha256=result_projection_sha256,
+            owner_can_login=False,
+            owner_password_absent=True,
+            application_can_login=True,
+            application_password_verifier_installed=True,
+        )
+
+    login_receipts = PostgreSQLLoginTransitionReceiptsV1(
+        primary_database=login_receipt(
+            context.intent.postgres_login_transitions.primary_database,
+            context.postgres_verifier_result_projection_sha256s[0],
+        ),
+        restore_database=login_receipt(
+            context.intent.postgres_login_transitions.restore_database,
+            context.postgres_verifier_result_projection_sha256s[1],
+        ),
     )
     request = context.intent.secret_delivery_request
     delivery_receipt = SecretDeliveryReceiptV1(
@@ -1599,7 +2235,7 @@ def _materialization_receipt(
                 purpose=slot.purpose,
                 reference_sha256=slot.reference_sha256,
                 sink=slot.sink,
-                target_processes=slot.target_processes,
+                target_identities=slot.target_identities,
                 delivered=True,
             )
             for slot in request.slots
@@ -1633,9 +2269,12 @@ def _materialization_receipt(
         observed_allocation_attestation_sha256=context.allocation_attestation_sha256,
         journal_uuid=context.intent.journal_uuid,
         idempotency_key=context.idempotency_key,
+        wrapper_manifest_sha256=context.intent.wrapper_manifest_sha256,
+        target_delivery_map_sha256=context.intent.target_delivery_map_sha256,
+        container_attach_protocol_sha256=context.intent.container_attach_protocol_sha256,
         executor_receipt_sha256=canonical_sha256(executor_receipt),
         executor_receipt=executor_receipt,
-        postgres_login_transition=login_receipt,
+        postgres_login_transitions=login_receipts,
         delivery_receipt=delivery_receipt,
         primary_infisical=observation("primary_infisical", "a"),
         primary_valkey=observation("primary_valkey", "b"),
@@ -1728,7 +2367,7 @@ def test_materialization_requires_observed_allocation_hashes(tmp_path: Path) -> 
     allocation, executor, _ = _allocation_bundle(tmp_path)
     receipt = _allocation_receipt(allocation)
     attestation = _allocation_attestation(allocation, receipt)
-    materialization, _, _ = _materialization_intent(allocation, executor, receipt, attestation)
+    materialization, *_ = _materialization_intent(allocation, executor, receipt, attestation)
 
     assert materialization.allocation_intent_sha256 == allocation_intent_sha256(allocation)
     assert materialization.allocation_effect_receipt_sha256 == allocation_effect_receipt_sha256(
@@ -1745,7 +2384,9 @@ def test_materialization_chain_binds_provider_and_allocated_volumes(tmp_path: Pa
     allocation, executor, _ = _allocation_bundle(tmp_path)
     receipt = _allocation_receipt(allocation)
     attestation = _allocation_attestation(allocation, receipt)
-    materialization, _, _ = _materialization_intent(allocation, executor, receipt, attestation)
+    materialization, _, _, _, target_delivery_map, _ = _materialization_intent(
+        allocation, executor, receipt, attestation
+    )
     policy = ReplayAuthorityPolicyV1(
         schema_version="rsd.replay-authority-policy.v1",
         service="replay-service",
@@ -1761,6 +2402,7 @@ def test_materialization_chain_binds_provider_and_allocated_volumes(tmp_path: Pa
     authorization._verify_materialization_intent_chain(
         allocation=stage,
         intent=chain_ready,
+        target_delivery_map=target_delivery_map,
         replay_policy=policy,
         expected_disposal_owner=_OWNER,
         expected_approver_identity=_APPROVER,
@@ -1777,6 +2419,7 @@ def test_materialization_chain_binds_provider_and_allocated_volumes(tmp_path: Pa
                     )
                 }
             ),
+            target_delivery_map=target_delivery_map,
             replay_policy=policy,
             expected_disposal_owner=_OWNER,
             expected_approver_identity=_APPROVER,
@@ -1792,6 +2435,7 @@ def test_materialization_chain_binds_provider_and_allocated_volumes(tmp_path: Pa
                     "plan": chain_ready.plan.model_copy(update={"primary_valkey": wrong_volume})
                 }
             ),
+            target_delivery_map=target_delivery_map,
             replay_policy=policy,
             expected_disposal_owner=_OWNER,
             expected_approver_identity=_APPROVER,
@@ -1805,9 +2449,14 @@ def test_materialization_control_policy_pins_component_images_and_configs(
     allocation, executor, _ = _allocation_bundle(tmp_path)
     receipt = _allocation_receipt(allocation)
     attestation = _allocation_attestation(allocation, receipt)
-    materialization, capability, handling = _materialization_intent(
-        allocation, executor, receipt, attestation
-    )
+    (
+        materialization,
+        capability,
+        handling,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
+    ) = _materialization_intent(allocation, executor, receipt, attestation)
     docker = _docker_policy(executor)
     postgres_prepared = _postgres_prepared_policy(executor)
     for name in (
@@ -1816,6 +2465,9 @@ def test_materialization_control_policy_pins_component_images_and_configs(
         "_verify_postgres_prepared_control_policy_signature",
         "_verify_secret_capability_policy_signature",
         "_verify_secret_handling_policy_signature",
+        "_verify_container_wrapper_manifest_signature",
+        "_verify_target_delivery_map_signature",
+        "_verify_container_attach_protocol_signature",
     ):
         monkeypatch.setattr(authorization, name, lambda *_args, **_kwargs: None)
 
@@ -1827,6 +2479,9 @@ def test_materialization_control_policy_pins_component_images_and_configs(
         postgres_prepared=postgres_prepared,
         secret_capability=capability,
         secret_handling=handling,
+        wrapper_manifest=wrapper_manifest,
+        target_delivery_map=target_delivery_map,
+        attach_protocol=attach_protocol,
         provider_material_attestation_sha256=_hash("provider-material-attestation"),
         signer=cast(Any, object()),
     )
@@ -1848,6 +2503,30 @@ def test_materialization_control_policy_pins_component_images_and_configs(
             postgres_prepared=postgres_prepared,
             secret_capability=capability,
             secret_handling=handling,
+            wrapper_manifest=wrapper_manifest,
+            target_delivery_map=target_delivery_map,
+            attach_protocol=attach_protocol,
+            provider_material_attestation_sha256=_hash("provider-material-attestation"),
+            signer=cast(Any, object()),
+        )
+
+    swapped_target = target_delivery_map.primary_infisical.model_copy(
+        update={"derived_image_policy_sha256": _hash("substituted-derived-image")}
+    )
+    with pytest.raises(AuthorizationError, match="materialization_control_policy_binding"):
+        authorization._verify_materialization_control_policy_bindings(
+            allocation_intent=allocation,
+            intent=materialization,
+            executor=executor,
+            docker=docker,
+            postgres_prepared=postgres_prepared,
+            secret_capability=capability,
+            secret_handling=handling,
+            wrapper_manifest=wrapper_manifest,
+            target_delivery_map=target_delivery_map.model_copy(
+                update={"primary_infisical": swapped_target}
+            ),
+            attach_protocol=attach_protocol,
             provider_material_attestation_sha256=_hash("provider-material-attestation"),
             signer=cast(Any, object()),
         )
@@ -1857,10 +2536,12 @@ def test_materialization_receipt_rejects_cross_attachment_and_publication(tmp_pa
     allocation, executor, _ = _allocation_bundle(tmp_path)
     allocation_receipt = _allocation_receipt(allocation)
     attestation = _allocation_attestation(allocation, allocation_receipt)
-    materialization, _, _ = _materialization_intent(
-        allocation, executor, allocation_receipt, attestation
+    materialization, _, _, wrapper_manifest, target_delivery_map, attach_protocol = (
+        _materialization_intent(allocation, executor, allocation_receipt, attestation)
     )
-    context = _materialization_context(materialization, attestation)
+    context = _materialization_context(
+        materialization, attestation, wrapper_manifest, target_delivery_map, attach_protocol
+    )
     receipt = _materialization_receipt(context)
 
     assert authorization._validate_materialization_effect_receipt(context, receipt) == receipt
@@ -1891,6 +2572,88 @@ def test_materialization_receipt_rejects_cross_attachment_and_publication(tmp_pa
     with pytest.raises(AuthorizationError, match="materialization_effect_receipt"):
         authorization._validate_materialization_effect_receipt(
             context, receipt.model_copy(update={"primary_infisical": publication})
+        )
+
+
+def test_materialization_reconstructs_compact_attach_receipt_before_signature(
+    tmp_path: Path,
+) -> None:
+    """The signed route, not executor-chosen compact fields, defines delivery."""
+
+    allocation, executor, _ = _allocation_bundle(tmp_path)
+    allocation_receipt = _allocation_receipt(allocation)
+    attestation = _allocation_attestation(allocation, allocation_receipt)
+    materialization, _, _, wrapper_manifest, target_delivery_map, attach_protocol = (
+        _materialization_intent(allocation, executor, allocation_receipt, attestation)
+    )
+    context = _materialization_context(
+        materialization, attestation, wrapper_manifest, target_delivery_map, attach_protocol
+    )
+    receipt = _materialization_receipt(context)
+    original = receipt.executor_receipt.containers[0]
+    original_attach = original.attach_receipt
+
+    def rebuilt_effect(
+        *, request_sha256: str, descriptors_sha256: str
+    ) -> MaterializationEffectReceiptV1:
+        ack = ContainerAttachTerminalAckV1(
+            schema_version="rsd.container-attach-terminal-ack.v1",
+            request_sha256=request_sha256,
+            state="terminal_ack_v1",
+            chunk_count=original_attach.chunk_count,
+            chunk_descriptors_sha256=descriptors_sha256,
+            chunks_zeroized=True,
+            persistence_allowed=False,
+            logging_allowed=False,
+            receipt_contains_secret=False,
+            eof_observed=True,
+        )
+        altered_attach = ContainerAttachReceiptV1.model_validate(
+            {
+                **original_attach.model_dump(mode="json"),
+                "request_sha256": request_sha256,
+                "chunk_descriptors_sha256": descriptors_sha256,
+                "terminal_ack_sha256": container_attach_ack_sha256(ack),
+            }
+        )
+        altered_container = ExecutorContainerInspectionV1(
+            component=original.component,
+            container_id=original.container_id,
+            inspection=original.inspection,
+            attach_receipt=altered_attach,
+            attach_receipt_sha256=container_attach_receipt_sha256(altered_attach),
+        )
+        altered_executor = receipt.executor_receipt.model_copy(
+            update={
+                "containers": (
+                    altered_container,
+                    *receipt.executor_receipt.containers[1:],
+                )
+            }
+        )
+        return receipt.model_copy(
+            update={
+                "executor_receipt": altered_executor,
+                "executor_receipt_sha256": canonical_sha256(altered_executor),
+            }
+        )
+
+    with pytest.raises(AuthorizationError, match="materialization_executor_attach_receipt"):
+        authorization._validate_materialization_effect_receipt(
+            context,
+            rebuilt_effect(
+                request_sha256=_hash("substituted-materialization-attach-request"),
+                descriptors_sha256=original_attach.chunk_descriptors_sha256,
+            ),
+        )
+
+    with pytest.raises(AuthorizationError, match="materialization_executor_attach_receipt"):
+        authorization._validate_materialization_effect_receipt(
+            context,
+            rebuilt_effect(
+                request_sha256=original_attach.request_sha256,
+                descriptors_sha256=_hash("substituted-materialization-attach-descriptors"),
+            ),
         )
 
 
@@ -2394,10 +3157,12 @@ def test_materialization_journal_requires_committed_allocation_and_never_replays
         update={"idempotency_key": context.idempotency_key}
     )
     attestation = _allocation_attestation(intent, allocation_receipt)
-    materialization, _, _ = _materialization_intent(
-        intent, executor, allocation_receipt, attestation
+    materialization, _, _, wrapper_manifest, target_delivery_map, attach_protocol = (
+        _materialization_intent(intent, executor, allocation_receipt, attestation)
     )
-    materialization_context = _materialization_context(materialization, attestation)
+    materialization_context = _materialization_context(
+        materialization, attestation, wrapper_manifest, target_delivery_map, attach_protocol
+    )
     materialization_verified = authorization._VerifiedMaterialization(
         context=materialization_context,
         nonce="materialization-nonce",
@@ -2633,10 +3398,12 @@ def test_v2_materialization_failure_is_terminal_and_never_replays(
     journal._begin_effect(allocation)
     journal._commit_effect(allocation, allocation_receipt)
     journal.assert_committed_allocation_stage(verified_intent, allocation_receipt, attestation)
-    materialization, _, _ = _materialization_intent(
-        intent, executor, allocation_receipt, attestation
+    materialization, _, _, wrapper_manifest, target_delivery_map, attach_protocol = (
+        _materialization_intent(intent, executor, allocation_receipt, attestation)
     )
-    context = _materialization_context(materialization, attestation)
+    context = _materialization_context(
+        materialization, attestation, wrapper_manifest, target_delivery_map, attach_protocol
+    )
     verified = authorization._VerifiedMaterialization(
         context=context,
         nonce="failed-materialization-nonce",

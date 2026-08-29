@@ -28,6 +28,12 @@ from omninode_rsd.lifecycle.authorization import (
     authorize_start_runtime_and_execute,
 )
 from omninode_rsd.lifecycle.infisical_disposable import (
+    ContainerAttachReceiptV1,
+    ContainerAttachRequestV1,
+    ContainerAttachTerminalAckV1,
+    ContainerBootstrapAttachProtocolV1,
+    ContainerBootstrapWrapperManifestV1,
+    ExecutorContainerInspectionV1,
     MaterializationEffectReceiptV1,
     MaterializationIntentV1,
     ObservedRuntimeAttestationV1,
@@ -38,6 +44,11 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     StartRuntimeEvidenceBindingsV2,
     StartRuntimeExecutorReceiptV2,
     StartRuntimeIntentV2,
+    TargetDeliveryMapV1,
+    container_attach_ack_sha256,
+    container_attach_chunk_descriptors_sha256,
+    container_attach_receipt_sha256,
+    container_attach_request_sha256,
     start_runtime_intent_sha256,
 )
 
@@ -114,6 +125,9 @@ def _start_intent(
             secret_capability_policy_sha256=_hash("secret-capability-policy"),
             secret_handling_policy_sha256=_hash("secret-handling-policy"),
             provider_material_attestation_sha256=provider_material_sha256,
+            wrapper_manifest_sha256=materialization.wrapper_manifest_sha256,
+            target_delivery_map_sha256=materialization.target_delivery_map_sha256,
+            container_attach_protocol_sha256=materialization.container_attach_protocol_sha256,
         ),
         delivery_request=delivery,
         retention_expires_at=_RETAINS,
@@ -140,6 +154,9 @@ def _start_context(
     start: StartRuntimeIntentV2,
     materialization: MaterializationIntentV1,
     materialization_receipt: MaterializationEffectReceiptV1,
+    wrapper_manifest: ContainerBootstrapWrapperManifestV1,
+    target_delivery_map: TargetDeliveryMapV1,
+    attach_protocol: ContainerBootstrapAttachProtocolV1,
 ) -> StartRuntimeExecutionContext:
     """Create the opaque context only for receipt/journal boundary testing."""
 
@@ -170,6 +187,9 @@ def _start_context(
             secret_handling_policy_sha256=_hash("secret-handling"),
         ),
         secret_handling_policy_sha256=_hash("secret-handling"),
+        wrapper_manifest=wrapper_manifest,
+        target_delivery_map=target_delivery_map,
+        container_attach_protocol=attach_protocol,
         secret_delivery_request=start.delivery_request,
         start_runtime_intent_sha256=start_runtime_intent_sha256(start),
         idempotency_key=_hash("start-idempotency"),
@@ -180,6 +200,89 @@ def _start_context(
         secret_capability_provenance_sha256=_hash("secret-capability-provenance"),
         secret_delivery_provenance_sha256=_hash("secret-delivery-provenance"),
         remote_session_provenance_sha256=_hash("remote-session-provenance"),
+    )
+
+
+def _fresh_start_attach_containers(
+    context: StartRuntimeExecutionContext,
+) -> tuple[
+    ExecutorContainerInspectionV1,
+    ExecutorContainerInspectionV1,
+    ExecutorContainerInspectionV1,
+    ExecutorContainerInspectionV1,
+]:
+    """Rebuild fresh local-delivery evidence for a restart, never reuse a claim."""
+
+    completed: list[ExecutorContainerInspectionV1] = []
+    for prior in context.materialization_receipt.executor_receipt.containers:
+        target = getattr(context.target_delivery_map, prior.component)
+        request = ContainerAttachRequestV1(
+            schema_version="rsd.container-attach-request.v1",
+            operation_scope="start_runtime_v2",
+            operation_id=context.start_operation_id,
+            component=prior.component,
+            container_id=prior.container_id,
+            derived_image_policy_sha256=target.derived_image_policy_sha256,
+            wrapper_manifest_sha256=context.materialization_intent.wrapper_manifest_sha256,
+            wrapper_artifact_binding_sha256=target.wrapper_artifact_binding_sha256,
+            attach_protocol_sha256=context.materialization_intent.container_attach_protocol_sha256,
+            target_delivery_map_sha256=context.materialization_intent.target_delivery_map_sha256,
+            request_nonce_sha256=context.secret_delivery_request.request_nonce_sha256,
+            channel_binding_sha256=context.secret_delivery_request.channel_binding_sha256,
+            session_binding_sha256=context.secret_delivery_request.session_binding_sha256,
+            expected_ready_state="ready_v1",
+            expected_claim_state="claimed_v1",
+            expected_terminal_ack_state="terminal_ack_v1",
+            fields=target.fields,
+        )
+        request_sha256 = container_attach_request_sha256(request)
+        descriptor_sha256 = container_attach_chunk_descriptors_sha256(request.fields)
+        ack = ContainerAttachTerminalAckV1(
+            schema_version="rsd.container-attach-terminal-ack.v1",
+            request_sha256=request_sha256,
+            state="terminal_ack_v1",
+            chunk_count=len(request.fields),
+            chunk_descriptors_sha256=descriptor_sha256,
+            chunks_zeroized=True,
+            persistence_allowed=False,
+            logging_allowed=False,
+            receipt_contains_secret=False,
+            eof_observed=True,
+        )
+        completed_attach = ContainerAttachReceiptV1(
+            schema_version="rsd.container-attach-receipt.v1",
+            request_sha256=request_sha256,
+            component=prior.component,
+            container_id=prior.container_id,
+            ready_state="ready_v1",
+            claim_state="claimed_v1",
+            chunk_count=len(request.fields),
+            chunk_descriptors_sha256=descriptor_sha256,
+            terminal_ack_state="terminal_ack_v1",
+            terminal_ack_sha256=container_attach_ack_sha256(ack),
+            chunks_zeroized=True,
+            persistence_allowed=False,
+            logging_allowed=False,
+            receipt_contains_secret=False,
+            eof_observed=True,
+        )
+        completed.append(
+            ExecutorContainerInspectionV1(
+                component=prior.component,
+                container_id=prior.container_id,
+                inspection=prior.inspection,
+                attach_receipt=completed_attach,
+                attach_receipt_sha256=container_attach_receipt_sha256(completed_attach),
+            )
+        )
+    return cast(
+        tuple[
+            ExecutorContainerInspectionV1,
+            ExecutorContainerInspectionV1,
+            ExecutorContainerInspectionV1,
+            ExecutorContainerInspectionV1,
+        ],
+        tuple(completed),
     )
 
 
@@ -202,7 +305,12 @@ def _start_effect_receipt(context: StartRuntimeExecutionContext) -> StartRuntime
         host_fingerprint_sha256=context.executor_expectation.host_fingerprint_sha256,
         engine_fingerprint_sha256=context.executor_expectation.engine_fingerprint_sha256,
         engine_operation_journal_sha256=_hash("start-engine-operation-journal"),
-        containers=context.materialization_receipt.executor_receipt.containers,
+        wrapper_manifest_sha256=context.materialization_intent.wrapper_manifest_sha256,
+        target_delivery_map_sha256=context.materialization_intent.target_delivery_map_sha256,
+        container_attach_protocol_sha256=(
+            context.materialization_intent.container_attach_protocol_sha256
+        ),
+        containers=_fresh_start_attach_containers(context),
         completed_at="2026-08-28T12:07:00Z",
         signer_key_id=context.executor_attestation_key_id,
         signature_base64=_SIGNATURE,
@@ -221,7 +329,7 @@ def _start_effect_receipt(context: StartRuntimeExecutionContext) -> StartRuntime
                 purpose=slot.purpose,
                 reference_sha256=slot.reference_sha256,
                 sink=slot.sink,
-                target_processes=slot.target_processes,
+                target_identities=slot.target_identities,
                 delivered=True,
             )
             for slot in request.slots
@@ -253,6 +361,11 @@ def _start_effect_receipt(context: StartRuntimeExecutionContext) -> StartRuntime
         ),
         journal_uuid=context.intent.journal_uuid,
         idempotency_key=context.idempotency_key,
+        wrapper_manifest_sha256=context.materialization_intent.wrapper_manifest_sha256,
+        target_delivery_map_sha256=context.materialization_intent.target_delivery_map_sha256,
+        container_attach_protocol_sha256=(
+            context.materialization_intent.container_attach_protocol_sha256
+        ),
         executor_receipt=executor_receipt,
         delivery_receipt=delivery,
         completed_at="2026-08-28T12:07:00Z",
@@ -263,14 +376,27 @@ def _materialized_start_context(tmp_path: Path) -> StartRuntimeExecutionContext:
     allocation, executor, _ = _allocation_bundle(tmp_path)
     allocation_receipt = _allocation_receipt(allocation)
     allocation_attestation = _allocation_attestation(allocation, allocation_receipt)
-    materialization, _, _ = _materialization_intent(
-        allocation, executor, allocation_receipt, allocation_attestation
+    materialization, _, _, wrapper_manifest, target_delivery_map, attach_protocol = (
+        _materialization_intent(allocation, executor, allocation_receipt, allocation_attestation)
     )
     _, signing_key = _trusted_signer()
-    materialization_context = _materialization_context(materialization, allocation_attestation)
+    materialization_context = _materialization_context(
+        materialization,
+        allocation_attestation,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
+    )
     materialization_receipt = _materialization_receipt(materialization_context)
     start = _start_intent(allocation, materialization, signer_private=signing_key)
-    return _start_context(start, materialization, materialization_receipt)
+    return _start_context(
+        start,
+        materialization,
+        materialization_receipt,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
+    )
 
 
 def test_start_runtime_receipt_rejects_container_and_secret_slot_substitution(
@@ -297,7 +423,7 @@ def test_start_runtime_receipt_rejects_container_and_secret_slot_substitution(
             )
         }
     )
-    with pytest.raises(AuthorizationError, match="start_runtime_executor_receipt"):
+    with pytest.raises(AuthorizationError, match="start_runtime_effect_receipt"):
         authorization._validate_start_runtime_effect_receipt(
             context, receipt.model_copy(update={"executor_receipt": altered_executor})
         )
@@ -314,6 +440,91 @@ def test_start_runtime_receipt_rejects_container_and_secret_slot_substitution(
         )
 
 
+def test_start_runtime_reconstructs_compact_attach_receipt_before_signature(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid compact receipt cannot choose its own request or descriptors.
+
+    The executor's outer signature is deliberately left stale in these
+    adversarial cases.  The local route verifier must reject the substituted
+    completion projection before a signature check could obscure that binding
+    failure.
+    """
+
+    monkeypatch.setattr(
+        authorization,
+        "_system_utc_clock",
+        lambda: datetime(2026, 8, 28, 12, 8, tzinfo=UTC),
+    )
+    context = _materialized_start_context(tmp_path)
+    receipt = _start_effect_receipt(context)
+    original = receipt.executor_receipt.containers[0]
+    original_attach = original.attach_receipt
+
+    def rebuilt_effect(
+        *, request_sha256: str, descriptors_sha256: str
+    ) -> StartRuntimeEffectReceiptV2:
+        ack = ContainerAttachTerminalAckV1(
+            schema_version="rsd.container-attach-terminal-ack.v1",
+            request_sha256=request_sha256,
+            state="terminal_ack_v1",
+            chunk_count=original_attach.chunk_count,
+            chunk_descriptors_sha256=descriptors_sha256,
+            chunks_zeroized=True,
+            persistence_allowed=False,
+            logging_allowed=False,
+            receipt_contains_secret=False,
+            eof_observed=True,
+        )
+        altered_attach = ContainerAttachReceiptV1.model_validate(
+            {
+                **original_attach.model_dump(mode="json"),
+                "request_sha256": request_sha256,
+                "chunk_descriptors_sha256": descriptors_sha256,
+                "terminal_ack_sha256": container_attach_ack_sha256(ack),
+            }
+        )
+        altered_container = ExecutorContainerInspectionV1(
+            component=original.component,
+            container_id=original.container_id,
+            inspection=original.inspection,
+            attach_receipt=altered_attach,
+            attach_receipt_sha256=container_attach_receipt_sha256(altered_attach),
+        )
+        altered_executor = receipt.executor_receipt.model_copy(
+            update={
+                "containers": (
+                    altered_container,
+                    *receipt.executor_receipt.containers[1:],
+                )
+            }
+        )
+        return receipt.model_copy(
+            update={
+                "executor_receipt": altered_executor,
+                "executor_receipt_sha256": authorization.canonical_sha256(altered_executor),
+            }
+        )
+
+    with pytest.raises(AuthorizationError, match="start_runtime_executor_attach_receipt"):
+        authorization._validate_start_runtime_effect_receipt(
+            context,
+            rebuilt_effect(
+                request_sha256=_hash("substituted-attach-request"),
+                descriptors_sha256=original_attach.chunk_descriptors_sha256,
+            ),
+        )
+
+    with pytest.raises(AuthorizationError, match="start_runtime_executor_attach_receipt"):
+        authorization._validate_start_runtime_effect_receipt(
+            context,
+            rebuilt_effect(
+                request_sha256=original_attach.request_sha256,
+                descriptors_sha256=_hash("substituted-attach-descriptors"),
+            ),
+        )
+
+
 def test_start_runtime_journal_requires_materialization_and_blocks_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -327,14 +538,27 @@ def test_start_runtime_journal_requires_materialization_and_blocks_replay(
     journal._begin_effect(allocation_verified)
     journal._commit_effect(allocation_verified, allocation_receipt)
 
-    materialization, _, _ = _materialization_intent(
-        allocation, executor, allocation_receipt, allocation_attestation
+    materialization, _, _, wrapper_manifest, target_delivery_map, attach_protocol = (
+        _materialization_intent(allocation, executor, allocation_receipt, allocation_attestation)
     )
-    materialization_context = _materialization_context(materialization, allocation_attestation)
+    materialization_context = _materialization_context(
+        materialization,
+        allocation_attestation,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
+    )
     materialization_receipt = _materialization_receipt(materialization_context)
     _, signing_key = _trusted_signer()
     start = _start_intent(allocation, materialization, signer_private=signing_key)
-    start_context = _start_context(start, materialization, materialization_receipt)
+    start_context = _start_context(
+        start,
+        materialization,
+        materialization_receipt,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
+    )
     verified_start = authorization._VerifiedStartRuntime(
         context=start_context,
         nonce="start-nonce",
@@ -409,13 +633,21 @@ def test_materialization_tombstone_and_start_journal_globally_bind_delivery_nonc
     journal._claim_verified(allocation_verified)
     journal._begin_effect(allocation_verified)
     journal._commit_effect(allocation_verified, allocation_receipt)
-    materialization, _, _ = _materialization_intent(
-        allocation,
-        executor,
-        allocation_receipt,
-        allocation_attestation,
+    materialization, _, _, wrapper_manifest, target_delivery_map, attach_protocol = (
+        _materialization_intent(
+            allocation,
+            executor,
+            allocation_receipt,
+            allocation_attestation,
+        )
     )
-    materialization_context = _materialization_context(materialization, allocation_attestation)
+    materialization_context = _materialization_context(
+        materialization,
+        allocation_attestation,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
+    )
     materialization_receipt = _materialization_receipt(materialization_context)
     verified_materialization = authorization._VerifiedMaterialization(
         context=materialization_context,
@@ -445,7 +677,14 @@ def test_materialization_tombstone_and_start_journal_globally_bind_delivery_nonc
         request_nonce_sha256=materialization.secret_delivery_request.request_nonce_sha256,
     )
     verified_start = authorization._VerifiedStartRuntime(
-        context=_start_context(reused, materialization, materialization_receipt),
+        context=_start_context(
+            reused,
+            materialization,
+            materialization_receipt,
+            wrapper_manifest,
+            target_delivery_map,
+            attach_protocol,
+        ),
         nonce="global-nonce-start",
         authorized_at=_NOW,
         capability=authorization._START_RUNTIME_VERIFIED_CAPABILITY,
@@ -511,7 +750,7 @@ def test_start_runtime_tls_type_drift_creates_no_artifact_root(tmp_path: Path) -
             ).decode("ascii"),
         }
     )
-    materialization, _, _ = _materialization_intent(
+    materialization, *_ = _materialization_intent(
         allocation,
         _allocation_bundle(tmp_path)[1],
         _allocation_receipt(allocation),

@@ -3397,7 +3397,7 @@ class MacOSKeychainSecretMaterialLease:
                         purpose=slot.purpose,
                         reference_sha256=slot.reference_sha256,
                         sink=slot.sink,
-                        target_processes=slot.target_processes,
+                        target_identities=slot.target_identities,
                         delivered=True,
                     )
                 )

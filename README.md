@@ -337,6 +337,41 @@ start journal state, and fresh bounded Keychain redelivery for every start or
 restart. No existing start or materialization receipt can be reused as restart
 authority.
 
+### Planned wrapper and local target-delivery contracts
+
+`ContainerBootstrapWrapperManifestV1` replaces the former opaque wrapper hash.
+It separately signs one immutable wrapper/derived-image declaration for each
+primary/restore Infisical and Valkey component: planned wrapper bytes and build
+provenance digests, the complete base/derived OCI digest chain, executable
+path/mode and `linux/amd64` requirements, exec-form Entrypoint/Cmd merge,
+PID1 signal forwarding/reaping/exit behavior, no-disk/no-log requirements, and
+the local attach-protocol commitment. A manifest is a planned contract only:
+this release contains neither wrapper bytes nor a build toolchain, image
+inspection evidence, or live PID1 proof.
+
+`TargetDeliveryMapV1` signs the exact four target routes plus independent
+`primary_database` and `restore_database` identities. It binds the five
+provider fingerprints, each exact Infisical variable or Valkey `requirepass`
+field, and value-free PostgreSQL/Valkey URI grammars. URI grammar commitments
+contain only authorities, role/database/cache identities, approved password
+reference fingerprints, and rendered byte counts; they never persist or return
+a URI, password, verifier, environment mapping, or target file. The primary
+and restore PostgreSQL transitions remain distinct: both keep their database
+owner NOLOGIN while a separate observed-OID-bound application login/verifier
+transition is authorized only at materialization.
+
+`ContainerBootstrapAttachProtocolV1` and the pure
+`container_attach` codec describe the future daemon-to-container stdin boundary
+separately from the Mac-to-daemon remote-session framing. A local request binds
+operation, component/container, derived-image, wrapper, protocol, target-map, nonce,
+channel, and session commitments before `ready_v1`, `claimed_v1`, ordered
+ordinal-tagged binary chunks, redacted terminal acknowledgement, and clean EOF.
+Chunk descriptors carry only format/count/fingerprint metadata. Buffers are
+mutable and zeroized best-effort on every codec path; any failure after the
+first chunk becomes non-retryable `attach_ambiguous_v1`. This is not a Docker
+attach adapter or a wrapper implementation, and it does not make
+materialization or start executable.
+
 ### Remote executor transport boundary
 
 The library now supplies an offline-testable transport boundary for a separately

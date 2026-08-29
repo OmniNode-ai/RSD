@@ -17,7 +17,7 @@ import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -55,6 +55,9 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     AllocatedResourceSetV2,
     AllocatedVolumeObservationV1,
     AllocationExecutorReceiptV1,
+    ContainerAttachReceiptV1,
+    ContainerAttachRequestV1,
+    ContainerAttachTerminalAckV1,
     ContainerBootstrapInspectionV1,
     ContainerSecretSinkV1,
     DockerEngineFilteredProjectionV1,
@@ -74,7 +77,13 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     SecretDeliverySlotV1,
     SSHConnectionPolicyV1,
     StartRuntimeExecutorReceiptV2,
+    TargetDeliveryFieldV1,
+    TargetDeliveryValueKindV1,
     canonical_sha256,
+    container_attach_ack_sha256,
+    container_attach_chunk_descriptors_sha256,
+    container_attach_receipt_sha256,
+    container_attach_request_sha256,
     docker_engine_fingerprint_sha256,
     docker_volume_instance_fingerprint_sha256,
 )
@@ -230,32 +239,37 @@ def _slot(purpose: str) -> SecretDeliverySlotV1:
         "encryption_key": (
             "infisical_hex_16_v1",
             32,
-            SecretDeliverySinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+            SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
             ("primary_infisical", "restore_infisical"),
         ),
         "auth_secret": (
             "infisical_auth_secret_base64_32_v1",
             44,
-            SecretDeliverySinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+            SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
             ("primary_infisical", "restore_infisical"),
         ),
         "primary_valkey_password": (
             "valkey_password_base64url_32_v1",
             43,
-            SecretDeliverySinkV1.VALKEY_STDIN_CONFIGURATION,
-            ("primary_valkey",),
+            SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+            ("primary_infisical", "primary_valkey"),
         ),
         "restore_valkey_password": (
             "valkey_password_base64url_32_v1",
             43,
-            SecretDeliverySinkV1.VALKEY_STDIN_CONFIGURATION,
-            ("restore_valkey",),
+            SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+            ("restore_infisical", "restore_valkey"),
         ),
         "postgres_application_password": (
             "postgres_application_password_base64url_32_v1",
             43,
-            SecretDeliverySinkV1.POSTGRES_APPLICATION_TARGET_ENVIRONMENT,
-            ("postgres_application_target",),
+            SecretDeliverySinkV1.POSTGRESQL_SCRAM_VERIFIER_DERIVATION,
+            (
+                "primary_database",
+                "restore_database",
+                "primary_infisical",
+                "restore_infisical",
+            ),
         ),
     }[purpose]
     return SecretDeliverySlotV1(
@@ -264,7 +278,7 @@ def _slot(purpose: str) -> SecretDeliverySlotV1:
         format=expected[0],
         encoded_byte_count=expected[1],
         sink=expected[2],
-        target_processes=expected[3],
+        target_identities=expected[3],
     )
 
 
@@ -716,7 +730,204 @@ class _Sink(ExecutorSecretSink):
         self.values.append(bytes(value))
 
 
-def _runtime_inspections() -> tuple[
+def _attach_fields(component: str) -> tuple[TargetDeliveryFieldV1, ...]:
+    """Return complete value-free routes for the transport fake's evidence."""
+
+    def field(
+        ordinal: int,
+        purpose: str,
+        target_field: str,
+        value_kind: TargetDeliveryValueKindV1,
+        field_format: str,
+        byte_count: int,
+        sink: ContainerSecretSinkV1,
+    ) -> TargetDeliveryFieldV1:
+        fingerprint = _hash(component + "-" + purpose + "-fingerprint")
+        return TargetDeliveryFieldV1(
+            ordinal=ordinal,
+            source_purpose=cast(Any, purpose),
+            source_reference_sha256=_hash(component + "-" + purpose + "-reference"),
+            source_fingerprint_sha256=fingerprint,
+            value_kind=value_kind,
+            target_field=cast(Any, target_field),
+            format=cast(Any, field_format),
+            encoded_byte_count=byte_count,
+            sink=sink,
+            derivation_binding_sha256=fingerprint,
+            persistence_allowed=False,
+            logging_allowed=False,
+            receipt_allowed=False,
+        )
+
+    if component == "primary_infisical":
+        sink = ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT
+        return (
+            field(
+                1,
+                "encryption_key",
+                "ENCRYPTION_KEY",
+                TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                "infisical_hex_16_v1",
+                32,
+                sink,
+            ),
+            field(
+                2,
+                "auth_secret",
+                "AUTH_SECRET",
+                TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                "infisical_auth_secret_base64_32_v1",
+                44,
+                sink,
+            ),
+            field(
+                3,
+                "postgres_application_password",
+                "DB_CONNECTION_URI",
+                TargetDeliveryValueKindV1.DERIVED_POSTGRESQL_URI,
+                "derived_postgresql_uri_v1",
+                128,
+                sink,
+            ),
+            field(
+                4,
+                "primary_valkey_password",
+                "REDIS_URL",
+                TargetDeliveryValueKindV1.DERIVED_VALKEY_URI,
+                "derived_valkey_uri_v1",
+                96,
+                sink,
+            ),
+        )
+    if component == "restore_infisical":
+        sink = ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT
+        return (
+            field(
+                1,
+                "encryption_key",
+                "ENCRYPTION_KEY",
+                TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                "infisical_hex_16_v1",
+                32,
+                sink,
+            ),
+            field(
+                2,
+                "auth_secret",
+                "AUTH_SECRET",
+                TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                "infisical_auth_secret_base64_32_v1",
+                44,
+                sink,
+            ),
+            field(
+                3,
+                "postgres_application_password",
+                "DB_CONNECTION_URI",
+                TargetDeliveryValueKindV1.DERIVED_POSTGRESQL_URI,
+                "derived_postgresql_uri_v1",
+                128,
+                sink,
+            ),
+            field(
+                4,
+                "restore_valkey_password",
+                "REDIS_URL",
+                TargetDeliveryValueKindV1.DERIVED_VALKEY_URI,
+                "derived_valkey_uri_v1",
+                96,
+                sink,
+            ),
+        )
+    if component == "primary_valkey":
+        return (
+            field(
+                1,
+                "primary_valkey_password",
+                "requirepass",
+                TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                "valkey_password_base64url_32_v1",
+                43,
+                ContainerSecretSinkV1.VALKEY_STDIN_CONFIGURATION,
+            ),
+        )
+    return (
+        field(
+            1,
+            "restore_valkey_password",
+            "requirepass",
+            TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+            "valkey_password_base64url_32_v1",
+            43,
+            ContainerSecretSinkV1.VALKEY_STDIN_CONFIGURATION,
+        ),
+    )
+
+
+def _attach_receipt(
+    *,
+    context: ExecutorBackendContextV2,
+    component: str,
+    container_id: str,
+    inspection: ContainerBootstrapInspectionV1,
+) -> ContainerAttachReceiptV1:
+    """Build fully completed, value-free local-attach evidence for one fake."""
+
+    request = ContainerAttachRequestV1(
+        schema_version="rsd.container-attach-request.v1",
+        operation_scope=cast(Any, context.operation_scope),
+        operation_id=context.operation_id,
+        component=cast(Any, component),
+        container_id=container_id,
+        derived_image_policy_sha256=canonical_sha256(inspection.image_policy),
+        wrapper_manifest_sha256=inspection.wrapper_manifest_sha256,
+        wrapper_artifact_binding_sha256=inspection.wrapper_artifact_binding_sha256,
+        attach_protocol_sha256=inspection.attach_protocol_sha256,
+        target_delivery_map_sha256=_hash("target-delivery-map"),
+        request_nonce_sha256=context.request_nonce_sha256,
+        channel_binding_sha256=context.channel_binding_sha256,
+        session_binding_sha256=context.session_binding_sha256,
+        expected_ready_state="ready_v1",
+        expected_claim_state="claimed_v1",
+        expected_terminal_ack_state="terminal_ack_v1",
+        fields=_attach_fields(component),
+    )
+    request_sha256 = container_attach_request_sha256(request)
+    descriptor_sha256 = container_attach_chunk_descriptors_sha256(request.fields)
+    ack = ContainerAttachTerminalAckV1(
+        schema_version="rsd.container-attach-terminal-ack.v1",
+        request_sha256=request_sha256,
+        state="terminal_ack_v1",
+        chunk_count=len(request.fields),
+        chunk_descriptors_sha256=descriptor_sha256,
+        chunks_zeroized=True,
+        persistence_allowed=False,
+        logging_allowed=False,
+        receipt_contains_secret=False,
+        eof_observed=True,
+    )
+    return ContainerAttachReceiptV1(
+        schema_version="rsd.container-attach-receipt.v1",
+        request_sha256=request_sha256,
+        component=cast(Any, component),
+        container_id=container_id,
+        ready_state="ready_v1",
+        claim_state="claimed_v1",
+        chunk_count=len(request.fields),
+        chunk_descriptors_sha256=descriptor_sha256,
+        terminal_ack_state="terminal_ack_v1",
+        terminal_ack_sha256=container_attach_ack_sha256(ack),
+        chunks_zeroized=True,
+        persistence_allowed=False,
+        logging_allowed=False,
+        receipt_contains_secret=False,
+        eof_observed=True,
+    )
+
+
+def _runtime_inspections(
+    context: ExecutorBackendContextV2,
+) -> tuple[
     ExecutorContainerInspectionV1,
     ExecutorContainerInspectionV1,
     ExecutorContainerInspectionV1,
@@ -767,8 +978,9 @@ def _runtime_inspections() -> tuple[
             command=(),
             entrypoint_sha256=entrypoint_sha256,
             template_sha256=_hash(component + "-template"),
-            bootstrap_wrapper_sha256=_hash(component + "-wrapper"),
-            ingress_protocol_sha256=_hash(component + "-ingress"),
+            wrapper_manifest_sha256=_hash(component + "-wrapper-manifest"),
+            wrapper_artifact_binding_sha256=_hash(component + "-wrapper-artifact"),
+            attach_protocol_sha256=_hash(component + "-attach-protocol"),
             create_request_sha256=_hash(component + "-create"),
             numeric_user="1001:1001",
             working_directory="/work",
@@ -805,11 +1017,20 @@ def _runtime_inspections() -> tuple[
             ),
             running=True,
         )
+        container_id = _hash(component + "-container")
+        completed_attach = _attach_receipt(
+            context=context,
+            component=component,
+            container_id=container_id,
+            inspection=inspection,
+        )
         values.append(
             ExecutorContainerInspectionV1(
-                component=component,
-                container_id=_hash(component + "-container"),
+                component=cast(Any, component),
+                container_id=container_id,
                 inspection=inspection,
+                attach_receipt=completed_attach,
+                attach_receipt_sha256=container_attach_receipt_sha256(completed_attach),
             )
         )
     return cast(
@@ -830,12 +1051,15 @@ def _runtime_executor_receipt(
 
     _complete_engine_operation_plan(context.engine_operations, label="runtime")
     engine_journal_sha256 = context.engine_operations.completed_projection_sha256()
-    containers = _runtime_inspections()
+    containers = _runtime_inspections(context)
     if context.operation_scope == "materialize_and_start_runtime_v1":
         return MaterializationExecutorReceiptV1(
             schema_version="rsd.materialization-executor-receipt.v1",
             executor_id=context.executor_id,
             installation_receipt_sha256=context.installation_receipt_sha256,
+            wrapper_manifest_sha256=_hash("wrapper-manifest"),
+            target_delivery_map_sha256=_hash("target-delivery-map"),
+            container_attach_protocol_sha256=_hash("container-attach-protocol"),
             operation_scope=context.operation_scope,
             operation_id=context.operation_id,
             idempotency_key=context.idempotency_key,
@@ -869,6 +1093,9 @@ def _runtime_executor_receipt(
         host_fingerprint_sha256=context.host_fingerprint_sha256,
         engine_fingerprint_sha256=context.engine_fingerprint_sha256,
         engine_operation_journal_sha256=engine_journal_sha256,
+        wrapper_manifest_sha256=_hash("wrapper-manifest"),
+        target_delivery_map_sha256=_hash("target-delivery-map"),
+        container_attach_protocol_sha256=_hash("container-attach-protocol"),
         containers=containers,
         completed_at=_NOW_TEXT,
         signer_key_id="backend-placeholder",

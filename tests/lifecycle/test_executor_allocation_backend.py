@@ -29,6 +29,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     NetworkOptionV1,
     PostgreSQLPreparedControlPolicyV2,
     PostgreSQLPreparedOperationV1,
+    PostgreSQLScramVerifierInstallsV1,
     PostgreSQLScramVerifierInstallV1,
     docker_engine_fingerprint_sha256,
     docker_unix_socket_identity_sha256,
@@ -224,8 +225,9 @@ def _image_policy() -> DockerImagePolicyV1:
 
 
 def _prepared_policy() -> PostgreSQLPreparedControlPolicyV2:
-    verifier = PostgreSQLScramVerifierInstallV1(
+    primary_verifier = PostgreSQLScramVerifierInstallV1(
         schema_version="rsd.postgresql-scram-verifier-install.v1",
+        database_identity="primary_database",
         prepared_operation_id="123e4567-e89b-42d3-a456-426614174003",
         application_password_reference_sha256=_hash("application-password"),
         algorithm="scram-sha-256",
@@ -239,6 +241,23 @@ def _prepared_policy() -> PostgreSQLPreparedControlPolicyV2:
         output_in_receipt_allowed=False,
         logs_allowed=False,
         template_sha256=_hash("verifier-template"),
+    )
+    restore_verifier = PostgreSQLScramVerifierInstallV1(
+        schema_version="rsd.postgresql-scram-verifier-install.v1",
+        database_identity="restore_database",
+        prepared_operation_id="123e4567-e89b-42d3-a456-426614174006",
+        application_password_reference_sha256=_hash("application-password"),
+        algorithm="scram-sha-256",
+        iterations=4096,
+        salt_bytes=16,
+        derivation_scope="executor_bounded_memory_v1",
+        sink="postgresql_prepared_psql_stdin_verifier_v1",
+        plaintext_to_psql_allowed=False,
+        verifier_in_receipt_allowed=False,
+        sql_in_receipt_allowed=False,
+        output_in_receipt_allowed=False,
+        logs_allowed=False,
+        template_sha256=_hash("restore-verifier-template"),
     )
     return PostgreSQLPreparedControlPolicyV2(
         schema_version="rsd.postgresql-prepared-control-policy.v2",
@@ -283,15 +302,26 @@ def _prepared_policy() -> PostgreSQLPreparedControlPolicyV2:
                 secret_input=False,
             ),
             PostgreSQLPreparedOperationV1(
-                operation_id=verifier.prepared_operation_id,
-                kind="install_scram_verifier_v1",
-                psql_template_sha256=verifier.template_sha256,
-                result_projection_sha256=_hash("verifier-result"),
+                operation_id=primary_verifier.prepared_operation_id,
+                kind="install_primary_scram_verifier_v1",
+                psql_template_sha256=primary_verifier.template_sha256,
+                result_projection_sha256=_hash("primary-verifier-result"),
+                stdin_protocol="postgresql_prepared_psql_stdin_v1",
+                secret_input=True,
+            ),
+            PostgreSQLPreparedOperationV1(
+                operation_id=restore_verifier.prepared_operation_id,
+                kind="install_restore_scram_verifier_v1",
+                psql_template_sha256=restore_verifier.template_sha256,
+                result_projection_sha256=_hash("restore-verifier-result"),
                 stdin_protocol="postgresql_prepared_psql_stdin_v1",
                 secret_input=True,
             ),
         ),
-        scram_verifier_install=verifier,
+        scram_verifier_installs=PostgreSQLScramVerifierInstallsV1(
+            primary_database=primary_verifier,
+            restore_database=restore_verifier,
+        ),
         created_at=_NOW,
         signer_key_id="test-signer",
         signature_base64=_SIGNATURE,
@@ -631,6 +661,7 @@ def test_postgres_hijack_rejects_stdin_channel_and_template_drift(
                 .operations[0]
                 .model_copy(update={"psql_template_sha256": _hash("drift")}),
                 _prepared_policy().operations[1],
+                _prepared_policy().operations[2],
             )
         }
     )

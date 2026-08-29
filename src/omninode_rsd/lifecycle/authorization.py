@@ -45,12 +45,16 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     AllocationExecutorReceiptV1,
     AllocationIntentV2,
     ApprovalEvidenceV1,
+    ContainerAttachRequestV1,
+    ContainerAttachTerminalAckV1,
+    ContainerBootstrapAttachProtocolV1,
     ContainerBootstrapInspectionV1,
     ContainerBootstrapTemplateV1,
+    ContainerBootstrapWrapperManifestV1,
     DisposablePreflightError,
     DisposableTransportProfile,
     DockerEngineControlPolicyV1,
-    EphemeralPostgreSQLConnectionPolicyV1,
+    ExecutorContainerInspectionV1,
     ExecutorControlPolicyV1,
     ExecutorInstallationIntentV1,
     ExecutorInstallationPolicyV1,
@@ -61,9 +65,12 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     MaterializationIntentV1,
     ObservedAllocationAttestationV1,
     ObservedRuntimeAttestationV1,
+    PostgreSQLConnectionUriGrammarV1,
     PostgreSQLControlPolicyV1,
+    PostgreSQLLoginTransitionIntentsV1,
     PostgreSQLLoginTransitionIntentV1,
     PostgreSQLPreparedControlPolicyV2,
+    PostgreSQLRuntimeDatabaseIdentitiesV1,
     PreflightPaths,
     PreflightReceiptV1,
     ProposalV1,
@@ -79,6 +86,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     StartRuntimeExecutorReceiptV2,
     StartRuntimeIntentV2,
     TargetAttestationV1,
+    TargetDeliveryMapV1,
     _OwnerOnlyReader,
     _strict_canonical_model,
     _UniqueLoader,
@@ -87,6 +95,11 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     allocation_intent_sha256,
     canonical_sha256,
     compile_preflight,
+    container_attach_ack_sha256,
+    container_attach_chunk_descriptors_sha256,
+    container_attach_request_sha256,
+    container_bootstrap_attach_protocol_sha256,
+    container_bootstrap_wrapper_manifest_sha256,
     materialization_effect_receipt_sha256,
     materialization_executor_receipt_message,
     materialization_intent_sha256,
@@ -98,6 +111,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     strict_canonical_allocation_intent,
     strict_canonical_materialization_intent,
     strict_canonical_start_runtime_intent,
+    target_delivery_map_sha256,
     validate_observed_allocation_transition,
     validate_observed_runtime_transition,
 )
@@ -137,6 +151,9 @@ _POSTGRES_CONTROL_POLICY_ARTIFACT_NAME: Final = "postgres-control-policy.yaml"
 _POSTGRES_PREPARED_CONTROL_POLICY_ARTIFACT_NAME: Final = "postgres-prepared-control-policy.yaml"
 _SECRET_CAPABILITY_POLICY_ARTIFACT_NAME: Final = "secret-capability-policy.yaml"
 _SECRET_HANDLING_POLICY_ARTIFACT_NAME: Final = "secret-handling-policy.yaml"
+_CONTAINER_WRAPPER_MANIFEST_ARTIFACT_NAME: Final = "container-wrapper-manifest.yaml"
+_TARGET_DELIVERY_MAP_ARTIFACT_NAME: Final = "target-delivery-map.yaml"
+_CONTAINER_ATTACH_PROTOCOL_ARTIFACT_NAME: Final = "container-attach-protocol.yaml"
 _EXECUTOR_INSTALLATION_POLICY_ARTIFACT_NAME: Final = "executor-installation-policy.yaml"
 _EXECUTOR_INSTALLATION_INTENT_ARTIFACT_NAME: Final = "executor-installation-intent.yaml"
 _EXECUTOR_INSTALLATION_RECEIPT_ARTIFACT_NAME: Final = "executor-installation-receipt.yaml"
@@ -172,6 +189,13 @@ _SECRET_CAPABILITY_POLICY_SIGNATURE_DOMAIN: Final = (
 )
 _SECRET_HANDLING_POLICY_SIGNATURE_DOMAIN: Final = (
     b"omninode-rsd.secret-handling-policy.ed25519.v1\x00"
+)
+_CONTAINER_WRAPPER_MANIFEST_SIGNATURE_DOMAIN: Final = (
+    b"omninode-rsd.container-wrapper-manifest.ed25519.v1\x00"
+)
+_TARGET_DELIVERY_MAP_SIGNATURE_DOMAIN: Final = b"omninode-rsd.target-delivery-map.ed25519.v1\x00"
+_CONTAINER_ATTACH_PROTOCOL_SIGNATURE_DOMAIN: Final = (
+    b"omninode-rsd.container-attach-protocol.ed25519.v1\x00"
 )
 _EXECUTOR_INSTALLATION_POLICY_SIGNATURE_DOMAIN: Final = (
     b"omninode-rsd.executor-installation-policy.ed25519.v1\x00"
@@ -835,14 +859,14 @@ class PostgreSQLLoginTransitionLease(Protocol):
         self,
         policy: PostgreSQLControlPolicyV1,
         transition: PostgreSQLLoginTransitionIntentV1,
-        connection: EphemeralPostgreSQLConnectionPolicyV1,
+        connection: PostgreSQLConnectionUriGrammarV1,
     ) -> PostgreSQLLoginTransitionProvenance | None: ...
 
     def recheck(
         self,
         policy: PostgreSQLControlPolicyV1,
         transition: PostgreSQLLoginTransitionIntentV1,
-        connection: EphemeralPostgreSQLConnectionPolicyV1,
+        connection: PostgreSQLConnectionUriGrammarV1,
     ) -> PostgreSQLLoginTransitionProvenance | None: ...
 
     def install_scram_verifier(
@@ -850,7 +874,7 @@ class PostgreSQLLoginTransitionLease(Protocol):
         policy: PostgreSQLControlPolicyV1,
         prepared: PostgreSQLPreparedControlPolicyV2,
         transition: PostgreSQLLoginTransitionIntentV1,
-        connection: EphemeralPostgreSQLConnectionPolicyV1,
+        connection: PostgreSQLConnectionUriGrammarV1,
     ) -> PostgreSQLPreparedOperationProvenance | None: ...
 
 
@@ -860,8 +884,8 @@ class PostgreSQLLoginTransitionCapability(Protocol):
     def acquire(
         self,
         policy: PostgreSQLControlPolicyV1,
-        transition: PostgreSQLLoginTransitionIntentV1,
-        connection: EphemeralPostgreSQLConnectionPolicyV1,
+        transitions: PostgreSQLLoginTransitionIntentsV1,
+        database_identities: PostgreSQLRuntimeDatabaseIdentitiesV1,
     ) -> AbstractContextManager[PostgreSQLLoginTransitionLease]: ...
 
 
@@ -876,6 +900,7 @@ class PostgreSQLControlExpectationV1(_Model):
 class PostgreSQLLoginTransitionExpectationV1(_Model):
     """Non-secret, exact transition binding exposed to the materialization effect."""
 
+    database_identity: Literal["primary_database", "restore_database"]
     authority: str
     system_identifier: str = Field(pattern=r"^[0-9]{8,32}$")
     database_oid: int = Field(ge=1)
@@ -1211,11 +1236,16 @@ class MaterializationExecutionContext:
     executor_attestation_public_key_base64: str
     executor_attestation_public_key_fingerprint_sha256: str
     docker_engine_control_policy_sha256: str
-    postgres_login_expectation: PostgreSQLLoginTransitionExpectationV1
+    postgres_login_expectations: tuple[
+        PostgreSQLLoginTransitionExpectationV1, PostgreSQLLoginTransitionExpectationV1
+    ]
     postgres_prepared_control_policy_sha256: str
-    postgres_verifier_result_projection_sha256: str
+    postgres_verifier_result_projection_sha256s: tuple[str, str]
     secret_material_expectation: SecretMaterialExpectationV1
     secret_handling_policy_sha256: str
+    wrapper_manifest: ContainerBootstrapWrapperManifestV1
+    target_delivery_map: TargetDeliveryMapV1
+    container_attach_protocol: ContainerBootstrapAttachProtocolV1
     secret_delivery_request: SecretDeliveryRequestV1
     materialization_intent_sha256: str
     idempotency_key: str
@@ -1261,6 +1291,9 @@ class StartRuntimeExecutionContext:
     executor_attestation_public_key_fingerprint_sha256: str
     secret_material_expectation: SecretMaterialExpectationV1
     secret_handling_policy_sha256: str
+    wrapper_manifest: ContainerBootstrapWrapperManifestV1
+    target_delivery_map: TargetDeliveryMapV1
+    container_attach_protocol: ContainerBootstrapAttachProtocolV1
     secret_delivery_request: SecretDeliveryRequestV1
     start_runtime_intent_sha256: str
     idempotency_key: str
@@ -1421,6 +1454,18 @@ class AuthorizationPaths:
         return _SECRET_HANDLING_POLICY_ARTIFACT_NAME
 
     @staticmethod
+    def container_wrapper_manifest_name() -> str:
+        return _CONTAINER_WRAPPER_MANIFEST_ARTIFACT_NAME
+
+    @staticmethod
+    def target_delivery_map_name() -> str:
+        return _TARGET_DELIVERY_MAP_ARTIFACT_NAME
+
+    @staticmethod
+    def container_attach_protocol_name() -> str:
+        return _CONTAINER_ATTACH_PROTOCOL_ARTIFACT_NAME
+
+    @staticmethod
     def executor_installation_policy_name() -> str:
         return _EXECUTOR_INSTALLATION_POLICY_ARTIFACT_NAME
 
@@ -1499,6 +1544,9 @@ class _MaterializationControlPolicies:
     installation_receipt: ExecutorInstallationReceiptV1
     secret_capability: SecretCapabilityPolicyV1
     handling: SecretHandlingPolicyV1
+    wrapper_manifest: ContainerBootstrapWrapperManifestV1
+    target_delivery_map: TargetDeliveryMapV1
+    attach_protocol: ContainerBootstrapAttachProtocolV1
 
 
 @dataclass(frozen=True, slots=True)
@@ -2173,6 +2221,24 @@ def _secret_handling_policy_message(policy: SecretHandlingPolicyV1) -> bytes:
     return _direct_signature_message(_SECRET_HANDLING_POLICY_SIGNATURE_DOMAIN, policy)
 
 
+def _container_wrapper_manifest_message(manifest: ContainerBootstrapWrapperManifestV1) -> bytes:
+    if type(manifest) is not ContainerBootstrapWrapperManifestV1:
+        raise AuthorizationError("container_wrapper_manifest_signature")
+    return _direct_signature_message(_CONTAINER_WRAPPER_MANIFEST_SIGNATURE_DOMAIN, manifest)
+
+
+def _target_delivery_map_message(delivery_map: TargetDeliveryMapV1) -> bytes:
+    if type(delivery_map) is not TargetDeliveryMapV1:
+        raise AuthorizationError("target_delivery_map_signature")
+    return _direct_signature_message(_TARGET_DELIVERY_MAP_SIGNATURE_DOMAIN, delivery_map)
+
+
+def _container_attach_protocol_message(protocol: ContainerBootstrapAttachProtocolV1) -> bytes:
+    if type(protocol) is not ContainerBootstrapAttachProtocolV1:
+        raise AuthorizationError("container_attach_protocol_signature")
+    return _direct_signature_message(_CONTAINER_ATTACH_PROTOCOL_SIGNATURE_DOMAIN, protocol)
+
+
 def _executor_installation_policy_message(policy: ExecutorInstallationPolicyV1) -> bytes:
     if type(policy) is not ExecutorInstallationPolicyV1:
         raise AuthorizationError("executor_installation_policy_signature")
@@ -2412,6 +2478,65 @@ def _verify_secret_handling_policy_signature(
         signer=signer,
         message=lambda model: _secret_handling_policy_message(cast(SecretHandlingPolicyV1, model)),
         phase="secret_handling_policy_signature",
+    )
+
+
+def _verify_container_wrapper_manifest_signature(
+    manifest: ContainerBootstrapWrapperManifestV1, *, signer: TrustedEd25519SignerV1
+) -> None:
+    manifest = cast(
+        ContainerBootstrapWrapperManifestV1,
+        _canonical_artifact_model(
+            manifest,
+            ContainerBootstrapWrapperManifestV1,
+            phase="container_wrapper_manifest_signature",
+        ),
+    )
+    _verify_direct_signature(
+        manifest,
+        signer=signer,
+        message=lambda model: _container_wrapper_manifest_message(
+            cast(ContainerBootstrapWrapperManifestV1, model)
+        ),
+        phase="container_wrapper_manifest_signature",
+    )
+
+
+def _verify_target_delivery_map_signature(
+    delivery_map: TargetDeliveryMapV1, *, signer: TrustedEd25519SignerV1
+) -> None:
+    delivery_map = cast(
+        TargetDeliveryMapV1,
+        _canonical_artifact_model(
+            delivery_map, TargetDeliveryMapV1, phase="target_delivery_map_signature"
+        ),
+    )
+    _verify_direct_signature(
+        delivery_map,
+        signer=signer,
+        message=lambda model: _target_delivery_map_message(cast(TargetDeliveryMapV1, model)),
+        phase="target_delivery_map_signature",
+    )
+
+
+def _verify_container_attach_protocol_signature(
+    protocol: ContainerBootstrapAttachProtocolV1, *, signer: TrustedEd25519SignerV1
+) -> None:
+    protocol = cast(
+        ContainerBootstrapAttachProtocolV1,
+        _canonical_artifact_model(
+            protocol,
+            ContainerBootstrapAttachProtocolV1,
+            phase="container_attach_protocol_signature",
+        ),
+    )
+    _verify_direct_signature(
+        protocol,
+        signer=signer,
+        message=lambda model: _container_attach_protocol_message(
+            cast(ContainerBootstrapAttachProtocolV1, model)
+        ),
+        phase="container_attach_protocol_signature",
     )
 
 
@@ -3203,6 +3328,9 @@ def _verify_materialization_control_policy_bindings(
     postgres_prepared: PostgreSQLPreparedControlPolicyV2,
     secret_capability: SecretCapabilityPolicyV1,
     secret_handling: SecretHandlingPolicyV1,
+    wrapper_manifest: ContainerBootstrapWrapperManifestV1,
+    target_delivery_map: TargetDeliveryMapV1,
+    attach_protocol: ContainerBootstrapAttachProtocolV1,
     provider_material_attestation_sha256: str,
     signer: TrustedEd25519SignerV1,
 ) -> None:
@@ -3213,16 +3341,40 @@ def _verify_materialization_control_policy_bindings(
     _verify_postgres_prepared_control_policy_signature(postgres_prepared, signer=signer)
     _verify_secret_capability_policy_signature(secret_capability, signer=signer)
     _verify_secret_handling_policy_signature(secret_handling, signer=signer)
+    _verify_container_wrapper_manifest_signature(wrapper_manifest, signer=signer)
+    _verify_target_delivery_map_signature(target_delivery_map, signer=signer)
+    _verify_container_attach_protocol_signature(attach_protocol, signer=signer)
     executor_hash = canonical_sha256(executor)
     docker_hash = canonical_sha256(docker)
     postgres_prepared_hash = canonical_sha256(postgres_prepared)
     secret_capability_hash = canonical_sha256(secret_capability)
     secret_handling_hash = canonical_sha256(secret_handling)
+    wrapper_manifest_hash = container_bootstrap_wrapper_manifest_sha256(wrapper_manifest)
+    target_delivery_map_hash = target_delivery_map_sha256(target_delivery_map)
+    attach_protocol_hash = container_bootstrap_attach_protocol_sha256(attach_protocol)
     component_image_bindings = (
         (intent.plan.primary_infisical, executor.image_configs[0]),
         (intent.plan.primary_valkey, executor.image_configs[1]),
         (intent.plan.restore_infisical, executor.image_configs[2]),
         (intent.plan.restore_valkey, executor.image_configs[3]),
+    )
+    wrapper_artifacts = (
+        wrapper_manifest.primary_infisical,
+        wrapper_manifest.primary_valkey,
+        wrapper_manifest.restore_infisical,
+        wrapper_manifest.restore_valkey,
+    )
+    bootstrap_templates = (
+        intent.bootstrap_templates.primary_infisical,
+        intent.bootstrap_templates.primary_valkey,
+        intent.bootstrap_templates.restore_infisical,
+        intent.bootstrap_templates.restore_valkey,
+    )
+    delivery_targets = (
+        target_delivery_map.primary_infisical,
+        target_delivery_map.primary_valkey,
+        target_delivery_map.restore_infisical,
+        target_delivery_map.restore_valkey,
     )
     if (
         executor.source_commit != allocation_intent.source_commit
@@ -3232,6 +3384,9 @@ def _verify_materialization_control_policy_bindings(
         or intent.evidence.postgres_prepared_control_policy_sha256 != postgres_prepared_hash
         or intent.evidence.secret_capability_policy_sha256 != secret_capability_hash
         or intent.evidence.secret_handling_policy_sha256 != secret_handling_hash
+        or intent.evidence.wrapper_manifest_sha256 != wrapper_manifest_hash
+        or intent.evidence.target_delivery_map_sha256 != target_delivery_map_hash
+        or intent.evidence.container_attach_protocol_sha256 != attach_protocol_hash
         or intent.evidence.provider_material_attestation_sha256
         != provider_material_attestation_sha256
         or secret_capability.source_commit != allocation_intent.source_commit
@@ -3244,6 +3399,19 @@ def _verify_materialization_control_policy_bindings(
         or secret_handling.provider_identity_sha256 != secret_capability.provider_identity_sha256
         or secret_handling.capability_fingerprint_sha256
         != secret_capability.capability_fingerprint_sha256
+        or wrapper_manifest.source_commit != allocation_intent.source_commit
+        or wrapper_manifest.allocation_intent_sha256 != allocation_intent_sha256(allocation_intent)
+        or wrapper_manifest.attach_protocol_sha256 != attach_protocol_hash
+        or target_delivery_map.source_commit != allocation_intent.source_commit
+        or target_delivery_map.allocation_intent_sha256
+        != allocation_intent_sha256(allocation_intent)
+        or target_delivery_map.wrapper_manifest_sha256 != wrapper_manifest_hash
+        or target_delivery_map.attach_protocol_sha256 != attach_protocol_hash
+        or target_delivery_map.secret_handling_policy_sha256 != secret_handling_hash
+        or target_delivery_map.provider_references != allocation_intent.provider_references
+        or intent.wrapper_manifest_sha256 != wrapper_manifest_hash
+        or intent.target_delivery_map_sha256 != target_delivery_map_hash
+        or intent.container_attach_protocol_sha256 != attach_protocol_hash
         or docker.source_commit != allocation_intent.source_commit
         or docker.executor_identity_sha256 != canonical_sha256(executor.executor)
         or docker_hash != allocation_intent.evidence.docker_engine_control_policy_sha256
@@ -3251,14 +3419,39 @@ def _verify_materialization_control_policy_bindings(
         or postgres_prepared.executor_identity_sha256 != canonical_sha256(executor.executor)
         or postgres_prepared_hash
         != allocation_intent.evidence.postgres_prepared_control_policy_sha256
-        or intent.postgres_login_transition.prepared_control_policy_sha256 != postgres_prepared_hash
-        or intent.postgres_login_transition.scram_verifier_install
-        != postgres_prepared.scram_verifier_install
-        or intent.postgres_login_transition.prepared_operation_id
+        or intent.postgres_login_transitions.primary_database.prepared_control_policy_sha256
+        != postgres_prepared_hash
+        or intent.postgres_login_transitions.restore_database.prepared_control_policy_sha256
+        != postgres_prepared_hash
+        or intent.postgres_login_transitions.primary_database.scram_verifier_install
+        != postgres_prepared.scram_verifier_installs.primary_database
+        or intent.postgres_login_transitions.restore_database.scram_verifier_install
+        != postgres_prepared.scram_verifier_installs.restore_database
+        or intent.postgres_login_transitions.primary_database.prepared_operation_id
         != postgres_prepared.operations[1].operation_id
+        or intent.postgres_login_transitions.restore_database.prepared_operation_id
+        != postgres_prepared.operations[2].operation_id
         or any(
             component.image != binding.image or component.config_sha256 != binding.config_sha256
             for component, binding in component_image_bindings
+        )
+        or tuple(artifact.derived_image_policy for artifact in wrapper_artifacts)
+        != tuple(template.image_policy for template in bootstrap_templates)
+        or any(
+            template.wrapper_manifest_sha256 != wrapper_manifest_hash
+            or template.wrapper_artifact_binding_sha256 != artifact.artifact_binding_sha256
+            or template.attach_protocol_sha256 != attach_protocol_hash
+            or template.entrypoint != artifact.wrapper_argv_prefix
+            or template.command != artifact.base_entrypoint + artifact.base_command
+            for template, artifact in zip(bootstrap_templates, wrapper_artifacts, strict=True)
+        )
+        or tuple(target.component for target in delivery_targets)
+        != ("primary_infisical", "primary_valkey", "restore_infisical", "restore_valkey")
+        or any(
+            target.derived_image_policy_sha256 != canonical_sha256(artifact.derived_image_policy)
+            or target.wrapper_artifact_binding_sha256 != artifact.artifact_binding_sha256
+            or target.attach_protocol_sha256 != attach_protocol_hash
+            for target, artifact in zip(delivery_targets, wrapper_artifacts, strict=True)
         )
     ):
         raise AuthorizationError("materialization_control_policy_binding")
@@ -3317,8 +3510,12 @@ def _verify_executor_installation_chain(
         or policy.allowed_engine_fingerprint_sha256 != executor.engine_fingerprint_sha256
         or policy.template_bundle_sha256
         != canonical_sha256(materialization_intent.bootstrap_templates)
+        or policy.wrapper_manifest_sha256 != materialization_intent.wrapper_manifest_sha256
+        or policy.target_delivery_map_sha256 != materialization_intent.target_delivery_map_sha256
+        or policy.container_attach_protocol_sha256
+        != materialization_intent.container_attach_protocol_sha256
         or policy.allowed_postgres_identity_sha256
-        != canonical_sha256(materialization_intent.postgres_login_transition)
+        != canonical_sha256(materialization_intent.postgres_login_transitions)
         or executor.installation_policy_sha256 != policy_hash
         or materialization_intent.evidence.executor_installation_policy_sha256 != policy_hash
         or intent.source_commit != allocation_intent.source_commit
@@ -3339,6 +3536,9 @@ def _verify_executor_installation_chain(
         or receipt.package_sha256 != policy.package_sha256
         or receipt.executable_sha256 != policy.executable_sha256
         or receipt.template_bundle_sha256 != policy.template_bundle_sha256
+        or receipt.wrapper_manifest_sha256 != policy.wrapper_manifest_sha256
+        or receipt.target_delivery_map_sha256 != policy.target_delivery_map_sha256
+        or receipt.container_attach_protocol_sha256 != policy.container_attach_protocol_sha256
         or receipt.systemd_unit_sha256 != policy.systemd_unit_sha256
         or receipt.unix_socket_policy_sha256 != policy.unix_socket_policy_sha256
         or receipt.ssh_policy_sha256 != canonical_sha256(policy.ssh)
@@ -3356,6 +3556,7 @@ def _verify_materialization_intent_chain(
     *,
     allocation: _AllocationStageArtifacts,
     intent: MaterializationIntentV1,
+    target_delivery_map: TargetDeliveryMapV1,
     replay_policy: ReplayAuthorityPolicyV1,
     expected_disposal_owner: str,
     expected_approver_identity: str,
@@ -3394,24 +3595,36 @@ def _verify_materialization_intent_chain(
     ):
         raise AuthorizationError("materialization_intent_binding")
     postgres = allocation.attestation.allocated_resources.postgres
-    transition = intent.postgres_login_transition
-    connection = intent.ephemeral_postgres_connection
+    primary = intent.postgres_login_transitions.primary_database
+    restore = intent.postgres_login_transitions.restore_database
+    primary_identity = target_delivery_map.database_identities.primary_database
+    restore_identity = target_delivery_map.database_identities.restore_database
     if (
-        transition.system_identifier != postgres.system_identifier
-        or transition.database_name != postgres.database_name
-        or transition.database_oid != postgres.database_oid
-        or transition.owner_role != postgres.owner_role
-        or transition.owner_role_oid != postgres.owner_role_oid
-        or transition.application_role != postgres.application_role
-        or transition.application_role_oid != postgres.application_role_oid
-        or transition.application_password_reference_sha256
+        target_delivery_map.allocation_intent_sha256 != allocation_intent_sha256(allocation.intent)
+        or target_delivery_map.provider_references != allocation.intent.provider_references
+        or target_delivery_map_sha256(target_delivery_map) != intent.target_delivery_map_sha256
+        or primary != primary_identity.login_transition
+        or restore != restore_identity.login_transition
+        or primary_identity.observation_binding_sha256 != canonical_sha256(postgres)
+        or primary.system_identifier != postgres.system_identifier
+        or primary.database_name != postgres.database_name
+        or primary.database_oid != postgres.database_oid
+        or primary.owner_role != postgres.owner_role
+        or primary.owner_role_oid != postgres.owner_role_oid
+        or primary.application_role != postgres.application_role
+        or primary.application_role_oid != postgres.application_role_oid
+        or primary.application_password_reference_sha256
         != allocation.intent.provider_references.postgres_application_password.reference_sha256
-        or connection.authority != allocation.intent.plan.postgres.authority
-        or connection.database_name != postgres.database_name
-        or connection.application_role != postgres.application_role
-        or connection.application_password_reference_sha256
-        != transition.application_password_reference_sha256
-        or connection.prepared_operation_id != transition.prepared_operation_id
+        or primary_identity.connection_uri.authority != allocation.intent.plan.postgres.authority
+        or primary_identity.connection_uri.database_name != postgres.database_name
+        or primary_identity.connection_uri.application_role != postgres.application_role
+        or primary_identity.connection_uri.application_password_reference_sha256
+        != primary.application_password_reference_sha256
+        or primary_identity.connection_uri.prepared_operation_id != primary.prepared_operation_id
+        or restore.database_name == primary.database_name
+        or restore.database_oid == primary.database_oid
+        or restore.application_role == primary.application_role
+        or restore.application_role_oid == primary.application_role_oid
     ):
         raise AuthorizationError("materialization_postgres_transition_binding")
 
@@ -3489,6 +3702,12 @@ def _verify_start_runtime_intent_chain(
         != canonical_sha256(controls.installation_receipt)
         or evidence.secret_capability_policy_sha256 != canonical_sha256(controls.secret_capability)
         or evidence.secret_handling_policy_sha256 != canonical_sha256(controls.handling)
+        or evidence.wrapper_manifest_sha256
+        != container_bootstrap_wrapper_manifest_sha256(controls.wrapper_manifest)
+        or evidence.target_delivery_map_sha256
+        != target_delivery_map_sha256(controls.target_delivery_map)
+        or evidence.container_attach_protocol_sha256
+        != container_bootstrap_attach_protocol_sha256(controls.attach_protocol)
         or evidence.provider_material_attestation_sha256 != provider_material_attestation_sha256
         or executor_receipt.operation_scope != materialization_intent.operation_scope
         or executor_receipt.operation_id != materialization_intent.materialization_operation_id
@@ -3498,6 +3717,12 @@ def _verify_start_runtime_intent_chain(
         or executor_receipt.host_fingerprint_sha256
         != controls.executor.executor.host_fingerprint_sha256
         or executor_receipt.engine_fingerprint_sha256 != controls.executor.engine_fingerprint_sha256
+        or executor_receipt.wrapper_manifest_sha256
+        != materialization_intent.wrapper_manifest_sha256
+        or executor_receipt.target_delivery_map_sha256
+        != materialization_intent.target_delivery_map_sha256
+        or executor_receipt.container_attach_protocol_sha256
+        != materialization_intent.container_attach_protocol_sha256
         or intent.delivery_request.operation_scope != "start_runtime_v2"
         or intent.delivery_request.operation_id != intent.start_operation_id
         or intent.delivery_request.journal_uuid != intent.journal_uuid
@@ -3541,6 +3766,24 @@ def _read_materialization_control_policies(
         model_type=SecretHandlingPolicyV1,
         phase="secret_handling_policy_artifact",
     )
+    wrapper_manifest_model, wrapper_manifest_raw = _read_canonical_signed_model(
+        reader,
+        name=paths.container_wrapper_manifest_name(),
+        model_type=ContainerBootstrapWrapperManifestV1,
+        phase="container_wrapper_manifest_artifact",
+    )
+    target_delivery_map_model, target_delivery_map_raw = _read_canonical_signed_model(
+        reader,
+        name=paths.target_delivery_map_name(),
+        model_type=TargetDeliveryMapV1,
+        phase="target_delivery_map_artifact",
+    )
+    attach_protocol_model, attach_protocol_raw = _read_canonical_signed_model(
+        reader,
+        name=paths.container_attach_protocol_name(),
+        model_type=ContainerBootstrapAttachProtocolV1,
+        phase="container_attach_protocol_artifact",
+    )
     postgres_model, postgres_raw = _read_canonical_signed_model(
         reader,
         name=paths.postgres_control_policy_name(),
@@ -3581,6 +3824,9 @@ def _read_materialization_control_policies(
         or type(installation_receipt_model) is not ExecutorInstallationReceiptV1
         or type(capability_model) is not SecretCapabilityPolicyV1
         or type(handling_model) is not SecretHandlingPolicyV1
+        or type(wrapper_manifest_model) is not ContainerBootstrapWrapperManifestV1
+        or type(target_delivery_map_model) is not TargetDeliveryMapV1
+        or type(attach_protocol_model) is not ContainerBootstrapAttachProtocolV1
     ):
         raise AuthorizationError("materialization_control_policy_artifact")
     _verify_materialization_control_policy_bindings(
@@ -3591,6 +3837,9 @@ def _read_materialization_control_policies(
         postgres_prepared=postgres_prepared_model,
         secret_capability=capability_model,
         secret_handling=handling_model,
+        wrapper_manifest=wrapper_manifest_model,
+        target_delivery_map=target_delivery_map_model,
+        attach_protocol=attach_protocol_model,
         provider_material_attestation_sha256=provider_material_attestation_sha256,
         signer=signer,
     )
@@ -3623,6 +3872,9 @@ def _read_materialization_control_policies(
             installation_receipt=installation_receipt_model,
             secret_capability=capability_model,
             handling=handling_model,
+            wrapper_manifest=wrapper_manifest_model,
+            target_delivery_map=target_delivery_map_model,
+            attach_protocol=attach_protocol_model,
         ),
         {
             paths.executor_control_policy_name(): executor_raw,
@@ -3634,6 +3886,9 @@ def _read_materialization_control_policies(
             paths.executor_installation_receipt_name(): installation_receipt_raw,
             paths.secret_capability_policy_name(): capability_raw,
             paths.secret_handling_policy_name(): handling_raw,
+            paths.container_wrapper_manifest_name(): wrapper_manifest_raw,
+            paths.target_delivery_map_name(): target_delivery_map_raw,
+            paths.container_attach_protocol_name(): attach_protocol_raw,
         },
     )
 
@@ -3693,6 +3948,47 @@ def _trusted_provider_fingerprints(
     ):
         raise AuthorizationError("provider_material_attestation")
     return result[0], result[1]
+
+
+def _verify_target_delivery_map_fingerprints(
+    delivery_map: TargetDeliveryMapV1, fingerprints: Mapping[str, str]
+) -> None:
+    """Bind every local target field to the verified provider attestation."""
+
+    if type(delivery_map) is not TargetDeliveryMapV1 or type(fingerprints) is not dict:
+        raise AuthorizationError("target_delivery_map_provider_binding")
+    try:
+        material = {
+            item.reference_sha256: item.fingerprint_sha256
+            for item in delivery_map.material_fingerprints
+        }
+        required_references = {
+            delivery_map.provider_references.encryption_key.reference_sha256,
+            delivery_map.provider_references.auth_secret.reference_sha256,
+            delivery_map.provider_references.primary_valkey_password.reference_sha256,
+            delivery_map.provider_references.restore_valkey_password.reference_sha256,
+            delivery_map.provider_references.postgres_application_password.reference_sha256,
+        }
+        verified_material = {
+            reference: fingerprints[reference] for reference in required_references
+        }
+        target_fields = tuple(
+            field
+            for target in (
+                delivery_map.primary_infisical,
+                delivery_map.primary_valkey,
+                delivery_map.restore_infisical,
+                delivery_map.restore_valkey,
+            )
+            for field in target.fields
+        )
+        if material != verified_material or any(
+            field.source_fingerprint_sha256 != fingerprints[field.source_reference_sha256]
+            for field in target_fields
+        ):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise AuthorizationError("target_delivery_map_provider_binding") from None
 
 
 def _safe_call(call: Callable[[], object]) -> object:
@@ -7652,8 +7948,9 @@ def _bootstrap_inspection_matches(
         and inspection.command == template.command
         and inspection.entrypoint_sha256 == template.entrypoint_sha256
         and inspection.template_sha256 == template.template_sha256
-        and inspection.bootstrap_wrapper_sha256 == template.bootstrap_wrapper_sha256
-        and inspection.ingress_protocol_sha256 == template.ingress_protocol_sha256
+        and inspection.wrapper_manifest_sha256 == template.wrapper_manifest_sha256
+        and inspection.wrapper_artifact_binding_sha256 == template.wrapper_artifact_binding_sha256
+        and inspection.attach_protocol_sha256 == template.attach_protocol_sha256
         and inspection.create_request_sha256 == template.create_request_sha256
         and inspection.numeric_user == template.numeric_user
         and inspection.working_directory == template.working_directory
@@ -7684,6 +7981,97 @@ def _bootstrap_inspection_matches(
         and inspection.accepted_secret_sink == template.accepted_secret_sink
         and inspection.running is True
     )
+
+
+def _verify_local_attach_evidence(
+    *,
+    containers: Sequence[ExecutorContainerInspectionV1],
+    operation_scope: Literal["materialize_and_start_runtime_v1", "start_runtime_v2"],
+    operation_id: str,
+    wrapper_manifest: ContainerBootstrapWrapperManifestV1,
+    target_delivery_map: TargetDeliveryMapV1,
+    attach_protocol: ContainerBootstrapAttachProtocolV1,
+    delivery_request: SecretDeliveryRequestV1,
+    phase: str,
+) -> None:
+    """Bind each signed local-attach completion to its exact target route.
+
+    The executor's signature authenticates its nested receipt, but that alone
+    cannot make an arbitrary signed attach request appropriate for this
+    operation.  Reconstruct the four signed target routes here, then require
+    the operation, session, image, wrapper, and ordered target fields before
+    accepting a materialization or restart effect receipt.  The compact local
+    receipt cannot choose its own count, descriptors, or terminal
+    acknowledgement: those are recomputed from the signed target route.
+    """
+
+    expected_targets = (
+        target_delivery_map.primary_infisical,
+        target_delivery_map.primary_valkey,
+        target_delivery_map.restore_infisical,
+        target_delivery_map.restore_valkey,
+    )
+    wrapper_manifest_sha256 = container_bootstrap_wrapper_manifest_sha256(wrapper_manifest)
+    target_delivery_map_sha = target_delivery_map_sha256(target_delivery_map)
+    attach_protocol_sha = container_bootstrap_attach_protocol_sha256(attach_protocol)
+    if len(containers) != 4 or tuple(item.component for item in containers) != tuple(
+        target.component for target in expected_targets
+    ):
+        raise AuthorizationError(phase)
+    for item, target in zip(containers, expected_targets, strict=True):
+        expected_request = ContainerAttachRequestV1(
+            schema_version="rsd.container-attach-request.v1",
+            operation_scope=operation_scope,
+            operation_id=operation_id,
+            component=target.component,
+            container_id=item.container_id,
+            derived_image_policy_sha256=target.derived_image_policy_sha256,
+            wrapper_manifest_sha256=wrapper_manifest_sha256,
+            wrapper_artifact_binding_sha256=target.wrapper_artifact_binding_sha256,
+            attach_protocol_sha256=attach_protocol_sha,
+            target_delivery_map_sha256=target_delivery_map_sha,
+            request_nonce_sha256=delivery_request.request_nonce_sha256,
+            channel_binding_sha256=delivery_request.channel_binding_sha256,
+            session_binding_sha256=delivery_request.session_binding_sha256,
+            expected_ready_state="ready_v1",
+            expected_claim_state="claimed_v1",
+            expected_terminal_ack_state="terminal_ack_v1",
+            fields=target.fields,
+        )
+        receipt = item.attach_receipt
+        expected_request_sha256 = container_attach_request_sha256(expected_request)
+        expected_descriptors_sha256 = container_attach_chunk_descriptors_sha256(
+            expected_request.fields
+        )
+        expected_ack = ContainerAttachTerminalAckV1(
+            schema_version="rsd.container-attach-terminal-ack.v1",
+            request_sha256=expected_request_sha256,
+            state="terminal_ack_v1",
+            chunk_count=len(expected_request.fields),
+            chunk_descriptors_sha256=expected_descriptors_sha256,
+            chunks_zeroized=True,
+            persistence_allowed=False,
+            logging_allowed=False,
+            receipt_contains_secret=False,
+            eof_observed=True,
+        )
+        if (
+            receipt.component != target.component
+            or receipt.container_id != item.container_id
+            or receipt.request_sha256 != expected_request_sha256
+            or receipt.ready_state != "ready_v1"
+            or receipt.claim_state != "claimed_v1"
+            or receipt.chunk_count != len(expected_request.fields)
+            or receipt.chunk_descriptors_sha256 != expected_descriptors_sha256
+            or receipt.terminal_ack_state != "terminal_ack_v1"
+            or receipt.terminal_ack_sha256 != container_attach_ack_sha256(expected_ack)
+            or receipt.chunks_zeroized is not True
+            or receipt.persistence_allowed is not False
+            or receipt.logging_allowed is not False
+            or receipt.receipt_contains_secret is not False
+            or receipt.eof_observed is not True
+        ):
+            raise AuthorizationError(phase)
 
 
 def _verify_context_executor_operation_receipt(
@@ -7737,6 +8125,9 @@ def _validate_materialization_effect_receipt(
         or receipt.observed_allocation_attestation_sha256 != context.allocation_attestation_sha256
         or receipt.journal_uuid != intent.journal_uuid
         or receipt.idempotency_key != context.idempotency_key
+        or receipt.wrapper_manifest_sha256 != intent.wrapper_manifest_sha256
+        or receipt.target_delivery_map_sha256 != intent.target_delivery_map_sha256
+        or receipt.container_attach_protocol_sha256 != intent.container_attach_protocol_sha256
     ):
         raise AuthorizationError("materialization_effect_receipt")
     plans = (
@@ -7806,11 +8197,19 @@ def _validate_materialization_effect_receipt(
         != context.allocation_attestation_sha256
         or executor_receipt.docker_engine_control_policy_sha256
         != context.docker_engine_control_policy_sha256
+        or executor_receipt.wrapper_manifest_sha256 != intent.wrapper_manifest_sha256
+        or executor_receipt.target_delivery_map_sha256 != intent.target_delivery_map_sha256
+        or executor_receipt.container_attach_protocol_sha256
+        != intent.container_attach_protocol_sha256
         or executor_receipt.executor_id != context.executor_expectation.executor_id
         or executor_receipt.host_fingerprint_sha256
         != context.executor_expectation.host_fingerprint_sha256
         or executor_receipt.engine_fingerprint_sha256
         != context.executor_expectation.engine_fingerprint_sha256
+        or executor_receipt.wrapper_manifest_sha256 != intent.wrapper_manifest_sha256
+        or executor_receipt.target_delivery_map_sha256 != intent.target_delivery_map_sha256
+        or executor_receipt.container_attach_protocol_sha256
+        != intent.container_attach_protocol_sha256
         or executor_receipt.channel_binding_sha256 != request.channel_binding_sha256
         or executor_receipt.session_binding_sha256 != request.session_binding_sha256
         or tuple(item.container_id for item in executor_receipt.containers)
@@ -7823,38 +8222,65 @@ def _validate_materialization_effect_receipt(
         )
     ):
         raise AuthorizationError("materialization_executor_receipt")
+    _verify_local_attach_evidence(
+        containers=executor_receipt.containers,
+        operation_scope=context.operation_scope,
+        operation_id=context.materialization_operation_id,
+        wrapper_manifest=context.wrapper_manifest,
+        target_delivery_map=context.target_delivery_map,
+        attach_protocol=context.container_attach_protocol,
+        delivery_request=request,
+        phase="materialization_executor_attach_receipt",
+    )
     _verify_context_executor_operation_receipt(context, executor_receipt)
-    transition = intent.postgres_login_transition
-    transition_receipt = receipt.postgres_login_transition
-    if (
-        transition_receipt.prepared_operation_id != transition.prepared_operation_id
-        or transition_receipt.system_identifier != transition.system_identifier
-        or transition_receipt.database_name != transition.database_name
-        or transition_receipt.database_oid != transition.database_oid
-        or transition_receipt.owner_role != transition.owner_role
-        or transition_receipt.owner_role_oid != transition.owner_role_oid
-        or transition_receipt.application_role != transition.application_role
-        or transition_receipt.application_role_oid != transition.application_role_oid
-        or transition_receipt.application_password_reference_sha256
-        != transition.application_password_reference_sha256
-        or transition_receipt.prepared_control_policy_sha256
-        != context.postgres_prepared_control_policy_sha256
-        or transition_receipt.prepared_operation_result_sha256
-        != context.postgres_verifier_result_projection_sha256
-        or transition_receipt.owner_can_login is not False
-        or transition_receipt.owner_password_absent is not True
-        or transition_receipt.application_can_login is not True
-        or transition_receipt.application_password_verifier_installed is not True
-        or context.postgres_login_expectation.prepared_operation_id
-        != transition.prepared_operation_id
-        or context.postgres_login_expectation.database_oid != transition.database_oid
-        or context.postgres_login_expectation.owner_role_oid != transition.owner_role_oid
-        or context.postgres_login_expectation.application_role_oid
-        != transition.application_role_oid
-        or context.postgres_login_expectation.application_password_reference_sha256
-        != transition.application_password_reference_sha256
+    transitions = (
+        intent.postgres_login_transitions.primary_database,
+        intent.postgres_login_transitions.restore_database,
+    )
+    transition_receipts = (
+        receipt.postgres_login_transitions.primary_database,
+        receipt.postgres_login_transitions.restore_database,
+    )
+    if tuple(item.database_identity for item in context.postgres_login_expectations) != (
+        "primary_database",
+        "restore_database",
     ):
         raise AuthorizationError("materialization_postgres_transition_receipt")
+    for transition, transition_receipt, expectation, result_projection in zip(
+        transitions,
+        transition_receipts,
+        context.postgres_login_expectations,
+        context.postgres_verifier_result_projection_sha256s,
+        strict=True,
+    ):
+        if (
+            transition_receipt.database_identity != transition.database_identity
+            or transition_receipt.prepared_operation_id != transition.prepared_operation_id
+            or transition_receipt.system_identifier != transition.system_identifier
+            or transition_receipt.database_name != transition.database_name
+            or transition_receipt.database_oid != transition.database_oid
+            or transition_receipt.owner_role != transition.owner_role
+            or transition_receipt.owner_role_oid != transition.owner_role_oid
+            or transition_receipt.application_role != transition.application_role
+            or transition_receipt.application_role_oid != transition.application_role_oid
+            or transition_receipt.application_password_reference_sha256
+            != transition.application_password_reference_sha256
+            or transition_receipt.prepared_control_policy_sha256
+            != context.postgres_prepared_control_policy_sha256
+            or transition_receipt.prepared_operation_result_sha256 != result_projection
+            or transition_receipt.owner_can_login is not False
+            or transition_receipt.owner_password_absent is not True
+            or transition_receipt.application_can_login is not True
+            or transition_receipt.application_password_verifier_installed is not True
+            or expectation.database_identity != transition.database_identity
+            or expectation.prepared_operation_id != transition.prepared_operation_id
+            or expectation.database_oid != transition.database_oid
+            or expectation.owner_role_oid != transition.owner_role_oid
+            or expectation.application_role_oid != transition.application_role_oid
+            or expectation.application_password_reference_sha256
+            != transition.application_password_reference_sha256
+        ):
+            raise AuthorizationError("materialization_postgres_transition_receipt")
     delivery = receipt.delivery_receipt
     if (
         delivery.operation_scope != request.operation_scope
@@ -7868,14 +8294,14 @@ def _validate_materialization_effect_receipt(
                 delivered.purpose,
                 delivered.reference_sha256,
                 delivered.sink,
-                delivered.target_processes,
+                delivered.target_identities,
                 delivered.delivered,
             )
             != (
                 slot.purpose,
                 slot.reference_sha256,
                 slot.sink,
-                slot.target_processes,
+                slot.target_identities,
                 True,
             )
             for delivered, slot in zip(delivery.slots, request.slots, strict=True)
@@ -7981,6 +8407,16 @@ def _validate_start_runtime_effect_receipt(
         )
     ):
         raise AuthorizationError("start_runtime_executor_receipt")
+    _verify_local_attach_evidence(
+        containers=executor_receipt.containers,
+        operation_scope=context.operation_scope,
+        operation_id=context.start_operation_id,
+        wrapper_manifest=context.wrapper_manifest,
+        target_delivery_map=context.target_delivery_map,
+        attach_protocol=context.container_attach_protocol,
+        delivery_request=request,
+        phase="start_runtime_executor_attach_receipt",
+    )
     _verify_context_start_runtime_executor_receipt(context, executor_receipt)
     delivery = receipt.delivery_receipt
     if (
@@ -7995,14 +8431,14 @@ def _validate_start_runtime_effect_receipt(
                 delivered.purpose,
                 delivered.reference_sha256,
                 delivered.sink,
-                delivered.target_processes,
+                delivered.target_identities,
                 delivered.delivered,
             )
             != (
                 slot.purpose,
                 slot.reference_sha256,
                 slot.sink,
-                slot.target_processes,
+                slot.target_identities,
                 True,
             )
             for delivered, slot in zip(delivery.slots, request.slots, strict=True)
@@ -8349,7 +8785,7 @@ def _postgres_login_transition_commitment(
     lease: PostgreSQLLoginTransitionLease,
     policy: PostgreSQLControlPolicyV1,
     transition: PostgreSQLLoginTransitionIntentV1,
-    connection: EphemeralPostgreSQLConnectionPolicyV1,
+    connection: PostgreSQLConnectionUriGrammarV1,
     *,
     recheck: bool,
 ) -> tuple[str, PostgreSQLLoginTransitionExpectationV1]:
@@ -8373,6 +8809,7 @@ def _postgres_login_transition_commitment(
         or type(provenance.capability_fingerprint_sha256) is not str
         or provenance.authority != policy.authority
         or provenance.authority != connection.authority
+        or transition.database_identity != connection.database_identity
         or provenance.system_identifier != transition.system_identifier
         or provenance.database_oid != transition.database_oid
         or provenance.owner_role_oid != transition.owner_role_oid
@@ -8386,6 +8823,7 @@ def _postgres_login_transition_commitment(
     ):
         raise AuthorizationError("postgres_login_transition_provenance")
     expectation = PostgreSQLLoginTransitionExpectationV1(
+        database_identity=transition.database_identity,
         authority=provenance.authority,
         system_identifier=provenance.system_identifier,
         database_oid=provenance.database_oid,
@@ -8396,6 +8834,52 @@ def _postgres_login_transition_commitment(
         capability_fingerprint_sha256=provenance.capability_fingerprint_sha256,
     )
     return _digest(_canonical_json_bytes(expectation.model_dump(mode="json"))), expectation
+
+
+def _postgres_login_transitions_commitment(
+    lease: PostgreSQLLoginTransitionLease,
+    policy: PostgreSQLControlPolicyV1,
+    transitions: PostgreSQLLoginTransitionIntentsV1,
+    identities: PostgreSQLRuntimeDatabaseIdentitiesV1,
+    *,
+    recheck: bool,
+) -> tuple[
+    str,
+    tuple[PostgreSQLLoginTransitionExpectationV1, PostgreSQLLoginTransitionExpectationV1],
+]:
+    """Commit the two independent observed-OID transitions as one ordered lease proof."""
+
+    pairs = (
+        (transitions.primary_database, identities.primary_database.connection_uri),
+        (transitions.restore_database, identities.restore_database.connection_uri),
+    )
+    if (
+        transitions.primary_database != identities.primary_database.login_transition
+        or transitions.restore_database != identities.restore_database.login_transition
+    ):
+        raise AuthorizationError("postgres_login_transition_provenance")
+    results = tuple(
+        _postgres_login_transition_commitment(
+            lease,
+            policy,
+            transition,
+            connection,
+            recheck=recheck,
+        )
+        for transition, connection in pairs
+    )
+    commitments = tuple(item[0] for item in results)
+    expectations = cast(
+        tuple[PostgreSQLLoginTransitionExpectationV1, PostgreSQLLoginTransitionExpectationV1],
+        tuple(item[1] for item in results),
+    )
+    if (
+        tuple(item.database_identity for item in expectations)
+        != ("primary_database", "restore_database")
+        or len(set(commitments)) != 2
+    ):
+        raise AuthorizationError("postgres_login_transition_provenance")
+    return _digest(_canonical_json_bytes({"commitments": commitments})), expectations
 
 
 def _secret_material_commitment(
@@ -9430,6 +9914,9 @@ def _run_materialization_authorization(
     materialization_intent: MaterializationIntentV1,
     secret_capability_policy: SecretCapabilityPolicyV1,
     secret_handling_policy: SecretHandlingPolicyV1,
+    wrapper_manifest: ContainerBootstrapWrapperManifestV1,
+    target_delivery_map: TargetDeliveryMapV1,
+    container_attach_protocol: ContainerBootstrapAttachProtocolV1,
     provider: ProviderProvenanceAdapter,
     expected_disposal_owner: str,
     expected_approver_identity: str,
@@ -9455,6 +9942,9 @@ def _run_materialization_authorization(
         or type(materialization_intent) is not MaterializationIntentV1
         or type(secret_capability_policy) is not SecretCapabilityPolicyV1
         or type(secret_handling_policy) is not SecretHandlingPolicyV1
+        or type(wrapper_manifest) is not ContainerBootstrapWrapperManifestV1
+        or type(target_delivery_map) is not TargetDeliveryMapV1
+        or type(container_attach_protocol) is not ContainerBootstrapAttachProtocolV1
         or type(journal) is not SQLiteAllocationJournal
         or type(replay_policy) is not ReplayAuthorityPolicyV1
     ):
@@ -9483,6 +9973,9 @@ def _run_materialization_authorization(
     )
     _verify_secret_capability_policy_signature(secret_capability_policy, signer=signer)
     _verify_secret_handling_policy_signature(secret_handling_policy, signer=signer)
+    _verify_container_wrapper_manifest_signature(wrapper_manifest, signer=signer)
+    _verify_target_delivery_map_signature(target_delivery_map, signer=signer)
+    _verify_container_attach_protocol_signature(container_attach_protocol, signer=signer)
     replay_policy = cast(
         ReplayAuthorityPolicyV1,
         _canonical_artifact_model(
@@ -9555,6 +10048,25 @@ def _run_materialization_authorization(
             ),
             phase="secret_handling_policy_artifact",
         )
+        artifact_lease.write_once_or_require_exact(
+            paths.container_wrapper_manifest_name(),
+            _signed_model_artifact_bytes(
+                wrapper_manifest, phase="container_wrapper_manifest_artifact"
+            ),
+            phase="container_wrapper_manifest_artifact",
+        )
+        artifact_lease.write_once_or_require_exact(
+            paths.target_delivery_map_name(),
+            _signed_model_artifact_bytes(target_delivery_map, phase="target_delivery_map_artifact"),
+            phase="target_delivery_map_artifact",
+        )
+        artifact_lease.write_once_or_require_exact(
+            paths.container_attach_protocol_name(),
+            _signed_model_artifact_bytes(
+                container_attach_protocol, phase="container_attach_protocol_artifact"
+            ),
+            phase="container_attach_protocol_artifact",
+        )
         persisted_intent_model, persisted_intent_raw = _read_canonical_signed_model(
             artifact_lease.reader(),
             name=paths.materialization_intent_name(),
@@ -9568,14 +10080,6 @@ def _run_materialization_authorization(
             persisted_intent_raw, _materialization_intent_artifact_bytes(materialization_intent)
         ):
             raise AuthorizationError("materialization_intent_artifact")
-        _verify_materialization_intent_chain(
-            allocation=allocation_stage,
-            intent=persisted_intent_model,
-            replay_policy=replay_policy,
-            expected_disposal_owner=expected_disposal_owner,
-            expected_approver_identity=expected_approver_identity,
-            now=_system_utc_clock(),
-        )
         fingerprints, material_snapshot = _trusted_provider_fingerprints(
             signer=signer,
             allocation_intent=verified_allocation.intent,
@@ -9597,8 +10101,21 @@ def _run_materialization_authorization(
         if (
             controls.secret_capability != secret_capability_policy
             or controls.handling != secret_handling_policy
+            or controls.wrapper_manifest != wrapper_manifest
+            or controls.target_delivery_map != target_delivery_map
+            or controls.attach_protocol != container_attach_protocol
         ):
             raise AuthorizationError("materialization_control_policy_artifact")
+        _verify_materialization_intent_chain(
+            allocation=allocation_stage,
+            intent=persisted_intent_model,
+            target_delivery_map=controls.target_delivery_map,
+            replay_policy=replay_policy,
+            expected_disposal_owner=expected_disposal_owner,
+            expected_approver_identity=expected_approver_identity,
+            now=_system_utc_clock(),
+        )
+        _verify_target_delivery_map_fingerprints(controls.target_delivery_map, fingerprints)
         references = verified_allocation.intent.provider_references.all()
         provider_manager, provider_lease = _acquire_provider_lease(provider, references)
         executor_manager: object | None = None
@@ -9617,8 +10134,8 @@ def _run_materialization_authorization(
                 postgres_login_transition,
                 controls.postgres,
                 phase="postgres_login_transition_provenance",
-                secondary_policy=persisted_intent_model.postgres_login_transition,
-                tertiary_policy=persisted_intent_model.ephemeral_postgres_connection,
+                secondary_policy=persisted_intent_model.postgres_login_transitions,
+                tertiary_policy=controls.target_delivery_map.database_identities,
             )
             secret_manager, secret_lease = _acquire_control_lease(
                 secret_material,
@@ -9635,12 +10152,12 @@ def _run_materialization_authorization(
             initial_executor_sha256, executor_expectation = _executor_control_commitment(
                 cast(ExecutorControlLease, executor_lease), controls.executor, recheck=False
             )
-            initial_postgres_login_sha256, postgres_login_expectation = (
-                _postgres_login_transition_commitment(
+            initial_postgres_login_sha256, postgres_login_expectations = (
+                _postgres_login_transitions_commitment(
                     cast(PostgreSQLLoginTransitionLease, postgres_login_lease),
                     controls.postgres,
-                    persisted_intent_model.postgres_login_transition,
-                    persisted_intent_model.ephemeral_postgres_connection,
+                    persisted_intent_model.postgres_login_transitions,
+                    controls.target_delivery_map.database_identities,
                     recheck=False,
                 )
             )
@@ -9712,12 +10229,12 @@ def _run_materialization_authorization(
             final_executor_sha256, final_executor_expectation = _executor_control_commitment(
                 cast(ExecutorControlLease, executor_lease), controls.executor, recheck=True
             )
-            final_postgres_login_sha256, final_postgres_login_expectation = (
-                _postgres_login_transition_commitment(
+            final_postgres_login_sha256, final_postgres_login_expectations = (
+                _postgres_login_transitions_commitment(
                     cast(PostgreSQLLoginTransitionLease, postgres_login_lease),
                     controls.postgres,
-                    persisted_intent_model.postgres_login_transition,
-                    persisted_intent_model.ephemeral_postgres_connection,
+                    persisted_intent_model.postgres_login_transitions,
+                    controls.target_delivery_map.database_identities,
                     recheck=True,
                 )
             )
@@ -9739,7 +10256,7 @@ def _run_materialization_authorization(
                 or initial_executor_sha256 != final_executor_sha256
                 or executor_expectation != final_executor_expectation
                 or initial_postgres_login_sha256 != final_postgres_login_sha256
-                or postgres_login_expectation != final_postgres_login_expectation
+                or postgres_login_expectations != final_postgres_login_expectations
                 or initial_secret_sha256 != final_secret_sha256
                 or secret_expectation != final_secret_expectation
                 or initial_delivery_sha256 != final_delivery_sha256
@@ -9765,15 +10282,19 @@ def _run_materialization_authorization(
                     controls.executor.executor.attestation_public_key_fingerprint_sha256
                 ),
                 docker_engine_control_policy_sha256=canonical_sha256(controls.docker),
-                postgres_login_expectation=final_postgres_login_expectation,
+                postgres_login_expectations=final_postgres_login_expectations,
                 postgres_prepared_control_policy_sha256=canonical_sha256(
                     controls.postgres_prepared
                 ),
-                postgres_verifier_result_projection_sha256=(
-                    controls.postgres_prepared.operations[1].result_projection_sha256
+                postgres_verifier_result_projection_sha256s=(
+                    controls.postgres_prepared.operations[1].result_projection_sha256,
+                    controls.postgres_prepared.operations[2].result_projection_sha256,
                 ),
                 secret_material_expectation=final_secret_expectation,
                 secret_handling_policy_sha256=canonical_sha256(controls.handling),
+                wrapper_manifest=controls.wrapper_manifest,
+                target_delivery_map=controls.target_delivery_map,
+                container_attach_protocol=controls.attach_protocol,
                 secret_delivery_request=persisted_intent_model.secret_delivery_request,
                 materialization_intent_sha256=materialization_intent_sha256(persisted_intent_model),
                 idempotency_key=_materialization_idempotency_key(
@@ -9861,11 +10382,11 @@ def _run_materialization_authorization(
                     )
                 )
                 post_postgres_login = _safe_call(
-                    lambda: _postgres_login_transition_commitment(
+                    lambda: _postgres_login_transitions_commitment(
                         cast(PostgreSQLLoginTransitionLease, postgres_login_lease),
                         controls.postgres,
-                        persisted_intent_model.postgres_login_transition,
-                        persisted_intent_model.ephemeral_postgres_connection,
+                        persisted_intent_model.postgres_login_transitions,
+                        controls.target_delivery_map.database_identities,
                         recheck=True,
                     )
                 )
@@ -9897,7 +10418,7 @@ def _run_materialization_authorization(
                     post_provider != (final_provider_sha256, final_expectations)
                     or post_executor != (final_executor_sha256, final_executor_expectation)
                     or post_postgres_login
-                    != (final_postgres_login_sha256, final_postgres_login_expectation)
+                    != (final_postgres_login_sha256, final_postgres_login_expectations)
                     or post_secret != (final_secret_sha256, final_secret_expectation)
                     or post_delivery != final_delivery_sha256
                     or post_controls != (controls, control_snapshot)
@@ -9970,6 +10491,9 @@ def authorize_materialization_and_execute(
     materialization_intent: MaterializationIntentV1,
     secret_capability_policy: SecretCapabilityPolicyV1,
     secret_handling_policy: SecretHandlingPolicyV1,
+    wrapper_manifest: ContainerBootstrapWrapperManifestV1,
+    target_delivery_map: TargetDeliveryMapV1,
+    container_attach_protocol: ContainerBootstrapAttachProtocolV1,
     provider: ProviderProvenanceAdapter,
     expected_disposal_owner: str,
     expected_approver_identity: str,
@@ -9990,6 +10514,9 @@ def authorize_materialization_and_execute(
         materialization_intent=materialization_intent,
         secret_capability_policy=secret_capability_policy,
         secret_handling_policy=secret_handling_policy,
+        wrapper_manifest=wrapper_manifest,
+        target_delivery_map=target_delivery_map,
+        container_attach_protocol=container_attach_protocol,
         provider=provider,
         expected_disposal_owner=expected_disposal_owner,
         expected_approver_identity=expected_approver_identity,
@@ -10349,6 +10876,9 @@ def _run_start_runtime_authorization(
                 ),
                 secret_material_expectation=final_secret_expectation,
                 secret_handling_policy_sha256=canonical_sha256(controls.handling),
+                wrapper_manifest=controls.wrapper_manifest,
+                target_delivery_map=controls.target_delivery_map,
+                container_attach_protocol=controls.attach_protocol,
                 secret_delivery_request=persisted_start.delivery_request,
                 start_runtime_intent_sha256=start_runtime_intent_sha256(persisted_start),
                 idempotency_key=_start_runtime_idempotency_key(
@@ -11358,3 +11888,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
+    database_identity: Literal["primary_database", "restore_database"]

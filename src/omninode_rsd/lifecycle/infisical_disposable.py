@@ -46,6 +46,17 @@ _VOLUME_INSTANCE_FINGERPRINT_DOMAIN: Final = (
 )
 _UNIX_SOCKET_IDENTITY_DOMAIN: Final = b"omninode-rsd.docker-unix-socket-identity.sha256.v1\x00"
 _CREATE_TEMPLATE_DOMAIN: Final = b"omninode-rsd.docker-create-template.sha256.v1\x00"
+_WRAPPER_ARTIFACT_DOMAIN: Final = b"omninode-rsd.container-wrapper-artifact.sha256.v1\x00"
+_WRAPPER_MANIFEST_DOMAIN: Final = b"omninode-rsd.container-wrapper-manifest.sha256.v1\x00"
+_LOCAL_ATTACH_PROTOCOL_DOMAIN: Final = b"omninode-rsd.container-attach-protocol.sha256.v1\x00"
+_TARGET_DELIVERY_MAP_DOMAIN: Final = b"omninode-rsd.target-delivery-map.sha256.v1\x00"
+_URI_GRAMMAR_DOMAIN: Final = b"omninode-rsd.runtime-uri-grammar.sha256.v1\x00"
+_LOCAL_ATTACH_REQUEST_DOMAIN: Final = b"omninode-rsd.container-attach-request.sha256.v1\x00"
+_LOCAL_ATTACH_ACK_DOMAIN: Final = b"omninode-rsd.container-attach-ack.sha256.v1\x00"
+_LOCAL_ATTACH_CHUNK_DESCRIPTORS_DOMAIN: Final = (
+    b"omninode-rsd.container-attach-chunk-descriptors.sha256.v1\x00"
+)
+_LOCAL_ATTACH_RECEIPT_DOMAIN: Final = b"omninode-rsd.container-attach-receipt.sha256.v1\x00"
 _ALLOCATION_EXECUTOR_RECEIPT_DOMAIN: Final = (
     b"omninode-rsd.allocation-executor-receipt.ed25519.v1\x00"
 )
@@ -1134,6 +1145,9 @@ class ExecutorInstallationPolicyV1(_Model):
     package_sha256: str = Field(pattern=_SHA256)
     executable_sha256: str = Field(pattern=_SHA256)
     template_bundle_sha256: str = Field(pattern=_SHA256)
+    wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    target_delivery_map_sha256: str = Field(pattern=_SHA256)
+    container_attach_protocol_sha256: str = Field(pattern=_SHA256)
     systemd_unit_sha256: str = Field(pattern=_SHA256)
     unix_socket_policy_sha256: str = Field(pattern=_SHA256)
     allowed_host_fingerprint_sha256: str = Field(pattern=_SHA256)
@@ -1178,6 +1192,9 @@ class ExecutorInstallationPolicyV1(_Model):
             self.package_sha256,
             self.executable_sha256,
             self.template_bundle_sha256,
+            self.wrapper_manifest_sha256,
+            self.target_delivery_map_sha256,
+            self.container_attach_protocol_sha256,
             self.systemd_unit_sha256,
             self.unix_socket_policy_sha256,
             self.allowed_host_fingerprint_sha256,
@@ -1572,7 +1589,11 @@ class PostgreSQLPreparedOperationV1(_Model):
     """One fixed psql stdin template and its value-free result projection."""
 
     operation_id: str = Field(pattern=_UUID)
-    kind: Literal["allocation_nologin_v1", "install_scram_verifier_v1"]
+    kind: Literal[
+        "allocation_nologin_v1",
+        "install_primary_scram_verifier_v1",
+        "install_restore_scram_verifier_v1",
+    ]
     psql_template_sha256: str = Field(pattern=_SHA256)
     result_projection_sha256: str = Field(pattern=_SHA256)
     stdin_protocol: Literal["postgresql_prepared_psql_stdin_v1"]
@@ -1582,7 +1603,11 @@ class PostgreSQLPreparedOperationV1(_Model):
     def exact_operation_shape(self) -> Self:
         if (
             (self.kind == "allocation_nologin_v1" and self.secret_input is not False)
-            or (self.kind == "install_scram_verifier_v1" and self.secret_input is not True)
+            or (
+                self.kind
+                in ("install_primary_scram_verifier_v1", "install_restore_scram_verifier_v1")
+                and self.secret_input is not True
+            )
             or self.psql_template_sha256 == self.result_projection_sha256
         ):
             raise ValueError("PostgreSQL prepared operation is invalid")
@@ -1598,6 +1623,7 @@ class PostgreSQLScramVerifierInstallV1(_Model):
     """
 
     schema_version: Literal["rsd.postgresql-scram-verifier-install.v1"]
+    database_identity: Literal["primary_database", "restore_database"]
     prepared_operation_id: str = Field(pattern=_UUID)
     application_password_reference_sha256: str = Field(pattern=_SHA256)
     algorithm: Literal["scram-sha-256"]
@@ -1611,6 +1637,26 @@ class PostgreSQLScramVerifierInstallV1(_Model):
     output_in_receipt_allowed: Literal[False]
     logs_allowed: Literal[False]
     template_sha256: str = Field(pattern=_SHA256)
+
+
+class PostgreSQLScramVerifierInstallsV1(_Model):
+    """Independent verifier-only sinks for the primary and restore databases."""
+
+    primary_database: PostgreSQLScramVerifierInstallV1
+    restore_database: PostgreSQLScramVerifierInstallV1
+
+    @model_validator(mode="after")
+    def independent_sinks(self) -> Self:
+        primary = self.primary_database
+        restore = self.restore_database
+        if (
+            primary.database_identity != "primary_database"
+            or restore.database_identity != "restore_database"
+            or primary.prepared_operation_id == restore.prepared_operation_id
+            or primary.template_sha256 == restore.template_sha256
+        ):
+            raise ValueError("PostgreSQL SCRAM verifier sinks are invalid")
+        return self
 
 
 class PostgreSQLPreparedControlPolicyV2(_Model):
@@ -1632,8 +1678,12 @@ class PostgreSQLPreparedControlPolicyV2(_Model):
     system_identifier: str = Field(pattern=r"^[0-9]{8,32}$")
     password_encryption: Literal["scram-sha-256"]
     statement_logging: Literal["disabled"]
-    operations: tuple[PostgreSQLPreparedOperationV1, PostgreSQLPreparedOperationV1]
-    scram_verifier_install: PostgreSQLScramVerifierInstallV1
+    operations: tuple[
+        PostgreSQLPreparedOperationV1,
+        PostgreSQLPreparedOperationV1,
+        PostgreSQLPreparedOperationV1,
+    ]
+    scram_verifier_installs: PostgreSQLScramVerifierInstallsV1
     created_at: str
     signer_key_id: str = Field(pattern=_IDENTIFIER)
     signature_base64: str = Field(min_length=4, max_length=256)
@@ -1651,23 +1701,36 @@ class PostgreSQLPreparedControlPolicyV2(_Model):
 
     @model_validator(mode="after")
     def exact_prepared_control(self) -> Self:
-        allocation, verifier = self.operations
+        allocation, primary_verifier, restore_verifier = self.operations
         values = (
             self.control_config_sha256,
             self.unix_socket_identity_sha256,
             self.psql_binary_sha256,
             allocation.psql_template_sha256,
             allocation.result_projection_sha256,
-            verifier.psql_template_sha256,
-            verifier.result_projection_sha256,
+            primary_verifier.psql_template_sha256,
+            primary_verifier.result_projection_sha256,
+            restore_verifier.psql_template_sha256,
+            restore_verifier.result_projection_sha256,
         )
         if (
             tuple(item.kind for item in self.operations)
-            != ("allocation_nologin_v1", "install_scram_verifier_v1")
+            != (
+                "allocation_nologin_v1",
+                "install_primary_scram_verifier_v1",
+                "install_restore_scram_verifier_v1",
+            )
             or allocation.secret_input is not False
-            or verifier.secret_input is not True
-            or verifier.operation_id != self.scram_verifier_install.prepared_operation_id
-            or verifier.psql_template_sha256 != self.scram_verifier_install.template_sha256
+            or primary_verifier.secret_input is not True
+            or restore_verifier.secret_input is not True
+            or primary_verifier.operation_id
+            != self.scram_verifier_installs.primary_database.prepared_operation_id
+            or primary_verifier.psql_template_sha256
+            != self.scram_verifier_installs.primary_database.template_sha256
+            or restore_verifier.operation_id
+            != self.scram_verifier_installs.restore_database.prepared_operation_id
+            or restore_verifier.psql_template_sha256
+            != self.scram_verifier_installs.restore_database.template_sha256
             or self.fixed_psql_argv
             != (
                 self.psql_absolute_path,
@@ -1776,11 +1839,15 @@ class SecretHandlingPolicyV1(_Model):
     capability_fingerprint_sha256: str = Field(pattern=_SHA256)
     infisical_target_processes: tuple[Literal["primary_infisical"], Literal["restore_infisical"]]
     valkey_stdin_config_processes: tuple[Literal["primary_valkey"], Literal["restore_valkey"]]
-    postgres_application_target_processes: tuple[Literal["postgres_application_target"]]
+    postgres_uri_target_processes: tuple[Literal["primary_infisical"], Literal["restore_infisical"]]
+    valkey_uri_target_processes: tuple[Literal["primary_infisical"], Literal["restore_infisical"]]
     infisical_target_process_environment_allowed: Literal[True]
     valkey_stdin_config_allowed: Literal[True]
-    postgres_application_target_process_environment_allowed: Literal[True]
+    postgres_uri_target_process_environment_allowed: Literal[True]
+    valkey_uri_target_process_environment_allowed: Literal[True]
     postgres_connection_uri_environment_variable: Literal["DB_CONNECTION_URI"]
+    valkey_connection_uri_environment_variable: Literal["REDIS_URL"]
+    valkey_stdin_configuration_directive: Literal["requirepass"]
     postgres_scram_verifier_executor_derivation_allowed: Literal[True]
     postgres_scram_verifier_psql_stdin_allowed: Literal[True]
     postgres_plaintext_password_to_psql_allowed: Literal[False]
@@ -1805,7 +1872,8 @@ class SecretHandlingPolicyV1(_Model):
     @field_validator(
         "infisical_target_processes",
         "valkey_stdin_config_processes",
-        "postgres_application_target_processes",
+        "postgres_uri_target_processes",
+        "valkey_uri_target_processes",
         mode="before",
     )
     @classmethod
@@ -1829,10 +1897,12 @@ class SecretHandlingPolicyV1(_Model):
         if (
             self.infisical_target_processes != ("primary_infisical", "restore_infisical")
             or self.valkey_stdin_config_processes != ("primary_valkey", "restore_valkey")
-            or self.postgres_application_target_processes != ("postgres_application_target",)
+            or self.postgres_uri_target_processes != ("primary_infisical", "restore_infisical")
+            or self.valkey_uri_target_processes != ("primary_infisical", "restore_infisical")
             or self.infisical_target_process_environment_allowed is not True
             or self.valkey_stdin_config_allowed is not True
-            or self.postgres_application_target_process_environment_allowed is not True
+            or self.postgres_uri_target_process_environment_allowed is not True
+            or self.valkey_uri_target_process_environment_allowed is not True
             or self.postgres_scram_verifier_executor_derivation_allowed is not True
             or self.postgres_scram_verifier_psql_stdin_allowed is not True
             or self.postgres_plaintext_password_to_psql_allowed is not False
@@ -2426,6 +2496,7 @@ class PostgreSQLLoginTransitionIntentV1(_Model):
 
     schema_version: Literal["rsd.postgresql-login-transition-intent.v1"]
     transition_kind: Literal["enable_application_login_with_provider_verifier_v1"]
+    database_identity: Literal["primary_database", "restore_database"]
     prepared_operation_id: str = Field(pattern=_UUID)
     system_identifier: str = Field(pattern=r"^[0-9]{8,32}$")
     database_name: str = Field(pattern=_IDENTIFIER)
@@ -2447,6 +2518,7 @@ class PostgreSQLLoginTransitionIntentV1(_Model):
         if (
             self.owner_role == self.application_role
             or self.owner_role_oid == self.application_role_oid
+            or self.scram_verifier_install.database_identity != self.database_identity
             or self.scram_verifier_install.prepared_operation_id != self.prepared_operation_id
             or self.scram_verifier_install.application_password_reference_sha256
             != self.application_password_reference_sha256
@@ -2459,6 +2531,7 @@ class PostgreSQLLoginTransitionReceiptV1(_Model):
     """Value-free effect evidence for the one prepared login transition."""
 
     schema_version: Literal["rsd.postgresql-login-transition-receipt.v1"]
+    database_identity: Literal["primary_database", "restore_database"]
     prepared_operation_id: str = Field(pattern=_UUID)
     system_identifier: str = Field(pattern=r"^[0-9]{8,32}$")
     database_name: str = Field(pattern=_IDENTIFIER)
@@ -2486,17 +2559,75 @@ class PostgreSQLLoginTransitionReceiptV1(_Model):
         return self
 
 
-class EphemeralPostgreSQLConnectionPolicyV1(_Model):
-    """Bounded URI assembly contract; no URI can leave the trusted effect."""
+def postgresql_connection_uri_rendered_byte_count(
+    *, authority: str, application_role: str, database_name: str
+) -> int:
+    """Return the exact URI size without ever assembling a provider value.
 
-    schema_version: Literal["rsd.postgresql-ephemeral-connection-policy.v1"]
+    The password placeholder has the fixed canonical Base64URL width of the
+    approved application-password material.  This is a grammar commitment,
+    not a URI and not a value-derived fingerprint.
+    """
+
+    parsed = urlsplit(authority)
+    if parsed.scheme != "postgresql" or parsed.hostname is None or parsed.port is None:
+        raise ValueError("PostgreSQL URI grammar is invalid")
+    return (
+        len("postgresql:")
+        + len("//")
+        + len(application_role)
+        + 1  # credential delimiter
+        + 43  # canonical unpadded Base64URL application-password width
+        + 1  # authority delimiter
+        + len(parsed.hostname)
+        + 1  # port delimiter
+        + len(str(parsed.port))
+        + 1  # database path delimiter
+        + len(database_name)
+    )
+
+
+def valkey_connection_uri_rendered_byte_count(*, authority: str, database_index: int) -> int:
+    """Return the exact Valkey URI size without constructing its password."""
+
+    parsed = urlsplit(authority)
+    if parsed.scheme != "redis" or parsed.hostname is None or parsed.port is None:
+        raise ValueError("Valkey URI grammar is invalid")
+    return (
+        len("redis:")
+        + len("//")
+        + 1  # empty username delimiter
+        + 43  # canonical unpadded Base64URL Valkey password width
+        + 1  # authority delimiter
+        + len(parsed.hostname)
+        + 1  # port delimiter
+        + len(str(parsed.port))
+        + 1  # database path delimiter
+        + len(str(database_index))
+    )
+
+
+class PostgreSQLConnectionUriGrammarV1(_Model):
+    """Value-free exact grammar for one target-only PostgreSQL URI.
+
+    A future effect may construct this URI only in its bounded memory and
+    place it only in the named target-process environment.  The model never
+    stores, returns, fingerprints, or serializes the resulting URI.
+    """
+
+    schema_version: Literal["rsd.postgresql-connection-uri-grammar.v1"]
+    database_identity: Literal["primary_database", "restore_database"]
     authority: str
     database_name: str = Field(pattern=_IDENTIFIER)
     application_role: str = Field(pattern=_IDENTIFIER)
     application_password_reference_sha256: str = Field(pattern=_SHA256)
     prepared_operation_id: str = Field(pattern=_UUID)
-    target_process: Literal["postgres_application_target"]
+    target_process: Literal["primary_infisical", "restore_infisical"]
     environment_variable: Literal["DB_CONNECTION_URI"]
+    uri_grammar: Literal["postgresql_user_password_authority_database_v1"]
+    application_password_format: Literal["postgres_application_password_base64url_32_v1"]
+    application_password_encoded_byte_count: Literal[43]
+    rendered_uri_byte_count: int = Field(ge=1, le=1024)
     return_uri_allowed: Literal[False]
     persistent_storage_allowed: Literal[False]
     logging_allowed: Literal[False]
@@ -2506,6 +2637,167 @@ class EphemeralPostgreSQLConnectionPolicyV1(_Model):
     @classmethod
     def canonical_postgres(cls, value: str) -> str:
         return _authority(value, schemes=frozenset({"postgresql"}))
+
+    @model_validator(mode="after")
+    def exact_value_free_grammar(self) -> Self:
+        expected_target = (
+            "primary_infisical"
+            if self.database_identity == "primary_database"
+            else "restore_infisical"
+        )
+        if (
+            self.target_process != expected_target
+            or self.rendered_uri_byte_count
+            != postgresql_connection_uri_rendered_byte_count(
+                authority=self.authority,
+                application_role=self.application_role,
+                database_name=self.database_name,
+            )
+        ):
+            raise ValueError("PostgreSQL URI grammar is invalid")
+        return self
+
+
+class ValkeyConnectionUriGrammarV1(_Model):
+    """Value-free exact grammar for an Infisical-to-Valkey target URI."""
+
+    schema_version: Literal["rsd.valkey-connection-uri-grammar.v1"]
+    cache_identity: Literal["primary_valkey", "restore_valkey"]
+    authority: str
+    database_index: int = Field(ge=0, le=15)
+    password_reference_sha256: str = Field(pattern=_SHA256)
+    target_process: Literal["primary_infisical", "restore_infisical"]
+    environment_variable: Literal["REDIS_URL"]
+    uri_grammar: Literal["redis_password_authority_database_v1"]
+    password_format: Literal["valkey_password_base64url_32_v1"]
+    password_encoded_byte_count: Literal[43]
+    rendered_uri_byte_count: int = Field(ge=1, le=1024)
+    return_uri_allowed: Literal[False]
+    persistent_storage_allowed: Literal[False]
+    logging_allowed: Literal[False]
+    public_artifact_allowed: Literal[False]
+
+    @field_validator("authority")
+    @classmethod
+    def canonical_valkey(cls, value: str) -> str:
+        return _authority(value, schemes=frozenset({"redis"}))
+
+    @model_validator(mode="after")
+    def exact_value_free_grammar(self) -> Self:
+        expected_target = (
+            "primary_infisical" if self.cache_identity == "primary_valkey" else "restore_infisical"
+        )
+        if (
+            self.target_process != expected_target
+            or self.rendered_uri_byte_count
+            != valkey_connection_uri_rendered_byte_count(
+                authority=self.authority, database_index=self.database_index
+            )
+        ):
+            raise ValueError("Valkey URI grammar is invalid")
+        return self
+
+
+def runtime_connection_uri_grammar_sha256(
+    grammar: PostgreSQLConnectionUriGrammarV1 | ValkeyConnectionUriGrammarV1,
+) -> str:
+    """Commit one value-free target URI grammar under its explicit domain.
+
+    This helper intentionally accepts only the two concrete grammar models.
+    It never renders a URI and therefore cannot acquire a copy of a password.
+    """
+
+    if type(grammar) not in {PostgreSQLConnectionUriGrammarV1, ValkeyConnectionUriGrammarV1}:
+        raise ValueError("runtime URI grammar is invalid")
+    return _domain_sha256(_URI_GRAMMAR_DOMAIN, grammar)
+
+
+class PostgreSQLRuntimeDatabaseIdentityV1(_Model):
+    """One observed-OID-bound database transition and target URI grammar."""
+
+    database_identity: Literal["primary_database", "restore_database"]
+    observation_binding_sha256: str = Field(pattern=_SHA256)
+    login_transition: PostgreSQLLoginTransitionIntentV1
+    connection_uri: PostgreSQLConnectionUriGrammarV1
+
+    @model_validator(mode="after")
+    def exact_observed_identity(self) -> Self:
+        if (
+            self.login_transition.database_identity != self.database_identity
+            or self.connection_uri.database_identity != self.database_identity
+            or self.connection_uri.database_name != self.login_transition.database_name
+            or self.connection_uri.application_role != self.login_transition.application_role
+            or self.connection_uri.application_password_reference_sha256
+            != self.login_transition.application_password_reference_sha256
+            or self.connection_uri.prepared_operation_id
+            != self.login_transition.prepared_operation_id
+        ):
+            raise ValueError("PostgreSQL runtime identity is invalid")
+        return self
+
+
+class PostgreSQLRuntimeDatabaseIdentitiesV1(_Model):
+    """The primary and restore identities must remain independent.
+
+    The currently implemented allocation stage observes only the primary
+    stage database.  A restore identity is still modeled separately here so a
+    future restore observation cannot be replaced by the primary route.
+    """
+
+    primary_database: PostgreSQLRuntimeDatabaseIdentityV1
+    restore_database: PostgreSQLRuntimeDatabaseIdentityV1
+
+    @model_validator(mode="after")
+    def independent_database_identities(self) -> Self:
+        primary = self.primary_database.login_transition
+        restore = self.restore_database.login_transition
+        if (
+            self.primary_database.database_identity != "primary_database"
+            or self.restore_database.database_identity != "restore_database"
+            or primary.database_name == restore.database_name
+            or primary.database_oid == restore.database_oid
+            or primary.application_role == restore.application_role
+            or primary.application_role_oid == restore.application_role_oid
+            or primary.prepared_operation_id == restore.prepared_operation_id
+            or self.primary_database.observation_binding_sha256
+            == self.restore_database.observation_binding_sha256
+        ):
+            raise ValueError("PostgreSQL runtime identities are invalid")
+        return self
+
+
+class PostgreSQLLoginTransitionIntentsV1(_Model):
+    """Canonical primary/restore transition set exposed to a bounded lease."""
+
+    primary_database: PostgreSQLLoginTransitionIntentV1
+    restore_database: PostgreSQLLoginTransitionIntentV1
+
+    @model_validator(mode="after")
+    def exact_transition_set(self) -> Self:
+        if (
+            self.primary_database.database_identity != "primary_database"
+            or self.restore_database.database_identity != "restore_database"
+            or self.primary_database == self.restore_database
+        ):
+            raise ValueError("PostgreSQL login transition set is invalid")
+        return self
+
+
+class PostgreSQLLoginTransitionReceiptsV1(_Model):
+    """Value-free receipts for both independent database transitions."""
+
+    primary_database: PostgreSQLLoginTransitionReceiptV1
+    restore_database: PostgreSQLLoginTransitionReceiptV1
+
+    @model_validator(mode="after")
+    def exact_receipt_set(self) -> Self:
+        if (
+            self.primary_database.database_identity != "primary_database"
+            or self.restore_database.database_identity != "restore_database"
+            or self.primary_database == self.restore_database
+        ):
+            raise ValueError("PostgreSQL login transition receipt set is invalid")
+        return self
 
 
 class MaterializationComponentPlanV1(_Model):
@@ -2553,9 +2845,19 @@ class MaterializationComponentPlanV1(_Model):
     @model_validator(mode="after")
     def bounded_component(self) -> Self:
         expected: dict[str, tuple[str, ...]] = {
-            "primary_infisical": ("encryption_key", "auth_secret", "primary_valkey_password"),
+            "primary_infisical": (
+                "encryption_key",
+                "auth_secret",
+                "primary_valkey_password",
+                "postgres_application_password",
+            ),
             "primary_valkey": ("primary_valkey_password",),
-            "restore_infisical": ("encryption_key", "auth_secret", "restore_valkey_password"),
+            "restore_infisical": (
+                "encryption_key",
+                "auth_secret",
+                "restore_valkey_password",
+                "postgres_application_password",
+            ),
             "restore_valkey": ("restore_valkey_password",),
         }
         cache = self.component.endswith("valkey")
@@ -2623,6 +2925,247 @@ class DockerNamedVolumeMountV1(_Model):
     propagation: Literal["none"]
 
 
+class ContainerBootstrapAttachProtocolV1(_Model):
+    """Signed, local daemon-to-container bootstrap framing contract.
+
+    This is intentionally distinct from the Mac-to-daemon remote-session framing.  It
+    describes only a future, container-stdin attach boundary and does not
+    create a socket, container, process, or secret-bearing frame.
+    """
+
+    schema_version: Literal["rsd.container-bootstrap-attach-protocol.v1"]
+    protocol_name: Literal["rsd_container_bootstrap_attach_v1"]
+    frame_magic: Literal["ONCA"]
+    frame_version: Literal[1]
+    metadata_encoding: Literal["canonical_json_utf8_v1"]
+    allowed_operation_scopes: tuple[
+        Literal["materialize_and_start_runtime_v1"], Literal["start_runtime_v2"]
+    ]
+    ready_state: Literal["ready_v1"]
+    claim_state: Literal["claimed_v1"]
+    terminal_ack_state: Literal["terminal_ack_v1"]
+    ambiguous_state: Literal["attach_ambiguous_v1"]
+    max_metadata_bytes: int = Field(ge=256, le=16_384)
+    max_chunk_bytes: int = Field(ge=1, le=65_536)
+    max_chunks_per_target: int = Field(ge=1, le=4)
+    max_total_secret_bytes: int = Field(ge=1, le=262_144)
+    ready_timeout_seconds: int = Field(ge=1, le=60)
+    claim_timeout_seconds: int = Field(ge=1, le=60)
+    terminal_ack_timeout_seconds: int = Field(ge=1, le=60)
+    eof_required_after_terminal_ack: Literal[True]
+    chunk_order_required: Literal[True]
+    replay_allowed: Literal[False]
+    auto_retry_after_secret_delivery_allowed: Literal[False]
+    secret_persistence_allowed: Literal[False]
+    secret_logging_allowed: Literal[False]
+    secret_receipt_allowed: Literal[False]
+    created_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("allowed_operation_scopes", mode="before")
+    @classmethod
+    def declared_scopes(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="container attach operation scopes")
+
+    @field_validator("created_at")
+    @classmethod
+    def canonical_created_at(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def exact_bounded_protocol(self) -> Self:
+        if (
+            self.allowed_operation_scopes
+            != ("materialize_and_start_runtime_v1", "start_runtime_v2")
+            or self.max_total_secret_bytes < self.max_chunk_bytes
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("container bootstrap attach protocol is invalid")
+        return self
+
+
+def container_bootstrap_attach_protocol_sha256(
+    protocol: ContainerBootstrapAttachProtocolV1,
+) -> str:
+    """Return the domain-separated commitment for the local attach contract."""
+
+    if type(protocol) is not ContainerBootstrapAttachProtocolV1:
+        raise ValueError("container bootstrap attach protocol is invalid")
+    return _domain_sha256(_LOCAL_ATTACH_PROTOCOL_DOMAIN, protocol)
+
+
+class ContainerWrapperRuntimeRequirementsV1(_Model):
+    """Runtime requirements declared for wrapper bytes, never observed here."""
+
+    architecture: Literal["linux/amd64"]
+    executable_mode: Literal["0755"]
+    requires_exec_form: Literal[True]
+    requires_private_pid_namespace: Literal[True]
+    requires_read_only_root_filesystem: Literal[True]
+    requires_log_driver_none: Literal[True]
+    requires_restart_policy_no: Literal[True]
+    writable_disk_allowed: Literal[False]
+    secret_file_allowed: Literal[False]
+    secret_log_allowed: Literal[False]
+
+
+class ContainerWrapperPid1PolicyV1(_Model):
+    """The exact lifecycle behavior a future wrapper must prove at runtime."""
+
+    schema_version: Literal["rsd.container-wrapper-pid1-policy.v1"]
+    signal_order: tuple[Literal["SIGTERM"], Literal["SIGINT"]]
+    forwards_signals_to_child: Literal[True]
+    reaps_children: Literal[True]
+    propagates_child_exit_status: Literal[True]
+    terminal_ack_before_exit_required: Literal[True]
+    shutdown_timeout_seconds: int = Field(ge=1, le=300)
+
+    @field_validator("signal_order", mode="before")
+    @classmethod
+    def declared_signals(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="container wrapper signals")
+
+    @model_validator(mode="after")
+    def exact_pid1_policy(self) -> Self:
+        if self.signal_order != ("SIGTERM", "SIGINT"):
+            raise ValueError("container wrapper PID1 policy is invalid")
+        return self
+
+
+def _merged_container_argv_sha256(
+    *,
+    wrapper_argv_prefix: tuple[str, ...],
+    base_entrypoint: tuple[str, ...],
+    base_command: tuple[str, ...],
+) -> str:
+    """Commit the exact exec-form merge without materializing a command line."""
+
+    return _digest(
+        json.dumps(
+            wrapper_argv_prefix + base_entrypoint + base_command,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+class ContainerBootstrapWrapperArtifactV1(_Model):
+    """One immutable wrapper/derived-image declaration.
+
+    Every field is a signed planned commitment.  It intentionally cannot be
+    mistaken for proof that bytes were built, installed, inspected, or run.
+    """
+
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    artifact_sha256: str = Field(pattern=_SHA256)
+    artifact_byte_count: int = Field(ge=1, le=16_777_216)
+    build_provenance_sha256: str = Field(pattern=_SHA256)
+    build_recipe_sha256: str = Field(pattern=_SHA256)
+    base_image_policy: DockerImagePolicyV1
+    derived_image_policy: DockerImagePolicyV1
+    executable_path: str = Field(pattern=r"^/[A-Za-z0-9._/-]{1,255}$")
+    wrapper_argv_prefix: tuple[str, ...] = Field(min_length=1, max_length=16)
+    base_entrypoint: tuple[str, ...] = Field(default=(), max_length=16)
+    base_command: tuple[str, ...] = Field(default=(), max_length=32)
+    entrypoint_command_merge: Literal["exec_wrapper_then_base_entrypoint_and_cmd_v1"]
+    merged_argv_sha256: str = Field(pattern=_SHA256)
+    runtime_requirements: ContainerWrapperRuntimeRequirementsV1
+    pid1_policy: ContainerWrapperPid1PolicyV1
+    attach_protocol_sha256: str = Field(pattern=_SHA256)
+    artifact_binding_sha256: str = Field(pattern=_SHA256)
+
+    @field_validator("wrapper_argv_prefix", "base_entrypoint", "base_command", mode="before")
+    @classmethod
+    def declared_argv(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="container wrapper argv")
+
+    @model_validator(mode="after")
+    def exact_immutable_wrapper_binding(self) -> Self:
+        if (
+            self.base_image_policy == self.derived_image_policy
+            or self.base_image_policy.image == self.derived_image_policy.image
+            or self.wrapper_argv_prefix[0] != self.executable_path
+            or not self.base_entrypoint + self.base_command
+            or self.merged_argv_sha256
+            != _merged_container_argv_sha256(
+                wrapper_argv_prefix=self.wrapper_argv_prefix,
+                base_entrypoint=self.base_entrypoint,
+                base_command=self.base_command,
+            )
+            or self.artifact_binding_sha256 != container_bootstrap_wrapper_artifact_sha256(self)
+        ):
+            raise ValueError("container bootstrap wrapper artifact is invalid")
+        return self
+
+
+def container_bootstrap_wrapper_artifact_sha256(
+    artifact: ContainerBootstrapWrapperArtifactV1,
+) -> str:
+    """Return the immutable wrapper-artifact commitment without a self-cycle."""
+
+    if type(artifact) is not ContainerBootstrapWrapperArtifactV1:
+        raise ValueError("container bootstrap wrapper artifact is invalid")
+    payload = artifact.model_copy(update={"artifact_binding_sha256": "0" * 64})
+    return _domain_sha256(_WRAPPER_ARTIFACT_DOMAIN, payload)
+
+
+class ContainerBootstrapWrapperManifestV1(_Model):
+    """Separately signed complete wrapper and derived-image manifest."""
+
+    schema_version: Literal["rsd.container-bootstrap-wrapper-manifest.v1"]
+    source_commit: str = Field(pattern=_COMMIT)
+    allocation_intent_sha256: str = Field(pattern=_SHA256)
+    attach_protocol_sha256: str = Field(pattern=_SHA256)
+    primary_infisical: ContainerBootstrapWrapperArtifactV1
+    primary_valkey: ContainerBootstrapWrapperArtifactV1
+    restore_infisical: ContainerBootstrapWrapperArtifactV1
+    restore_valkey: ContainerBootstrapWrapperArtifactV1
+    created_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("created_at")
+    @classmethod
+    def canonical_created_at(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def complete_immutable_manifest(self) -> Self:
+        artifacts = (
+            self.primary_infisical,
+            self.primary_valkey,
+            self.restore_infisical,
+            self.restore_valkey,
+        )
+        if (
+            tuple(item.component for item in artifacts)
+            != ("primary_infisical", "primary_valkey", "restore_infisical", "restore_valkey")
+            or any(item.attach_protocol_sha256 != self.attach_protocol_sha256 for item in artifacts)
+            or len({item.artifact_binding_sha256 for item in artifacts}) != 4
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("container bootstrap wrapper manifest is invalid")
+        return self
+
+
+def container_bootstrap_wrapper_manifest_sha256(
+    manifest: ContainerBootstrapWrapperManifestV1,
+) -> str:
+    """Return the domain-separated signed-wrapper manifest commitment."""
+
+    if type(manifest) is not ContainerBootstrapWrapperManifestV1:
+        raise ValueError("container bootstrap wrapper manifest is invalid")
+    return _domain_sha256(_WRAPPER_MANIFEST_DOMAIN, manifest)
+
+
 class ContainerBootstrapTemplateV1(_Model):
     """Canonical non-secret Docker bootstrap contract for one component.
 
@@ -2643,8 +3186,9 @@ class ContainerBootstrapTemplateV1(_Model):
     command: tuple[str, ...] = Field(default=(), max_length=32)
     entrypoint_sha256: str = Field(pattern=_SHA256)
     template_sha256: str = Field(pattern=_SHA256)
-    bootstrap_wrapper_sha256: str = Field(pattern=_SHA256)
-    ingress_protocol_sha256: str = Field(pattern=_SHA256)
+    wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    wrapper_artifact_binding_sha256: str = Field(pattern=_SHA256)
+    attach_protocol_sha256: str = Field(pattern=_SHA256)
     create_request_sha256: str = Field(pattern=_SHA256)
     numeric_user: str = Field(pattern=r"^[1-9][0-9]{0,8}:[1-9][0-9]{0,8}$")
     working_directory: str = Field(pattern=r"^/[A-Za-z0-9._/-]{0,255}$")
@@ -2721,7 +3265,14 @@ class ContainerBootstrapTemplateV1(_Model):
                 json.dumps(self.entrypoint, sort_keys=True, separators=(",", ":")).encode("utf-8")
             )
             or self.entrypoint_sha256 == self.template_sha256
-            or self.bootstrap_wrapper_sha256 == self.ingress_protocol_sha256
+            or len(
+                {
+                    self.wrapper_manifest_sha256,
+                    self.wrapper_artifact_binding_sha256,
+                    self.attach_protocol_sha256,
+                }
+            )
+            != 3
             or self.security_options != ("no-new-privileges:true",)
             or self.cap_add != ()
             or self.labels != ()
@@ -2779,11 +3330,10 @@ class ContainerBootstrapTemplatesV1(_Model):
 
 
 class SecretDeliverySinkV1(StrEnum):
-    """The exact non-secret destinations admitted for one delivered slot."""
+    """The exact value-free routes admitted for one provider-material slot."""
 
-    INFISICAL_TARGET_PROCESS_ENVIRONMENT = "infisical_target_process_environment_v1"
-    VALKEY_STDIN_CONFIGURATION = "valkey_stdin_configuration_v1"
-    POSTGRES_APPLICATION_TARGET_ENVIRONMENT = "postgres_application_target_environment_v1"
+    TARGET_DELIVERY_MAP = "signed_target_delivery_map_v1"
+    POSTGRESQL_SCRAM_VERIFIER_DERIVATION = "postgresql_scram_verifier_derivation_v1"
 
 
 class SecretDeliverySlotV1(_Model):
@@ -2810,9 +3360,9 @@ class SecretDeliverySlotV1(_Model):
     ]
     encoded_byte_count: int = Field(ge=1, le=128)
     sink: SecretDeliverySinkV1
-    target_processes: tuple[str, ...] = Field(min_length=1, max_length=2)
+    target_identities: tuple[str, ...] = Field(min_length=1, max_length=4)
 
-    @field_validator("target_processes", mode="before")
+    @field_validator("target_identities", mode="before")
     @classmethod
     def declared_targets(cls, value: object) -> tuple[object, ...]:
         return _items(value, field="secret delivery targets")
@@ -2835,37 +3385,42 @@ class SecretDeliverySlotV1(_Model):
             "encryption_key": (
                 "infisical_hex_16_v1",
                 32,
-                SecretDeliverySinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
                 ("primary_infisical", "restore_infisical"),
             ),
             "auth_secret": (
                 "infisical_auth_secret_base64_32_v1",
                 44,
-                SecretDeliverySinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
                 ("primary_infisical", "restore_infisical"),
             ),
             "primary_valkey_password": (
                 "valkey_password_base64url_32_v1",
                 43,
-                SecretDeliverySinkV1.VALKEY_STDIN_CONFIGURATION,
-                ("primary_valkey",),
+                SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+                ("primary_infisical", "primary_valkey"),
             ),
             "restore_valkey_password": (
                 "valkey_password_base64url_32_v1",
                 43,
-                SecretDeliverySinkV1.VALKEY_STDIN_CONFIGURATION,
-                ("restore_valkey",),
+                SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+                ("restore_infisical", "restore_valkey"),
             ),
             "postgres_application_password": (
                 "postgres_application_password_base64url_32_v1",
                 43,
-                SecretDeliverySinkV1.POSTGRES_APPLICATION_TARGET_ENVIRONMENT,
-                ("postgres_application_target",),
+                SecretDeliverySinkV1.POSTGRESQL_SCRAM_VERIFIER_DERIVATION,
+                (
+                    "primary_database",
+                    "restore_database",
+                    "primary_infisical",
+                    "restore_infisical",
+                ),
             ),
         }
         if (
             type(self.sink) is not SecretDeliverySinkV1
-            or self.target_processes != expected[self.purpose][3]
+            or self.target_identities != expected[self.purpose][3]
             or (self.format, self.encoded_byte_count, self.sink) != expected[self.purpose][:3]
         ):
             raise ValueError("secret delivery slot is invalid")
@@ -2929,10 +3484,10 @@ class SecretDeliverySlotReceiptV1(_Model):
     ]
     reference_sha256: str = Field(pattern=_SHA256)
     sink: SecretDeliverySinkV1
-    target_processes: tuple[str, ...] = Field(min_length=1, max_length=2)
+    target_identities: tuple[str, ...] = Field(min_length=1, max_length=4)
     delivered: Literal[True]
 
-    @field_validator("target_processes", mode="before")
+    @field_validator("target_identities", mode="before")
     @classmethod
     def declared_targets(cls, value: object) -> tuple[object, ...]:
         return _items(value, field="secret delivery receipt targets")
@@ -2946,31 +3501,36 @@ class SecretDeliverySlotReceiptV1(_Model):
     def exact_slot_route(self) -> Self:
         expected: dict[str, tuple[SecretDeliverySinkV1, tuple[str, ...]]] = {
             "encryption_key": (
-                SecretDeliverySinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
                 ("primary_infisical", "restore_infisical"),
             ),
             "auth_secret": (
-                SecretDeliverySinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
                 ("primary_infisical", "restore_infisical"),
             ),
             "primary_valkey_password": (
-                SecretDeliverySinkV1.VALKEY_STDIN_CONFIGURATION,
-                ("primary_valkey",),
+                SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+                ("primary_infisical", "primary_valkey"),
             ),
             "restore_valkey_password": (
-                SecretDeliverySinkV1.VALKEY_STDIN_CONFIGURATION,
-                ("restore_valkey",),
+                SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+                ("restore_infisical", "restore_valkey"),
             ),
             "postgres_application_password": (
-                SecretDeliverySinkV1.POSTGRES_APPLICATION_TARGET_ENVIRONMENT,
-                ("postgres_application_target",),
+                SecretDeliverySinkV1.POSTGRESQL_SCRAM_VERIFIER_DERIVATION,
+                (
+                    "primary_database",
+                    "restore_database",
+                    "primary_infisical",
+                    "restore_infisical",
+                ),
             ),
         }
         if (
             type(self.sink) is not SecretDeliverySinkV1
             or (
                 self.sink,
-                self.target_processes,
+                self.target_identities,
             )
             != expected[self.purpose]
         ):
@@ -3022,6 +3582,628 @@ class SecretDeliveryReceiptV1(_Model):
         return self
 
 
+class ProviderMaterialFingerprintBindingV1(_Model):
+    """One value-free material fingerprint admitted to a target delivery map."""
+
+    purpose: Literal[
+        "encryption_key",
+        "auth_secret",
+        "primary_valkey_password",
+        "restore_valkey_password",
+        "postgres_application_password",
+    ]
+    reference_sha256: str = Field(pattern=_SHA256)
+    fingerprint_sha256: str = Field(pattern=_SHA256)
+
+
+class TargetDeliveryValueKindV1(StrEnum):
+    """A local attach field is either direct material or a bounded derivation."""
+
+    DIRECT_PROVIDER_MATERIAL = "direct_provider_material_v1"
+    DERIVED_POSTGRESQL_URI = "derived_postgresql_uri_v1"
+    DERIVED_VALKEY_URI = "derived_valkey_uri_v1"
+
+
+class TargetDeliveryFieldV1(_Model):
+    """One ordered, value-free field sent to an exact target wrapper.
+
+    ``derivation_binding_sha256`` is a grammar commitment, never a hash of a
+    raw URI or a secret-bearing result.
+    """
+
+    ordinal: int = Field(ge=1, le=4)
+    source_purpose: Literal[
+        "encryption_key",
+        "auth_secret",
+        "primary_valkey_password",
+        "restore_valkey_password",
+        "postgres_application_password",
+    ]
+    source_reference_sha256: str = Field(pattern=_SHA256)
+    source_fingerprint_sha256: str = Field(pattern=_SHA256)
+    value_kind: TargetDeliveryValueKindV1
+    target_field: Literal[
+        "ENCRYPTION_KEY", "AUTH_SECRET", "DB_CONNECTION_URI", "REDIS_URL", "requirepass"
+    ]
+    format: Literal[
+        "infisical_hex_16_v1",
+        "infisical_auth_secret_base64_32_v1",
+        "valkey_password_base64url_32_v1",
+        "derived_postgresql_uri_v1",
+        "derived_valkey_uri_v1",
+    ]
+    encoded_byte_count: int = Field(ge=1, le=1024)
+    sink: ContainerSecretSinkV1
+    derivation_binding_sha256: str = Field(pattern=_SHA256)
+    persistence_allowed: Literal[False]
+    logging_allowed: Literal[False]
+    receipt_allowed: Literal[False]
+
+    @field_validator("value_kind", mode="before")
+    @classmethod
+    def canonical_value_kind(cls, value: object) -> TargetDeliveryValueKindV1:
+        if type(value) is TargetDeliveryValueKindV1:
+            return value
+        if type(value) is str:
+            try:
+                return TargetDeliveryValueKindV1(value)
+            except ValueError:
+                pass
+        raise ValueError("target delivery value kind is invalid")
+
+    @field_validator("sink", mode="before")
+    @classmethod
+    def canonical_sink(cls, value: object) -> ContainerSecretSinkV1:
+        return ContainerBootstrapTemplateV1.canonical_sink(value)
+
+
+class ContainerTargetDeliveryV1(_Model):
+    """One complete target-process or stdin-config delivery route."""
+
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    derived_image_policy_sha256: str = Field(pattern=_SHA256)
+    wrapper_artifact_binding_sha256: str = Field(pattern=_SHA256)
+    attach_protocol_sha256: str = Field(pattern=_SHA256)
+    sink: ContainerSecretSinkV1
+    fields: tuple[TargetDeliveryFieldV1, ...] = Field(min_length=1, max_length=4)
+
+    @field_validator("fields", mode="before")
+    @classmethod
+    def declared_fields(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="target delivery fields")
+
+    @field_validator("sink", mode="before")
+    @classmethod
+    def canonical_sink(cls, value: object) -> ContainerSecretSinkV1:
+        return ContainerBootstrapTemplateV1.canonical_sink(value)
+
+    @model_validator(mode="after")
+    def exact_target_route(self) -> Self:
+        expected: dict[str, tuple[ContainerSecretSinkV1, tuple[str, ...]]] = {
+            "primary_infisical": (
+                ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                ("ENCRYPTION_KEY", "AUTH_SECRET", "DB_CONNECTION_URI", "REDIS_URL"),
+            ),
+            "restore_infisical": (
+                ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                ("ENCRYPTION_KEY", "AUTH_SECRET", "DB_CONNECTION_URI", "REDIS_URL"),
+            ),
+            "primary_valkey": (
+                ContainerSecretSinkV1.VALKEY_STDIN_CONFIGURATION,
+                ("requirepass",),
+            ),
+            "restore_valkey": (
+                ContainerSecretSinkV1.VALKEY_STDIN_CONFIGURATION,
+                ("requirepass",),
+            ),
+        }
+        if (
+            type(self.sink) is not ContainerSecretSinkV1
+            or self.sink != expected[self.component][0]
+            or tuple(item.ordinal for item in self.fields) != tuple(range(1, len(self.fields) + 1))
+            or tuple(item.target_field for item in self.fields) != expected[self.component][1]
+            or any(item.sink is not self.sink for item in self.fields)
+            or len(
+                {
+                    self.derived_image_policy_sha256,
+                    self.wrapper_artifact_binding_sha256,
+                    self.attach_protocol_sha256,
+                }
+            )
+            != 3
+        ):
+            raise ValueError("container target delivery is invalid")
+        return self
+
+
+class TargetDeliveryMapV1(_Model):
+    """Separately signed route map for all four processes and both databases.
+
+    It contains only component identities, exact field grammar, provider
+    metadata, and derivation commitments.  It cannot contain a secret,
+    verifier, URI, command line, environment mapping, or target file.
+    """
+
+    schema_version: Literal["rsd.target-delivery-map.v1"]
+    source_commit: str = Field(pattern=_COMMIT)
+    allocation_intent_sha256: str = Field(pattern=_SHA256)
+    wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    attach_protocol_sha256: str = Field(pattern=_SHA256)
+    secret_handling_policy_sha256: str = Field(pattern=_SHA256)
+    provider_references: ProviderReferencesV2
+    material_fingerprints: tuple[
+        ProviderMaterialFingerprintBindingV1,
+        ProviderMaterialFingerprintBindingV1,
+        ProviderMaterialFingerprintBindingV1,
+        ProviderMaterialFingerprintBindingV1,
+        ProviderMaterialFingerprintBindingV1,
+    ]
+    database_identities: PostgreSQLRuntimeDatabaseIdentitiesV1
+    primary_valkey_connection_uri: ValkeyConnectionUriGrammarV1
+    restore_valkey_connection_uri: ValkeyConnectionUriGrammarV1
+    primary_infisical: ContainerTargetDeliveryV1
+    primary_valkey: ContainerTargetDeliveryV1
+    restore_infisical: ContainerTargetDeliveryV1
+    restore_valkey: ContainerTargetDeliveryV1
+    created_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("material_fingerprints", mode="before")
+    @classmethod
+    def declared_fingerprints(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="target delivery material fingerprints")
+
+    @field_validator("created_at")
+    @classmethod
+    def canonical_created_at(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def exact_complete_map(self) -> Self:
+        targets = (
+            self.primary_infisical,
+            self.primary_valkey,
+            self.restore_infisical,
+            self.restore_valkey,
+        )
+        fingerprints = self.material_fingerprints
+        expected_purposes = (
+            "encryption_key",
+            "auth_secret",
+            "primary_valkey_password",
+            "restore_valkey_password",
+            "postgres_application_password",
+        )
+        references = {
+            "encryption_key": self.provider_references.encryption_key.reference_sha256,
+            "auth_secret": self.provider_references.auth_secret.reference_sha256,
+            "primary_valkey_password": (
+                self.provider_references.primary_valkey_password.reference_sha256
+            ),
+            "restore_valkey_password": (
+                self.provider_references.restore_valkey_password.reference_sha256
+            ),
+            "postgres_application_password": (
+                self.provider_references.postgres_application_password.reference_sha256
+            ),
+        }
+        fields = tuple(field for target in targets for field in target.fields)
+        expected_source_purposes: dict[str, tuple[str, ...]] = {
+            "primary_infisical": (
+                "encryption_key",
+                "auth_secret",
+                "postgres_application_password",
+                "primary_valkey_password",
+            ),
+            "restore_infisical": (
+                "encryption_key",
+                "auth_secret",
+                "postgres_application_password",
+                "restore_valkey_password",
+            ),
+            "primary_valkey": ("primary_valkey_password",),
+            "restore_valkey": ("restore_valkey_password",),
+        }
+        by_component = {str(target.component): target for target in targets}
+        primary_uri = self.database_identities.primary_database.connection_uri
+        restore_uri = self.database_identities.restore_database.connection_uri
+        primary_valkey_uri = self.primary_valkey_connection_uri
+        restore_valkey_uri = self.restore_valkey_connection_uri
+        fingerprint_by_purpose = {item.purpose: item for item in fingerprints}
+        expected_fields: dict[str, tuple[tuple[object, ...], ...]] = {
+            "primary_infisical": (
+                (
+                    "encryption_key",
+                    TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                    "infisical_hex_16_v1",
+                    32,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    fingerprint_by_purpose.get("encryption_key"),
+                ),
+                (
+                    "auth_secret",
+                    TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                    "infisical_auth_secret_base64_32_v1",
+                    44,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    fingerprint_by_purpose.get("auth_secret"),
+                ),
+                (
+                    "postgres_application_password",
+                    TargetDeliveryValueKindV1.DERIVED_POSTGRESQL_URI,
+                    "derived_postgresql_uri_v1",
+                    primary_uri.rendered_uri_byte_count,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    primary_uri,
+                ),
+                (
+                    "primary_valkey_password",
+                    TargetDeliveryValueKindV1.DERIVED_VALKEY_URI,
+                    "derived_valkey_uri_v1",
+                    primary_valkey_uri.rendered_uri_byte_count,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    primary_valkey_uri,
+                ),
+            ),
+            "restore_infisical": (
+                (
+                    "encryption_key",
+                    TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                    "infisical_hex_16_v1",
+                    32,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    fingerprint_by_purpose.get("encryption_key"),
+                ),
+                (
+                    "auth_secret",
+                    TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                    "infisical_auth_secret_base64_32_v1",
+                    44,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    fingerprint_by_purpose.get("auth_secret"),
+                ),
+                (
+                    "postgres_application_password",
+                    TargetDeliveryValueKindV1.DERIVED_POSTGRESQL_URI,
+                    "derived_postgresql_uri_v1",
+                    restore_uri.rendered_uri_byte_count,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    restore_uri,
+                ),
+                (
+                    "restore_valkey_password",
+                    TargetDeliveryValueKindV1.DERIVED_VALKEY_URI,
+                    "derived_valkey_uri_v1",
+                    restore_valkey_uri.rendered_uri_byte_count,
+                    ContainerSecretSinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+                    restore_valkey_uri,
+                ),
+            ),
+            "primary_valkey": (
+                (
+                    "primary_valkey_password",
+                    TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                    "valkey_password_base64url_32_v1",
+                    43,
+                    ContainerSecretSinkV1.VALKEY_STDIN_CONFIGURATION,
+                    fingerprint_by_purpose.get("primary_valkey_password"),
+                ),
+            ),
+            "restore_valkey": (
+                (
+                    "restore_valkey_password",
+                    TargetDeliveryValueKindV1.DIRECT_PROVIDER_MATERIAL,
+                    "valkey_password_base64url_32_v1",
+                    43,
+                    ContainerSecretSinkV1.VALKEY_STDIN_CONFIGURATION,
+                    fingerprint_by_purpose.get("restore_valkey_password"),
+                ),
+            ),
+        }
+
+        def field_matches(field: TargetDeliveryFieldV1, expected: tuple[object, ...]) -> bool:
+            purpose, value_kind, field_format, byte_count, sink, binding = expected
+            if (
+                field.source_purpose != purpose
+                or field.value_kind is not value_kind
+                or field.format != field_format
+                or field.encoded_byte_count != byte_count
+                or field.sink is not sink
+            ):
+                return False
+            if type(binding) is ProviderMaterialFingerprintBindingV1:
+                return (
+                    field.source_reference_sha256 == binding.reference_sha256
+                    and field.source_fingerprint_sha256 == binding.fingerprint_sha256
+                    and field.derivation_binding_sha256 == binding.fingerprint_sha256
+                )
+            if type(binding) is PostgreSQLConnectionUriGrammarV1:
+                return field.derivation_binding_sha256 == runtime_connection_uri_grammar_sha256(
+                    binding
+                )
+            if type(binding) is ValkeyConnectionUriGrammarV1:
+                return field.derivation_binding_sha256 == runtime_connection_uri_grammar_sha256(
+                    binding
+                )
+            return False
+
+        if (
+            tuple(item.component for item in targets)
+            != ("primary_infisical", "primary_valkey", "restore_infisical", "restore_valkey")
+            or tuple(item.purpose for item in fingerprints) != expected_purposes
+            or len({item.reference_sha256 for item in fingerprints}) != 5
+            or len({item.fingerprint_sha256 for item in fingerprints}) != 5
+            or any(item.reference_sha256 != references[item.purpose] for item in fingerprints)
+            or any(
+                tuple(field.source_purpose for field in by_component[component].fields)
+                != expected_source_purposes[component]
+                for component in expected_source_purposes
+            )
+            or any(
+                field.source_reference_sha256 != references[field.source_purpose]
+                for field in fields
+            )
+            or any(
+                field.source_fingerprint_sha256
+                != fingerprint_by_purpose[field.source_purpose].fingerprint_sha256
+                for field in fields
+            )
+            or primary_valkey_uri.cache_identity != "primary_valkey"
+            or restore_valkey_uri.cache_identity != "restore_valkey"
+            or primary_valkey_uri.password_reference_sha256 != references["primary_valkey_password"]
+            or restore_valkey_uri.password_reference_sha256 != references["restore_valkey_password"]
+            or any(
+                not field_matches(field, expected)
+                for component, target in by_component.items()
+                for field, expected in zip(target.fields, expected_fields[component], strict=True)
+            )
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("target delivery map is invalid")
+        return self
+
+
+def target_delivery_map_sha256(delivery_map: TargetDeliveryMapV1) -> str:
+    """Return the signed map commitment used by intents, receipts, and journals."""
+
+    if type(delivery_map) is not TargetDeliveryMapV1:
+        raise ValueError("target delivery map is invalid")
+    return _domain_sha256(_TARGET_DELIVERY_MAP_DOMAIN, delivery_map)
+
+
+class ContainerAttachRequestV1(_Model):
+    """Value-free metadata preceding one local attach secret stream.
+
+    This request is emitted only after a target wrapper has reached its
+    declared readiness state.  Secret chunks are carried separately by the
+    local framing codec and never enter this model, its hash, an error, or a
+    receipt.
+    """
+
+    schema_version: Literal["rsd.container-attach-request.v1"]
+    operation_scope: Literal["materialize_and_start_runtime_v1", "start_runtime_v2"]
+    operation_id: str = Field(pattern=_UUID)
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    derived_image_policy_sha256: str = Field(pattern=_SHA256)
+    wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    wrapper_artifact_binding_sha256: str = Field(pattern=_SHA256)
+    attach_protocol_sha256: str = Field(pattern=_SHA256)
+    target_delivery_map_sha256: str = Field(pattern=_SHA256)
+    request_nonce_sha256: str = Field(pattern=_SHA256)
+    channel_binding_sha256: str = Field(pattern=_SHA256)
+    session_binding_sha256: str = Field(pattern=_SHA256)
+    expected_ready_state: Literal["ready_v1"]
+    expected_claim_state: Literal["claimed_v1"]
+    expected_terminal_ack_state: Literal["terminal_ack_v1"]
+    fields: tuple[TargetDeliveryFieldV1, ...] = Field(min_length=1, max_length=4)
+
+    @field_validator("fields", mode="before")
+    @classmethod
+    def declared_fields(cls, value: object) -> tuple[object, ...]:
+        return _items(value, field="container attach fields")
+
+    @model_validator(mode="after")
+    def bounded_nonsecret_request(self) -> Self:
+        if (
+            tuple(field.ordinal for field in self.fields) != tuple(range(1, len(self.fields) + 1))
+            or len(
+                {
+                    self.derived_image_policy_sha256,
+                    self.wrapper_manifest_sha256,
+                    self.wrapper_artifact_binding_sha256,
+                    self.attach_protocol_sha256,
+                    self.target_delivery_map_sha256,
+                    self.request_nonce_sha256,
+                    self.channel_binding_sha256,
+                    self.session_binding_sha256,
+                }
+            )
+            != 8
+        ):
+            raise ValueError("container attach request is invalid")
+        return self
+
+
+def container_attach_request_sha256(request: ContainerAttachRequestV1) -> str:
+    """Commit one value-free local attach request under its own domain."""
+
+    if type(request) is not ContainerAttachRequestV1:
+        raise ValueError("container attach request is invalid")
+    return _domain_sha256(_LOCAL_ATTACH_REQUEST_DOMAIN, request)
+
+
+def container_attach_chunk_descriptors_sha256(
+    fields: tuple[TargetDeliveryFieldV1, ...],
+) -> str:
+    """Commit ordered value-free local-attach chunk descriptors.
+
+    The commitment intentionally covers only the signed descriptor metadata
+    (purpose, source fingerprint, grammar, target field, and exact byte
+    count).  It never incorporates a delivered value, URI, verifier, or a
+    secret-bearing chunk digest.
+    """
+
+    if (
+        type(fields) is not tuple
+        or not 1 <= len(fields) <= 4
+        or any(type(field) is not TargetDeliveryFieldV1 for field in fields)
+    ):
+        raise ValueError("container attach chunk descriptors are invalid")
+    try:
+        canonical_fields = tuple(
+            _strict_canonical_model(field, TargetDeliveryFieldV1) for field in fields
+        )
+        if tuple(field.ordinal for field in canonical_fields) != tuple(
+            range(1, len(canonical_fields) + 1)
+        ):
+            raise ValueError("container attach chunk descriptors are invalid")
+        payload = json.dumps(
+            [field.model_dump(mode="json", warnings="error") for field in canonical_fields],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        raise ValueError("container attach chunk descriptors are invalid") from None
+    return _digest(_LOCAL_ATTACH_CHUNK_DESCRIPTORS_DOMAIN + payload)
+
+
+class ContainerAttachReadyV1(_Model):
+    """Non-secret wrapper readiness acknowledgement before any chunk is sent."""
+
+    schema_version: Literal["rsd.container-attach-ready.v1"]
+    request_sha256: str = Field(pattern=_SHA256)
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    state: Literal["ready_v1"]
+    wrapper_artifact_binding_sha256: str = Field(pattern=_SHA256)
+    attach_protocol_sha256: str = Field(pattern=_SHA256)
+
+
+class ContainerAttachClaimV1(_Model):
+    """One local claim immediately before the ordered binary chunks."""
+
+    schema_version: Literal["rsd.container-attach-claim.v1"]
+    request_sha256: str = Field(pattern=_SHA256)
+    state: Literal["claimed_v1"]
+    chunk_count: int = Field(ge=1, le=4)
+    chunk_descriptors_sha256: str = Field(pattern=_SHA256)
+    eof_required_after_terminal_ack: Literal[True]
+
+
+class ContainerAttachTerminalAckV1(_Model):
+    """Redacted terminal acknowledgement after all ordered chunks are consumed."""
+
+    schema_version: Literal["rsd.container-attach-terminal-ack.v1"]
+    request_sha256: str = Field(pattern=_SHA256)
+    state: Literal["terminal_ack_v1"]
+    chunk_count: int = Field(ge=1, le=4)
+    chunk_descriptors_sha256: str = Field(pattern=_SHA256)
+    chunks_zeroized: Literal[True]
+    persistence_allowed: Literal[False]
+    logging_allowed: Literal[False]
+    receipt_contains_secret: Literal[False]
+    eof_observed: Literal[True]
+
+
+def container_attach_ack_sha256(ack: ContainerAttachTerminalAckV1) -> str:
+    """Return a receipt-safe, domain-separated terminal-ack commitment."""
+
+    if type(ack) is not ContainerAttachTerminalAckV1:
+        raise ValueError("container attach terminal acknowledgement is invalid")
+    return _domain_sha256(_LOCAL_ATTACH_ACK_DOMAIN, ack)
+
+
+class ContainerAttachReceiptV1(_Model):
+    """Value-free local attach evidence nested in a signed executor receipt.
+
+    The future daemon may attest this record only after its direct local attach
+    adapter has observed the complete request/ready/claim/chunk/ack/EOF state
+    machine.  It deliberately carries one request commitment and a compact
+    completed-state projection rather than duplicating the complete request or
+    nested protocol messages.  The outer authorizer reconstructs that request
+    from its signed controls and verifies every field below.  No chunk byte,
+    URI, verifier, target environment, or raw attach response is representable
+    here.
+    """
+
+    schema_version: Literal["rsd.container-attach-receipt.v1"]
+    request_sha256: str = Field(pattern=_SHA256)
+    component: Literal[
+        "primary_infisical",
+        "primary_valkey",
+        "restore_infisical",
+        "restore_valkey",
+    ]
+    container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    ready_state: Literal["ready_v1"]
+    claim_state: Literal["claimed_v1"]
+    chunk_count: int = Field(ge=1, le=4)
+    chunk_descriptors_sha256: str = Field(pattern=_SHA256)
+    terminal_ack_state: Literal["terminal_ack_v1"]
+    terminal_ack_sha256: str = Field(pattern=_SHA256)
+    chunks_zeroized: Literal[True]
+    persistence_allowed: Literal[False]
+    logging_allowed: Literal[False]
+    receipt_contains_secret: Literal[False]
+    eof_observed: Literal[True]
+
+    @model_validator(mode="after")
+    def exact_completed_attach_state(self) -> Self:
+        invalid = (
+            self.chunks_zeroized is not True
+            or self.persistence_allowed is not False
+            or self.logging_allowed is not False
+            or self.receipt_contains_secret is not False
+            or self.eof_observed is not True
+        )
+        if invalid:
+            raise ValueError("container attach receipt is invalid")
+        try:
+            terminal_ack = ContainerAttachTerminalAckV1(
+                schema_version="rsd.container-attach-terminal-ack.v1",
+                request_sha256=self.request_sha256,
+                state=self.terminal_ack_state,
+                chunk_count=self.chunk_count,
+                chunk_descriptors_sha256=self.chunk_descriptors_sha256,
+                chunks_zeroized=self.chunks_zeroized,
+                persistence_allowed=self.persistence_allowed,
+                logging_allowed=self.logging_allowed,
+                receipt_contains_secret=self.receipt_contains_secret,
+                eof_observed=self.eof_observed,
+            )
+        except ValueError:
+            raise ValueError("container attach receipt is invalid") from None
+        if self.terminal_ack_sha256 != container_attach_ack_sha256(terminal_ack):
+            raise ValueError("container attach receipt is invalid")
+        return self
+
+
+def container_attach_receipt_sha256(receipt: ContainerAttachReceiptV1) -> str:
+    """Return the receipt-safe local attach completion commitment."""
+
+    if type(receipt) is not ContainerAttachReceiptV1:
+        raise ValueError("container attach receipt is invalid")
+    return _domain_sha256(_LOCAL_ATTACH_RECEIPT_DOMAIN, receipt)
+
+
 class MaterializationEvidenceBindingsV1(_Model):
     """Signed chain from allocation observation to the one materialization operation."""
 
@@ -3037,10 +4219,13 @@ class MaterializationEvidenceBindingsV1(_Model):
     secret_capability_policy_sha256: str = Field(pattern=_SHA256)
     secret_handling_policy_sha256: str = Field(pattern=_SHA256)
     provider_material_attestation_sha256: str = Field(pattern=_SHA256)
+    wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    target_delivery_map_sha256: str = Field(pattern=_SHA256)
+    container_attach_protocol_sha256: str = Field(pattern=_SHA256)
 
     @model_validator(mode="after")
     def distinct_bindings(self) -> Self:
-        if len(set(self.model_dump(mode="python").values())) != 12:
+        if len(set(self.model_dump(mode="python").values())) != 15:
             raise ValueError("materialization evidence bindings must be distinct")
         return self
 
@@ -3062,8 +4247,10 @@ class MaterializationIntentV1(_Model):
     topology: AllocationTopologyV2
     plan: MaterializationPlanV1
     bootstrap_templates: ContainerBootstrapTemplatesV1
-    postgres_login_transition: PostgreSQLLoginTransitionIntentV1
-    ephemeral_postgres_connection: EphemeralPostgreSQLConnectionPolicyV1
+    wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    target_delivery_map_sha256: str = Field(pattern=_SHA256)
+    container_attach_protocol_sha256: str = Field(pattern=_SHA256)
+    postgres_login_transitions: PostgreSQLLoginTransitionIntentsV1
     secret_delivery_request: SecretDeliveryRequestV1
     provider_references: ProviderReferencesV2
     evidence: MaterializationEvidenceBindingsV1
@@ -3123,14 +4310,28 @@ class MaterializationIntentV1(_Model):
             != self.executor_installation_intent_sha256
             or self.evidence.executor_installation_receipt_sha256
             != self.executor_installation_receipt_sha256
-            or self.postgres_login_transition.application_password_reference_sha256
-            != self.provider_references.postgres_application_password.reference_sha256
-            or self.ephemeral_postgres_connection.application_password_reference_sha256
-            != self.postgres_login_transition.application_password_reference_sha256
-            or self.ephemeral_postgres_connection.prepared_operation_id
-            != self.postgres_login_transition.prepared_operation_id
-            or self.ephemeral_postgres_connection.application_role
-            != self.postgres_login_transition.application_role
+            or any(
+                transition.application_password_reference_sha256
+                != self.provider_references.postgres_application_password.reference_sha256
+                for transition in (
+                    self.postgres_login_transitions.primary_database,
+                    self.postgres_login_transitions.restore_database,
+                )
+            )
+            or self.postgres_login_transitions.primary_database.system_identifier
+            != self.postgres_login_transitions.restore_database.system_identifier
+            or len(
+                {
+                    self.wrapper_manifest_sha256,
+                    self.target_delivery_map_sha256,
+                    self.container_attach_protocol_sha256,
+                }
+            )
+            != 3
+            or self.evidence.wrapper_manifest_sha256 != self.wrapper_manifest_sha256
+            or self.evidence.target_delivery_map_sha256 != self.target_delivery_map_sha256
+            or self.evidence.container_attach_protocol_sha256
+            != self.container_attach_protocol_sha256
             or self.secret_delivery_request.operation_scope != self.operation_scope
             or self.secret_delivery_request.operation_id != self.materialization_operation_id
             or self.secret_delivery_request.journal_uuid != self.journal_uuid
@@ -3227,8 +4428,9 @@ class ContainerBootstrapInspectionV1(_Model):
     command: tuple[str, ...] = Field(default=(), max_length=32)
     entrypoint_sha256: str = Field(pattern=_SHA256)
     template_sha256: str = Field(pattern=_SHA256)
-    bootstrap_wrapper_sha256: str = Field(pattern=_SHA256)
-    ingress_protocol_sha256: str = Field(pattern=_SHA256)
+    wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    wrapper_artifact_binding_sha256: str = Field(pattern=_SHA256)
+    attach_protocol_sha256: str = Field(pattern=_SHA256)
     create_request_sha256: str = Field(pattern=_SHA256)
     numeric_user: str = Field(pattern=r"^[1-9][0-9]{0,8}:[1-9][0-9]{0,8}$")
     working_directory: str = Field(pattern=r"^/[A-Za-z0-9._/-]{0,255}$")
@@ -3291,7 +4493,14 @@ class ContainerBootstrapInspectionV1(_Model):
                 json.dumps(self.entrypoint, sort_keys=True, separators=(",", ":")).encode("utf-8")
             )
             or self.entrypoint_sha256 == self.template_sha256
-            or self.bootstrap_wrapper_sha256 == self.ingress_protocol_sha256
+            or len(
+                {
+                    self.wrapper_manifest_sha256,
+                    self.wrapper_artifact_binding_sha256,
+                    self.attach_protocol_sha256,
+                }
+            )
+            != 3
             or self.security_options != ("no-new-privileges:true",)
             or self.cap_add != ()
             or self.labels != ()
@@ -3379,6 +4588,9 @@ class ExecutorInstallationReceiptV1(_Model):
     package_sha256: str = Field(pattern=_SHA256)
     executable_sha256: str = Field(pattern=_SHA256)
     template_bundle_sha256: str = Field(pattern=_SHA256)
+    wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    target_delivery_map_sha256: str = Field(pattern=_SHA256)
+    container_attach_protocol_sha256: str = Field(pattern=_SHA256)
     systemd_unit_sha256: str = Field(pattern=_SHA256)
     unix_socket_policy_sha256: str = Field(pattern=_SHA256)
     ssh_policy_sha256: str = Field(pattern=_SHA256)
@@ -3412,6 +4624,18 @@ class ExecutorContainerInspectionV1(_Model):
     ]
     container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     inspection: ContainerBootstrapInspectionV1
+    attach_receipt: ContainerAttachReceiptV1
+    attach_receipt_sha256: str = Field(pattern=_SHA256)
+
+    @model_validator(mode="after")
+    def exact_local_attach_evidence(self) -> Self:
+        if (
+            self.attach_receipt_sha256 != container_attach_receipt_sha256(self.attach_receipt)
+            or self.attach_receipt.component != self.component
+            or self.attach_receipt.container_id != self.container_id
+        ):
+            raise ValueError("executor container attach evidence is invalid")
+        return self
 
 
 class MaterializationExecutorReceiptV1(_Model):
@@ -3420,6 +4644,9 @@ class MaterializationExecutorReceiptV1(_Model):
     schema_version: Literal["rsd.materialization-executor-receipt.v1"]
     executor_id: str = Field(pattern=_IDENTIFIER)
     installation_receipt_sha256: str = Field(pattern=_SHA256)
+    wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    target_delivery_map_sha256: str = Field(pattern=_SHA256)
+    container_attach_protocol_sha256: str = Field(pattern=_SHA256)
     operation_scope: Literal["materialize_and_start_runtime_v1"]
     operation_id: str = Field(pattern=_UUID)
     idempotency_key: str = Field(pattern=_SHA256)
@@ -3459,6 +4686,14 @@ class MaterializationExecutorReceiptV1(_Model):
             tuple(item.component for item in self.containers)
             != ("primary_infisical", "primary_valkey", "restore_infisical", "restore_valkey")
             or len({item.container_id for item in self.containers}) != 4
+            or len(
+                {
+                    self.wrapper_manifest_sha256,
+                    self.target_delivery_map_sha256,
+                    self.container_attach_protocol_sha256,
+                }
+            )
+            != 3
             or len(_canonical_base64_bytes(self.signature_base64)) != 64
         ):
             raise ValueError("executor operation receipt is invalid")
@@ -3486,9 +4721,12 @@ class MaterializationEffectReceiptV1(_Model):
     observed_allocation_attestation_sha256: str = Field(pattern=_SHA256)
     journal_uuid: str = Field(pattern=_UUID)
     idempotency_key: str = Field(pattern=_SHA256)
+    wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    target_delivery_map_sha256: str = Field(pattern=_SHA256)
+    container_attach_protocol_sha256: str = Field(pattern=_SHA256)
     executor_receipt_sha256: str = Field(pattern=_SHA256)
     executor_receipt: MaterializationExecutorReceiptV1
-    postgres_login_transition: PostgreSQLLoginTransitionReceiptV1
+    postgres_login_transitions: PostgreSQLLoginTransitionReceiptsV1
     delivery_receipt: SecretDeliveryReceiptV1
     primary_infisical: RuntimeContainerObservationV1
     primary_valkey: RuntimeContainerObservationV1
@@ -3518,6 +4756,18 @@ class MaterializationEffectReceiptV1(_Model):
             or self.executor_receipt_sha256 != canonical_sha256(self.executor_receipt)
             or self.executor_receipt.secret_delivery_receipt_sha256
             != canonical_sha256(self.delivery_receipt)
+            or self.executor_receipt.wrapper_manifest_sha256 != self.wrapper_manifest_sha256
+            or self.executor_receipt.target_delivery_map_sha256 != self.target_delivery_map_sha256
+            or self.executor_receipt.container_attach_protocol_sha256
+            != self.container_attach_protocol_sha256
+            or len(
+                {
+                    self.wrapper_manifest_sha256,
+                    self.target_delivery_map_sha256,
+                    self.container_attach_protocol_sha256,
+                }
+            )
+            != 3
             or self.delivery_receipt.operation_scope != self.operation_scope
             or self.delivery_receipt.operation_id != self.materialization_operation_id
             or self.delivery_receipt.journal_uuid != self.journal_uuid
@@ -3545,10 +4795,13 @@ class StartRuntimeEvidenceBindingsV2(_Model):
     secret_capability_policy_sha256: str = Field(pattern=_SHA256)
     secret_handling_policy_sha256: str = Field(pattern=_SHA256)
     provider_material_attestation_sha256: str = Field(pattern=_SHA256)
+    wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    target_delivery_map_sha256: str = Field(pattern=_SHA256)
+    container_attach_protocol_sha256: str = Field(pattern=_SHA256)
 
     @model_validator(mode="after")
     def distinct_bindings(self) -> Self:
-        if len(set(self.model_dump(mode="python").values())) != 10:
+        if len(set(self.model_dump(mode="python").values())) != 13:
             raise ValueError("start runtime evidence bindings must be distinct")
         return self
 
@@ -3656,6 +4909,9 @@ class StartRuntimeExecutorReceiptV2(_Model):
     host_fingerprint_sha256: str = Field(pattern=_SHA256)
     engine_fingerprint_sha256: str = Field(pattern=_SHA256)
     engine_operation_journal_sha256: str = Field(pattern=_SHA256)
+    wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    target_delivery_map_sha256: str = Field(pattern=_SHA256)
+    container_attach_protocol_sha256: str = Field(pattern=_SHA256)
     containers: tuple[
         ExecutorContainerInspectionV1,
         ExecutorContainerInspectionV1,
@@ -3683,6 +4939,14 @@ class StartRuntimeExecutorReceiptV2(_Model):
             tuple(item.component for item in self.containers)
             != ("primary_infisical", "primary_valkey", "restore_infisical", "restore_valkey")
             or len({item.container_id for item in self.containers}) != 4
+            or len(
+                {
+                    self.wrapper_manifest_sha256,
+                    self.target_delivery_map_sha256,
+                    self.container_attach_protocol_sha256,
+                }
+            )
+            != 3
             or len(_canonical_base64_bytes(self.signature_base64)) != 64
         ):
             raise ValueError("start executor receipt is invalid")
@@ -3709,6 +4973,9 @@ class StartRuntimeEffectReceiptV2(_Model):
     materialization_effect_receipt_sha256: str = Field(pattern=_SHA256)
     journal_uuid: str = Field(pattern=_UUID)
     idempotency_key: str = Field(pattern=_SHA256)
+    wrapper_manifest_sha256: str = Field(pattern=_SHA256)
+    target_delivery_map_sha256: str = Field(pattern=_SHA256)
+    container_attach_protocol_sha256: str = Field(pattern=_SHA256)
     executor_receipt: StartRuntimeExecutorReceiptV2
     delivery_receipt: SecretDeliveryReceiptV1
     completed_at: str
@@ -3728,6 +4995,9 @@ class StartRuntimeEffectReceiptV2(_Model):
             or executor.start_runtime_intent_sha256 != self.start_runtime_intent_sha256
             or executor.idempotency_key != self.idempotency_key
             or executor.secret_delivery_receipt_sha256 != canonical_sha256(delivery)
+            or executor.wrapper_manifest_sha256 != self.wrapper_manifest_sha256
+            or executor.target_delivery_map_sha256 != self.target_delivery_map_sha256
+            or executor.container_attach_protocol_sha256 != self.container_attach_protocol_sha256
             or delivery.operation_scope != self.operation_scope
             or delivery.operation_id != self.start_operation_id
             or delivery.journal_uuid != self.journal_uuid

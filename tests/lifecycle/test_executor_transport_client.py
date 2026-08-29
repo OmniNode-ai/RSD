@@ -430,40 +430,45 @@ def test_request_verifier_rejects_expired_or_cross_session_metadata(
             reference_sha256=_H("encryption-key"),
             format="infisical_hex_16_v1",
             encoded_byte_count=32,
-            sink=SecretDeliverySinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
-            target_processes=("primary_infisical", "restore_infisical"),
+            sink=SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+            target_identities=("primary_infisical", "restore_infisical"),
         ),
         SecretDeliverySlotV1(
             purpose="auth_secret",
             reference_sha256=_H("auth-secret"),
             format="infisical_auth_secret_base64_32_v1",
             encoded_byte_count=44,
-            sink=SecretDeliverySinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
-            target_processes=("primary_infisical", "restore_infisical"),
+            sink=SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+            target_identities=("primary_infisical", "restore_infisical"),
         ),
         SecretDeliverySlotV1(
             purpose="primary_valkey_password",
             reference_sha256=_H("primary-valkey"),
             format="valkey_password_base64url_32_v1",
             encoded_byte_count=43,
-            sink=SecretDeliverySinkV1.VALKEY_STDIN_CONFIGURATION,
-            target_processes=("primary_valkey",),
+            sink=SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+            target_identities=("primary_infisical", "primary_valkey"),
         ),
         SecretDeliverySlotV1(
             purpose="restore_valkey_password",
             reference_sha256=_H("restore-valkey"),
             format="valkey_password_base64url_32_v1",
             encoded_byte_count=43,
-            sink=SecretDeliverySinkV1.VALKEY_STDIN_CONFIGURATION,
-            target_processes=("restore_valkey",),
+            sink=SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+            target_identities=("restore_infisical", "restore_valkey"),
         ),
         SecretDeliverySlotV1(
             purpose="postgres_application_password",
             reference_sha256=_H("postgres-password"),
             format="postgres_application_password_base64url_32_v1",
             encoded_byte_count=43,
-            sink=SecretDeliverySinkV1.POSTGRES_APPLICATION_TARGET_ENVIRONMENT,
-            target_processes=("postgres_application_target",),
+            sink=SecretDeliverySinkV1.POSTGRESQL_SCRAM_VERIFIER_DERIVATION,
+            target_identities=(
+                "primary_database",
+                "restore_database",
+                "primary_infisical",
+                "restore_infisical",
+            ),
         ),
     )
     witness = transport.RemoteEffectAuthorizationWitnessV1(
@@ -877,24 +882,29 @@ def test_keychain_stream_uses_exact_slots_and_zeroizes_each_read(tmp_path: Path)
     )
     runtime = {
         "encryption_key": (
-            SecretDeliverySinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+            SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
             ("primary_infisical", "restore_infisical"),
         ),
         "auth_secret": (
-            SecretDeliverySinkV1.INFISICAL_TARGET_PROCESS_ENVIRONMENT,
+            SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
             ("primary_infisical", "restore_infisical"),
         ),
         "primary_valkey_password": (
-            SecretDeliverySinkV1.VALKEY_STDIN_CONFIGURATION,
-            ("primary_valkey",),
+            SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+            ("primary_infisical", "primary_valkey"),
         ),
         "restore_valkey_password": (
-            SecretDeliverySinkV1.VALKEY_STDIN_CONFIGURATION,
-            ("restore_valkey",),
+            SecretDeliverySinkV1.TARGET_DELIVERY_MAP,
+            ("restore_infisical", "restore_valkey"),
         ),
         "postgres_application_password": (
-            SecretDeliverySinkV1.POSTGRES_APPLICATION_TARGET_ENVIRONMENT,
-            ("postgres_application_target",),
+            SecretDeliverySinkV1.POSTGRESQL_SCRAM_VERIFIER_DERIVATION,
+            (
+                "primary_database",
+                "restore_database",
+                "primary_infisical",
+                "restore_infisical",
+            ),
         ),
     }
     slots = tuple(
@@ -920,7 +930,7 @@ def test_keychain_stream_uses_exact_slots_and_zeroizes_each_read(tmp_path: Path)
                 ]
             ),
             sink=sink,
-            target_processes=targets,
+            target_identities=targets,
         )
         for purpose, (sink, targets) in runtime.items()
     )
