@@ -108,6 +108,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     NoHostPublicationEvidenceV1,
     NoHostPublicationGroundworkV1,
     ObservedAllocationAttestationV1,
+    ObservedRestoreDatabaseAttestationV1,
     PostgreSQLAllocationRoleStateV1,
     PostgreSQLConnectionUriGrammarV1,
     PostgreSQLControlPolicyV1,
@@ -158,6 +159,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     docker_volume_instance_fingerprint_sha256,
     materialization_intent_sha256,
     observed_allocation_attestation_sha256,
+    observed_restore_database_attestation_sha256,
     postgresql_connection_uri_rendered_byte_count,
     runtime_connection_uri_grammar_sha256,
     strict_canonical_allocation_intent,
@@ -1231,6 +1233,79 @@ def _allocation_attestation(
     )
 
 
+def _restore_database_attestation(
+    intent: AllocationIntentV2,
+    allocation: ObservedAllocationAttestationV1,
+    *,
+    signer_private: Ed25519PrivateKey | None = None,
+) -> ObservedRestoreDatabaseAttestationV1:
+    """Build the later, independent restore observation used by V2 tests."""
+
+    source = allocation.allocated_resources.postgres
+    observed = AllocatedPostgreSQLObservationV1(
+        system_identifier=source.system_identifier,
+        database_name=f"{intent.plan.postgres.restore_database_prefix}-stage",
+        database_oid=201,
+        schema_name=source.schema_name,
+        schema_oid=202,
+        prepared_operation_id="123e4567-e89b-42d3-a456-426614174006",
+        prepared_operation_result_sha256=_hash("restore-postgres-verifier-result"),
+        owner_role="restore-owner-role",
+        owner_role_oid=203,
+        application_role="restore-application-role",
+        application_role_oid=204,
+        role_oids=(
+            PostgreSQLRoleObservationV1(
+                role="restore-owner-role", role_oid=203, can_login=False, password_absent=True
+            ),
+            PostgreSQLRoleObservationV1(
+                role="restore-application-role",
+                role_oid=204,
+                can_login=False,
+                password_absent=True,
+            ),
+        ),
+        grants=(
+            PostgreSQLGrantObservationV1(
+                role="restore-owner-role",
+                grantee="restore-application-role",
+                privilege="SELECT",
+                schema_name=source.schema_name,
+            ),
+        ),
+        acl_sha256=_hash("restore-postgres-acl"),
+    )
+    unsigned = ObservedRestoreDatabaseAttestationV1(
+        schema_version="rsd.observed-restore-database-attestation.v1",
+        operation_kind="restore_database_observation_v1",
+        restore_observation_operation_id="123e4567-e89b-42d3-a456-426614174007",
+        allocation_operation_id=intent.allocation_operation_id,
+        allocation_intent_sha256=allocation_intent_sha256(intent),
+        allocation_effect_receipt_sha256=allocation.allocation_effect_receipt_sha256,
+        observed_allocation_attestation_sha256=observed_allocation_attestation_sha256(allocation),
+        journal_uuid=intent.journal_uuid,
+        source_database_observation_sha256=canonical_sha256(source),
+        source_backup_commitment_sha256=_hash("source-backup-commitment"),
+        restore_commitment_sha256=_hash("restore-commitment"),
+        authority=intent.plan.postgres.authority,
+        restore_database=observed,
+        observed_at="2026-08-28T12:02:30Z",
+        signer_key_id="test-signer",
+        signature_base64=_SIGNATURE,
+    )
+    if signer_private is None:
+        return unsigned
+    return unsigned.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                signer_private.sign(
+                    authorization._observed_restore_database_attestation_message(unsigned)
+                )
+            ).decode("ascii")
+        }
+    )
+
+
 def _secret_policies(
     intent: AllocationIntentV2, executor: ExecutorControlPolicyV1
 ) -> tuple[SecretCapabilityPolicyV1, SecretHandlingPolicyV1]:
@@ -1303,8 +1378,11 @@ def _materialization_intent(
     executor: ExecutorControlPolicyV1,
     receipt: AllocationEffectReceiptV2,
     attestation: ObservedAllocationAttestationV1,
+    *,
+    restore_observation: ObservedRestoreDatabaseAttestationV1 | None = None,
 ) -> tuple[
     MaterializationIntentV1,
+    ObservedRestoreDatabaseAttestationV1,
     SecretCapabilityPolicyV1,
     SecretHandlingPolicyV1,
     ContainerBootstrapWrapperManifestV1,
@@ -1313,6 +1391,9 @@ def _materialization_intent(
 ]:
     capability, handling = _secret_policies(allocation, executor)
     topology = allocation.plan.topology
+    restore_observation = restore_observation or _restore_database_attestation(
+        allocation, attestation
+    )
     requirements: dict[str, tuple[str, ...]] = {
         "primary_infisical": (
             "encryption_key",
@@ -1597,13 +1678,13 @@ def _materialization_intent(
     )
     restore_transition = login_transition(
         database_identity="restore_database",
-        prepared_operation_id=postgres_prepared.scram_verifier_installs.restore_database.prepared_operation_id,
-        database_name="restore-stage-db",
-        database_oid=202,
-        owner_role="restore-owner",
-        owner_role_oid=203,
-        application_role="restore-app",
-        application_role_oid=204,
+        prepared_operation_id=restore_observation.restore_database.prepared_operation_id,
+        database_name=restore_observation.restore_database.database_name,
+        database_oid=restore_observation.restore_database.database_oid,
+        owner_role=restore_observation.restore_database.owner_role,
+        owner_role_oid=restore_observation.restore_database.owner_role_oid,
+        application_role=restore_observation.restore_database.application_role,
+        application_role_oid=restore_observation.restore_database.application_role_oid,
     )
     postgres_login_transitions = PostgreSQLLoginTransitionIntentsV1(
         primary_database=primary_transition,
@@ -1664,7 +1745,9 @@ def _materialization_intent(
         ),
         restore_database=PostgreSQLRuntimeDatabaseIdentityV1(
             database_identity="restore_database",
-            observation_binding_sha256=_hash("restore-database-observation"),
+            observation_binding_sha256=observed_restore_database_attestation_sha256(
+                restore_observation
+            ),
             login_transition=restore_transition,
             connection_uri=restore_uri,
         ),
@@ -1853,6 +1936,7 @@ def _materialization_intent(
         schema_version="rsd.target-delivery-map.v1",
         source_commit=_COMMIT,
         allocation_intent_sha256=allocation_intent_sha256(allocation),
+        topology=topology,
         wrapper_manifest_sha256=wrapper_manifest_hash,
         attach_protocol_sha256=attach_protocol_hash,
         secret_handling_policy_sha256=canonical_sha256(handling),
@@ -2002,6 +2086,9 @@ def _materialization_intent(
             observed_allocation_attestation_sha256=observed_allocation_attestation_sha256(
                 attestation
             ),
+            observed_restore_database_attestation_sha256=(
+                observed_restore_database_attestation_sha256(restore_observation)
+            ),
             executor_installation_intent_sha256=_hash("executor-installation-intent"),
             executor_installation_receipt_sha256=_hash("executor-installation-receipt"),
             topology=topology,
@@ -2018,6 +2105,9 @@ def _materialization_intent(
                 allocation_effect_receipt_sha256=allocation_effect_receipt_sha256(receipt),
                 observed_allocation_attestation_sha256=observed_allocation_attestation_sha256(
                     attestation
+                ),
+                observed_restore_database_attestation_sha256=(
+                    observed_restore_database_attestation_sha256(restore_observation)
                 ),
                 executor_control_policy_sha256=canonical_sha256(executor),
                 docker_engine_control_policy_sha256=canonical_sha256(_docker_policy(executor)),
@@ -2042,6 +2132,7 @@ def _materialization_intent(
             signer_key_id="test-signer",
             signature_base64=_SIGNATURE,
         ),
+        restore_observation,
         capability,
         handling,
         wrapper_manifest,
@@ -2053,6 +2144,7 @@ def _materialization_intent(
 def _materialization_context(
     intent: MaterializationIntentV1,
     allocation: ObservedAllocationAttestationV1,
+    restore_database_attestation: ObservedRestoreDatabaseAttestationV1,
     wrapper_manifest: ContainerBootstrapWrapperManifestV1,
     target_delivery_map: TargetDeliveryMapV1,
     attach_protocol: ContainerBootstrapAttachProtocolV1,
@@ -2081,6 +2173,10 @@ def _materialization_context(
         intent=intent,
         allocation_attestation=allocation,
         allocation_attestation_sha256=observed_allocation_attestation_sha256(allocation),
+        restore_database_attestation=restore_database_attestation,
+        restore_database_attestation_sha256=observed_restore_database_attestation_sha256(
+            restore_database_attestation
+        ),
         provider_expectations=(),
         executor_expectation=ExecutorControlExpectationV1(
             executor_id="local-executor",
@@ -2531,11 +2627,208 @@ def test_materialization_requires_observed_allocation_hashes(tmp_path: Path) -> 
     assert materialization.operation_scope == "materialize_and_start_runtime_v1"
 
 
+def test_restore_database_predecessor_rejects_attacker_oids_staleness_and_substitution(
+    tmp_path: Path,
+) -> None:
+    """A recomputed materialization chain cannot nominate its own restore DB."""
+
+    allocation, executor, _ = _allocation_bundle(tmp_path)
+    receipt = _allocation_receipt(allocation)
+    allocation_observation = _allocation_attestation(allocation, receipt)
+    restore = _restore_database_attestation(allocation, allocation_observation)
+    signer, signing_key = _trusted_signer()
+    restore = _restore_database_attestation(
+        allocation, allocation_observation, signer_private=signing_key
+    )
+    authorization._verify_observed_restore_database_attestation_signature(restore, signer=signer)
+
+    attacker_data = restore.restore_database.model_dump(mode="python")
+    attacker_data.update(
+        {
+            "database_name": "attacker-stage-db",
+            "database_oid": 901,
+            "schema_oid": 902,
+            "prepared_operation_id": restore.restore_database.prepared_operation_id,
+            "owner_role": "attacker-owner-role",
+            "owner_role_oid": 903,
+            "application_role": "attacker-application-role",
+            "application_role_oid": 904,
+            "role_oids": (
+                PostgreSQLRoleObservationV1(
+                    role="attacker-owner-role", role_oid=903, can_login=False, password_absent=True
+                ),
+                PostgreSQLRoleObservationV1(
+                    role="attacker-application-role",
+                    role_oid=904,
+                    can_login=False,
+                    password_absent=True,
+                ),
+            ),
+            "grants": (
+                PostgreSQLGrantObservationV1(
+                    role="attacker-owner-role",
+                    grantee="attacker-application-role",
+                    privilege="SELECT",
+                    schema_name=restore.restore_database.schema_name,
+                ),
+            ),
+        }
+    )
+    attacker_database = AllocatedPostgreSQLObservationV1.model_validate(attacker_data)
+    unsigned_attacker = restore.model_copy(
+        update={
+            "restore_database": attacker_database,
+            "signature_base64": _SIGNATURE,
+        }
+    )
+    attacker = unsigned_attacker.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                signing_key.sign(
+                    authorization._observed_restore_database_attestation_message(unsigned_attacker)
+                )
+            ).decode("ascii")
+        }
+    )
+    authorization._verify_observed_restore_database_attestation_signature(attacker, signer=signer)
+    attacker_materialization, _, _, _, _, attacker_map, _ = _materialization_intent(
+        allocation,
+        executor,
+        receipt,
+        allocation_observation,
+        restore_observation=attacker,
+    )
+    policy = ReplayAuthorityPolicyV1(
+        schema_version="rsd.replay-authority-policy.v1",
+        service="replay-service",
+        account_prefix="replay-prefix",
+    )
+    stage = authorization._AllocationStageArtifacts(
+        intent=allocation,
+        receipt=receipt,
+        attestation=allocation_observation,
+    )
+    with pytest.raises(AuthorizationError, match="materialization_restore_database_binding"):
+        authorization._verify_materialization_intent_chain(
+            allocation=stage,
+            intent=attacker_materialization.model_copy(
+                update={"replay_policy_sha256": policy.sha256()}
+            ),
+            restore_database_attestation=attacker,
+            target_delivery_map=attacker_map,
+            replay_policy=policy,
+            expected_disposal_owner=_OWNER,
+            expected_approver_identity=_APPROVER,
+            now=_TEST_CLOCK,
+        )
+
+    stale = restore.model_copy(update={"observed_at": "2026-08-27T12:02:30Z"})
+    materialization, _, _, _, _, target_delivery_map, _ = _materialization_intent(
+        allocation,
+        executor,
+        receipt,
+        allocation_observation,
+        restore_observation=stale,
+    )
+    with pytest.raises(AuthorizationError, match="materialization_intent_freshness"):
+        authorization._verify_materialization_intent_chain(
+            allocation=stage,
+            intent=materialization.model_copy(update={"replay_policy_sha256": policy.sha256()}),
+            restore_database_attestation=stale,
+            target_delivery_map=target_delivery_map,
+            replay_policy=policy,
+            expected_disposal_owner=_OWNER,
+            expected_approver_identity=_APPROVER,
+            now=_TEST_CLOCK,
+        )
+
+    substituted = restore.model_copy(update={"restore_commitment_sha256": _hash("substituted")})
+    with pytest.raises(AuthorizationError, match="materialization_intent_binding"):
+        authorization._verify_materialization_intent_chain(
+            allocation=stage,
+            intent=materialization.model_copy(update={"replay_policy_sha256": policy.sha256()}),
+            restore_database_attestation=substituted,
+            target_delivery_map=target_delivery_map,
+            replay_policy=policy,
+            expected_disposal_owner=_OWNER,
+            expected_approver_identity=_APPROVER,
+            now=_TEST_CLOCK,
+        )
+
+
+@pytest.mark.parametrize(
+    ("uri_field", "authority"),
+    (
+        ("primary_valkey_connection_uri", "redis://192.0.2.77:6379"),
+        ("restore_valkey_connection_uri", "redis://198.51.100.77:6379"),
+        ("primary_valkey_connection_uri", "redis://192.0.2.3:6380"),
+        ("restore_valkey_connection_uri", "redis://192.0.2.3:6379"),
+    ),
+)
+def test_target_delivery_map_rejects_unplanned_valkey_authority_port_and_swap(
+    tmp_path: Path, uri_field: str, authority: str
+) -> None:
+    allocation, executor, _ = _allocation_bundle(tmp_path)
+    receipt = _allocation_receipt(allocation)
+    attestation = _allocation_attestation(allocation, receipt)
+    _, _, _, _, _, target_delivery_map, _ = _materialization_intent(
+        allocation, executor, receipt, attestation
+    )
+    raw = target_delivery_map.model_dump(mode="python")
+    uri = dict(raw[uri_field])
+    uri["authority"] = authority
+    uri["rendered_uri_byte_count"] = valkey_connection_uri_rendered_byte_count(
+        authority=authority, database_index=0
+    )
+    raw[uri_field] = uri
+    with pytest.raises(ValueError, match="target delivery map"):
+        TargetDeliveryMapV1.model_validate(raw)
+
+
+def test_runtime_topology_comparison_requires_exact_alias_and_static_address(
+    tmp_path: Path,
+) -> None:
+    """A matching component/image/network cannot hide a changed attachment route."""
+
+    import omninode_rsd.lifecycle.infisical_disposable as disposable
+
+    allocation, executor, _ = _allocation_bundle(tmp_path)
+    receipt = _allocation_receipt(allocation)
+    attestation = _allocation_attestation(allocation, receipt)
+    materialization, restore, _, _, wrapper, target_map, attach_protocol = _materialization_intent(
+        allocation, executor, receipt, attestation
+    )
+    context = _materialization_context(
+        materialization, attestation, restore, wrapper, target_map, attach_protocol
+    )
+    runtime = _materialization_receipt(context).primary_infisical
+    placement = materialization.topology.primary_infisical
+    network_id = attestation.allocated_resources.primary_network.network_id
+
+    assert disposable._matches_runtime_topology(runtime, placement=placement, network_id=network_id)
+    for update in (
+        {"alias": "wrong-alias"},
+        {"static_ipv4": materialization.topology.primary_valkey.static_ipv4},
+    ):
+        altered = runtime.model_copy(
+            update={"attachments": (runtime.attachments[0].model_copy(update=update),)}
+        )
+        assert not disposable._matches_runtime_topology(
+            altered, placement=placement, network_id=network_id
+        )
+
+    malformed = runtime.model_copy(update={"attachments": ()})
+    assert not disposable._matches_runtime_component(malformed, cast(Any, object()))
+    assert not disposable._matches_runtime_topology(
+        malformed, placement=placement, network_id=network_id
+    )
+
+
 def test_materialization_chain_binds_provider_and_allocated_volumes(tmp_path: Path) -> None:
     allocation, executor, _ = _allocation_bundle(tmp_path)
     receipt = _allocation_receipt(allocation)
     attestation = _allocation_attestation(allocation, receipt)
-    materialization, _, _, _, target_delivery_map, _ = _materialization_intent(
+    materialization, restore_observation, _, _, _, target_delivery_map, _ = _materialization_intent(
         allocation, executor, receipt, attestation
     )
     policy = ReplayAuthorityPolicyV1(
@@ -2553,6 +2846,7 @@ def test_materialization_chain_binds_provider_and_allocated_volumes(tmp_path: Pa
     authorization._verify_materialization_intent_chain(
         allocation=stage,
         intent=chain_ready,
+        restore_database_attestation=restore_observation,
         target_delivery_map=target_delivery_map,
         replay_policy=policy,
         expected_disposal_owner=_OWNER,
@@ -2570,6 +2864,7 @@ def test_materialization_chain_binds_provider_and_allocated_volumes(tmp_path: Pa
                     )
                 }
             ),
+            restore_database_attestation=restore_observation,
             target_delivery_map=target_delivery_map,
             replay_policy=policy,
             expected_disposal_owner=_OWNER,
@@ -2586,6 +2881,7 @@ def test_materialization_chain_binds_provider_and_allocated_volumes(tmp_path: Pa
                     "plan": chain_ready.plan.model_copy(update={"primary_valkey": wrong_volume})
                 }
             ),
+            restore_database_attestation=restore_observation,
             target_delivery_map=target_delivery_map,
             replay_policy=policy,
             expected_disposal_owner=_OWNER,
@@ -2602,6 +2898,7 @@ def test_materialization_control_policy_pins_component_images_and_configs(
     attestation = _allocation_attestation(allocation, receipt)
     (
         materialization,
+        _restore_observation,
         capability,
         handling,
         wrapper_manifest,
@@ -2687,11 +2984,22 @@ def test_materialization_receipt_rejects_cross_attachment_and_publication(tmp_pa
     allocation, executor, _ = _allocation_bundle(tmp_path)
     allocation_receipt = _allocation_receipt(allocation)
     attestation = _allocation_attestation(allocation, allocation_receipt)
-    materialization, _, _, wrapper_manifest, target_delivery_map, attach_protocol = (
-        _materialization_intent(allocation, executor, allocation_receipt, attestation)
-    )
+    (
+        materialization,
+        restore_observation,
+        _,
+        _,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
+    ) = _materialization_intent(allocation, executor, allocation_receipt, attestation)
     context = _materialization_context(
-        materialization, attestation, wrapper_manifest, target_delivery_map, attach_protocol
+        materialization,
+        attestation,
+        restore_observation,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
     )
     receipt = _materialization_receipt(context)
 
@@ -2734,11 +3042,22 @@ def test_materialization_reconstructs_compact_attach_receipt_before_signature(
     allocation, executor, _ = _allocation_bundle(tmp_path)
     allocation_receipt = _allocation_receipt(allocation)
     attestation = _allocation_attestation(allocation, allocation_receipt)
-    materialization, _, _, wrapper_manifest, target_delivery_map, attach_protocol = (
-        _materialization_intent(allocation, executor, allocation_receipt, attestation)
-    )
+    (
+        materialization,
+        restore_observation,
+        _,
+        _,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
+    ) = _materialization_intent(allocation, executor, allocation_receipt, attestation)
     context = _materialization_context(
-        materialization, attestation, wrapper_manifest, target_delivery_map, attach_protocol
+        materialization,
+        attestation,
+        restore_observation,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
     )
     receipt = _materialization_receipt(context)
     original = receipt.executor_receipt.containers[0]
@@ -3308,11 +3627,22 @@ def test_materialization_journal_requires_committed_allocation_and_never_replays
         update={"idempotency_key": context.idempotency_key}
     )
     attestation = _allocation_attestation(intent, allocation_receipt)
-    materialization, _, _, wrapper_manifest, target_delivery_map, attach_protocol = (
-        _materialization_intent(intent, executor, allocation_receipt, attestation)
-    )
+    (
+        materialization,
+        restore_observation,
+        _,
+        _,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
+    ) = _materialization_intent(intent, executor, allocation_receipt, attestation)
     materialization_context = _materialization_context(
-        materialization, attestation, wrapper_manifest, target_delivery_map, attach_protocol
+        materialization,
+        attestation,
+        restore_observation,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
     )
     materialization_verified = authorization._VerifiedMaterialization(
         context=materialization_context,
@@ -3549,11 +3879,22 @@ def test_v2_materialization_failure_is_terminal_and_never_replays(
     journal._begin_effect(allocation)
     journal._commit_effect(allocation, allocation_receipt)
     journal.assert_committed_allocation_stage(verified_intent, allocation_receipt, attestation)
-    materialization, _, _, wrapper_manifest, target_delivery_map, attach_protocol = (
-        _materialization_intent(intent, executor, allocation_receipt, attestation)
-    )
+    (
+        materialization,
+        restore_observation,
+        _,
+        _,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
+    ) = _materialization_intent(intent, executor, allocation_receipt, attestation)
     context = _materialization_context(
-        materialization, attestation, wrapper_manifest, target_delivery_map, attach_protocol
+        materialization,
+        attestation,
+        restore_observation,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
     )
     verified = authorization._VerifiedMaterialization(
         context=context,

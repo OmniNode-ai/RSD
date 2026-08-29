@@ -51,12 +51,17 @@ _WRAPPER_MANIFEST_DOMAIN: Final = b"omninode-rsd.container-wrapper-manifest.sha2
 _LOCAL_ATTACH_PROTOCOL_DOMAIN: Final = b"omninode-rsd.container-attach-protocol.sha256.v1\x00"
 _TARGET_DELIVERY_MAP_DOMAIN: Final = b"omninode-rsd.target-delivery-map.sha256.v1\x00"
 _URI_GRAMMAR_DOMAIN: Final = b"omninode-rsd.runtime-uri-grammar.sha256.v1\x00"
+_VALKEY_SCHEME: Final = "redis:"
+_VALKEY_FIXED_PORT: Final = 6379
 _LOCAL_ATTACH_REQUEST_DOMAIN: Final = b"omninode-rsd.container-attach-request.sha256.v1\x00"
 _LOCAL_ATTACH_ACK_DOMAIN: Final = b"omninode-rsd.container-attach-ack.sha256.v1\x00"
 _LOCAL_ATTACH_CHUNK_DESCRIPTORS_DOMAIN: Final = (
     b"omninode-rsd.container-attach-chunk-descriptors.sha256.v1\x00"
 )
 _LOCAL_ATTACH_RECEIPT_DOMAIN: Final = b"omninode-rsd.container-attach-receipt.sha256.v1\x00"
+_OBSERVED_RESTORE_DATABASE_ATTESTATION_DOMAIN: Final = (
+    b"omninode-rsd.observed-restore-database-attestation.sha256.v1\x00"
+)
 _ALLOCATION_EXECUTOR_RECEIPT_DOMAIN: Final = (
     b"omninode-rsd.allocation-executor-receipt.ed25519.v1\x00"
 )
@@ -2487,6 +2492,114 @@ def observed_allocation_attestation_sha256(attestation: ObservedAllocationAttest
     return canonical_sha256(attestation)
 
 
+class ObservedRestoreDatabaseAttestationV1(_Model):
+    """Signed, post-backup observation of the independent restore database.
+
+    Allocation intentionally observes only the empty primary database.  A
+    later backup/restore operation must therefore introduce a separate,
+    signed predecessor before either materialization or a fresh start can use
+    a restore login transition.  The model carries only stable PostgreSQL
+    identifiers, prepared-operation commitments, and value-free backup/
+    restore commitments; it cannot carry a dump, connection URI, verifier, or
+    credential.
+    """
+
+    schema_version: Literal["rsd.observed-restore-database-attestation.v1"]
+    operation_kind: Literal["restore_database_observation_v1"]
+    restore_observation_operation_id: str = Field(pattern=_UUID)
+    allocation_operation_id: str = Field(pattern=_UUID)
+    allocation_intent_sha256: str = Field(pattern=_SHA256)
+    allocation_effect_receipt_sha256: str = Field(pattern=_SHA256)
+    observed_allocation_attestation_sha256: str = Field(pattern=_SHA256)
+    journal_uuid: str = Field(pattern=_UUID)
+    source_database_observation_sha256: str = Field(pattern=_SHA256)
+    source_backup_commitment_sha256: str = Field(pattern=_SHA256)
+    restore_commitment_sha256: str = Field(pattern=_SHA256)
+    authority: str
+    restore_database: AllocatedPostgreSQLObservationV1
+    observed_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("authority")
+    @classmethod
+    def canonical_authority(cls, value: str) -> str:
+        return _authority(value, schemes=frozenset({"postgresql"}))
+
+    @field_validator("observed_at")
+    @classmethod
+    def observation_time(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def binds_distinct_restore_operation(self) -> Self:
+        commitments = (
+            self.allocation_intent_sha256,
+            self.allocation_effect_receipt_sha256,
+            self.observed_allocation_attestation_sha256,
+            self.source_database_observation_sha256,
+            self.source_backup_commitment_sha256,
+            self.restore_commitment_sha256,
+        )
+        if (
+            self.restore_observation_operation_id == self.allocation_operation_id
+            or len(set(commitments)) != len(commitments)
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("observed restore database attestation is invalid")
+        return self
+
+
+def observed_restore_database_attestation_sha256(
+    attestation: ObservedRestoreDatabaseAttestationV1,
+) -> str:
+    """Return the domain-separated commitment for one restore observation."""
+
+    if type(attestation) is not ObservedRestoreDatabaseAttestationV1:
+        raise ValueError("observed restore database attestation is invalid")
+    return _domain_sha256(_OBSERVED_RESTORE_DATABASE_ATTESTATION_DOMAIN, attestation)
+
+
+def validate_observed_restore_database_transition(
+    intent: AllocationIntentV2,
+    receipt: AllocationEffectReceiptV2,
+    allocation: ObservedAllocationAttestationV1,
+    restore: ObservedRestoreDatabaseAttestationV1,
+) -> None:
+    """Require an exact, independent backup-to-restore observation chain."""
+
+    if (
+        type(intent) is not AllocationIntentV2
+        or type(receipt) is not AllocationEffectReceiptV2
+        or type(allocation) is not ObservedAllocationAttestationV1
+        or type(restore) is not ObservedRestoreDatabaseAttestationV1
+    ):
+        raise ValueError("restore database observation transition is invalid")
+    source = allocation.allocated_resources.postgres
+    observed = restore.restore_database
+    if (
+        restore.allocation_operation_id != intent.allocation_operation_id
+        or restore.allocation_intent_sha256 != allocation_intent_sha256(intent)
+        or restore.allocation_effect_receipt_sha256 != allocation_effect_receipt_sha256(receipt)
+        or restore.observed_allocation_attestation_sha256
+        != observed_allocation_attestation_sha256(allocation)
+        or restore.journal_uuid != intent.journal_uuid
+        or restore.source_database_observation_sha256 != canonical_sha256(source)
+        or restore.authority != intent.plan.postgres.authority
+        or observed.system_identifier != source.system_identifier
+        or not observed.database_name.startswith(intent.plan.postgres.restore_database_prefix)
+        or observed.database_name == source.database_name
+        or observed.database_oid == source.database_oid
+        or observed.schema_name != source.schema_name
+        or observed.owner_role == source.owner_role
+        or observed.owner_role_oid == source.owner_role_oid
+        or observed.application_role == source.application_role
+        or observed.application_role_oid == source.application_role_oid
+    ):
+        raise ValueError("restore database observation transition is invalid")
+
+
 class PostgreSQLLoginTransitionIntentV1(_Model):
     """Signed, observed-OID-bound authorization for the one login transition.
 
@@ -2617,6 +2730,23 @@ def valkey_connection_uri_rendered_byte_count(*, authority: str, database_index:
         + 1  # database path delimiter
         + len(str(database_index).encode("ascii"))
     )
+
+
+def valkey_static_authority(static_ipv4: str) -> str:
+    """Render the one canonical planned Valkey authority without a credential.
+
+    Static component placement is an IPv4-only allocation contract.  Keeping
+    the scheme and port constants separate also prevents a caller from
+    treating the URI grammar as an arbitrary listener selection.
+    """
+
+    if type(static_ipv4) is not str:
+        raise ValueError("Valkey static authority is invalid")
+    try:
+        address = ipaddress.IPv4Address(static_ipv4)
+    except ipaddress.AddressValueError:
+        raise ValueError("Valkey static authority is invalid") from None
+    return f"{_VALKEY_SCHEME}//{address}:{_VALKEY_FIXED_PORT}"
 
 
 class PostgreSQLConnectionUriGrammarV1(_Model):
@@ -3744,6 +3874,7 @@ class TargetDeliveryMapV1(_Model):
     schema_version: Literal["rsd.target-delivery-map.v1"]
     source_commit: str = Field(pattern=_COMMIT)
     allocation_intent_sha256: str = Field(pattern=_SHA256)
+    topology: AllocationTopologyV2
     wrapper_manifest_sha256: str = Field(pattern=_SHA256)
     attach_protocol_sha256: str = Field(pattern=_SHA256)
     secret_handling_policy_sha256: str = Field(pattern=_SHA256)
@@ -3828,6 +3959,7 @@ class TargetDeliveryMapV1(_Model):
         restore_uri = self.database_identities.restore_database.connection_uri
         primary_valkey_uri = self.primary_valkey_connection_uri
         restore_valkey_uri = self.restore_valkey_connection_uri
+        topology = self.topology
         fingerprint_by_purpose = {item.purpose: item for item in fingerprints}
         expected_fields: dict[str, tuple[tuple[object, ...], ...]] = {
             "primary_infisical": (
@@ -3969,6 +4101,10 @@ class TargetDeliveryMapV1(_Model):
             )
             or primary_valkey_uri.cache_identity != "primary_valkey"
             or restore_valkey_uri.cache_identity != "restore_valkey"
+            or primary_valkey_uri.authority
+            != valkey_static_authority(topology.primary_valkey.static_ipv4)
+            or restore_valkey_uri.authority
+            != valkey_static_authority(topology.restore_valkey.static_ipv4)
             or primary_valkey_uri.password_reference_sha256 != references["primary_valkey_password"]
             or restore_valkey_uri.password_reference_sha256 != references["restore_valkey_password"]
             or any(
@@ -4222,6 +4358,7 @@ class MaterializationEvidenceBindingsV1(_Model):
     allocation_intent_sha256: str = Field(pattern=_SHA256)
     allocation_effect_receipt_sha256: str = Field(pattern=_SHA256)
     observed_allocation_attestation_sha256: str = Field(pattern=_SHA256)
+    observed_restore_database_attestation_sha256: str = Field(pattern=_SHA256)
     executor_control_policy_sha256: str = Field(pattern=_SHA256)
     docker_engine_control_policy_sha256: str = Field(pattern=_SHA256)
     postgres_prepared_control_policy_sha256: str = Field(pattern=_SHA256)
@@ -4237,7 +4374,7 @@ class MaterializationEvidenceBindingsV1(_Model):
 
     @model_validator(mode="after")
     def distinct_bindings(self) -> Self:
-        if len(set(self.model_dump(mode="python").values())) != 15:
+        if len(set(self.model_dump(mode="python").values())) != 16:
             raise ValueError("materialization evidence bindings must be distinct")
         return self
 
@@ -4254,6 +4391,7 @@ class MaterializationIntentV1(_Model):
     allocation_intent_sha256: str = Field(pattern=_SHA256)
     allocation_effect_receipt_sha256: str = Field(pattern=_SHA256)
     observed_allocation_attestation_sha256: str = Field(pattern=_SHA256)
+    observed_restore_database_attestation_sha256: str = Field(pattern=_SHA256)
     executor_installation_intent_sha256: str = Field(pattern=_SHA256)
     executor_installation_receipt_sha256: str = Field(pattern=_SHA256)
     topology: AllocationTopologyV2
@@ -4312,6 +4450,8 @@ class MaterializationIntentV1(_Model):
             != self.allocation_effect_receipt_sha256
             or self.evidence.observed_allocation_attestation_sha256
             != self.observed_allocation_attestation_sha256
+            or self.evidence.observed_restore_database_attestation_sha256
+            != self.observed_restore_database_attestation_sha256
             or self.evidence.executor_control_policy_sha256
             == self.evidence.secret_capability_policy_sha256
             or self.evidence.docker_engine_control_policy_sha256
@@ -4800,6 +4940,7 @@ class StartRuntimeEvidenceBindingsV2(_Model):
     materialization_intent_sha256: str = Field(pattern=_SHA256)
     materialization_effect_receipt_sha256: str = Field(pattern=_SHA256)
     observed_runtime_attestation_sha256: str = Field(pattern=_SHA256)
+    observed_restore_database_attestation_sha256: str = Field(pattern=_SHA256)
     executor_control_policy_sha256: str = Field(pattern=_SHA256)
     executor_installation_policy_sha256: str = Field(pattern=_SHA256)
     executor_installation_intent_sha256: str = Field(pattern=_SHA256)
@@ -4813,7 +4954,7 @@ class StartRuntimeEvidenceBindingsV2(_Model):
 
     @model_validator(mode="after")
     def distinct_bindings(self) -> Self:
-        if len(set(self.model_dump(mode="python").values())) != 13:
+        if len(set(self.model_dump(mode="python").values())) != 14:
             raise ValueError("start runtime evidence bindings must be distinct")
         return self
 
@@ -4835,6 +4976,7 @@ class StartRuntimeIntentV2(_Model):
     materialization_intent_sha256: str = Field(pattern=_SHA256)
     materialization_effect_receipt_sha256: str = Field(pattern=_SHA256)
     observed_runtime_attestation_sha256: str = Field(pattern=_SHA256)
+    observed_restore_database_attestation_sha256: str = Field(pattern=_SHA256)
     provider_references: ProviderReferencesV2
     evidence: StartRuntimeEvidenceBindingsV2
     delivery_request: SecretDeliveryRequestV1
@@ -4871,6 +5013,8 @@ class StartRuntimeIntentV2(_Model):
             != self.materialization_effect_receipt_sha256
             or self.evidence.observed_runtime_attestation_sha256
             != self.observed_runtime_attestation_sha256
+            or self.evidence.observed_restore_database_attestation_sha256
+            != self.observed_restore_database_attestation_sha256
         ):
             raise ValueError("start runtime intent is invalid")
         references = {
@@ -5109,6 +5253,12 @@ def _matches_runtime_component(
     observed: RuntimeContainerObservationV1,
     candidate: ServiceIdentityV1 | ValkeyIdentityV1,
 ) -> bool:
+    if (
+        type(observed.attachments) is not tuple
+        or len(observed.attachments) != 1
+        or type(observed.attachments[0]) is not RuntimeNetworkAttachmentV1
+    ):
+        return False
     attachment = observed.attachments[0]
     return (
         observed.container_id == candidate.container_id
@@ -5118,8 +5268,32 @@ def _matches_runtime_component(
     )
 
 
+def _matches_runtime_topology(
+    observed: RuntimeContainerObservationV1,
+    *,
+    placement: ComponentPlacementV1,
+    network_id: str,
+) -> bool:
+    """Require every inspected attachment field, not just network identity."""
+
+    if (
+        type(observed.attachments) is not tuple
+        or len(observed.attachments) != 1
+        or type(observed.attachments[0]) is not RuntimeNetworkAttachmentV1
+    ):
+        return False
+    attachment = observed.attachments[0]
+    return (
+        attachment.network_name == placement.network_name
+        and attachment.network_id == network_id
+        and attachment.alias == placement.alias
+        and attachment.static_ipv4 == placement.static_ipv4
+    )
+
+
 def validate_observed_runtime_transition(
     allocation: ObservedAllocationAttestationV1,
+    restore_database: ObservedRestoreDatabaseAttestationV1,
     intent: MaterializationIntentV1,
     receipt: MaterializationEffectReceiptV1,
     attestation: ObservedRuntimeAttestationV1,
@@ -5130,6 +5304,7 @@ def validate_observed_runtime_transition(
 
     if (
         type(allocation) is not ObservedAllocationAttestationV1
+        or type(restore_database) is not ObservedRestoreDatabaseAttestationV1
         or type(intent) is not MaterializationIntentV1
         or type(receipt) is not MaterializationEffectReceiptV1
         or type(attestation) is not ObservedRuntimeAttestationV1
@@ -5140,6 +5315,8 @@ def validate_observed_runtime_transition(
     if (
         intent.observed_allocation_attestation_sha256
         != observed_allocation_attestation_sha256(allocation)
+        or intent.observed_restore_database_attestation_sha256
+        != observed_restore_database_attestation_sha256(restore_database)
         or intent.allocation_operation_id != allocation.allocation_operation_id
         or intent.allocation_intent_sha256 != allocation.allocation_intent_sha256
         or intent.allocation_effect_receipt_sha256 != allocation.allocation_effect_receipt_sha256
@@ -5168,6 +5345,26 @@ def validate_observed_runtime_transition(
         )
         or not _matches_runtime_component(receipt.primary_valkey, proposal.candidate.primary_valkey)
         or not _matches_runtime_component(receipt.restore_valkey, proposal.candidate.restore_valkey)
+        or not _matches_runtime_topology(
+            receipt.primary_infisical,
+            placement=intent.topology.primary_infisical,
+            network_id=allocation.allocated_resources.primary_network.network_id,
+        )
+        or not _matches_runtime_topology(
+            receipt.primary_valkey,
+            placement=intent.topology.primary_valkey,
+            network_id=allocation.allocated_resources.primary_network.network_id,
+        )
+        or not _matches_runtime_topology(
+            receipt.restore_infisical,
+            placement=intent.topology.restore_infisical,
+            network_id=allocation.allocated_resources.restore_network.network_id,
+        )
+        or not _matches_runtime_topology(
+            receipt.restore_valkey,
+            placement=intent.topology.restore_valkey,
+            network_id=allocation.allocated_resources.restore_network.network_id,
+        )
         or allocation.allocated_resources.postgres.system_identifier
         != proposal.candidate.postgres.system_identifier
         or allocation.allocated_resources.postgres.database_oid

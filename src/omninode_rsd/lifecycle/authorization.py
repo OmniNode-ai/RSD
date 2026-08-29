@@ -64,6 +64,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     MaterializationExecutorReceiptV1,
     MaterializationIntentV1,
     ObservedAllocationAttestationV1,
+    ObservedRestoreDatabaseAttestationV1,
     ObservedRuntimeAttestationV1,
     PostgreSQLConnectionUriGrammarV1,
     PostgreSQLControlPolicyV1,
@@ -104,6 +105,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     materialization_executor_receipt_message,
     materialization_intent_sha256,
     observed_allocation_attestation_sha256,
+    observed_restore_database_attestation_sha256,
     observed_runtime_attestation_sha256,
     start_runtime_effect_receipt_sha256,
     start_runtime_executor_receipt_message,
@@ -113,7 +115,9 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     strict_canonical_start_runtime_intent,
     target_delivery_map_sha256,
     validate_observed_allocation_transition,
+    validate_observed_restore_database_transition,
     validate_observed_runtime_transition,
+    valkey_static_authority,
 )
 from omninode_rsd.lifecycle.provider_crypto import (
     ReplayAuthorityPolicyArtifactV1,
@@ -142,6 +146,9 @@ _JOURNAL_GENESIS_ARTIFACT_NAME: Final = "journal-genesis.yaml"
 _ALLOCATION_INTENT_ARTIFACT_NAME: Final = "allocation-intent.yaml"
 _ALLOCATION_RECEIPT_ARTIFACT_NAME: Final = "allocation-receipt.yaml"
 _OBSERVED_ALLOCATION_ATTESTATION_ARTIFACT_NAME: Final = "observed-allocation-attestation.yaml"
+_OBSERVED_RESTORE_DATABASE_ATTESTATION_ARTIFACT_NAME: Final = (
+    "observed-restore-database-attestation.yaml"
+)
 _MATERIALIZATION_INTENT_ARTIFACT_NAME: Final = "materialization-intent.yaml"
 _MATERIALIZATION_RECEIPT_ARTIFACT_NAME: Final = "materialization-receipt.yaml"
 _OBSERVED_RUNTIME_ATTESTATION_ARTIFACT_NAME: Final = "observed-runtime-attestation.yaml"
@@ -165,6 +172,9 @@ _SIGNATURE_DOMAIN: Final = b"omninode-rsd.authorization.ed25519.v3\x00"
 _ALLOCATION_INTENT_SIGNATURE_DOMAIN: Final = b"omninode-rsd.allocation-intent.ed25519.v2\x00"
 _OBSERVED_ALLOCATION_ATTESTATION_SIGNATURE_DOMAIN: Final = (
     b"omninode-rsd.observed-allocation-attestation.ed25519.v1\x00"
+)
+_OBSERVED_RESTORE_DATABASE_ATTESTATION_SIGNATURE_DOMAIN: Final = (
+    b"omninode-rsd.observed-restore-database-attestation.ed25519.v1\x00"
 )
 _MATERIALIZATION_INTENT_SIGNATURE_DOMAIN: Final = (
     b"omninode-rsd.materialization-intent.ed25519.v1\x00"
@@ -1230,6 +1240,8 @@ class MaterializationExecutionContext:
     intent: MaterializationIntentV1
     allocation_attestation: ObservedAllocationAttestationV1
     allocation_attestation_sha256: str
+    restore_database_attestation: ObservedRestoreDatabaseAttestationV1
+    restore_database_attestation_sha256: str
     provider_expectations: tuple[ProviderExpectationV1, ...]
     executor_expectation: ExecutorControlExpectationV1
     executor_attestation_key_id: str
@@ -1283,6 +1295,7 @@ class StartRuntimeExecutionContext:
     intent: StartRuntimeIntentV2
     materialization_intent: MaterializationIntentV1
     materialization_receipt: MaterializationEffectReceiptV1
+    restore_database_attestation: ObservedRestoreDatabaseAttestationV1
     observed_runtime_attestation: ObservedRuntimeAttestationV1
     provider_expectations: tuple[ProviderExpectationV1, ...]
     executor_expectation: ExecutorControlExpectationV1
@@ -1418,6 +1431,12 @@ class AuthorizationPaths:
         return _OBSERVED_ALLOCATION_ATTESTATION_ARTIFACT_NAME
 
     @staticmethod
+    def observed_restore_database_attestation_name() -> str:
+        """Fixed artifact name for the signed backup-to-restore observation."""
+
+        return _OBSERVED_RESTORE_DATABASE_ATTESTATION_ARTIFACT_NAME
+
+    @staticmethod
     def materialization_intent_name() -> str:
         return _MATERIALIZATION_INTENT_ARTIFACT_NAME
 
@@ -1518,6 +1537,7 @@ class _MaterializationStageArtifacts:
 
     intent: MaterializationIntentV1
     receipt: MaterializationEffectReceiptV1
+    restore_database_attestation: ObservedRestoreDatabaseAttestationV1
     attestation: ObservedRuntimeAttestationV1
 
 
@@ -2173,6 +2193,16 @@ def _observed_allocation_attestation_message(
     return _direct_signature_message(_OBSERVED_ALLOCATION_ATTESTATION_SIGNATURE_DOMAIN, attestation)
 
 
+def _observed_restore_database_attestation_message(
+    attestation: ObservedRestoreDatabaseAttestationV1,
+) -> bytes:
+    if type(attestation) is not ObservedRestoreDatabaseAttestationV1:
+        raise AuthorizationError("observed_restore_database_signature")
+    return _direct_signature_message(
+        _OBSERVED_RESTORE_DATABASE_ATTESTATION_SIGNATURE_DOMAIN, attestation
+    )
+
+
 def _materialization_intent_message(intent: MaterializationIntentV1) -> bytes:
     if type(intent) is not MaterializationIntentV1:
         raise AuthorizationError("materialization_intent_signature")
@@ -2347,6 +2377,29 @@ def _verify_observed_allocation_attestation_signature(
             cast(ObservedAllocationAttestationV1, model)
         ),
         phase="observed_allocation_signature",
+    )
+
+
+def _verify_observed_restore_database_attestation_signature(
+    attestation: ObservedRestoreDatabaseAttestationV1,
+    *,
+    signer: TrustedEd25519SignerV1,
+) -> None:
+    attestation = cast(
+        ObservedRestoreDatabaseAttestationV1,
+        _canonical_artifact_model(
+            attestation,
+            ObservedRestoreDatabaseAttestationV1,
+            phase="observed_restore_database_signature",
+        ),
+    )
+    _verify_direct_signature(
+        attestation,
+        signer=signer,
+        message=lambda model: _observed_restore_database_attestation_message(
+            cast(ObservedRestoreDatabaseAttestationV1, model)
+        ),
+        phase="observed_restore_database_signature",
     )
 
 
@@ -3047,6 +3100,7 @@ def _read_materialization_stage_artifacts(
     names = (
         paths.materialization_intent_name(),
         paths.materialization_receipt_name(),
+        paths.observed_restore_database_attestation_name(),
         paths.observed_runtime_attestation_name(),
     )
     try:
@@ -3063,6 +3117,15 @@ def _read_materialization_stage_artifacts(
             )
         )
         receipt = _strict_canonical_model(receipt, MaterializationEffectReceiptV1)
+        restore_database_attestation = ObservedRestoreDatabaseAttestationV1.model_validate(
+            _parse_document(
+                raw[paths.observed_restore_database_attestation_name()],
+                phase="observed_restore_database_attestation_artifact",
+            )
+        )
+        restore_database_attestation = _strict_canonical_model(
+            restore_database_attestation, ObservedRestoreDatabaseAttestationV1
+        )
         attestation = ObservedRuntimeAttestationV1.model_validate(
             _parse_document(
                 raw[paths.observed_runtime_attestation_name()],
@@ -3073,10 +3136,16 @@ def _read_materialization_stage_artifacts(
     except (AuthorizationError, DisposablePreflightError, ValidationError, ValueError):
         raise AuthorizationError("materialization_stage_artifact") from None
     _verify_materialization_intent_signature(intent, signer=signer)
+    _verify_observed_restore_database_attestation_signature(
+        restore_database_attestation, signer=signer
+    )
     _verify_observed_runtime_attestation_signature(attestation, signer=signer)
     try:
         created = datetime.fromisoformat(intent.created_at.removesuffix("Z") + "+00:00")
         completed = datetime.fromisoformat(receipt.completed_at.removesuffix("Z") + "+00:00")
+        restore_observed = datetime.fromisoformat(
+            restore_database_attestation.observed_at.removesuffix("Z") + "+00:00"
+        )
         observed = datetime.fromisoformat(attestation.observed_at.removesuffix("Z") + "+00:00")
         retained = datetime.fromisoformat(intent.retention_expires_at.removesuffix("Z") + "+00:00")
     except ValueError:
@@ -3084,13 +3153,17 @@ def _read_materialization_stage_artifacts(
     if (
         created.tzinfo is None
         or completed.tzinfo is None
+        or restore_observed.tzinfo is None
         or observed.tzinfo is None
         or retained.tzinfo is None
         or created.astimezone(UTC) > now
         or completed.astimezone(UTC) > now
+        or restore_observed.astimezone(UTC) > now
         or observed.astimezone(UTC) > now
         or completed.astimezone(UTC) < created.astimezone(UTC)
+        or restore_observed.astimezone(UTC) < completed.astimezone(UTC)
         or observed.astimezone(UTC) < completed.astimezone(UTC)
+        or now - restore_observed.astimezone(UTC) > _STAGE_ATTESTATION_FRESHNESS
         or now - observed.astimezone(UTC) > _STAGE_ATTESTATION_FRESHNESS
         or retained.astimezone(UTC) <= now
         or intent.disposal_owner != expected_disposal_owner
@@ -3098,8 +3171,15 @@ def _read_materialization_stage_artifacts(
     ):
         raise AuthorizationError("materialization_stage_freshness")
     try:
+        validate_observed_restore_database_transition(
+            allocation.intent,
+            allocation.receipt,
+            allocation.attestation,
+            restore_database_attestation,
+        )
         validate_observed_runtime_transition(
             allocation.attestation,
+            restore_database_attestation,
             intent,
             receipt,
             attestation,
@@ -3108,7 +3188,9 @@ def _read_materialization_stage_artifacts(
         )
     except ValueError:
         raise AuthorizationError("materialization_stage_transition") from None
-    return _MaterializationStageArtifacts(intent, receipt, attestation), raw
+    return _MaterializationStageArtifacts(
+        intent, receipt, restore_database_attestation, attestation
+    ), raw
 
 
 def _read_verified_allocation_intent(
@@ -3405,6 +3487,8 @@ def _verify_materialization_control_policy_bindings(
         or target_delivery_map.source_commit != allocation_intent.source_commit
         or target_delivery_map.allocation_intent_sha256
         != allocation_intent_sha256(allocation_intent)
+        or target_delivery_map.topology != allocation_intent.plan.topology
+        or target_delivery_map.topology != intent.topology
         or target_delivery_map.wrapper_manifest_sha256 != wrapper_manifest_hash
         or target_delivery_map.attach_protocol_sha256 != attach_protocol_hash
         or target_delivery_map.secret_handling_policy_sha256 != secret_handling_hash
@@ -3556,6 +3640,7 @@ def _verify_materialization_intent_chain(
     *,
     allocation: _AllocationStageArtifacts,
     intent: MaterializationIntentV1,
+    restore_database_attestation: ObservedRestoreDatabaseAttestationV1,
     target_delivery_map: TargetDeliveryMapV1,
     replay_policy: ReplayAuthorityPolicyV1,
     expected_disposal_owner: str,
@@ -3567,24 +3652,51 @@ def _verify_materialization_intent_chain(
     try:
         created = datetime.fromisoformat(intent.created_at.removesuffix("Z") + "+00:00")
         retained = datetime.fromisoformat(intent.retention_expires_at.removesuffix("Z") + "+00:00")
+        allocation_completed = datetime.fromisoformat(
+            allocation.receipt.completed_at.removesuffix("Z") + "+00:00"
+        )
+        restore_observed = datetime.fromisoformat(
+            restore_database_attestation.observed_at.removesuffix("Z") + "+00:00"
+        )
     except ValueError:
         raise AuthorizationError("materialization_intent_freshness") from None
+    try:
+        validate_observed_restore_database_transition(
+            allocation.intent,
+            allocation.receipt,
+            allocation.attestation,
+            restore_database_attestation,
+        )
+    except ValueError:
+        raise AuthorizationError("materialization_restore_database_binding") from None
     if (
         created.tzinfo is None
         or retained.tzinfo is None
+        or allocation_completed.tzinfo is None
+        or restore_observed.tzinfo is None
         or created.astimezone(UTC) > now
         or now - created.astimezone(UTC) > _STAGE_ATTESTATION_FRESHNESS
+        or allocation_completed.astimezone(UTC) > restore_observed.astimezone(UTC)
+        or restore_observed.astimezone(UTC) > created.astimezone(UTC)
+        or restore_observed.astimezone(UTC) > now
+        or now - restore_observed.astimezone(UTC) > _STAGE_ATTESTATION_FRESHNESS
         or retained.astimezone(UTC) <= now
-        or intent.source_commit != allocation.intent.source_commit
+    ):
+        raise AuthorizationError("materialization_intent_freshness")
+    if (
+        intent.source_commit != allocation.intent.source_commit
         or intent.allocation_operation_id != allocation.intent.allocation_operation_id
         or intent.allocation_intent_sha256 != allocation_intent_sha256(allocation.intent)
         or intent.allocation_effect_receipt_sha256
         != allocation_effect_receipt_sha256(allocation.receipt)
         or intent.observed_allocation_attestation_sha256
         != observed_allocation_attestation_sha256(allocation.attestation)
+        or intent.observed_restore_database_attestation_sha256
+        != observed_restore_database_attestation_sha256(restore_database_attestation)
         or intent.journal_uuid != allocation.intent.journal_uuid
         or intent.replay_policy_sha256 != replay_policy.sha256()
         or intent.topology != allocation.intent.plan.topology
+        or target_delivery_map.topology != allocation.intent.plan.topology
         or intent.provider_references != allocation.intent.provider_references
         or intent.plan.primary_valkey.volume_name
         != allocation.intent.plan.primary_valkey_volume.name
@@ -3595,6 +3707,7 @@ def _verify_materialization_intent_chain(
     ):
         raise AuthorizationError("materialization_intent_binding")
     postgres = allocation.attestation.allocated_resources.postgres
+    restore_postgres = restore_database_attestation.restore_database
     primary = intent.postgres_login_transitions.primary_database
     restore = intent.postgres_login_transitions.restore_database
     primary_identity = target_delivery_map.database_identities.primary_database
@@ -3602,7 +3715,12 @@ def _verify_materialization_intent_chain(
     if (
         target_delivery_map.allocation_intent_sha256 != allocation_intent_sha256(allocation.intent)
         or target_delivery_map.provider_references != allocation.intent.provider_references
+        or target_delivery_map.topology != intent.topology
         or target_delivery_map_sha256(target_delivery_map) != intent.target_delivery_map_sha256
+        or target_delivery_map.primary_valkey_connection_uri.authority
+        != valkey_static_authority(intent.topology.primary_valkey.static_ipv4)
+        or target_delivery_map.restore_valkey_connection_uri.authority
+        != valkey_static_authority(intent.topology.restore_valkey.static_ipv4)
         or primary != primary_identity.login_transition
         or restore != restore_identity.login_transition
         or primary_identity.observation_binding_sha256 != canonical_sha256(postgres)
@@ -3621,10 +3739,23 @@ def _verify_materialization_intent_chain(
         or primary_identity.connection_uri.application_password_reference_sha256
         != primary.application_password_reference_sha256
         or primary_identity.connection_uri.prepared_operation_id != primary.prepared_operation_id
-        or restore.database_name == primary.database_name
-        or restore.database_oid == primary.database_oid
-        or restore.application_role == primary.application_role
-        or restore.application_role_oid == primary.application_role_oid
+        or restore_identity.observation_binding_sha256
+        != observed_restore_database_attestation_sha256(restore_database_attestation)
+        or restore.system_identifier != restore_postgres.system_identifier
+        or restore.database_name != restore_postgres.database_name
+        or restore.database_oid != restore_postgres.database_oid
+        or restore.owner_role != restore_postgres.owner_role
+        or restore.owner_role_oid != restore_postgres.owner_role_oid
+        or restore.application_role != restore_postgres.application_role
+        or restore.application_role_oid != restore_postgres.application_role_oid
+        or restore.application_password_reference_sha256
+        != allocation.intent.provider_references.postgres_application_password.reference_sha256
+        or restore_identity.connection_uri.authority != restore_database_attestation.authority
+        or restore_identity.connection_uri.database_name != restore_postgres.database_name
+        or restore_identity.connection_uri.application_role != restore_postgres.application_role
+        or restore_identity.connection_uri.application_password_reference_sha256
+        != restore.application_password_reference_sha256
+        or restore_identity.connection_uri.prepared_operation_id != restore.prepared_operation_id
     ):
         raise AuthorizationError("materialization_postgres_transition_binding")
 
@@ -3655,6 +3786,7 @@ def _verify_start_runtime_intent_chain(
         raise AuthorizationError("start_runtime_intent_freshness") from None
     materialization_intent = materialization.intent
     materialization_receipt = materialization.receipt
+    restore_database_attestation = materialization.restore_database_attestation
     evidence = intent.evidence
     executor_receipt = materialization_receipt.executor_receipt
     _verify_executor_attestation_signature(
@@ -3680,6 +3812,8 @@ def _verify_start_runtime_intent_chain(
         != materialization_effect_receipt_sha256(materialization_receipt)
         or intent.observed_runtime_attestation_sha256
         != observed_runtime_attestation_sha256(materialization.attestation)
+        or intent.observed_restore_database_attestation_sha256
+        != observed_restore_database_attestation_sha256(restore_database_attestation)
         or intent.provider_references != allocation.intent.provider_references
         or intent.provider_references != materialization_intent.provider_references
         or intent.journal_uuid != allocation.intent.journal_uuid
@@ -3693,6 +3827,8 @@ def _verify_start_runtime_intent_chain(
         != materialization_effect_receipt_sha256(materialization_receipt)
         or evidence.observed_runtime_attestation_sha256
         != observed_runtime_attestation_sha256(materialization.attestation)
+        or evidence.observed_restore_database_attestation_sha256
+        != observed_restore_database_attestation_sha256(restore_database_attestation)
         or evidence.executor_control_policy_sha256 != canonical_sha256(controls.executor)
         or evidence.executor_installation_policy_sha256
         != canonical_sha256(controls.installation_policy)
@@ -9912,6 +10048,7 @@ def _run_materialization_authorization(
     signer: TrustedEd25519SignerV1,
     allocation_intent: AllocationIntentV2,
     materialization_intent: MaterializationIntentV1,
+    observed_restore_database_attestation: ObservedRestoreDatabaseAttestationV1,
     secret_capability_policy: SecretCapabilityPolicyV1,
     secret_handling_policy: SecretHandlingPolicyV1,
     wrapper_manifest: ContainerBootstrapWrapperManifestV1,
@@ -9940,6 +10077,7 @@ def _run_materialization_authorization(
         or type(signer) is not TrustedEd25519SignerV1
         or type(allocation_intent) is not AllocationIntentV2
         or type(materialization_intent) is not MaterializationIntentV1
+        or type(observed_restore_database_attestation) is not ObservedRestoreDatabaseAttestationV1
         or type(secret_capability_policy) is not SecretCapabilityPolicyV1
         or type(secret_handling_policy) is not SecretHandlingPolicyV1
         or type(wrapper_manifest) is not ContainerBootstrapWrapperManifestV1
@@ -9954,6 +10092,17 @@ def _run_materialization_authorization(
         materialization_intent,
         allocation_intent=allocation_intent,
         signer=signer,
+    )
+    observed_restore_database_attestation = cast(
+        ObservedRestoreDatabaseAttestationV1,
+        _canonical_artifact_model(
+            observed_restore_database_attestation,
+            ObservedRestoreDatabaseAttestationV1,
+            phase="observed_restore_database_attestation_artifact",
+        ),
+    )
+    _verify_observed_restore_database_attestation_signature(
+        observed_restore_database_attestation, signer=signer
     )
     secret_capability_policy = cast(
         SecretCapabilityPolicyV1,
@@ -10019,6 +10168,39 @@ def _run_materialization_authorization(
             allocation_stage.receipt,
             allocation_stage.attestation,
         )
+        persisted_restore_database_attestation, persisted_restore_database_raw = (
+            _read_canonical_signed_model(
+                artifact_lease.reader(),
+                name=paths.observed_restore_database_attestation_name(),
+                model_type=ObservedRestoreDatabaseAttestationV1,
+                phase="observed_restore_database_attestation_artifact",
+            )
+        )
+        if type(persisted_restore_database_attestation) is not ObservedRestoreDatabaseAttestationV1:
+            raise AuthorizationError("observed_restore_database_attestation_artifact")
+        _verify_observed_restore_database_attestation_signature(
+            persisted_restore_database_attestation, signer=signer
+        )
+        if (
+            persisted_restore_database_attestation != observed_restore_database_attestation
+            or not hmac.compare_digest(
+                persisted_restore_database_raw,
+                _signed_model_artifact_bytes(
+                    observed_restore_database_attestation,
+                    phase="observed_restore_database_attestation_artifact",
+                ),
+            )
+        ):
+            raise AuthorizationError("observed_restore_database_attestation_artifact")
+        try:
+            validate_observed_restore_database_transition(
+                allocation_stage.intent,
+                allocation_stage.receipt,
+                allocation_stage.attestation,
+                persisted_restore_database_attestation,
+            )
+        except ValueError:
+            raise AuthorizationError("observed_restore_database_transition") from None
         _replay_artifact, _replay_raw = _read_replay_policy_artifact(
             paths,
             signer=signer,
@@ -10080,6 +10262,24 @@ def _run_materialization_authorization(
             persisted_intent_raw, _materialization_intent_artifact_bytes(materialization_intent)
         ):
             raise AuthorizationError("materialization_intent_artifact")
+        reopened_restore_database_attestation, reopened_restore_database_raw = (
+            _read_canonical_signed_model(
+                artifact_lease.reader(),
+                name=paths.observed_restore_database_attestation_name(),
+                model_type=ObservedRestoreDatabaseAttestationV1,
+                phase="observed_restore_database_attestation_artifact",
+            )
+        )
+        if type(reopened_restore_database_attestation) is not ObservedRestoreDatabaseAttestationV1:
+            raise AuthorizationError("observed_restore_database_attestation_artifact")
+        _verify_observed_restore_database_attestation_signature(
+            reopened_restore_database_attestation, signer=signer
+        )
+        if (
+            reopened_restore_database_attestation != persisted_restore_database_attestation
+            or reopened_restore_database_raw != persisted_restore_database_raw
+        ):
+            raise AuthorizationError("observed_restore_database_attestation_artifact")
         fingerprints, material_snapshot = _trusted_provider_fingerprints(
             signer=signer,
             allocation_intent=verified_allocation.intent,
@@ -10109,6 +10309,7 @@ def _run_materialization_authorization(
         _verify_materialization_intent_chain(
             allocation=allocation_stage,
             intent=persisted_intent_model,
+            restore_database_attestation=persisted_restore_database_attestation,
             target_delivery_map=controls.target_delivery_map,
             replay_policy=replay_policy,
             expected_disposal_owner=expected_disposal_owner,
@@ -10192,6 +10393,22 @@ def _run_materialization_authorization(
             if type(repeated_intent_model) is not MaterializationIntentV1:
                 raise AuthorizationError("materialization_intent_artifact")
             _verify_materialization_intent_signature(repeated_intent_model, signer=signer)
+            repeated_restore_database_attestation, repeated_restore_database_raw = (
+                _read_canonical_signed_model(
+                    artifact_lease.reader(),
+                    name=paths.observed_restore_database_attestation_name(),
+                    model_type=ObservedRestoreDatabaseAttestationV1,
+                    phase="observed_restore_database_attestation_artifact",
+                )
+            )
+            if (
+                type(repeated_restore_database_attestation)
+                is not ObservedRestoreDatabaseAttestationV1
+            ):
+                raise AuthorizationError("observed_restore_database_attestation_artifact")
+            _verify_observed_restore_database_attestation_signature(
+                repeated_restore_database_attestation, signer=signer
+            )
             repeated_fingerprints, repeated_material_snapshot = _trusted_provider_fingerprints(
                 signer=signer,
                 allocation_intent=verified_allocation.intent,
@@ -10214,6 +10431,8 @@ def _run_materialization_authorization(
                 or allocation_stage != repeated_allocation
                 or persisted_intent_model != repeated_intent_model
                 or persisted_intent_raw != repeated_intent_raw
+                or persisted_restore_database_attestation != repeated_restore_database_attestation
+                or persisted_restore_database_raw != repeated_restore_database_raw
                 or fingerprints != repeated_fingerprints
                 or material_snapshot != repeated_material_snapshot
                 or controls != repeated_controls
@@ -10271,6 +10490,12 @@ def _run_materialization_authorization(
                 allocation_attestation=allocation_stage.attestation,
                 allocation_attestation_sha256=observed_allocation_attestation_sha256(
                     allocation_stage.attestation
+                ),
+                restore_database_attestation=persisted_restore_database_attestation,
+                restore_database_attestation_sha256=(
+                    observed_restore_database_attestation_sha256(
+                        persisted_restore_database_attestation
+                    )
                 ),
                 provider_expectations=final_expectations,
                 executor_expectation=final_executor_expectation,
@@ -10489,6 +10714,7 @@ def authorize_materialization_and_execute(
     signer: TrustedEd25519SignerV1,
     allocation_intent: AllocationIntentV2,
     materialization_intent: MaterializationIntentV1,
+    observed_restore_database_attestation: ObservedRestoreDatabaseAttestationV1,
     secret_capability_policy: SecretCapabilityPolicyV1,
     secret_handling_policy: SecretHandlingPolicyV1,
     wrapper_manifest: ContainerBootstrapWrapperManifestV1,
@@ -10512,6 +10738,7 @@ def authorize_materialization_and_execute(
         signer=signer,
         allocation_intent=allocation_intent,
         materialization_intent=materialization_intent,
+        observed_restore_database_attestation=observed_restore_database_attestation,
         secret_capability_policy=secret_capability_policy,
         secret_handling_policy=secret_handling_policy,
         wrapper_manifest=wrapper_manifest,
@@ -10685,6 +10912,7 @@ def _run_start_runtime_authorization(
                 now=now,
                 reader=artifact_lease.reader(),
             )
+            _verify_target_delivery_map_fingerprints(controls.target_delivery_map, fingerprints)
             _verify_start_runtime_intent_chain(
                 allocation=allocation,
                 materialization=materialization,
@@ -10864,6 +11092,7 @@ def _run_start_runtime_authorization(
                 intent=persisted_start,
                 materialization_intent=materialization_stage.intent,
                 materialization_receipt=materialization_stage.receipt,
+                restore_database_attestation=(materialization_stage.restore_database_attestation),
                 observed_runtime_attestation=materialization_stage.attestation,
                 provider_expectations=final_expectations,
                 executor_expectation=final_executor_expectation,

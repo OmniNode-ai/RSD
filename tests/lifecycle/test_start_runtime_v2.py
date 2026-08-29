@@ -36,6 +36,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     ExecutorContainerInspectionV1,
     MaterializationEffectReceiptV1,
     MaterializationIntentV1,
+    ObservedRestoreDatabaseAttestationV1,
     ObservedRuntimeAttestationV1,
     SecretDeliveryReceiptV1,
     SecretDeliveryRequestV1,
@@ -111,6 +112,9 @@ def _start_intent(
         materialization_intent_sha256=authorization.materialization_intent_sha256(materialization),
         materialization_effect_receipt_sha256=_hash("materialization-effect"),
         observed_runtime_attestation_sha256=_hash("observed-runtime"),
+        observed_restore_database_attestation_sha256=(
+            materialization.observed_restore_database_attestation_sha256
+        ),
         provider_references=allocation_intent.provider_references,
         evidence=StartRuntimeEvidenceBindingsV2(
             materialization_intent_sha256=authorization.materialization_intent_sha256(
@@ -118,6 +122,9 @@ def _start_intent(
             ),
             materialization_effect_receipt_sha256=_hash("materialization-effect"),
             observed_runtime_attestation_sha256=_hash("observed-runtime"),
+            observed_restore_database_attestation_sha256=(
+                materialization.observed_restore_database_attestation_sha256
+            ),
             executor_control_policy_sha256=_hash("executor-control-policy"),
             executor_installation_policy_sha256=_hash("executor-installation-policy"),
             executor_installation_intent_sha256=_hash("executor-installation-intent"),
@@ -154,6 +161,7 @@ def _start_context(
     start: StartRuntimeIntentV2,
     materialization: MaterializationIntentV1,
     materialization_receipt: MaterializationEffectReceiptV1,
+    restore_database_attestation: ObservedRestoreDatabaseAttestationV1,
     wrapper_manifest: ContainerBootstrapWrapperManifestV1,
     target_delivery_map: TargetDeliveryMapV1,
     attach_protocol: ContainerBootstrapAttachProtocolV1,
@@ -167,6 +175,7 @@ def _start_context(
         intent=start,
         materialization_intent=materialization,
         materialization_receipt=materialization_receipt,
+        restore_database_attestation=restore_database_attestation,
         observed_runtime_attestation=ObservedRuntimeAttestationV1.model_construct(),
         provider_expectations=(),
         executor_expectation=ExecutorControlExpectationV1(
@@ -286,6 +295,31 @@ def _fresh_start_attach_containers(
     )
 
 
+def test_start_runtime_requires_refreshed_target_delivery_map_fingerprints(
+    tmp_path: Path,
+) -> None:
+    """A fresh StartV2 snapshot cannot reuse stale target-map fingerprints."""
+
+    allocation, executor, _ = _allocation_bundle(tmp_path)
+    allocation_receipt = _allocation_receipt(allocation)
+    allocation_observation = _allocation_attestation(allocation, allocation_receipt)
+    _, _, _, _, _, target_delivery_map, _ = _materialization_intent(
+        allocation, executor, allocation_receipt, allocation_observation
+    )
+    refreshed = {
+        item.reference_sha256: item.fingerprint_sha256
+        for item in target_delivery_map.material_fingerprints
+    }
+    authorization._verify_target_delivery_map_fingerprints(target_delivery_map, refreshed)
+
+    stale = dict(refreshed)
+    stale[allocation.provider_references.auth_secret.reference_sha256] = _hash(
+        "refreshed-but-different-auth-secret"
+    )
+    with pytest.raises(AuthorizationError, match="target_delivery_map_provider_binding"):
+        authorization._verify_target_delivery_map_fingerprints(target_delivery_map, stale)
+
+
 def _start_effect_receipt(context: StartRuntimeExecutionContext) -> StartRuntimeEffectReceiptV2:
     """Create a valid redacted, executor-signed receipt for one test context."""
 
@@ -376,13 +410,20 @@ def _materialized_start_context(tmp_path: Path) -> StartRuntimeExecutionContext:
     allocation, executor, _ = _allocation_bundle(tmp_path)
     allocation_receipt = _allocation_receipt(allocation)
     allocation_attestation = _allocation_attestation(allocation, allocation_receipt)
-    materialization, _, _, wrapper_manifest, target_delivery_map, attach_protocol = (
-        _materialization_intent(allocation, executor, allocation_receipt, allocation_attestation)
-    )
+    (
+        materialization,
+        restore_observation,
+        _,
+        _,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
+    ) = _materialization_intent(allocation, executor, allocation_receipt, allocation_attestation)
     _, signing_key = _trusted_signer()
     materialization_context = _materialization_context(
         materialization,
         allocation_attestation,
+        restore_observation,
         wrapper_manifest,
         target_delivery_map,
         attach_protocol,
@@ -393,6 +434,7 @@ def _materialized_start_context(tmp_path: Path) -> StartRuntimeExecutionContext:
         start,
         materialization,
         materialization_receipt,
+        restore_observation,
         wrapper_manifest,
         target_delivery_map,
         attach_protocol,
@@ -538,12 +580,19 @@ def test_start_runtime_journal_requires_materialization_and_blocks_replay(
     journal._begin_effect(allocation_verified)
     journal._commit_effect(allocation_verified, allocation_receipt)
 
-    materialization, _, _, wrapper_manifest, target_delivery_map, attach_protocol = (
-        _materialization_intent(allocation, executor, allocation_receipt, allocation_attestation)
-    )
+    (
+        materialization,
+        restore_observation,
+        _,
+        _,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
+    ) = _materialization_intent(allocation, executor, allocation_receipt, allocation_attestation)
     materialization_context = _materialization_context(
         materialization,
         allocation_attestation,
+        restore_observation,
         wrapper_manifest,
         target_delivery_map,
         attach_protocol,
@@ -555,6 +604,7 @@ def test_start_runtime_journal_requires_materialization_and_blocks_replay(
         start,
         materialization,
         materialization_receipt,
+        restore_observation,
         wrapper_manifest,
         target_delivery_map,
         attach_protocol,
@@ -633,17 +683,24 @@ def test_materialization_tombstone_and_start_journal_globally_bind_delivery_nonc
     journal._claim_verified(allocation_verified)
     journal._begin_effect(allocation_verified)
     journal._commit_effect(allocation_verified, allocation_receipt)
-    materialization, _, _, wrapper_manifest, target_delivery_map, attach_protocol = (
-        _materialization_intent(
-            allocation,
-            executor,
-            allocation_receipt,
-            allocation_attestation,
-        )
+    (
+        materialization,
+        restore_observation,
+        _,
+        _,
+        wrapper_manifest,
+        target_delivery_map,
+        attach_protocol,
+    ) = _materialization_intent(
+        allocation,
+        executor,
+        allocation_receipt,
+        allocation_attestation,
     )
     materialization_context = _materialization_context(
         materialization,
         allocation_attestation,
+        restore_observation,
         wrapper_manifest,
         target_delivery_map,
         attach_protocol,
@@ -681,6 +738,7 @@ def test_materialization_tombstone_and_start_journal_globally_bind_delivery_nonc
             reused,
             materialization,
             materialization_receipt,
+            restore_observation,
             wrapper_manifest,
             target_delivery_map,
             attach_protocol,

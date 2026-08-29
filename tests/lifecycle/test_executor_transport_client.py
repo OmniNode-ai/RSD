@@ -7,6 +7,8 @@ import hashlib
 import io
 import json
 import struct
+import traceback
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -377,6 +379,93 @@ def test_live_client_rejects_caller_selected_process_or_file_seams() -> None:
             _artifacts(_policy()),
             _popen=lambda argv, **kwargs: _Process(),
         )
+
+
+def test_remote_transport_metadata_failures_detach_secret_error_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Early malformed metadata cannot retain a sentinel via exception chaining."""
+
+    sentinel = "transport-metadata-secret-sentinel"
+
+    @contextmanager
+    def fake_open(_client: transport.MacOSSecureShellClient):
+        yield object()
+
+    monkeypatch.setattr(transport.MacOSSecureShellClient, "open", fake_open)
+    client = object.__new__(transport.MacOSSecureShellClient)
+    remote = transport.RemoteExecutorTransportClient(client, artifacts=_artifacts(_policy()))
+
+    class Lease:
+        def stream_to(
+            self,
+            request: SecretDeliveryRequestV1,
+            writer: object,
+            *,
+            completed_at: str,
+        ) -> object:
+            del request, writer, completed_at
+            raise RuntimeError(sentinel)
+
+    malformed_delivery = transport.ExecutorTransportRequestV2.model_construct(
+        schema_version=sentinel
+    )
+    with pytest.raises(transport.ExecutorTransportError) as delivery_error:
+        remote.deliver(
+            malformed_delivery,
+            SecretDeliveryRequestV1.model_construct(),
+            Lease(),
+        )
+    malformed_allocation = transport.ExecutorAllocationTransportRequestV1.model_construct(
+        schema_version=sentinel
+    )
+    with pytest.raises(transport.ExecutorTransportError) as allocation_error:
+        remote.allocate(malformed_allocation)
+
+    for error in (delivery_error.value, allocation_error.value):
+        assert sentinel not in str(error)
+        assert sentinel not in repr(error)
+        assert sentinel not in repr(error.__dict__)
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        assert all(sentinel not in line for line in traceback.format_exception(error))
+
+
+def test_remote_transport_pre_delivery_error_phase_is_fixed_and_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A peer-controlled internal error phase cannot become public error text."""
+
+    sentinel = "transport-phase-secret-sentinel"
+
+    @contextmanager
+    def fake_open(_client: transport.MacOSSecureShellClient):
+        yield object()
+
+    def hostile_strict_model(*_args: object, **_kwargs: object) -> object:
+        raise transport.ExecutorTransportError(sentinel)
+
+    monkeypatch.setattr(transport.MacOSSecureShellClient, "open", fake_open)
+    monkeypatch.setattr(transport, "_strict_model", hostile_strict_model)
+    client = object.__new__(transport.MacOSSecureShellClient)
+    remote = transport.RemoteExecutorTransportClient(client, artifacts=_artifacts(_policy()))
+
+    with pytest.raises(transport.ExecutorTransportError, match="transport_delivery") as delivery:
+        remote.deliver(
+            transport.ExecutorTransportRequestV2.model_construct(),
+            SecretDeliveryRequestV1.model_construct(),
+            cast(object, object()),
+        )
+    with pytest.raises(
+        transport.ExecutorTransportError, match="allocation_transport"
+    ) as allocation:
+        remote.allocate(transport.ExecutorAllocationTransportRequestV1.model_construct())
+
+    for error in (delivery.value, allocation.value):
+        assert sentinel not in str(error)
+        assert sentinel not in repr(error)
+        assert error.__cause__ is None
+        assert error.__context__ is None
 
 
 def test_ssh_pipe_deadline_rejects_a_stalled_descriptor(

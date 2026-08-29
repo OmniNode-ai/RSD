@@ -1,17 +1,18 @@
-"""Adversarial tests for the offline daemon-to-container attach codec.
+"""Adversarial tests for deadline-bound, one-shot local attach framing.
 
-The stream fixtures are in-memory only.  They prove framing and zeroization
-rules without creating a Docker attach connection, wrapper process, provider,
-database, network endpoint, or runtime workload.
+All channels are in-memory fakes.  They prove the public-safe contract without
+opening an attach socket, Docker engine, provider, database, or network endpoint.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
-import io
 import json
 import struct
+import threading
+import traceback
+from dataclasses import dataclass, field
 from typing import cast
 
 import pytest
@@ -21,9 +22,12 @@ from omninode_rsd.lifecycle.container_attach import (
     ContainerAttachDaemonSession,
     ContainerAttachError,
     ContainerAttachFrameType,
+    ContainerAttachNonceAuthority,
+    ContainerAttachNonceClaimResult,
+    ContainerAttachNonceClaimV1,
     ContainerAttachSessionState,
+    consume_container_attach_secret_chunks,
     read_container_attach_request,
-    read_secret_chunks,
 )
 from omninode_rsd.lifecycle.infisical_disposable import (
     ContainerAttachClaimV1,
@@ -62,6 +66,89 @@ def _frame(frame_type: ContainerAttachFrameType, payload: bytes) -> bytes:
     return _HEADER.pack(b"ONCA", 1, int(frame_type), len(payload)) + payload
 
 
+@dataclass(slots=True)
+class _Clock:
+    now: float = 100.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+@dataclass(slots=True)
+class _Channel:
+    """A deadline-capable byte channel with controlled partial/failure behavior."""
+
+    clock: _Clock
+    incoming: bytearray = field(default_factory=bytearray)
+    outgoing: bytearray = field(default_factory=bytearray)
+    read_limit: int | None = None
+    write_limit: int | None = None
+    advance_on_read: float = 0.0
+    advance_on_write: float = 0.0
+    fail_write_call: int | None = None
+    none_write_call: int | None = None
+    sentinel: str | None = None
+    write_calls: int = 0
+
+    def read(self, count: int, *, deadline: float) -> bytes:
+        if self.clock.now >= deadline:
+            raise TimeoutError("deadline")
+        self.clock.now += self.advance_on_read
+        if self.clock.now >= deadline:
+            raise TimeoutError("deadline")
+        if not self.incoming:
+            return b""
+        limit = count if self.read_limit is None else min(count, self.read_limit)
+        value = bytes(self.incoming[:limit])
+        del self.incoming[:limit]
+        return value
+
+    def write(self, data: bytes | bytearray | memoryview, *, deadline: float) -> int:
+        if self.clock.now >= deadline:
+            raise TimeoutError("deadline")
+        self.write_calls += 1
+        if self.fail_write_call == self.write_calls:
+            raise RuntimeError(self.sentinel or "writer failure")
+        self.clock.now += self.advance_on_write
+        if self.clock.now >= deadline:
+            raise TimeoutError("deadline")
+        rendered = bytes(data)
+        if self.none_write_call == self.write_calls:
+            self.outgoing.extend(rendered)
+            return cast(int, None)
+        if self.write_limit is not None and self.write_limit < len(rendered):
+            self.outgoing.extend(rendered[: self.write_limit])
+            return self.write_limit
+        self.outgoing.extend(rendered)
+        return len(rendered)
+
+
+class _NonceAuthority(ContainerAttachNonceAuthority):
+    def __init__(self) -> None:
+        self._claims: set[tuple[str, str, str, str, str, str]] = set()
+        self._lock = threading.Lock()
+        self.claims: list[ContainerAttachNonceClaimV1] = []
+        self.unavailable = False
+
+    def claim_once(self, claim: ContainerAttachNonceClaimV1) -> ContainerAttachNonceClaimResult:
+        key = (
+            claim.boundary,
+            claim.request_sha256,
+            claim.operation_id,
+            claim.component,
+            claim.request_nonce_sha256,
+            claim.target_delivery_map_sha256,
+        )
+        with self._lock:
+            self.claims.append(claim)
+            if self.unavailable:
+                return ContainerAttachNonceClaimResult.UNAVAILABLE
+            if key in self._claims:
+                return ContainerAttachNonceClaimResult.REPLAYED
+            self._claims.add(key)
+            return ContainerAttachNonceClaimResult.CLAIMED
+
+
 def _protocol() -> ContainerBootstrapAttachProtocolV1:
     return ContainerBootstrapAttachProtocolV1(
         schema_version="rsd.container-bootstrap-attach-protocol.v1",
@@ -95,11 +182,7 @@ def _protocol() -> ContainerBootstrapAttachProtocolV1:
 
 
 def _field(
-    ordinal: int,
-    *,
-    purpose: str,
-    target_field: str,
-    byte_count: int,
+    ordinal: int, *, purpose: str, target_field: str, byte_count: int
 ) -> TargetDeliveryFieldV1:
     return TargetDeliveryFieldV1(
         ordinal=ordinal,
@@ -141,18 +224,8 @@ def _request(protocol: ContainerBootstrapAttachProtocolV1) -> ContainerAttachReq
         expected_claim_state="claimed_v1",
         expected_terminal_ack_state="terminal_ack_v1",
         fields=(
-            _field(
-                1,
-                purpose="encryption_key",
-                target_field="ENCRYPTION_KEY",
-                byte_count=32,
-            ),
-            _field(
-                2,
-                purpose="auth_secret",
-                target_field="AUTH_SECRET",
-                byte_count=44,
-            ),
+            _field(1, purpose="encryption_key", target_field="ENCRYPTION_KEY", byte_count=32),
+            _field(2, purpose="auth_secret", target_field="AUTH_SECRET", byte_count=44),
         ),
     )
 
@@ -196,20 +269,38 @@ def _ack(request: ContainerAttachRequestV1) -> ContainerAttachTerminalAckV1:
     )
 
 
+def _session(
+    protocol: ContainerBootstrapAttachProtocolV1,
+    request: ContainerAttachRequestV1,
+    clock: _Clock,
+    authority: _NonceAuthority | None = None,
+) -> ContainerAttachDaemonSession:
+    return ContainerAttachDaemonSession(
+        protocol=protocol,
+        request=request,
+        deadline_clock=clock,
+        nonce_authority=authority or _NonceAuthority(),
+    )
+
+
 def _claimed_session() -> tuple[
     ContainerAttachDaemonSession,
     ContainerBootstrapAttachProtocolV1,
     ContainerAttachRequestV1,
+    _Clock,
 ]:
     protocol = _protocol()
     request = _request(protocol)
-    session = ContainerAttachDaemonSession(protocol=protocol, request=request)
-    session.write_request(io.BytesIO())
+    clock = _Clock()
+    session = _session(protocol, request, clock)
+    session.write_request(_Channel(clock))
     session.read_ready(
-        io.BytesIO(_frame(ContainerAttachFrameType.READY, _metadata(_ready(request))))
+        _Channel(
+            clock, bytearray(_frame(ContainerAttachFrameType.READY, _metadata(_ready(request))))
+        )
     )
-    session.write_claim(io.BytesIO())
-    return session, protocol, request
+    session.write_claim(_Channel(clock))
+    return session, protocol, request, clock
 
 
 class _Sink:
@@ -220,71 +311,64 @@ class _Sink:
         self.received.append((descriptor.target_field, bytes(value)))
 
 
-class _FailingWriter:
-    def __init__(self, sentinel: str) -> None:
-        self._sentinel = sentinel
-        self.calls = 0
-
-    def write(self, data: bytes | bytearray | memoryview) -> int:
-        del data
-        self.calls += 1
-        if self.calls == 3:
-            raise RuntimeError(self._sentinel)
-        return 0
-
-
 def _secret_frame(ordinal: int, value: bytes) -> bytes:
-    payload = struct.pack("!H", ordinal) + value
-    return _frame(ContainerAttachFrameType.SECRET_CHUNK, payload)
+    return _frame(ContainerAttachFrameType.SECRET_CHUNK, struct.pack("!H", ordinal) + value)
 
 
 def test_attach_round_trip_binds_metadata_consumes_ordered_chunks_and_zeroizes() -> None:
     protocol = _protocol()
     request = _request(protocol)
-    session = ContainerAttachDaemonSession(protocol=protocol, request=request)
-    request_wire = io.BytesIO()
+    clock = _Clock()
+    sender_authority = _NonceAuthority()
+    session = _session(protocol, request, clock, sender_authority)
+    request_wire = _Channel(clock)
     session.write_request(request_wire)
 
     assert (
         read_container_attach_request(
-            io.BytesIO(request_wire.getvalue()),
+            _Channel(clock, bytearray(request_wire.outgoing)),
             protocol=protocol,
             expected_request=request,
+            deadline_clock=clock,
         )
         == request
     )
     session.read_ready(
-        io.BytesIO(_frame(ContainerAttachFrameType.READY, _metadata(_ready(request))))
+        _Channel(
+            clock, bytearray(_frame(ContainerAttachFrameType.READY, _metadata(_ready(request))))
+        )
     )
-    claim = session.write_claim(io.BytesIO())
+    claim = session.write_claim(_Channel(clock))
     first = bytearray(b"one-attach-sentinel" + b"x" * 13)
     second = bytearray(b"two-attach-sentinel" + b"y" * 25)
-    assert len(first) == 32
-    assert len(second) == 44
-    secret_wire = io.BytesIO()
+    secret_wire = _Channel(clock)
     session.write_secret_chunks(secret_wire, (first, second))
     assert first == bytearray(32)
     assert second == bytearray(44)
 
-    delivery = read_secret_chunks(
-        io.BytesIO(secret_wire.getvalue()),
+    sink = _Sink()
+    consume_container_attach_secret_chunks(
+        _Channel(clock, bytearray(secret_wire.outgoing)),
         protocol=protocol,
         request=request,
         claim=claim,
+        sink=sink,
+        deadline_clock=clock,
+        nonce_authority=_NonceAuthority(),
     )
-    sink = _Sink()
-    delivery.consume_into(sink)
     assert sink.received == [
         ("ENCRYPTION_KEY", b"one-attach-sentinel" + b"x" * 13),
         ("AUTH_SECRET", b"two-attach-sentinel" + b"y" * 25),
     ]
-    assert all(buffer == bytearray(len(buffer)) for buffer in delivery._buffers)
-
     session.read_terminal_ack(
-        io.BytesIO(_frame(ContainerAttachFrameType.TERMINAL_ACK, _metadata(_ack(request))))
+        _Channel(
+            clock,
+            bytearray(_frame(ContainerAttachFrameType.TERMINAL_ACK, _metadata(_ack(request)))),
+        )
     )
-    session.require_eof(io.BytesIO())
+    session.require_eof(_Channel(clock))
     assert session.state is ContainerAttachSessionState.CLOSED
+    assert sender_authority.claims[0].boundary == "daemon_send_v1"
 
 
 @pytest.mark.parametrize(
@@ -302,14 +386,18 @@ def test_wrapper_rejects_substituted_request_bindings_before_ready(
 ) -> None:
     protocol = _protocol()
     expected = _request(protocol)
+    clock = _Clock()
     substituted = expected.model_copy(update={field: replacement})
-    sender = ContainerAttachDaemonSession(protocol=protocol, request=substituted)
-    wire = io.BytesIO()
+    sender = _session(protocol, substituted, clock)
+    wire = _Channel(clock)
     sender.write_request(wire)
 
     with pytest.raises(ContainerAttachError, match="attach_request"):
         read_container_attach_request(
-            io.BytesIO(wire.getvalue()), protocol=protocol, expected_request=expected
+            _Channel(clock, bytearray(wire.outgoing)),
+            protocol=protocol,
+            expected_request=expected,
+            deadline_clock=clock,
         )
 
 
@@ -317,6 +405,7 @@ def test_wrapper_rejects_field_order_swap_before_any_chunk() -> None:
     protocol = _protocol()
     expected = _request(protocol)
     first, second = expected.fields
+    clock = _Clock()
     swapped = expected.model_copy(
         update={
             "fields": (
@@ -325,142 +414,326 @@ def test_wrapper_rejects_field_order_swap_before_any_chunk() -> None:
             )
         }
     )
-    sender = ContainerAttachDaemonSession(protocol=protocol, request=swapped)
-    wire = io.BytesIO()
+    sender = _session(protocol, swapped, clock)
+    wire = _Channel(clock)
     sender.write_request(wire)
 
     with pytest.raises(ContainerAttachError, match="attach_request"):
         read_container_attach_request(
-            io.BytesIO(wire.getvalue()), protocol=protocol, expected_request=expected
+            _Channel(clock, bytearray(wire.outgoing)),
+            protocol=protocol,
+            expected_request=expected,
+            deadline_clock=clock,
         )
 
 
-def test_attach_rejects_oversized_truncated_and_unknown_frames() -> None:
+def test_attach_rejects_oversized_truncated_unknown_and_generic_blocking_streams() -> None:
     protocol = _protocol()
     request = _request(protocol)
+    clock = _Clock()
     oversized = _HEADER.pack(
         b"ONCA", 1, int(ContainerAttachFrameType.REQUEST), protocol.max_metadata_bytes + 1
     )
     with pytest.raises(ContainerAttachError, match="frame_header"):
         read_container_attach_request(
-            io.BytesIO(oversized), protocol=protocol, expected_request=request
+            _Channel(clock, bytearray(oversized)),
+            protocol=protocol,
+            expected_request=request,
+            deadline_clock=clock,
         )
 
-    session = ContainerAttachDaemonSession(protocol=protocol, request=request)
-    request_wire = io.BytesIO()
+    session = _session(protocol, request, clock)
+    request_wire = _Channel(clock)
     session.write_request(request_wire)
     with pytest.raises(ContainerAttachError, match="frame_payload"):
         read_container_attach_request(
-            io.BytesIO(request_wire.getvalue()[:-1]), protocol=protocol, expected_request=request
+            _Channel(clock, bytearray(request_wire.outgoing[:-1])),
+            protocol=protocol,
+            expected_request=request,
+            deadline_clock=clock,
         )
+    with pytest.raises(ContainerAttachError, match="frame_header"):
+        session.read_ready(_Channel(clock, bytearray(_HEADER.pack(b"ONCA", 1, 99, 0))))
+
+    class BlockingBinaryIo:
+        def read(self, count: int) -> bytes:
+            del count
+            return b""
 
     with pytest.raises(ContainerAttachError, match="frame_header"):
-        session.read_ready(io.BytesIO(_HEADER.pack(b"ONCA", 1, 99, 0)))
+        read_container_attach_request(
+            BlockingBinaryIo(),  # type: ignore[arg-type]
+            protocol=protocol,
+            expected_request=request,
+            deadline_clock=clock,
+        )
 
 
 def test_attach_rejects_repeated_or_out_of_order_claim_and_ack() -> None:
     protocol = _protocol()
     request = _request(protocol)
-    session = ContainerAttachDaemonSession(protocol=protocol, request=request)
-    session.write_request(io.BytesIO())
+    clock = _Clock()
+    session = _session(protocol, request, clock)
+    session.write_request(_Channel(clock))
     with pytest.raises(ContainerAttachError, match="frame_header"):
         session.read_ready(
-            io.BytesIO(_frame(ContainerAttachFrameType.CLAIM, _metadata(_claim(request))))
+            _Channel(
+                clock,
+                bytearray(_frame(ContainerAttachFrameType.CLAIM, _metadata(_claim(request)))),
+            )
         )
 
-    session, _, request = _claimed_session()
+    session, _, request, clock = _claimed_session()
     with pytest.raises(ContainerAttachError, match="state"):
-        session.write_claim(io.BytesIO())
+        session.write_claim(_Channel(clock))
     with pytest.raises(ContainerAttachError, match="state"):
         session.read_terminal_ack(
-            io.BytesIO(_frame(ContainerAttachFrameType.TERMINAL_ACK, _metadata(_ack(request))))
+            _Channel(
+                clock,
+                bytearray(_frame(ContainerAttachFrameType.TERMINAL_ACK, _metadata(_ack(request)))),
+            )
         )
 
 
-def test_attach_rejects_secret_chunk_reordering_by_wire_ordinal() -> None:
+def test_attach_rejects_secret_chunk_reordering_and_local_receiver_replay() -> None:
     protocol = _protocol()
     request = _request(protocol)
     claim = _claim(request)
+    clock = _Clock()
     reordered = _secret_frame(2, b"b" * 44) + _secret_frame(1, b"a" * 32)
-
+    authority = _NonceAuthority()
     with pytest.raises(ContainerAttachError, match="secret_chunk"):
-        read_secret_chunks(io.BytesIO(reordered), protocol=protocol, request=request, claim=claim)
-
-
-def test_attach_terminal_ack_failure_or_trailing_data_is_ambiguous() -> None:
-    session, _, request = _claimed_session()
-    first = bytearray(b"a" * 32)
-    second = bytearray(b"b" * 44)
-    session.write_secret_chunks(io.BytesIO(), (first, second))
-    bad_ack = _ack(request).model_copy(update={"chunk_count": 1})
-
-    with pytest.raises(ContainerAttachError, match="terminal_ack"):
-        session.read_terminal_ack(
-            io.BytesIO(_frame(ContainerAttachFrameType.TERMINAL_ACK, _metadata(bad_ack)))
+        consume_container_attach_secret_chunks(
+            _Channel(clock, bytearray(reordered)),
+            protocol=protocol,
+            request=request,
+            claim=claim,
+            sink=_Sink(),
+            deadline_clock=clock,
+            nonce_authority=authority,
         )
-    assert session.state is ContainerAttachSessionState.AMBIGUOUS
-    with pytest.raises(ContainerAttachError, match="state"):
-        session.write_secret_chunks(io.BytesIO(), (bytearray(b"a" * 32), bytearray(b"b" * 44)))
 
-    session, _, request = _claimed_session()
-    session.write_secret_chunks(io.BytesIO(), (bytearray(b"a" * 32), bytearray(b"b" * 44)))
+    valid = _secret_frame(1, b"a" * 32) + _secret_frame(2, b"b" * 44)
+    with pytest.raises(ContainerAttachError, match="replay"):
+        consume_container_attach_secret_chunks(
+            _Channel(clock, bytearray(valid)),
+            protocol=protocol,
+            request=request,
+            claim=claim,
+            sink=_Sink(),
+            deadline_clock=clock,
+            nonce_authority=authority,
+        )
+
+
+def test_attach_sender_replay_is_claimed_before_secret_frames_and_buffers_zeroize() -> None:
+    protocol = _protocol()
+    request = _request(protocol)
+    clock = _Clock()
+    authority = _NonceAuthority()
+    first, second = bytearray(b"a" * 32), bytearray(b"b" * 44)
+    session = _session(protocol, request, clock, authority)
+    session.write_request(_Channel(clock))
+    session.read_ready(
+        _Channel(
+            clock, bytearray(_frame(ContainerAttachFrameType.READY, _metadata(_ready(request))))
+        )
+    )
+    session.write_claim(_Channel(clock))
+    session.write_secret_chunks(_Channel(clock), (first, second))
+
+    replay_first, replay_second = bytearray(b"a" * 32), bytearray(b"b" * 44)
+    replay = _session(protocol, request, clock, authority)
+    replay.write_request(_Channel(clock))
+    replay.read_ready(
+        _Channel(
+            clock, bytearray(_frame(ContainerAttachFrameType.READY, _metadata(_ready(request))))
+        )
+    )
+    replay.write_claim(_Channel(clock))
+    writer = _Channel(clock)
+    with pytest.raises(ContainerAttachError, match="replay"):
+        replay.write_secret_chunks(writer, (replay_first, replay_second))
+    assert writer.outgoing == b""
+    assert replay_first == bytearray(32)
+    assert replay_second == bytearray(44)
+
+
+@pytest.mark.parametrize("fail_write_call", (None, 1))
+def test_attach_rejects_list_buffers_before_any_claim_or_secret_handling(
+    fail_write_call: int | None,
+) -> None:
+    """Lists are rejected equally before a would-be success or writer failure."""
+
+    session, _, _, clock = _claimed_session()
+    first, second = bytearray(b"a" * 32), bytearray(b"b" * 44)
+    list_chunks = [first, second]
+    writer = _Channel(clock, fail_write_call=fail_write_call)
+    with pytest.raises(ContainerAttachError, match="secret_chunks"):
+        session.write_secret_chunks(writer, list_chunks)  # type: ignore[arg-type]
+    assert writer.outgoing == b""
+    assert first == bytearray(b"a" * 32)
+    assert second == bytearray(b"b" * 44)
+
+
+def test_attach_tuple_buffers_zeroize_on_writer_failure_without_secret_context() -> None:
+    sentinel = "container-attach-secret-sentinel"
+    session, _, _, clock = _claimed_session()
+    first, second = bytearray(b"a" * 32), bytearray(b"b" * 44)
+    writer = _Channel(clock, fail_write_call=3, sentinel=sentinel)
+    with pytest.raises(ContainerAttachError) as raised:
+        session.write_secret_chunks(writer, (first, second))
+    _assert_redacted(raised.value, sentinel)
+    assert first == bytearray(32)
+    assert second == bytearray(44)
+    assert session.state is ContainerAttachSessionState.AMBIGUOUS
+
+
+def test_attach_rejects_unknown_write_result_and_zeroizes_buffers() -> None:
+    """A writer must prove a complete write rather than return ``None``."""
+
+    session, _, _, clock = _claimed_session()
+    first, second = bytearray(b"a" * 32), bytearray(b"b" * 44)
+    writer = _Channel(clock, none_write_call=1)
+    with pytest.raises(ContainerAttachError, match="frame_write"):
+        session.write_secret_chunks(writer, (first, second))
+    assert first == bytearray(32)
+    assert second == bytearray(44)
+    assert session.state is ContainerAttachSessionState.AMBIGUOUS
+
+
+def test_attach_timeout_partial_no_progress_and_ack_failure_are_fail_closed() -> None:
+    session, _, request, clock = _claimed_session()
+    first, second = bytearray(b"a" * 32), bytearray(b"b" * 44)
+    session.write_secret_chunks(_Channel(clock), (first, second))
+    slow = _Channel(
+        clock,
+        bytearray(_frame(ContainerAttachFrameType.TERMINAL_ACK, _metadata(_ack(request)))),
+        read_limit=1,
+        advance_on_read=11.0,
+    )
+    with pytest.raises(ContainerAttachError, match="frame_header"):
+        session.read_terminal_ack(slow)
+    assert session.state is ContainerAttachSessionState.AMBIGUOUS
+
+    session, _, request, clock = _claimed_session()
+    session.write_secret_chunks(_Channel(clock), (bytearray(b"a" * 32), bytearray(b"b" * 44)))
     session.read_terminal_ack(
-        io.BytesIO(_frame(ContainerAttachFrameType.TERMINAL_ACK, _metadata(_ack(request))))
+        _Channel(
+            clock,
+            bytearray(_frame(ContainerAttachFrameType.TERMINAL_ACK, _metadata(_ack(request)))),
+        )
     )
     with pytest.raises(ContainerAttachError, match="trailing_data"):
-        session.require_eof(io.BytesIO(b"x"))
+        session.require_eof(_Channel(clock, bytearray(b"x")))
     assert session.state is ContainerAttachSessionState.AMBIGUOUS
 
 
-def test_attach_rejects_invalid_timeout_type_drift_before_io() -> None:
-    protocol = _protocol().model_copy(update={"ready_timeout_seconds": 0})
-    with pytest.raises(ContainerAttachError, match="attach_protocol"):
-        ContainerAttachDaemonSession(protocol=protocol, request=_request(_protocol()))
-
-
-def test_attach_secret_sentinel_never_enters_metadata_errors_or_receipt_state() -> None:
-    sentinel = "container-attach-secret-sentinel"
-    session, protocol, request = _claimed_session()
-    metadata = _metadata(request) + _metadata(_claim(request)) + _metadata(_ack(request))
-    assert sentinel.encode("ascii") not in metadata
-    value = bytearray((sentinel.encode("ascii") + b"x" * 32)[:32])
-    other = bytearray(b"b" * 44)
-
-    with pytest.raises(ContainerAttachError) as raised:
-        session.write_secret_chunks(_FailingWriter(sentinel), (value, other))
-    error = raised.value
+def _assert_redacted(error: BaseException, sentinel: str) -> None:
     assert sentinel not in str(error)
     assert sentinel not in repr(error)
+    assert sentinel not in repr(error.__dict__)
     assert error.__cause__ is None
     assert error.__context__ is None
-    assert value == bytearray(32)
-    assert other == bytearray(44)
-    assert session.state is ContainerAttachSessionState.AMBIGUOUS
+    assert all(sentinel not in line for line in traceback.format_exception(error))
+    assert all(sentinel not in str(note) for note in getattr(error, "__notes__", ()))
 
-    claim = _claim(request)
-    delivery = read_secret_chunks(
-        io.BytesIO(_secret_frame(1, b"a" * 32) + _secret_frame(2, b"b" * 44)),
-        protocol=protocol,
-        request=request,
-        claim=claim,
-    )
 
-    class SinkFailure:
+def test_attach_metadata_and_sink_failures_have_no_secret_error_chain() -> None:
+    protocol = _protocol()
+    request = _request(protocol)
+    clock = _Clock()
+    sentinel = "container-attach-secret-sentinel"
+    invalid = request.model_copy(update={"container_id": sentinel})
+    with pytest.raises(ContainerAttachError) as raised:
+        read_container_attach_request(
+            _Channel(
+                clock, bytearray(_frame(ContainerAttachFrameType.REQUEST, _metadata(invalid)))
+            ),
+            protocol=protocol,
+            expected_request=request,
+            deadline_clock=clock,
+        )
+    _assert_redacted(raised.value, sentinel)
+
+    class FailingSink:
         def accept(self, descriptor: TargetDeliveryFieldV1, value: memoryview) -> None:
             del descriptor, value
             raise RuntimeError(sentinel)
 
     with pytest.raises(ContainerAttachError) as sink_raised:
-        delivery.consume_into(SinkFailure())
-    assert sentinel not in str(sink_raised.value)
-    assert sink_raised.value.__cause__ is None
-    assert sink_raised.value.__context__ is None
-    assert sentinel not in repr(delivery)
-    assert all(buffer == bytearray(len(buffer)) for buffer in delivery._buffers)
+        consume_container_attach_secret_chunks(
+            _Channel(
+                clock,
+                bytearray(_secret_frame(1, b"a" * 32) + _secret_frame(2, b"b" * 44)),
+            ),
+            protocol=protocol,
+            request=request,
+            claim=_claim(request),
+            sink=FailingSink(),
+            deadline_clock=clock,
+            nonce_authority=_NonceAuthority(),
+        )
+    _assert_redacted(sink_raised.value, sentinel)
 
 
-def test_attach_protocol_model_rejects_zero_timeout() -> None:
+def test_attach_nonce_authority_failure_blocks_before_secret_read_and_concurrent_claims() -> None:
+    protocol = _protocol()
+    request = _request(protocol)
+    claim = _claim(request)
+    clock = _Clock()
+    unavailable = _NonceAuthority()
+    unavailable.unavailable = True
+    wire = _Channel(clock, bytearray(_secret_frame(1, b"a" * 32) + _secret_frame(2, b"b" * 44)))
+    with pytest.raises(ContainerAttachError, match="nonce_authority"):
+        consume_container_attach_secret_chunks(
+            wire,
+            protocol=protocol,
+            request=request,
+            claim=claim,
+            sink=_Sink(),
+            deadline_clock=clock,
+            nonce_authority=unavailable,
+        )
+    assert wire.incoming
+
+    authority = _NonceAuthority()
+    outcomes: list[str] = []
+    lock = threading.Lock()
+
+    def consume() -> None:
+        try:
+            consume_container_attach_secret_chunks(
+                _Channel(
+                    clock,
+                    bytearray(_secret_frame(1, b"a" * 32) + _secret_frame(2, b"b" * 44)),
+                ),
+                protocol=protocol,
+                request=request,
+                claim=claim,
+                sink=_Sink(),
+                deadline_clock=clock,
+                nonce_authority=authority,
+            )
+            result = "claimed"
+        except ContainerAttachError as error:
+            result = error.phase
+        with lock:
+            outcomes.append(result)
+
+    threads = [threading.Thread(target=consume) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(outcomes) == ["claimed", "replay"]
+
+
+def test_attach_protocol_model_rejects_zero_timeout_and_type_drift_before_io() -> None:
     with pytest.raises(ValidationError):
         ContainerBootstrapAttachProtocolV1.model_validate(
             _protocol().model_dump(mode="python") | {"terminal_ack_timeout_seconds": 0}
         )
+    protocol = _protocol().model_copy(update={"ready_timeout_seconds": 0})
+    with pytest.raises(ContainerAttachError, match="attach_protocol"):
+        _session(protocol, _request(_protocol()), _Clock())

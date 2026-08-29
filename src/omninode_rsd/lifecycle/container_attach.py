@@ -5,17 +5,18 @@ It supplies only a value-redacted binary framing contract for a future direct
 container-stdin adapter.  It neither creates a container nor opens an attach
 connection, reads a provider, renders a URI, or starts a workload.
 
-The only secret-bearing interface is ``write_secret_chunks`` /
-``read_secret_chunks``.  It accepts mutable buffers, sends or consumes them in
-the exact signed field order, and best-effort zeroizes every buffer on every
-exit path.  The receipt-safe models and all errors contain metadata only.
+The only secret-bearing interfaces are lexical consume scopes.  A caller can
+stream mutable buffers once, but cannot receive a delivery object or raw
+secret mapping back.  Every production-facing stream operation requires a
+deadline-capable channel and an atomic local replay authority before any
+secret frame can cross the boundary.
 """
 
 from __future__ import annotations
 
 import json
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from typing import Final, Protocol, cast
 
@@ -48,6 +49,16 @@ class ContainerAttachError(RuntimeError):
         super().__init__(f"container attach failed at phase: {phase}")
 
 
+def _fresh_error(phase: str) -> ContainerAttachError:
+    """Create an error after any secret-bearing exception scope has ended."""
+
+    error = ContainerAttachError(phase)
+    error.__cause__ = None
+    error.__context__ = None
+    error.__suppress_context__ = True
+    return error
+
+
 class ContainerAttachFrameType(IntEnum):
     """The one fixed directional frame set for local wrapper bootstrap."""
 
@@ -71,16 +82,48 @@ class ContainerAttachSessionState(StrEnum):
     AMBIGUOUS = "ambiguous"
 
 
-class AttachByteReader(Protocol):
-    """Narrow binary reader required by the pure framing codec."""
+class AttachMonotonicClock(Protocol):
+    """The only clock authority accepted by local attach framing."""
 
-    def read(self, count: int) -> bytes: ...
+    def monotonic(self) -> float: ...
 
 
-class AttachByteWriter(Protocol):
-    """Narrow binary writer required by the pure framing codec."""
+class AttachDeadlineReader(Protocol):
+    """A bounded reader that fails itself once an absolute deadline expires."""
 
-    def write(self, data: bytes | bytearray | memoryview) -> object: ...
+    def read(self, count: int, *, deadline: float) -> bytes: ...
+
+
+class AttachDeadlineWriter(Protocol):
+    """A bounded writer that fails itself once an absolute deadline expires."""
+
+    def write(self, data: bytes | bytearray | memoryview, *, deadline: float) -> object: ...
+
+
+class ContainerAttachNonceClaimResult(StrEnum):
+    """The only legal outcomes of a local attach nonce claim."""
+
+    CLAIMED = "claimed"
+    REPLAYED = "replayed"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class ContainerAttachNonceClaimV1:
+    """Value-free local one-shot key bound to one directional attach flow."""
+
+    boundary: str
+    request_sha256: str
+    operation_id: str
+    component: str
+    request_nonce_sha256: str
+    target_delivery_map_sha256: str
+
+
+class ContainerAttachNonceAuthority(Protocol):
+    """Durable atomic replay authority required before secret delivery."""
+
+    def claim_once(self, claim: ContainerAttachNonceClaimV1) -> ContainerAttachNonceClaimResult: ...
 
 
 class ContainerAttachSecretSink(Protocol):
@@ -95,15 +138,20 @@ def _zeroize(buffer: bytearray) -> None:
 
 
 def _canonical_metadata(model: BaseModel) -> bytes:
+    failed = False
     try:
-        return json.dumps(
+        rendered = json.dumps(
             model.model_dump(mode="json", warnings="error"),
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("ascii")
     except (TypeError, ValueError):
-        raise ContainerAttachError("metadata") from None
+        failed = True
+        rendered = b""
+    if failed:
+        raise _fresh_error("metadata")
+    return rendered
 
 
 def _same_exact_shape(original: object, canonical: object) -> bool:
@@ -144,42 +192,79 @@ def _strict_model[ModelType: BaseModel](
     value: object, model_type: type[ModelType], *, phase: str
 ) -> ModelType:
     if type(value) is not model_type:
-        raise ContainerAttachError(phase)
+        raise _fresh_error(phase)
+    failure_phase: str | None = None
+    canonical: ModelType | None = None
+    original = b""
+    rendered = b""
     try:
         original = _canonical_metadata(cast(BaseModel, value))
         canonical = model_type.model_validate_json(original, strict=True)
         rendered = _canonical_metadata(canonical)
     except (ContainerAttachError, TypeError, ValidationError, ValueError):
-        raise ContainerAttachError(phase) from None
+        failure_phase = phase
+    if failure_phase is not None or canonical is None:
+        raise _fresh_error(phase)
     if (
         type(canonical) is not model_type
         or original != rendered
         or not _same_exact_shape(value, canonical)
     ):
-        raise ContainerAttachError(phase)
+        raise _fresh_error(phase)
     return canonical
 
 
-def _read_exact(
-    reader: AttachByteReader, count: int, *, mutable: bool, phase: str
-) -> bytes | bytearray:
-    if type(count) is not int or count < 0:
-        raise ContainerAttachError(phase)
-    result = bytearray()
+def _deadline(clock: AttachMonotonicClock, seconds: int, *, phase: str) -> float:
     failed = False
+    now = 0.0
     try:
-        while len(result) < count:
-            block = reader.read(count - len(result))
-            if type(block) is not bytes or not block or len(block) > count - len(result):
-                raise ContainerAttachError(phase)
-            result.extend(block)
-    except ContainerAttachError:
-        failed = True
+        now = clock.monotonic()
     except Exception:
         failed = True
-    if failed:
+    if failed or type(now) is not float or now < 0.0:
+        raise _fresh_error(phase)
+    return now + float(seconds)
+
+
+def _require_before(clock: AttachMonotonicClock, deadline: float, *, phase: str) -> None:
+    failed = False
+    now = 0.0
+    try:
+        now = clock.monotonic()
+    except Exception:
+        failed = True
+    if failed or type(now) is not float or now < 0.0 or now >= deadline:
+        raise _fresh_error(phase)
+
+
+def _read_exact(
+    reader: AttachDeadlineReader,
+    clock: AttachMonotonicClock,
+    deadline: float,
+    count: int,
+    *,
+    mutable: bool,
+    phase: str,
+) -> bytes | bytearray:
+    if type(count) is not int or count < 0:
+        raise _fresh_error(phase)
+    result = bytearray()
+    failure_phase: str | None = None
+    try:
+        while len(result) < count:
+            _require_before(clock, deadline, phase=phase)
+            block = reader.read(count - len(result), deadline=deadline)
+            _require_before(clock, deadline, phase=phase)
+            if type(block) is not bytes or not block or len(block) > count - len(result):
+                raise _fresh_error(phase)
+            result.extend(block)
+    except ContainerAttachError:
+        failure_phase = phase
+    except Exception:
+        failure_phase = phase
+    if failure_phase is not None:
         _zeroize(result)
-        raise ContainerAttachError(phase)
+        raise _fresh_error(phase)
     if mutable:
         return result
     rendered = bytes(result)
@@ -187,19 +272,30 @@ def _read_exact(
     return rendered
 
 
-def _write(writer: AttachByteWriter, data: bytes | bytearray | memoryview, *, phase: str) -> None:
+def _write(
+    writer: AttachDeadlineWriter,
+    clock: AttachMonotonicClock,
+    deadline: float,
+    data: bytes | bytearray | memoryview,
+    *,
+    phase: str,
+) -> None:
     failed = False
     try:
-        written = writer.write(data)
+        _require_before(clock, deadline, phase=phase)
+        written = writer.write(data, deadline=deadline)
+        _require_before(clock, deadline, phase=phase)
     except Exception:
         failed = True
         written = None
-    if failed or (written is not None and (type(written) is not int or written != len(data))):
-        raise ContainerAttachError(phase)
+    if failed or type(written) is not int or written != len(data):
+        raise _fresh_error(phase)
 
 
 def _write_frame(
-    writer: AttachByteWriter,
+    writer: AttachDeadlineWriter,
+    clock: AttachMonotonicClock,
+    deadline: float,
     *,
     protocol: ContainerBootstrapAttachProtocolV1,
     frame_type: ContainerAttachFrameType,
@@ -210,25 +306,33 @@ def _write_frame(
         protocol.max_chunk_bytes + _CHUNK_ORDINAL.size if secret else protocol.max_metadata_bytes
     )
     if len(payload) > limit:
-        raise ContainerAttachError("frame_size")
+        raise _fresh_error("frame_size")
     header = _HEADER.pack(_MAGIC, _FRAME_VERSION, int(frame_type), len(payload))
-    _write(writer, header, phase="frame_write")
-    _write(writer, payload, phase="frame_write")
+    _write(writer, clock, deadline, header, phase="frame_write")
+    _write(writer, clock, deadline, payload, phase="frame_write")
 
 
 def _read_frame(
-    reader: AttachByteReader,
+    reader: AttachDeadlineReader,
+    clock: AttachMonotonicClock,
+    deadline: float,
     *,
     protocol: ContainerBootstrapAttachProtocolV1,
     expected_type: ContainerAttachFrameType,
     secret: bool,
 ) -> bytes | bytearray:
-    header = _read_exact(reader, _HEADER_BYTES, mutable=False, phase="frame_header")
+    header = _read_exact(
+        reader, clock, deadline, _HEADER_BYTES, mutable=False, phase="frame_header"
+    )
+    failure_phase: str | None = None
+    frame_type: ContainerAttachFrameType | None = None
     try:
         magic, version, raw_type, length = _HEADER.unpack(cast(bytes, header))
         frame_type = ContainerAttachFrameType(raw_type)
     except (ValueError, struct.error):
-        raise ContainerAttachError("frame_header") from None
+        failure_phase = "frame_header"
+    if failure_phase is not None or frame_type is None:
+        raise _fresh_error("frame_header")
     if (
         magic != _MAGIC
         or version != _FRAME_VERSION
@@ -240,56 +344,75 @@ def _read_frame(
             else protocol.max_metadata_bytes
         )
     ):
-        raise ContainerAttachError("frame_header")
-    return _read_exact(reader, length, mutable=secret, phase="frame_payload")
+        raise _fresh_error("frame_header")
+    return _read_exact(reader, clock, deadline, length, mutable=secret, phase="frame_payload")
 
 
 def _read_metadata[ModelType: BaseModel](
-    reader: AttachByteReader,
+    reader: AttachDeadlineReader,
+    clock: AttachMonotonicClock,
+    deadline: float,
     *,
     protocol: ContainerBootstrapAttachProtocolV1,
     frame_type: ContainerAttachFrameType,
     model_type: type[ModelType],
     phase: str,
 ) -> ModelType:
-    raw = _read_frame(reader, protocol=protocol, expected_type=frame_type, secret=False)
+    raw = _read_frame(
+        reader,
+        clock,
+        deadline,
+        protocol=protocol,
+        expected_type=frame_type,
+        secret=False,
+    )
+    failure_phase: str | None = None
+    model: ModelType | None = None
     try:
         model = model_type.model_validate_json(cast(bytes, raw), strict=True)
         if _canonical_metadata(model) != raw:
-            raise ContainerAttachError(phase)
+            raise _fresh_error(phase)
     except (ContainerAttachError, TypeError, ValidationError, ValueError):
-        raise ContainerAttachError(phase) from None
+        failure_phase = phase
+    if failure_phase is not None or model is None:
+        raise _fresh_error(phase)
     return _strict_model(model, model_type, phase=phase)
 
 
 def _write_secret_frame(
-    writer: AttachByteWriter,
+    writer: AttachDeadlineWriter,
+    clock: AttachMonotonicClock,
+    deadline: float,
     *,
     protocol: ContainerBootstrapAttachProtocolV1,
     ordinal: int,
     chunk: bytearray,
 ) -> None:
     if not 1 <= ordinal <= protocol.max_chunks_per_target or len(chunk) > protocol.max_chunk_bytes:
-        raise ContainerAttachError("secret_chunk")
+        raise _fresh_error("secret_chunk")
     header = _HEADER.pack(
         _MAGIC,
         _FRAME_VERSION,
         int(ContainerAttachFrameType.SECRET_CHUNK),
         _CHUNK_ORDINAL.size + len(chunk),
     )
-    _write(writer, header, phase="frame_write")
-    _write(writer, _CHUNK_ORDINAL.pack(ordinal), phase="frame_write")
-    _write(writer, memoryview(chunk), phase="frame_write")
+    _write(writer, clock, deadline, header, phase="frame_write")
+    _write(writer, clock, deadline, _CHUNK_ORDINAL.pack(ordinal), phase="frame_write")
+    _write(writer, clock, deadline, memoryview(chunk), phase="frame_write")
 
 
 def _read_secret_chunk(
-    reader: AttachByteReader,
+    reader: AttachDeadlineReader,
+    clock: AttachMonotonicClock,
+    deadline: float,
     *,
     protocol: ContainerBootstrapAttachProtocolV1,
     expected_ordinal: int,
 ) -> bytearray:
     payload = _read_frame(
         reader,
+        clock,
+        deadline,
         protocol=protocol,
         expected_type=ContainerAttachFrameType.SECRET_CHUNK,
         secret=True,
@@ -298,7 +421,7 @@ def _read_secret_chunk(
     failed = False
     try:
         if len(buffer) < _CHUNK_ORDINAL.size:
-            raise ContainerAttachError("secret_chunk")
+            raise _fresh_error("secret_chunk")
         ordinal = _CHUNK_ORDINAL.unpack(bytes(buffer[: _CHUNK_ORDINAL.size]))[0]
         if ordinal != expected_ordinal:
             raise ContainerAttachError("secret_chunk")
@@ -309,7 +432,7 @@ def _read_secret_chunk(
         failed = True
     if failed:
         _zeroize(buffer)
-        raise ContainerAttachError("secret_chunk")
+        raise _fresh_error("secret_chunk")
     return buffer
 
 
@@ -324,7 +447,7 @@ def _require_protocol_and_request(
     try:
         descriptor_bytes = sum(field.encoded_byte_count for field in checked_request.fields)
     except TypeError:
-        raise ContainerAttachError("attach_request") from None
+        descriptor_bytes = -1
     if (
         checked_request.attach_protocol_sha256
         != container_bootstrap_attach_protocol_sha256(checked_protocol)
@@ -339,7 +462,7 @@ def _require_protocol_and_request(
             for field in checked_request.fields
         )
     ):
-        raise ContainerAttachError("attach_request")
+        raise _fresh_error("attach_request")
     return checked_protocol, checked_request
 
 
@@ -348,10 +471,11 @@ def _request_metadata(request: ContainerAttachRequestV1) -> bytes:
 
 
 def read_container_attach_request(
-    reader: AttachByteReader,
+    reader: AttachDeadlineReader,
     *,
     protocol: ContainerBootstrapAttachProtocolV1,
     expected_request: ContainerAttachRequestV1,
+    deadline_clock: AttachMonotonicClock,
 ) -> ContainerAttachRequestV1:
     """Read and exactly bind a wrapper-side request before any readiness ack.
 
@@ -362,8 +486,13 @@ def read_container_attach_request(
     """
 
     checked_protocol, checked_expected = _require_protocol_and_request(protocol, expected_request)
+    deadline = _deadline(
+        deadline_clock, checked_protocol.ready_timeout_seconds, phase="attach_request"
+    )
     incoming = _read_metadata(
         reader,
+        deadline_clock,
+        deadline,
         protocol=checked_protocol,
         frame_type=ContainerAttachFrameType.REQUEST,
         model_type=ContainerAttachRequestV1,
@@ -373,7 +502,7 @@ def read_container_attach_request(
     if checked_incoming != checked_expected or not _same_exact_shape(
         checked_incoming, checked_expected
     ):
-        raise ContainerAttachError("attach_request")
+        raise _fresh_error("attach_request")
     return checked_incoming
 
 
@@ -401,7 +530,7 @@ def _validate_ready(
         or ready.wrapper_artifact_binding_sha256 != request.wrapper_artifact_binding_sha256
         or ready.attach_protocol_sha256 != request.attach_protocol_sha256
     ):
-        raise ContainerAttachError("ready")
+        raise _fresh_error("ready")
 
 
 def _validate_claim(
@@ -411,7 +540,7 @@ def _validate_claim(
 ) -> None:
     expected = _expected_claim(request)
     if claim != expected:
-        raise ContainerAttachError("claim")
+        raise _fresh_error("claim")
 
 
 def _validate_ack(
@@ -431,87 +560,90 @@ def _validate_ack(
         or ack.receipt_contains_secret is not False
         or ack.eof_observed is not True
     ):
-        raise ContainerAttachError("terminal_ack")
+        raise _fresh_error("terminal_ack")
 
 
-@dataclass(slots=True, repr=False)
-class ContainerAttachDelivery:
-    """Ephemeral receiver-side buffers for exactly one target attach request."""
-
-    _fields: tuple[TargetDeliveryFieldV1, ...] = field(repr=False)
-    _buffers: tuple[bytearray, ...] = field(repr=False)
-    _consumed: bool = field(default=False, init=False, repr=False)
-
-    @property
-    def chunk_count(self) -> int:
-        """Return receipt-safe delivery metadata without exposing chunk bytes."""
-
-        return len(self._fields)
-
-    def consume_into(self, sink: ContainerAttachSecretSink) -> None:
-        """Provide chunks once to the exact target capability and zeroize them."""
-
-        if self._consumed:
-            raise ContainerAttachError("delivery_reused")
-        self._consumed = True
-        failed = False
-        try:
-            for descriptor, buffer in zip(self._fields, self._buffers, strict=True):
-                sink.accept(descriptor, memoryview(buffer))
-        except Exception:
-            failed = True
-        finally:
-            for buffer in self._buffers:
-                _zeroize(buffer)
-        if failed:
-            raise ContainerAttachError("target_sink")
-
-    def abandon(self) -> None:
-        """Zeroize a never-consumed delivery after a fail-closed abort."""
-
-        if not self._consumed:
-            self._consumed = True
-            for buffer in self._buffers:
-                _zeroize(buffer)
+def _nonce_claim(
+    request: ContainerAttachRequestV1, *, boundary: str
+) -> ContainerAttachNonceClaimV1:
+    return ContainerAttachNonceClaimV1(
+        boundary=boundary,
+        request_sha256=container_attach_request_sha256(request),
+        operation_id=request.operation_id,
+        component=request.component,
+        request_nonce_sha256=request.request_nonce_sha256,
+        target_delivery_map_sha256=request.target_delivery_map_sha256,
+    )
 
 
-def read_secret_chunks(
-    reader: AttachByteReader,
+def _claim_nonce(
+    authority: ContainerAttachNonceAuthority,
+    request: ContainerAttachRequestV1,
+    *,
+    boundary: str,
+) -> None:
+    outcome: ContainerAttachNonceClaimResult | None = None
+    failed = False
+    try:
+        outcome = authority.claim_once(_nonce_claim(request, boundary=boundary))
+    except Exception:
+        failed = True
+    if failed or outcome is ContainerAttachNonceClaimResult.UNAVAILABLE:
+        raise _fresh_error("nonce_authority")
+    if outcome is not ContainerAttachNonceClaimResult.CLAIMED:
+        raise _fresh_error("replay")
+
+
+def consume_container_attach_secret_chunks(
+    reader: AttachDeadlineReader,
     *,
     protocol: ContainerBootstrapAttachProtocolV1,
     request: ContainerAttachRequestV1,
     claim: ContainerAttachClaimV1,
-) -> ContainerAttachDelivery:
-    """Read the one exact ordered secret sequence for a validated local claim.
+    sink: ContainerAttachSecretSink,
+    deadline_clock: AttachMonotonicClock,
+    nonce_authority: ContainerAttachNonceAuthority,
+) -> None:
+    """Consume each secret in one lexical scope and zeroize it before return.
 
-    This target-side helper does not return a mapping, values, or wire bytes;
-    callers must consume the returned capability once and then emit a redacted
-    terminal acknowledgement through their own future wrapper implementation.
+    The target wrapper must supply a durable, atomic one-shot authority.  Its
+    claim happens before reading the first secret frame, so a post-claim error
+    is irrecoverably ambiguous and a replay cannot be hidden behind an outer
+    authorization tombstone.
     """
 
     checked_protocol, checked_request = _require_protocol_and_request(protocol, request)
     checked_claim = _strict_model(claim, ContainerAttachClaimV1, phase="claim")
     _validate_claim(checked_claim, request=checked_request)
-    buffers: list[bytearray] = []
-    failed = False
-    try:
-        for descriptor in checked_request.fields:
+    deadline = _deadline(
+        deadline_clock, checked_protocol.claim_timeout_seconds, phase="secret_chunk"
+    )
+    _claim_nonce(nonce_authority, checked_request, boundary="container_receive_v1")
+    failure_phase: str | None = None
+    for descriptor in checked_request.fields:
+        buffer: bytearray | None = None
+        try:
             buffer = _read_secret_chunk(
                 reader,
+                deadline_clock,
+                deadline,
                 protocol=checked_protocol,
                 expected_ordinal=descriptor.ordinal,
             )
             if len(buffer) != descriptor.encoded_byte_count:
+                raise _fresh_error("secret_chunk")
+            sink.accept(descriptor, memoryview(buffer))
+        except ContainerAttachError as error:
+            failure_phase = error.phase
+        except Exception:
+            failure_phase = "target_sink"
+        finally:
+            if buffer is not None:
                 _zeroize(buffer)
-                raise ContainerAttachError("secret_chunk")
-            buffers.append(buffer)
-    except Exception:
-        failed = True
-    if failed:
-        for buffer in buffers:
-            _zeroize(buffer)
-        raise ContainerAttachError("secret_chunk")
-    return ContainerAttachDelivery(checked_request.fields, tuple(buffers))
+        if failure_phase is not None:
+            break
+    if failure_phase is not None:
+        raise _fresh_error(failure_phase)
 
 
 class ContainerAttachDaemonSession:
@@ -523,15 +655,19 @@ class ContainerAttachDaemonSession:
     retry, resume, adoption, or replay path.
     """
 
-    __slots__ = ("_protocol", "_request", "_state")
+    __slots__ = ("_deadline_clock", "_nonce_authority", "_protocol", "_request", "_state")
 
     def __init__(
         self,
         *,
         protocol: ContainerBootstrapAttachProtocolV1,
         request: ContainerAttachRequestV1,
+        deadline_clock: AttachMonotonicClock,
+        nonce_authority: ContainerAttachNonceAuthority,
     ) -> None:
         self._protocol, self._request = _require_protocol_and_request(protocol, request)
+        self._deadline_clock = deadline_clock
+        self._nonce_authority = nonce_authority
         self._state = ContainerAttachSessionState.NEW
 
     @property
@@ -546,11 +682,16 @@ class ContainerAttachDaemonSession:
 
         return _expected_claim(self._request)
 
-    def write_request(self, writer: AttachByteWriter) -> None:
+    def write_request(self, writer: AttachDeadlineWriter) -> None:
         if self._state is not ContainerAttachSessionState.NEW:
-            raise ContainerAttachError("state")
+            raise _fresh_error("state")
+        deadline = _deadline(
+            self._deadline_clock, self._protocol.ready_timeout_seconds, phase="request"
+        )
         _write_frame(
             writer,
+            self._deadline_clock,
+            deadline,
             protocol=self._protocol,
             frame_type=ContainerAttachFrameType.REQUEST,
             payload=_request_metadata(self._request),
@@ -558,56 +699,91 @@ class ContainerAttachDaemonSession:
         )
         self._state = ContainerAttachSessionState.REQUEST_SENT
 
-    def read_ready(self, reader: AttachByteReader) -> ContainerAttachReadyV1:
+    def read_ready(self, reader: AttachDeadlineReader) -> ContainerAttachReadyV1:
         if self._state is not ContainerAttachSessionState.REQUEST_SENT:
-            raise ContainerAttachError("state")
-        ready = _read_metadata(
-            reader,
-            protocol=self._protocol,
-            frame_type=ContainerAttachFrameType.READY,
-            model_type=ContainerAttachReadyV1,
-            phase="ready",
+            raise _fresh_error("state")
+        deadline = _deadline(
+            self._deadline_clock, self._protocol.ready_timeout_seconds, phase="ready"
         )
-        _validate_ready(ready, request=self._request)
+        failure_phase: str | None = None
+        ready: ContainerAttachReadyV1 | None = None
+        try:
+            ready = _read_metadata(
+                reader,
+                self._deadline_clock,
+                deadline,
+                protocol=self._protocol,
+                frame_type=ContainerAttachFrameType.READY,
+                model_type=ContainerAttachReadyV1,
+                phase="ready",
+            )
+            _validate_ready(ready, request=self._request)
+        except ContainerAttachError as error:
+            failure_phase = error.phase
+        if failure_phase is not None or ready is None:
+            self._state = ContainerAttachSessionState.AMBIGUOUS
+            raise _fresh_error(failure_phase or "ready")
         self._state = ContainerAttachSessionState.READY_RECEIVED
         return ready
 
-    def write_claim(self, writer: AttachByteWriter) -> ContainerAttachClaimV1:
+    def write_claim(self, writer: AttachDeadlineWriter) -> ContainerAttachClaimV1:
         if self._state is not ContainerAttachSessionState.READY_RECEIVED:
-            raise ContainerAttachError("state")
+            raise _fresh_error("state")
         claim = _expected_claim(self._request)
-        _write_frame(
-            writer,
-            protocol=self._protocol,
-            frame_type=ContainerAttachFrameType.CLAIM,
-            payload=_canonical_metadata(claim),
-            secret=False,
+        deadline = _deadline(
+            self._deadline_clock, self._protocol.claim_timeout_seconds, phase="claim"
         )
+        failure_phase: str | None = None
+        try:
+            _write_frame(
+                writer,
+                self._deadline_clock,
+                deadline,
+                protocol=self._protocol,
+                frame_type=ContainerAttachFrameType.CLAIM,
+                payload=_canonical_metadata(claim),
+                secret=False,
+            )
+        except ContainerAttachError as error:
+            failure_phase = error.phase
+        if failure_phase is not None:
+            self._state = ContainerAttachSessionState.AMBIGUOUS
+            raise _fresh_error(failure_phase)
         self._state = ContainerAttachSessionState.CLAIM_SENT
         return claim
 
     def write_secret_chunks(
         self,
-        writer: AttachByteWriter,
+        writer: AttachDeadlineWriter,
         chunks: tuple[bytearray, ...],
     ) -> None:
         """Stream mutable chunks once, in signed order, then zeroize all input."""
 
-        buffers = chunks if type(chunks) is tuple else ()
+        if type(chunks) is not tuple:
+            raise _fresh_error("secret_chunks")
+        buffers = chunks
         failure_phase: str | None = None
+        claimed = False
         try:
             if self._state is not ContainerAttachSessionState.CLAIM_SENT:
-                raise ContainerAttachError("state")
+                raise _fresh_error("state")
             if len(chunks) != len(self._request.fields) or any(
                 type(chunk) is not bytearray for chunk in chunks
             ):
-                raise ContainerAttachError("secret_chunks")
+                raise _fresh_error("secret_chunks")
+            _claim_nonce(self._nonce_authority, self._request, boundary="daemon_send_v1")
+            claimed = True
+            deadline = _deadline(
+                self._deadline_clock, self._protocol.claim_timeout_seconds, phase="secret_chunk"
+            )
             self._state = ContainerAttachSessionState.CHUNKS_SENT
             for descriptor, chunk in zip(self._request.fields, chunks, strict=True):
                 if len(chunk) != descriptor.encoded_byte_count:
-                    raise ContainerAttachError("secret_chunk")
+                    raise _fresh_error("secret_chunk")
                 _write_secret_frame(
                     writer,
+                    self._deadline_clock,
+                    deadline,
                     protocol=self._protocol,
                     ordinal=descriptor.ordinal,
                     chunk=chunk,
@@ -621,17 +797,25 @@ class ContainerAttachDaemonSession:
                 if type(buffer) is bytearray:
                     _zeroize(buffer)
         if failure_phase is not None:
-            self._state = ContainerAttachSessionState.AMBIGUOUS
-            raise ContainerAttachError(failure_phase)
+            if claimed or self._state is ContainerAttachSessionState.CHUNKS_SENT:
+                self._state = ContainerAttachSessionState.AMBIGUOUS
+            raise _fresh_error(failure_phase)
 
-    def read_terminal_ack(self, reader: AttachByteReader) -> ContainerAttachTerminalAckV1:
+    def read_terminal_ack(self, reader: AttachDeadlineReader) -> ContainerAttachTerminalAckV1:
         if self._state is not ContainerAttachSessionState.CHUNKS_SENT:
-            raise ContainerAttachError("state")
+            raise _fresh_error("state")
         failure_phase: str | None = None
         ack: ContainerAttachTerminalAckV1 | None = None
+        deadline = _deadline(
+            self._deadline_clock,
+            self._protocol.terminal_ack_timeout_seconds,
+            phase="terminal_ack",
+        )
         try:
             ack = _read_metadata(
                 reader,
+                self._deadline_clock,
+                deadline,
                 protocol=self._protocol,
                 frame_type=ContainerAttachFrameType.TERMINAL_ACK,
                 model_type=ContainerAttachTerminalAckV1,
@@ -642,28 +826,35 @@ class ContainerAttachDaemonSession:
             failure_phase = error.phase
         if failure_phase is not None:
             self._state = ContainerAttachSessionState.AMBIGUOUS
-            raise ContainerAttachError(failure_phase)
+            raise _fresh_error(failure_phase)
         if ack is None:
             self._state = ContainerAttachSessionState.AMBIGUOUS
-            raise ContainerAttachError("terminal_ack")
+            raise _fresh_error("terminal_ack")
         self._state = ContainerAttachSessionState.TERMINAL_ACK_RECEIVED
         return ack
 
-    def require_eof(self, reader: AttachByteReader) -> None:
+    def require_eof(self, reader: AttachDeadlineReader) -> None:
         """Require the terminal clean EOF after a redacted terminal ack."""
 
         if self._state is not ContainerAttachSessionState.TERMINAL_ACK_RECEIVED:
-            raise ContainerAttachError("state")
+            raise _fresh_error("state")
         failure_phase: str | None = None
+        deadline = _deadline(
+            self._deadline_clock,
+            self._protocol.terminal_ack_timeout_seconds,
+            phase="eof",
+        )
         try:
-            trailing = reader.read(1)
+            _require_before(self._deadline_clock, deadline, phase="eof")
+            trailing = reader.read(1, deadline=deadline)
+            _require_before(self._deadline_clock, deadline, phase="eof")
             if type(trailing) is not bytes or trailing != b"":
-                raise ContainerAttachError("trailing_data")
+                raise _fresh_error("trailing_data")
         except ContainerAttachError as error:
             failure_phase = error.phase
         except Exception:
             failure_phase = "eof"
         if failure_phase is not None:
             self._state = ContainerAttachSessionState.AMBIGUOUS
-            raise ContainerAttachError(failure_phase)
+            raise _fresh_error(failure_phase)
         self._state = ContainerAttachSessionState.CLOSED

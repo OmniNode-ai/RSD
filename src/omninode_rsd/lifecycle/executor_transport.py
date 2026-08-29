@@ -128,6 +128,16 @@ class ExecutorTransportError(RuntimeError):
         super().__init__(f"executor transport failed at phase: {phase}")
 
 
+def _fresh_transport_error(phase: str) -> ExecutorTransportError:
+    """Return a redacted error detached from a provider/transport exception."""
+
+    error = ExecutorTransportError(phase)
+    error.__cause__ = None
+    error.__context__ = None
+    error.__suppress_context__ = True
+    return error
+
+
 class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
 
@@ -2965,6 +2975,7 @@ class RemoteExecutorTransportClient:
         if not isinstance(material_lease, _StreamingSecretLease):
             raise ExecutorTransportError("transport_delivery")
         delivery_started = False
+        failure_phase: str | None = None
         try:
             with self._client.open() as session:
                 request = cast(
@@ -3039,12 +3050,17 @@ class RemoteExecutorTransportClient:
                 if receipt.delivery_binding_sha256 != transport_delivery_binding_sha256(request):
                     raise ExecutorTransportError("transport_receipt")
                 return delivery, receipt
-        except ExecutorTransportError as error:
-            if delivery_started:
-                raise ExecutorTransportError("transport_delivery_ambiguous") from None
-            raise error
-        except (TransportError, ValidationError, ValueError):
-            raise ExecutorTransportError("transport_delivery_ambiguous") from None
+        except ExecutorTransportError:
+            failure_phase = (
+                "transport_delivery_ambiguous" if delivery_started else "transport_delivery"
+            )
+        except Exception:
+            failure_phase = (
+                "transport_delivery_ambiguous" if delivery_started else "transport_delivery"
+            )
+        if failure_phase is not None:
+            raise _fresh_transport_error(failure_phase)
+        raise AssertionError("unreachable transport delivery state")
 
     def allocate(
         self,
@@ -3059,6 +3075,7 @@ class RemoteExecutorTransportClient:
         """
 
         request_started = False
+        failure_phase: str | None = None
         try:
             with self._client.open() as session:
                 request = cast(
@@ -3120,14 +3137,17 @@ class RemoteExecutorTransportClient:
                     attestation_public_key_base64=self._artifacts.attestation_public_key_base64,
                     attestation_key_id=self._artifacts.attestation_key_id,
                 )
-        except ExecutorTransportError as error:
-            if request_started:
-                raise ExecutorTransportError("allocation_transport_ambiguous") from None
-            raise error
-        except (TransportError, ValidationError, ValueError):
-            if request_started:
-                raise ExecutorTransportError("allocation_transport_ambiguous") from None
-            raise ExecutorTransportError("allocation_transport") from None
+        except ExecutorTransportError:
+            failure_phase = (
+                "allocation_transport_ambiguous" if request_started else "allocation_transport"
+            )
+        except Exception:
+            failure_phase = (
+                "allocation_transport_ambiguous" if request_started else "allocation_transport"
+            )
+        if failure_phase is not None:
+            raise _fresh_transport_error(failure_phase)
+        raise AssertionError("unreachable allocation transport state")
 
 
 class _KeychainValueStore(Protocol):

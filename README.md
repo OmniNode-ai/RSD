@@ -360,6 +360,26 @@ and restore PostgreSQL transitions remain distinct: both keep their database
 owner NOLOGIN while a separate observed-OID-bound application login/verifier
 transition is authorized only at materialization.
 
+Before materialization or a later start can use the restore identity, a separate
+signed `ObservedRestoreDatabaseAttestationV1` must already exist in the
+owner-only artifact root. It binds the allocation intent and receipt, observed
+allocation attestation, allocation journal, source-database observation,
+backup/restore commitments, and the exact observed restore database/schema and
+owner/application role OIDs. A caller-supplied equivalent object is not enough:
+the authorization boundary descriptor-reopens, canonicalizes, and verifies the
+persisted signed predecessor. Missing, stale, substituted, or primary-derived
+restore observations block. The actual backup/restore effect that creates this
+predecessor remains a separately authorized future capability. Until that
+effect and its replay authority are separately defined, the backup and restore
+commitments in this observation are signed opaque identifiers, not a claim that
+this release verifies or executes a backup/restore operation.
+
+Valkey URI authorities are not free-form route hints: `TargetDeliveryMapV1`
+requires each primary/restore URI to use the exact signed static IPv4 address
+of its own planned component and fixed port `6379`. Cross-network swaps,
+gateway or unrelated authorities, and different ports are rejected during
+canonical model validation and again in materialization/start authorization.
+
 `ContainerBootstrapAttachProtocolV1` and the pure
 `container_attach` codec describe the future daemon-to-container stdin boundary
 separately from the Mac-to-daemon remote-session framing. A local request binds
@@ -371,6 +391,16 @@ mutable and zeroized best-effort on every codec path; any failure after the
 first chunk becomes non-retryable `attach_ambiguous_v1`. This is not a Docker
 attach adapter or a wrapper implementation, and it does not make
 materialization or start executable.
+
+The codec accepts only an exact tuple of mutable secret buffers, so it owns and
+zeroizes every accepted buffer on every completion or failure path. Its reader
+and writer are deadline-capable interfaces rather than generic blocking streams:
+the signed ready, claim, and terminal time limits are enforced with a monotonic
+deadline. A mandatory local atomic nonce authority claims a directional binding
+of request hash, operation, component, nonce, and target-map hash before either
+side accepts a secret chunk. That local claim is independent of outer replay
+tombstones; a codec replay is rejected even if an unsafe caller bypasses an
+outer boundary.
 
 ### Remote executor transport boundary
 
