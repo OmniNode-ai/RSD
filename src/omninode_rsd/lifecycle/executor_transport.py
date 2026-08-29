@@ -442,11 +442,25 @@ class ExecutorClientHelloV2(_Model):
 class ExecutorEngineOperationKindV1(StrEnum):
     """Closed Engine/PostgreSQL steps a future backend may checkpoint."""
 
+    ENGINE_PING = "engine_ping"
+    ENGINE_VERSION = "engine_version"
+    ENGINE_INFO = "engine_info"
+    IMAGE_INSPECT = "image_inspect"
+    NETWORK_ABSENCE_CHECK = "network_absence_check"
     NETWORK_CREATE = "network_create"
     NETWORK_INSPECT = "network_inspect"
+    NETWORK_FINAL_INSPECT = "network_final_inspect"
+    VOLUME_ABSENCE_CHECK = "volume_absence_check"
     VOLUME_CREATE = "volume_create"
     VOLUME_INSPECT = "volume_inspect"
+    VOLUME_FINAL_INSPECT = "volume_final_inspect"
     POSTGRES_PREPARED_CONTROL = "postgres_prepared_control"
+    POSTGRES_BINARY_EXEC_CREATE = "postgres_binary_exec_create"
+    POSTGRES_BINARY_EXEC_INSPECT = "postgres_binary_exec_inspect"
+    POSTGRES_BINARY_EXEC_START = "postgres_binary_exec_start"
+    POSTGRES_EXEC_CREATE = "postgres_exec_create"
+    POSTGRES_EXEC_INSPECT = "postgres_exec_inspect"
+    POSTGRES_EXEC_START = "postgres_exec_start"
     CONTAINER_CREATE = "container_create"
     CONTAINER_INSPECT = "container_inspect"
     CONTAINER_START = "container_start"
@@ -457,11 +471,18 @@ class ExecutorEngineOperationKindV1(StrEnum):
 class ExecutorEngineOperationTargetV1(StrEnum):
     """Value-free target identities for the closed checkpoint plan."""
 
+    ENGINE = "engine"
+    CONTROL_IMAGE = "control_image"
+    CONTROL_POSTGRES = "control_postgres"
     PRIMARY_NETWORK = "primary_network"
     RESTORE_NETWORK = "restore_network"
     PRIMARY_CACHE_VOLUME = "primary_cache_volume"
     RESTORE_CACHE_VOLUME = "restore_cache_volume"
     ALLOCATION_POSTGRES = "allocation_postgres"
+    ALLOCATION_POSTGRES_ROLES = "allocation_postgres_roles"
+    ALLOCATION_POSTGRES_DATABASE = "allocation_postgres_database"
+    ALLOCATION_POSTGRES_SCHEMA_ACL = "allocation_postgres_schema_acl"
+    ALLOCATION_POSTGRES_OBSERVATION = "allocation_postgres_observation"
     APPLICATION_POSTGRES = "application_postgres"
     PRIMARY_INFISICAL = "primary_infisical"
     PRIMARY_VALKEY = "primary_valkey"
@@ -494,17 +515,104 @@ def _expected_engine_operation_steps(
     target = ExecutorEngineOperationTargetV1
     if operation_scope == "allocate_isolated_empty_resources_v2":
         return (
+            step(operation_kind=kind.ENGINE_PING, target=target.ENGINE),
+            step(operation_kind=kind.ENGINE_VERSION, target=target.ENGINE),
+            step(operation_kind=kind.ENGINE_INFO, target=target.ENGINE),
+            step(operation_kind=kind.IMAGE_INSPECT, target=target.CONTROL_IMAGE),
+            step(operation_kind=kind.CONTAINER_INSPECT, target=target.CONTROL_POSTGRES),
+            step(
+                operation_kind=kind.POSTGRES_BINARY_EXEC_CREATE,
+                target=target.CONTROL_POSTGRES,
+            ),
+            step(
+                operation_kind=kind.POSTGRES_BINARY_EXEC_INSPECT,
+                target=target.CONTROL_POSTGRES,
+            ),
+            step(
+                operation_kind=kind.POSTGRES_BINARY_EXEC_START,
+                target=target.CONTROL_POSTGRES,
+            ),
+            step(operation_kind=kind.NETWORK_ABSENCE_CHECK, target=target.PRIMARY_NETWORK),
             step(operation_kind=kind.NETWORK_CREATE, target=target.PRIMARY_NETWORK),
             step(operation_kind=kind.NETWORK_INSPECT, target=target.PRIMARY_NETWORK),
+            step(operation_kind=kind.NETWORK_ABSENCE_CHECK, target=target.RESTORE_NETWORK),
             step(operation_kind=kind.NETWORK_CREATE, target=target.RESTORE_NETWORK),
             step(operation_kind=kind.NETWORK_INSPECT, target=target.RESTORE_NETWORK),
+            step(
+                operation_kind=kind.VOLUME_ABSENCE_CHECK,
+                target=target.PRIMARY_CACHE_VOLUME,
+            ),
             step(operation_kind=kind.VOLUME_CREATE, target=target.PRIMARY_CACHE_VOLUME),
             step(operation_kind=kind.VOLUME_INSPECT, target=target.PRIMARY_CACHE_VOLUME),
+            step(
+                operation_kind=kind.VOLUME_ABSENCE_CHECK,
+                target=target.RESTORE_CACHE_VOLUME,
+            ),
             step(operation_kind=kind.VOLUME_CREATE, target=target.RESTORE_CACHE_VOLUME),
             step(operation_kind=kind.VOLUME_INSPECT, target=target.RESTORE_CACHE_VOLUME),
             step(
-                operation_kind=kind.POSTGRES_PREPARED_CONTROL,
-                target=target.ALLOCATION_POSTGRES,
+                operation_kind=kind.POSTGRES_EXEC_CREATE,
+                target=target.ALLOCATION_POSTGRES_ROLES,
+            ),
+            step(
+                operation_kind=kind.POSTGRES_EXEC_INSPECT,
+                target=target.ALLOCATION_POSTGRES_ROLES,
+            ),
+            step(
+                operation_kind=kind.POSTGRES_EXEC_START,
+                target=target.ALLOCATION_POSTGRES_ROLES,
+            ),
+            step(
+                operation_kind=kind.POSTGRES_EXEC_CREATE,
+                target=target.ALLOCATION_POSTGRES_DATABASE,
+            ),
+            step(
+                operation_kind=kind.POSTGRES_EXEC_INSPECT,
+                target=target.ALLOCATION_POSTGRES_DATABASE,
+            ),
+            step(
+                operation_kind=kind.POSTGRES_EXEC_START,
+                target=target.ALLOCATION_POSTGRES_DATABASE,
+            ),
+            step(
+                operation_kind=kind.POSTGRES_EXEC_CREATE,
+                target=target.ALLOCATION_POSTGRES_SCHEMA_ACL,
+            ),
+            step(
+                operation_kind=kind.POSTGRES_EXEC_INSPECT,
+                target=target.ALLOCATION_POSTGRES_SCHEMA_ACL,
+            ),
+            step(
+                operation_kind=kind.POSTGRES_EXEC_START,
+                target=target.ALLOCATION_POSTGRES_SCHEMA_ACL,
+            ),
+            step(
+                operation_kind=kind.POSTGRES_EXEC_CREATE,
+                target=target.ALLOCATION_POSTGRES_OBSERVATION,
+            ),
+            step(
+                operation_kind=kind.POSTGRES_EXEC_INSPECT,
+                target=target.ALLOCATION_POSTGRES_OBSERVATION,
+            ),
+            step(
+                operation_kind=kind.POSTGRES_EXEC_START,
+                target=target.ALLOCATION_POSTGRES_OBSERVATION,
+            ),
+            step(
+                operation_kind=kind.NETWORK_FINAL_INSPECT,
+                target=target.PRIMARY_NETWORK,
+            ),
+            step(
+                operation_kind=kind.NETWORK_FINAL_INSPECT,
+                target=target.RESTORE_NETWORK,
+            ),
+            step(
+                operation_kind=kind.VOLUME_FINAL_INSPECT,
+                target=target.PRIMARY_CACHE_VOLUME,
+            ),
+            step(
+                operation_kind=kind.VOLUME_FINAL_INSPECT,
+                target=target.RESTORE_CACHE_VOLUME,
             ),
         )
     if operation_scope == "materialize_and_start_runtime_v1":

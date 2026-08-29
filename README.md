@@ -365,11 +365,51 @@ envelope is bounded to 16 KiB even when it carries the four filtered container
 inspections; secret chunks remain separate opaque bounded frames. The daemon
 and client verifier reject future-dated inner executor receipts.
 
-The exposed future-backend contract is deliberately narrow: it can claim and
-complete only the next signed operation with a SHA-256 of a filtered projection.
-It receives no Docker socket, raw Engine response, raw PostgreSQL result, or
-journal connection. A concrete Engine/PostgreSQL adapter remains outside this
-release and must bind these typed receipts before any live mutation.
+The exposed backend contract is deliberately narrow: it can claim and complete
+only the next signed operation with a SHA-256 of a filtered projection. It
+receives no Docker socket, raw Engine response, raw PostgreSQL result, or
+journal connection.
+
+### Sealed zero-secret allocation backend
+
+This release includes one concrete, allocation-only Linux adapter:
+`SealedAllocationBackendV1`. It is not a general Docker client and is never
+selected by a caller-supplied socket, URL, callback, SQL string, or command.
+Production construction descriptor-loads and signature-verifies the exact
+allocation intent, executor policy, Docker Engine policy, and PostgreSQL
+prepared-control policy from an owner-only, no-follow artifact root. Its
+signed Unix socket policy pins the canonical path digest, device, inode, owner,
+group, and mode; the live adapter rechecks that identity and Linux peer
+credentials before and after each connection. Its parent directories must be
+root-owned and non-writable, so the root-controlled Engine/executor remains the
+explicit TCB for the unavoidable pathname-based AF_UNIX connect.
+
+The adapter permits only Engine ping/version/info, the pinned control-image and
+control-container inspections, exact named internal-network and local-volume
+absence/create/inspect operations, and fixed control-container `exec`
+create/inspect/start calls.
+It rejects preexisting names rather than adopting them, does not pull, delete,
+prune, update, restart, connect networks, read logs/events, or create runtime
+containers, and persists a durable signed-plan checkpoint before every Engine
+call. A timeout, EOF, status/framing failure, or crash after a claim is
+ambiguous: no retry, adoption, cleanup, or automatic recovery is permitted.
+
+PostgreSQL allocation uses a fixed signed `psql` argv and stdin-only templates
+for NOLOGIN role creation, database creation, schema/ACL creation, and typed
+state observation. Before that it proves the signed `psql` binary checksum in
+the pinned control image. SQL, raw Engine data, Docker paths/labels, psql
+output, and any secret are excluded from journal state and receipts. The
+adapter reports a full typed `AllocatedResourceSetV2` with zero containers and
+no host publication. Its read-only reconciliation path can only inspect the
+known allocation names plus fixed PostgreSQL presence/observation queries; it
+produces a signed, non-resumable reconciliation receipt and never repairs or
+continues partial state.
+
+Materialization and start remain `NoMutationBackend` operations. The sealed
+allocation backend raises `backend_unavailable` for both, and
+`serve_systemd_activated_allocation_session()` accepts only an allocation
+transport request from that sealed adapter. No generic allocation CLI creates
+or installs an Engine control path.
 
 The client builds one fixed OpenSSH invocation with strict host-key checking,
 no forwarding, no interactive authentication, no control socket, and pinned
@@ -413,10 +453,11 @@ opened, so this public package cannot accidentally accept delivery material
 without a separately reviewed concrete backend.
 
 This release still provides no configured executor installation, network
-connection, Docker, PostgreSQL, or service-mutation backend. `NoMutationBackend`
-is the safe default. A future deployment must separately install and attest the
-rendered policy, bind a concrete typed backend, and satisfy the existing
-signed authorization and external replay gates.
+connection, Docker daemon, PostgreSQL instance, or service-mutation backend.
+`NoMutationBackend` remains the safe default unless a separately installed,
+attested executable constructs the sealed allocation adapter from its verified
+artifact root. A future deployment must separately install and attest that
+policy and satisfy the existing signed authorization and external replay gates.
 
 The observed SQLite journal requires an owner-only directory and database file, uses
 `BEGIN IMMEDIATE`, `DELETE` journaling, and `FULL` synchronous durability. A

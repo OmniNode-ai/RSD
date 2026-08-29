@@ -31,7 +31,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from threading import Lock
-from typing import Final, Literal, Protocol
+from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
 from uuid import uuid4
 
 from cryptography.exceptions import InvalidSignature
@@ -63,6 +63,7 @@ from omninode_rsd.lifecycle.executor_transport import (
     verify_executor_transport_request,
 )
 from omninode_rsd.lifecycle.infisical_disposable import (
+    AllocatedResourceSetV2,
     AllocationExecutorReceiptV1,
     EngineIdentityObservationV1,
     ExecutorIdentityV1,
@@ -89,6 +90,9 @@ from omninode_rsd.lifecycle.transport import (
     FrameByteWriter,
     TransportError,
 )
+
+if TYPE_CHECKING:
+    from omninode_rsd.lifecycle.executor_allocation import AllocationReconciliationReceiptV1
 
 _SHA256: Final = r"^[0-9a-f]{64}$"
 _UUID: Final = r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -1428,7 +1432,7 @@ class ExecutorAllocationBackendEvidenceV1:
     """
 
     engine: EngineIdentityObservationV1
-    allocated_resources_projection_sha256: str
+    allocated_resources: AllocatedResourceSetV2
     engine_operation_journal_sha256: str
     completed_at: str
 
@@ -1571,6 +1575,8 @@ class ExecutorAttestationSigner(Protocol):
         self, receipt: ExecutorAllocationTransportReceiptV1
     ) -> str: ...
 
+    def sign_allocation_reconciliation_receipt(self, receipt: object) -> str: ...
+
     def sign_materialization_executor_receipt(
         self, receipt: MaterializationExecutorReceiptV1
     ) -> str: ...
@@ -1711,6 +1717,18 @@ class SystemdCredentialAttestationSigner:
     ) -> str:
         return self._sign(executor_allocation_transport_receipt_message(receipt))
 
+    def sign_allocation_reconciliation_receipt(self, receipt: object) -> str:
+        """Sign only the typed allocation reconciliation receipt domain."""
+
+        from omninode_rsd.lifecycle.executor_allocation import (
+            AllocationReconciliationReceiptV1,
+            allocation_reconciliation_receipt_message,
+        )
+
+        if type(receipt) is not AllocationReconciliationReceiptV1:
+            raise ExecutorDaemonError("attestation_credential")
+        return self._sign(allocation_reconciliation_receipt_message(receipt))
+
     def sign_materialization_executor_receipt(
         self, receipt: MaterializationExecutorReceiptV1
     ) -> str:
@@ -1747,6 +1765,7 @@ class ExecutorDaemonSessionEngine:
             or not hasattr(attestation_signer, "sign_receipt")
             or not hasattr(attestation_signer, "sign_allocation_executor_receipt")
             or not hasattr(attestation_signer, "sign_allocation_transport_receipt")
+            or not hasattr(attestation_signer, "sign_allocation_reconciliation_receipt")
             or not hasattr(attestation_signer, "sign_materialization_executor_receipt")
             or not hasattr(attestation_signer, "sign_start_runtime_executor_receipt")
         ):
@@ -1759,6 +1778,41 @@ class ExecutorDaemonSessionEngine:
         self._memory = LinuxMemorySafetyPreflight() if memory_safety is None else memory_safety
         self._active = Lock()
 
+    def reconcile_allocation_read_only(self) -> AllocationReconciliationReceiptV1:
+        """Produce a signed, non-resumable allocation reconciliation receipt.
+
+        This entry point admits only the sealed allocation adapter. It never
+        claims an operation or invokes a mutating backend method. It does hold
+        the same nonblocking session lease as a live request so it cannot sign
+        an inconsistent snapshot while allocation is running.
+        """
+
+        from omninode_rsd.lifecycle.executor_allocation import (
+            AllocationReconciliationReceiptV1,
+            SealedAllocationBackendV1,
+        )
+
+        if type(self._backend) is not SealedAllocationBackendV1:
+            raise ExecutorDaemonError("backend_unavailable")
+        if not self._active.acquire(blocking=False):
+            raise ExecutorDaemonError("session_busy")
+        try:
+            with self._journal.acquire_session_lease():
+                projection = self._backend.reconcile_read_only()
+                unsigned = AllocationReconciliationReceiptV1(
+                    schema_version="rsd.allocation-reconciliation-receipt.v1",
+                    projection=projection,
+                    projection_sha256=canonical_sha256(projection),
+                    signer_key_id=self._attestation_signer.key_id,
+                    signature_base64=base64.b64encode(b"0" * 64).decode("ascii"),
+                )
+                signature = self._attestation_signer.sign_allocation_reconciliation_receipt(
+                    unsigned
+                )
+                return unsigned.model_copy(update={"signature_base64": signature})
+        finally:
+            self._active.release()
+
     @classmethod
     def from_verified_artifact_paths(
         cls,
@@ -1769,10 +1823,16 @@ class ExecutorDaemonSessionEngine:
         allocation_intent: object,
         attestation_signer: SystemdCredentialAttestationSigner,
         journal: ExecutorSessionJournal,
-        backend: ExecutorMutationBackend | None = None,
+        allocation_backend_paths: object | None = None,
         memory_safety: MemorySafetyPreflight | None = None,
     ) -> ExecutorDaemonSessionEngine:
-        """Production construction path: canonical-load all signed artifacts first."""
+        """Production construction path with no caller-injected effect adapter.
+
+        A missing allocation artifact root intentionally leaves the daemon on
+        ``NoMutationBackend``.  The only concrete production adapter is loaded
+        from its own descriptor-verified allocation artifact root; tests that
+        need fakes use the explicitly test-only factory below.
+        """
 
         # ``load_verified_executor_transport_artifacts`` makes the exact
         # concrete model checks and removes arbitrary object/caller clock
@@ -1796,12 +1856,26 @@ class ExecutorDaemonSessionEngine:
             )
             if attestation_signer.key_id != artifacts.attestation_key_id:
                 raise ValueError
+            resolved_backend: ExecutorMutationBackend | None = None
+            if allocation_backend_paths is not None:
+                from omninode_rsd.lifecycle.executor_allocation import (
+                    AllocationBackendArtifactPathsV1,
+                    load_sealed_allocation_backend,
+                )
+
+                if type(allocation_backend_paths) is not AllocationBackendArtifactPathsV1:
+                    raise ValueError
+                resolved_backend = load_sealed_allocation_backend(
+                    allocation_backend_paths,
+                    signer=signer,
+                    transport=artifacts,
+                )
             return cls(
                 policy=artifacts.policy,
                 signer_genesis=artifacts.signer_genesis,
                 attestation_signer=attestation_signer,
                 journal=journal,
-                backend=backend,
+                backend=resolved_backend,
                 memory_safety=memory_safety,
                 _capability=_DAEMON_ENGINE_CAPABILITY,
             )
@@ -1814,6 +1888,7 @@ class ExecutorDaemonSessionEngine:
         sink: FrameByteWriter,
         *,
         peer_uid: int,
+        allocation_only: bool = False,
     ) -> ExecutorTransportReceiptV2 | ExecutorAllocationTransportReceiptV1:
         """Internal fake-frame seam; installed flows use ``serve_socket`` only."""
 
@@ -1823,7 +1898,7 @@ class ExecutorDaemonSessionEngine:
             raise ExecutorDaemonError("session_busy")
         try:
             with self._journal.acquire_session_lease():
-                return self._serve_held(source, sink)
+                return self._serve_held(source, sink, allocation_only=allocation_only)
         finally:
             self._active.release()
 
@@ -1991,7 +2066,8 @@ class ExecutorDaemonSessionEngine:
                 type(evidence) is not ExecutorAllocationBackendEvidenceV1
                 or type(evidence.engine) is not EngineIdentityObservationV1
                 or evidence.engine.engine_fingerprint_sha256 != request.engine_fingerprint_sha256
-                or re_fullmatch(_SHA256, evidence.allocated_resources_projection_sha256) is None
+                or type(evidence.allocated_resources) is not AllocatedResourceSetV2
+                or evidence.allocated_resources.engine != evidence.engine
                 or re_fullmatch(_SHA256, evidence.engine_operation_journal_sha256) is None
                 or _timestamp(evidence.completed_at) > _system_utc_clock()
                 or evidence.engine_operation_journal_sha256
@@ -2011,8 +2087,9 @@ class ExecutorDaemonSessionEngine:
                 ),
                 host_fingerprint_sha256=request.host_fingerprint_sha256,
                 engine=evidence.engine,
-                allocated_resources_projection_sha256=(
-                    evidence.allocated_resources_projection_sha256
+                allocated_resources=evidence.allocated_resources,
+                allocated_resources_projection_sha256=canonical_sha256(
+                    evidence.allocated_resources
                 ),
                 engine_operation_journal_sha256=evidence.engine_operation_journal_sha256,
                 completed_at=evidence.completed_at,
@@ -2080,6 +2157,8 @@ class ExecutorDaemonSessionEngine:
         self,
         source: FrameByteReader,
         sink: FrameByteWriter,
+        *,
+        allocation_only: bool = False,
     ) -> ExecutorTransportReceiptV2 | ExecutorAllocationTransportReceiptV1:
         """Perform one session while the global OS lease remains held."""
 
@@ -2139,6 +2218,12 @@ class ExecutorDaemonSessionEngine:
                     source=source,
                     sink=sink,
                 )
+            if allocation_only:
+                # Reject a material/start metadata envelope before validation,
+                # durable claim, or the first secret chunk read. The sealed
+                # allocation systemd entry point must never become a delivery
+                # endpoint merely because its UDS is reachable.
+                raise ExecutorDaemonError("allocation_only")
             if message_kind not in {"materialize", "start"}:
                 raise ExecutorDaemonError("session_request")
             request = ExecutorTransportRequestV2.model_validate_json(request_raw)
@@ -2301,7 +2386,7 @@ class ExecutorDaemonSessionEngine:
                     lease.release()
 
     def serve_socket(
-        self, connection: socket.socket
+        self, connection: socket.socket, *, allocation_only: bool = False
     ) -> ExecutorTransportReceiptV2 | ExecutorAllocationTransportReceiptV1:
         """Serve one AF_UNIX connection after obtaining its kernel peer UID."""
 
@@ -2319,7 +2404,7 @@ class ExecutorDaemonSessionEngine:
                 raise ExecutorDaemonError("session_busy")
             try:
                 with self._journal.acquire_session_lease():
-                    return self._serve_held(stream, stream)
+                    return self._serve_held(stream, stream, allocation_only=allocation_only)
             finally:
                 self._active.release()
         finally:
@@ -2401,6 +2486,8 @@ def _activated_listener_identity(
 def _serve_activated_listener(
     engine: ExecutorDaemonSessionEngine,
     listener: socket.socket,
+    *,
+    allocation_only: bool = False,
 ) -> ExecutorTransportReceiptV2 | ExecutorAllocationTransportReceiptV1:
     """Accept exactly one signed local connection from a systemd listener."""
 
@@ -2413,7 +2500,7 @@ def _serve_activated_listener(
         connection, _address = listener.accept()
         if _activated_listener_identity(listener, engine._policy) != before:
             raise ValueError
-        result = engine.serve_socket(connection)
+        result = engine.serve_socket(connection, allocation_only=allocation_only)
         connection = None
         return result
     except ExecutorDaemonError:
@@ -2436,14 +2523,44 @@ def serve_systemd_activated_session(
     starts a service, or supplies a mutation backend.
     """
 
-    if (
-        type(engine) is not ExecutorDaemonSessionEngine
-        or type(engine._backend) is NoMutationBackend
-    ):
+    from omninode_rsd.lifecycle.executor_allocation import SealedAllocationBackendV1
+
+    if type(engine) is not ExecutorDaemonSessionEngine or type(engine._backend) in {
+        NoMutationBackend,
+        SealedAllocationBackendV1,
+    }:
         raise ExecutorDaemonError("backend_unavailable")
     listener = _systemd_activated_listener()
     try:
         return _serve_activated_listener(engine, listener)
+    finally:
+        with suppress(Exception):
+            listener.close()
+
+
+def serve_systemd_activated_allocation_session(
+    engine: ExecutorDaemonSessionEngine,
+) -> ExecutorAllocationTransportReceiptV1:
+    """Serve exactly one allocation session from the sealed Engine backend.
+
+    This narrow entry point cannot select materialization or start and does
+    not install a service.  The generic systemd entry point remains available
+    only to already-sealed future effect backends.
+    """
+
+    from omninode_rsd.lifecycle.executor_allocation import SealedAllocationBackendV1
+
+    if (
+        type(engine) is not ExecutorDaemonSessionEngine
+        or type(cast(object, engine._backend)) is not SealedAllocationBackendV1
+    ):
+        raise ExecutorDaemonError("backend_unavailable")
+    listener = _systemd_activated_listener()
+    try:
+        result = _serve_activated_listener(engine, listener, allocation_only=True)
+        if type(result) is not ExecutorAllocationTransportReceiptV1:
+            raise ExecutorDaemonError("allocation_backend")
+        return result
     finally:
         with suppress(Exception):
             listener.close()
@@ -2963,6 +3080,7 @@ __all__ = [
     "MemorySafetyPreflight",
     "NoMutationBackend",
     "SystemdCredentialAttestationSigner",
+    "serve_systemd_activated_allocation_session",
     "serve_systemd_activated_session",
     "unix_peer_uid",
     "verify_executor_recovery_receipt",

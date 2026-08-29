@@ -44,6 +44,7 @@ _ENGINE_FINGERPRINT_DOMAIN: Final = b"omninode-rsd.docker-engine-projection.sha2
 _VOLUME_INSTANCE_FINGERPRINT_DOMAIN: Final = (
     b"omninode-rsd.docker-named-volume-instance.sha256.v1\x00"
 )
+_UNIX_SOCKET_IDENTITY_DOMAIN: Final = b"omninode-rsd.docker-unix-socket-identity.sha256.v1\x00"
 _CREATE_TEMPLATE_DOMAIN: Final = b"omninode-rsd.docker-create-template.sha256.v1\x00"
 _ALLOCATION_EXECUTOR_RECEIPT_DOMAIN: Final = (
     b"omninode-rsd.allocation-executor-receipt.ed25519.v1\x00"
@@ -1239,25 +1240,103 @@ class DockerImagePolicyV1(_Model):
         return self
 
 
-class DockerUnixSocketPolicyV1(_Model):
-    """A value-free local Engine endpoint identity; no socket path is public."""
+class _DockerUnixSocketIdentityProjectionV1(_Model):
+    """Internal canonical preimage for one pinned Unix-domain socket."""
 
-    socket_identity_sha256: str = Field(pattern=_SHA256)
+    socket_path_sha256: str = Field(pattern=_SHA256)
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
     owner_uid: int = Field(ge=0, le=2_147_483_647)
     group_gid: int = Field(ge=0, le=2_147_483_647)
-    mode: Literal[384]
+    mode: int = Field(ge=0, le=0o777)
+
+
+def docker_unix_socket_identity_sha256(
+    *,
+    socket_path_sha256: str,
+    device: int,
+    inode: int,
+    owner_uid: int,
+    group_gid: int,
+    mode: int,
+) -> str:
+    """Return the signed, native identity of a Docker Engine socket."""
+
+    projection = _DockerUnixSocketIdentityProjectionV1(
+        socket_path_sha256=socket_path_sha256,
+        device=device,
+        inode=inode,
+        owner_uid=owner_uid,
+        group_gid=group_gid,
+        mode=mode,
+    )
+    return _domain_sha256(_UNIX_SOCKET_IDENTITY_DOMAIN, projection)
+
+
+class DockerUnixSocketPolicyV1(_Model):
+    """One exact local Engine socket identity for a sealed executor.
+
+    The path is an installation-scoped deployment value, but it is still a
+    signed part of the policy: an allocation backend must never select an
+    ambient Docker socket.  The device/inode pair deliberately makes a daemon
+    restart or socket replacement fail closed until a newly reviewed policy is
+    installed.
+    """
+
+    socket_path: str = Field(min_length=1, max_length=4096)
+    socket_path_sha256: str = Field(pattern=_SHA256)
+    socket_identity_sha256: str = Field(pattern=_SHA256)
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
+    owner_uid: int = Field(ge=0, le=2_147_483_647)
+    group_gid: int = Field(ge=0, le=2_147_483_647)
+    mode: int = Field(ge=0, le=0o777)
     endpoint_scheme: Literal["unix"]
     symlink_allowed: Literal[False]
     replacement_allowed: Literal[False]
 
+    @field_validator("socket_path")
+    @classmethod
+    def canonical_socket_path(cls, value: str) -> str:
+        path = Path(value)
+        if (
+            type(value) is not str
+            or not path.is_absolute()
+            or os.path.normpath(value) != value
+            or "\x00" in value
+        ):
+            raise ValueError("Docker socket path is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def exact_socket_identity(self) -> Self:
+        expected_path = _digest(os.fsencode(self.socket_path))
+        if (
+            self.socket_path_sha256 != expected_path
+            or self.socket_identity_sha256
+            != docker_unix_socket_identity_sha256(
+                socket_path_sha256=self.socket_path_sha256,
+                device=self.device,
+                inode=self.inode,
+                owner_uid=self.owner_uid,
+                group_gid=self.group_gid,
+                mode=self.mode,
+            )
+            or self.mode & 0o007 != 0
+            or self.mode == 0
+        ):
+            raise ValueError("Docker socket policy is invalid")
+        return self
+
 
 class DockerEngineControlPolicyV1(_Model):
-    """Signed closed Docker Engine API contract for the future local backend.
+    """Signed closed Docker Engine API contract for allocation only.
 
-    It intentionally models only the narrow endpoints required by allocation
-    and the future bootstrap wrapper.  Pull, delete, prune, update, restart,
-    network-connect, logs, events, arbitrary exec and shell execution are not
-    representable.
+    It intentionally models only the narrow endpoints required by empty
+    allocation and its pre-existing PostgreSQL control container. Pull,
+    delete, prune, update, restart, network-connect, logs, events, arbitrary
+    exec, container create/start/attach, and shell execution are not
+    representable. A later runtime effect requires a distinct signed policy.
     """
 
     schema_version: Literal["rsd.docker-engine-control-policy.v1"]
@@ -1269,14 +1348,18 @@ class DockerEngineControlPolicyV1(_Model):
     engine_fingerprint_sha256: str = Field(pattern=_SHA256)
     allowed_operations: tuple[
         Literal[
+            "engine_ping",
+            "engine_version",
+            "engine_info",
+            "image_inspect",
             "network_create",
             "network_inspect",
             "volume_create",
             "volume_inspect",
-            "container_create",
             "container_inspect",
-            "container_start",
-            "container_attach",
+            "exec_create",
+            "exec_inspect",
+            "exec_start",
         ],
         ...,
     ]
@@ -1303,14 +1386,18 @@ class DockerEngineControlPolicyV1(_Model):
     @model_validator(mode="after")
     def closed_engine_api(self) -> Self:
         expected = (
+            "engine_ping",
+            "engine_version",
+            "engine_info",
+            "image_inspect",
             "network_create",
             "network_inspect",
             "volume_create",
             "volume_inspect",
-            "container_create",
             "container_inspect",
-            "container_start",
-            "container_attach",
+            "exec_create",
+            "exec_inspect",
+            "exec_start",
         )
         if (
             self.allowed_operations != expected
@@ -1460,7 +1547,9 @@ class PostgreSQLControlPolicyV1(_Model):
             or tuple(state.role_kind for state in self.allocation_role_states)
             != ("database_owner", "application")
             or any(
-                grant.role not in self.role_names or grant.grantee not in self.role_names
+                grant.role != self.owner_role
+                or grant.grantee not in self.role_names
+                or grant.schema_name != self.schema_name
                 for grant in self.grants
             )
             or tuple(
@@ -1534,7 +1623,12 @@ class PostgreSQLPreparedControlPolicyV2(_Model):
     control_image: DockerImagePolicyV1
     control_config_sha256: str = Field(pattern=_SHA256)
     unix_socket_identity_sha256: str = Field(pattern=_SHA256)
+    psql_absolute_path: str = Field(pattern=r"^/[A-Za-z0-9._/-]{1,255}$")
     psql_binary_sha256: str = Field(pattern=_SHA256)
+    psql_operating_system_user: str = Field(pattern=_IDENTIFIER)
+    postgres_unix_socket_directory: str = Field(pattern=r"^/[A-Za-z0-9._/-]{1,255}$")
+    maintenance_database: str = Field(pattern=_IDENTIFIER)
+    fixed_psql_argv: tuple[str, ...] = Field(min_length=7, max_length=16)
     system_identifier: str = Field(pattern=r"^[0-9]{8,32}$")
     password_encryption: Literal["scram-sha-256"]
     statement_logging: Literal["disabled"]
@@ -1544,7 +1638,7 @@ class PostgreSQLPreparedControlPolicyV2(_Model):
     signer_key_id: str = Field(pattern=_IDENTIFIER)
     signature_base64: str = Field(min_length=4, max_length=256)
 
-    @field_validator("operations", mode="before")
+    @field_validator("operations", "fixed_psql_argv", mode="before")
     @classmethod
     def declared_operations(cls, value: object) -> tuple[object, ...]:
         return _items(value, field="PostgreSQL prepared operations")
@@ -1574,6 +1668,24 @@ class PostgreSQLPreparedControlPolicyV2(_Model):
             or verifier.secret_input is not True
             or verifier.operation_id != self.scram_verifier_install.prepared_operation_id
             or verifier.psql_template_sha256 != self.scram_verifier_install.template_sha256
+            or self.fixed_psql_argv
+            != (
+                self.psql_absolute_path,
+                "-X",
+                "-q",
+                "-A",
+                "-t",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-h",
+                self.postgres_unix_socket_directory,
+                "-U",
+                self.psql_operating_system_user,
+                "-d",
+                self.maintenance_database,
+                "-f",
+                "-",
+            )
             or len(set(values)) != len(values)
             or len(_canonical_base64_bytes(self.signature_base64)) != 64
         ):
@@ -1791,7 +1903,9 @@ class AllocationPostgreSQLPlanV2(_Model):
             or tuple(state.role_kind for state in self.allocation_role_states)
             != ("database_owner", "application")
             or any(
-                grant.role not in self.role_names or grant.grantee not in self.role_names
+                grant.role != self.owner_role
+                or grant.grantee not in self.role_names
+                or grant.schema_name != self.schema_name
                 for grant in self.grants
             )
             or tuple(
@@ -2167,6 +2281,7 @@ class AllocationExecutorReceiptV1(_Model):
     postgres_prepared_control_policy_sha256: str = Field(pattern=_SHA256)
     host_fingerprint_sha256: str = Field(pattern=_SHA256)
     engine: EngineIdentityObservationV1
+    allocated_resources: AllocatedResourceSetV2
     allocated_resources_projection_sha256: str = Field(pattern=_SHA256)
     engine_operation_journal_sha256: str = Field(pattern=_SHA256)
     completed_at: str
@@ -2190,6 +2305,9 @@ class AllocationExecutorReceiptV1(_Model):
         )
         if (
             len(set(values)) != len(values)
+            or self.allocated_resources.engine != self.engine
+            or self.allocated_resources_projection_sha256
+            != canonical_sha256(self.allocated_resources)
             or len(_canonical_base64_bytes(self.signature_base64)) != 64
         ):
             raise ValueError("allocation executor receipt is invalid")

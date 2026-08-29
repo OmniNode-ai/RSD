@@ -50,6 +50,10 @@ from omninode_rsd.lifecycle.executor_transport import (
     SecureShellIdentityReferenceV1,
 )
 from omninode_rsd.lifecycle.infisical_disposable import (
+    AllocatedNetworkObservationV1,
+    AllocatedPostgreSQLObservationV1,
+    AllocatedResourceSetV2,
+    AllocatedVolumeObservationV1,
     AllocationExecutorReceiptV1,
     ContainerBootstrapInspectionV1,
     ContainerSecretSinkV1,
@@ -63,12 +67,16 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     ExecutorInstallationReceiptV1,
     ImageReferenceV1,
     MaterializationExecutorReceiptV1,
+    NoHostPublicationGroundworkV1,
+    PostgreSQLGrantObservationV1,
+    PostgreSQLRoleObservationV1,
     SecretDeliverySinkV1,
     SecretDeliverySlotV1,
     SSHConnectionPolicyV1,
     StartRuntimeExecutorReceiptV2,
     canonical_sha256,
     docker_engine_fingerprint_sha256,
+    docker_volume_instance_fingerprint_sha256,
 )
 from omninode_rsd.lifecycle.provider_crypto import (
     SignerGenesisV1,
@@ -112,6 +120,109 @@ def _allocation_engine_fingerprint() -> str:
         architecture="amd64",
     )
     return docker_engine_fingerprint_sha256(projection)
+
+
+def _allocation_resources(engine: EngineIdentityObservationV1) -> AllocatedResourceSetV2:
+    """Typed non-secret allocation evidence for the daemon-only fake."""
+
+    primary_created = "2026-08-28T12:00:00Z"
+    restore_created = "2026-08-28T12:00:01Z"
+    primary_volume = AllocatedVolumeObservationV1(
+        name="primary-cache-volume",
+        engine_fingerprint_sha256=engine.engine_fingerprint_sha256,
+        driver="local",
+        scope="local",
+        created_at=primary_created,
+        options=(),
+        volume_instance_fingerprint_sha256=docker_volume_instance_fingerprint_sha256(
+            name="primary-cache-volume",
+            engine_fingerprint_sha256=engine.engine_fingerprint_sha256,
+            driver="local",
+            scope="local",
+            created_at=primary_created,
+            options=(),
+        ),
+    )
+    restore_volume = AllocatedVolumeObservationV1(
+        name="restore-cache-volume",
+        engine_fingerprint_sha256=engine.engine_fingerprint_sha256,
+        driver="local",
+        scope="local",
+        created_at=restore_created,
+        options=(),
+        volume_instance_fingerprint_sha256=docker_volume_instance_fingerprint_sha256(
+            name="restore-cache-volume",
+            engine_fingerprint_sha256=engine.engine_fingerprint_sha256,
+            driver="local",
+            scope="local",
+            created_at=restore_created,
+            options=(),
+        ),
+    )
+    return AllocatedResourceSetV2(
+        engine=engine,
+        primary_network=AllocatedNetworkObservationV1(
+            name="primary-network",
+            network_id=_hash("primary-network"),
+            driver="bridge",
+            internal=True,
+            subnet="192.0.2.0/24",
+            gateway="192.0.2.1",
+            options=(),
+        ),
+        restore_network=AllocatedNetworkObservationV1(
+            name="restore-network",
+            network_id=_hash("restore-network"),
+            driver="bridge",
+            internal=True,
+            subnet="198.51.100.0/24",
+            gateway="198.51.100.1",
+            options=(),
+        ),
+        primary_cache_volume=primary_volume,
+        restore_cache_volume=restore_volume,
+        postgres=AllocatedPostgreSQLObservationV1(
+            system_identifier="12345678",
+            database_name="allocation-db",
+            database_oid=101,
+            schema_name="allocation-schema",
+            schema_oid=102,
+            prepared_operation_id=_UUIDS[2],
+            prepared_operation_result_sha256=_hash("allocation-result"),
+            owner_role="allocation-owner",
+            owner_role_oid=103,
+            application_role="allocation-application",
+            application_role_oid=104,
+            role_oids=(
+                PostgreSQLRoleObservationV1(
+                    role="allocation-owner",
+                    role_oid=103,
+                    can_login=False,
+                    password_absent=True,
+                ),
+                PostgreSQLRoleObservationV1(
+                    role="allocation-application",
+                    role_oid=104,
+                    can_login=False,
+                    password_absent=True,
+                ),
+            ),
+            grants=(
+                PostgreSQLGrantObservationV1(
+                    role="allocation-owner",
+                    grantee="allocation-application",
+                    privilege="SELECT",
+                    schema_name="allocation-schema",
+                ),
+            ),
+            acl_sha256=_hash("allocation-acl"),
+        ),
+        no_host_publication=NoHostPublicationGroundworkV1(
+            host_network=False,
+            publish_all_ports=False,
+            allowed_attachment_set_sha256=_hash("allocation-topology"),
+        ),
+    )
 
 
 def _slot(purpose: str) -> SecretDeliverySlotV1:
@@ -504,6 +615,10 @@ class _Attestation:
         del receipt
         return base64.b64encode(b"t" * 64).decode("ascii")
 
+    def sign_allocation_reconciliation_receipt(self, receipt: object) -> str:
+        del receipt
+        return base64.b64encode(b"c" * 64).decode("ascii")
+
     def sign_materialization_executor_receipt(self, receipt: object) -> str:
         del receipt
         return base64.b64encode(b"m" * 64).decode("ascii")
@@ -549,6 +664,20 @@ class _AllocationAttestation:
             self._key.sign(
                 transport.executor_allocation_transport_receipt_message(
                     cast(ExecutorAllocationTransportReceiptV1, receipt)
+                )
+            )
+        ).decode("ascii")
+
+    def sign_allocation_reconciliation_receipt(self, receipt: object) -> str:
+        from omninode_rsd.lifecycle.executor_allocation import (
+            AllocationReconciliationReceiptV1,
+            allocation_reconciliation_receipt_message,
+        )
+
+        return base64.b64encode(
+            self._key.sign(
+                allocation_reconciliation_receipt_message(
+                    cast(AllocationReconciliationReceiptV1, receipt)
                 )
             )
         ).decode("ascii")
@@ -846,7 +975,7 @@ class _AllocationBackend:
         _complete_engine_operation_plan(context.engine_operations, label="allocation")
         return ExecutorAllocationBackendEvidenceV1(
             engine=engine,
-            allocated_resources_projection_sha256=_hash("allocated-resources"),
+            allocated_resources=_allocation_resources(engine),
             engine_operation_journal_sha256=(
                 context.engine_operations.completed_projection_sha256()
             ),
@@ -1187,6 +1316,27 @@ def test_runtime_witness_substitution_blocks_before_claim_or_delivery(
         engine._serve_for_test(_Source(_session_bytes(forged)), io.BytesIO(), peer_uid=1001)
     assert backend.calls == 0
     assert engine._journal.state(request.operation_id) is None
+
+
+def test_allocation_only_dispatch_rejects_delivery_before_claim_or_chunk_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sealed allocation socket is never a materialization/start sink."""
+
+    monkeypatch.setattr(daemon, "_system_utc_clock", lambda: _NOW)
+    backend = _Backend()
+    engine, request, _, _ = _engine(tmp_path, backend)
+    events: list[str] = []
+    with pytest.raises(ExecutorDaemonError, match="allocation_only"):
+        engine._serve_for_test(
+            _Source(_session_bytes(request), events),
+            io.BytesIO(),
+            peer_uid=1001,
+            allocation_only=True,
+        )
+    assert backend.calls == 0
+    assert engine._journal.state(request.operation_id) is None
+    assert "chunk-read" not in events
 
 
 def test_runtime_typed_receipt_binds_host_and_engine_to_the_signed_request(
