@@ -12,6 +12,7 @@ because an unexpected, empty, or renamed field was ignored.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -73,6 +74,7 @@ CATEGORIES: Final[frozenset[str]] = frozenset(
     }
 )
 CONFIDENCES: Final[frozenset[str]] = frozenset({"high", "medium", "low"})
+MODEL_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +97,22 @@ def _require_nonempty_string(value: object, label: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{label} must be a non-empty string")
     return value
+
+
+def _require_model_name(value: object, label: str) -> str:
+    model = _require_nonempty_string(value, label)
+    if MODEL_NAME_RE.fullmatch(model) is None:
+        raise ValueError(f"{label} is not a safe model name")
+    return model
+
+
+def _require_model_names(value: object, label: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list of non-empty strings")
+    models: list[str] = []
+    for index, item in enumerate(value):
+        models.append(_require_model_name(item, f"{label}[{index}]"))
+    return models
 
 
 def _require_nonnegative_integer(value: object, label: str) -> int:
@@ -163,20 +181,13 @@ def parse_review_result(raw_json: str) -> ReviewSummary:
 
     try:
         raw_result = json.loads(raw_json)
-    except json.JSONDecodeError as error:
-        raise ValueError("review result is not valid JSON") from error
+    except json.JSONDecodeError as json_error:
+        raise ValueError("review result is not valid JSON") from json_error
     result = _require_keys(raw_result, MULTI_RESULT_FIELDS, "multi-model result")
 
-    attempted = result["models_attempted"]
-    succeeded = result["models_succeeded"]
-    failed = result["models_failed"]
-    for field, value in (
-        ("models_attempted", attempted),
-        ("models_succeeded", succeeded),
-        ("models_failed", failed),
-    ):
-        if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
-            raise ValueError(f"{field} must be a list of non-empty strings")
+    attempted = _require_model_names(result["models_attempted"], "models_attempted")
+    succeeded = _require_model_names(result["models_succeeded"], "models_succeeded")
+    failed = _require_model_names(result["models_failed"], "models_failed")
     if not attempted:
         raise ValueError("models_attempted must not be empty")
     if len(set(attempted)) != len(attempted):
@@ -196,17 +207,17 @@ def parse_review_result(raw_json: str) -> ReviewSummary:
             PER_MODEL_RESULT_FIELDS,
             "per-model result",
         )
-        model = _require_nonempty_string(model_result["model"], "model")
+        model = _require_model_name(model_result["model"], "model")
         _require_nonempty_string(model_result["prompt_version"], "prompt_version")
         success = model_result["success"]
         if not isinstance(success, bool):
             raise ValueError("success must be boolean")
-        error = model_result["error"]
-        if error is not None and not isinstance(error, str):
+        model_error = model_result["error"]
+        if model_error is not None and not isinstance(model_error, str):
             raise ValueError("error must be null or a string")
-        if success and error is not None:
+        if success and model_error is not None:
             raise ValueError("successful result cannot contain an error")
-        if not success and not error:
+        if not success and not model_error:
             raise ValueError("failed result must contain an error")
         raw_findings = model_result["findings"]
         if not isinstance(raw_findings, list):

@@ -95,7 +95,9 @@ DOCUMENTATION_NETWORKS: Final[tuple[tuple[IPv4Address | IPv6Address, int], ...]]
     (IPv6Address("2001:db8::"), 32),
 )
 SAFE_HOSTS: Final[frozenset[str]] = frozenset({"localhost", "127.0.0.1", "::1"})
-SAFE_PUBLIC_HOSTS: Final[frozenset[str]] = frozenset({"github.com", "img.shields.io"})
+SAFE_PUBLIC_HOSTS: Final[frozenset[str]] = frozenset(
+    {"api.github.com", "github.com", "img.shields.io"}
+)
 SAFE_DOCUMENTATION_SUFFIXES: Final[tuple[str, ...]] = (
     ".example.com",
     ".example.invalid",
@@ -200,6 +202,7 @@ def _is_allowed_file(path: Path) -> bool:
     if parts in {
         VALIDATOR_PATH.parts,
         ("scripts", "ci", "parse_hostile_review.py"),
+        ("scripts", "ci", "fetch_hostile_review_input.py"),
     }:
         return True
     if parts[:2] == ("src", "omninode_rsd"):
