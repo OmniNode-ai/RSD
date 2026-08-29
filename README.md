@@ -444,6 +444,25 @@ wired to an executor backend. Materialization and start continue to use
 `NoMutationBackend`; there is no V2 wrapper implementation, Docker mutation,
 provider read, or runtime effect in this contract amendment.
 
+### V3 static ticket safety notice
+
+`container_attach_static_v3` remains an effect-free synthetic ticket and claim
+contract. It does not authorize a frame, provider read, container attachment,
+or runtime effect, and this release contains no V3 wrapper bytes, runtime, or
+effect adapter.
+
+`ContainerBootstrapStaticRoleProfileV3` is not eligible as a compiled wrapper
+or static-output profile. Its exercised `target_delivery_map_sha256` commits to
+the full `TargetDeliveryMapV1`, whose wrapper-manifest, wrapper-artifact, and
+image commitments are output-dependent. Compiling that profile into wrapper
+bytes would therefore create an output/profile binding cycle. Its target
+delivery descriptor also lacks the complete value-free URI grammar required to
+construct derived target values.
+
+A fresh V4 contract will replace this use with output-independent static
+inputs, then bind the full output evidence downstream. V3 will not be
+reinterpreted as that future static profile.
+
 ### Remote executor transport boundary
 
 The library now supplies an offline-testable transport boundary for a separately

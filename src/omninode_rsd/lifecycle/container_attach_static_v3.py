@@ -1,18 +1,22 @@
-"""Output-independent V3 target attach-ticket primitives.
+"""Effect-free synthetic V3 target attach-ticket primitives.
 
-This module deliberately stops at the target-verification boundary.  It has no
-frame reader, secret carrier, Engine client, provider access, or effect API.
-The static profile is suitable for compiling into a future role-specific
-wrapper because its digest excludes wrapper bytes, artifact bindings,
-signatures, generated provenance/SBOM/reproducibility results, and every
-other field derived from built output.
+This module deliberately stops at the target-verification boundary. It has no
+frame reader, secret carrier, Engine client, provider access, runtime adapter,
+or effect API. It is not evidence that a wrapper was built, inspected,
+authorized, or allowed to receive a delivery.
 
-It is therefore *not* evidence that a wrapper was built, inspected,
-authorized, or allowed to receive a delivery.  Those cross-bindings remain a
-separate V3 lifecycle/evidence slice.
+``ContainerBootstrapStaticRoleProfileV3`` is not eligible as a compiled
+wrapper or static-output profile. Its exercised ``target_delivery_map_sha256``
+commits to the full ``TargetDeliveryMapV1``, including output-dependent
+wrapper-manifest, wrapper-artifact, and image commitments. Compiling the V3
+profile into wrapper bytes would therefore create an output/profile binding
+cycle. Its target descriptor also does not carry the complete value-free URI
+grammar required to construct derived target values. A fresh V4 contract must
+use output-independent static inputs and bind full output evidence only
+downstream.
 
 This is the first published V3 replay grammar: it has no production authority,
-durable V3 state, or migration path.  Future production authorities must use
+durable V3 state, or migration path. Future production authorities must use
 this exact atomic claim shape rather than adopting a local draft or legacy key.
 """
 
@@ -315,11 +319,12 @@ def _read_trusted_monotonic_now() -> float:
 
 
 class ContainerBootstrapAttachProtocolV3(_Model):
-    """Compiled V3 frame grammar and limits, without a runtime codec.
+    """Synthetic V3 frame grammar and limits, without a runtime codec.
 
-    The protocol is static input to the profile rather than a signed owner-side
-    artifact.  The profile digest binds it; a future full V3 authorization
-    chain must prove how that digest relates to its signed policy and image.
+    The protocol is committed by the synthetic profile but is not a compiled
+    wrapper input or authorization artifact. A future V4 contract must bind
+    output-independent static inputs before it can relate this grammar to
+    signed policy, image, or output evidence.
     """
 
     schema_version: Literal["rsd.container-bootstrap-attach-protocol.v3"]
@@ -437,14 +442,14 @@ def container_bootstrap_attach_v3_protocol_sha256(
 
 
 class ContainerBootstrapDerivedUriCommitmentV3(_Model):
-    """One exact, value-free URI derivation admitted to a static role profile.
+    """One synthetic, value-free URI commitment carried by a V3 profile.
 
     URI byte counts and grammar hashes cannot be universal constants: they
     depend on the signed, value-free delivery-map grammar for the particular
-    allocation.  The compiled profile therefore carries these exact values as
-    its target-side authority.  A later V3 evidence slice must prove this
-    commitment was derived from the signed delivery map; this type does not
-    claim that cross-binding has happened.
+    allocation. V3 does not establish that grammar or authorize target-value
+    construction: its descriptor lacks the complete value-free URI grammar and
+    the full map has output-dependent commitments. V4 must carry and verify an
+    output-independent projection before any wrapper work.
     """
 
     schema_version: Literal["rsd.container-bootstrap-derived-uri-commitment.v3"]
@@ -813,12 +818,15 @@ class ContainerBootstrapBaseLaunchCommitmentV3(_Model):
 
 
 class ContainerBootstrapStaticRoleProfileV3(_Model):
-    """The output-independent, compile-time target profile for one fixed role.
+    """Synthetic V3 role profile; never a compiled/static output input.
 
-    It intentionally contains no wrapper byte digest, artifact self-binding,
-    signature, generated provenance/SBOM/reproducibility result, or derived
-    image/output identity.  Its digest is therefore stable if hypothetical
-    future wrapper bytes change, which removes the V2 fixed-point problem.
+    Although it excludes direct wrapper-output fields,
+    ``target_delivery_map_sha256`` was exercised with the full
+    ``TargetDeliveryMapV1``. That map carries output-dependent manifest,
+    artifact, and image commitments, so a compiled V3 profile would create an
+    output/profile cycle. The nested descriptor also lacks the complete
+    value-free URI grammar for derived target values. V4 must replace this
+    profile with output-independent static inputs before any wrapper work.
     """
 
     schema_version: Literal["rsd.container-bootstrap-static-role-profile.v3"]
@@ -893,7 +901,7 @@ def strict_canonical_container_bootstrap_static_role_profile_v3(
 def container_bootstrap_static_role_profile_v3_canonical_json(
     profile: ContainerBootstrapStaticRoleProfileV3,
 ) -> bytes:
-    """Return the canonical, output-independent V3 profile JSON."""
+    """Return canonical JSON for the synthetic V3 profile."""
 
     profile = strict_canonical_container_bootstrap_static_role_profile_v3(profile)
     try:
@@ -906,7 +914,7 @@ def container_bootstrap_static_role_profile_v3_canonical_json(
 def parse_container_bootstrap_static_role_profile_v3_canonical_json(
     payload: bytes,
 ) -> ContainerBootstrapStaticRoleProfileV3:
-    """Parse only the exact canonical, output-independent profile JSON spelling."""
+    """Parse only the exact canonical synthetic V3 profile JSON spelling."""
 
     try:
         return _parse_canonical_json(payload, ContainerBootstrapStaticRoleProfileV3)
@@ -918,7 +926,7 @@ def parse_container_bootstrap_static_role_profile_v3_canonical_json(
 def container_bootstrap_static_role_profile_v3_sha256(
     profile: ContainerBootstrapStaticRoleProfileV3,
 ) -> str:
-    """Return a static digest independent of hypothetical wrapper output bytes."""
+    """Return the canonical digest of a synthetic V3 profile."""
 
     profile = strict_canonical_container_bootstrap_static_role_profile_v3(profile)
     try:
