@@ -197,7 +197,10 @@ def _is_allowed_file(path: Path) -> bool:
         return parts[0] in ALLOWED_TOP_LEVEL - {".github", "scripts", "src", "tests"}
     if parts[:2] == (".github", "workflows") and path.suffix == ".yml":
         return True
-    if parts == VALIDATOR_PATH.parts:
+    if parts in {
+        VALIDATOR_PATH.parts,
+        ("scripts", "ci", "parse_hostile_review.py"),
+    }:
         return True
     if parts[:2] == ("src", "omninode_rsd"):
         return (
