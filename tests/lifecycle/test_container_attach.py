@@ -452,7 +452,7 @@ def test_attach_rejects_oversized_truncated_unknown_and_generic_blocking_streams
             expected_request=request,
             deadline_clock=clock,
         )
-    with pytest.raises(ContainerAttachError, match="frame_header"):
+    with pytest.raises(ContainerAttachError, match="ready"):
         session.read_ready(_Channel(clock, bytearray(_HEADER.pack(b"ONCA", 1, 99, 0))))
 
     class BlockingBinaryIo:
@@ -475,7 +475,7 @@ def test_attach_rejects_repeated_or_out_of_order_claim_and_ack() -> None:
     clock = _Clock()
     session = _session(protocol, request, clock)
     session.write_request(_Channel(clock))
-    with pytest.raises(ContainerAttachError, match="frame_header"):
+    with pytest.raises(ContainerAttachError, match="ready"):
         session.read_ready(
             _Channel(
                 clock,
@@ -612,7 +612,7 @@ def test_attach_timeout_partial_no_progress_and_ack_failure_are_fail_closed() ->
         read_limit=1,
         advance_on_read=11.0,
     )
-    with pytest.raises(ContainerAttachError, match="frame_header"):
+    with pytest.raises(ContainerAttachError, match="terminal_ack"):
         session.read_terminal_ack(slow)
     assert session.state is ContainerAttachSessionState.AMBIGUOUS
 
@@ -624,7 +624,7 @@ def test_attach_timeout_partial_no_progress_and_ack_failure_are_fail_closed() ->
             bytearray(_frame(ContainerAttachFrameType.TERMINAL_ACK, _metadata(_ack(request)))),
         )
     )
-    with pytest.raises(ContainerAttachError, match="trailing_data"):
+    with pytest.raises(ContainerAttachError, match="eof"):
         session.require_eof(_Channel(clock, bytearray(b"x")))
     assert session.state is ContainerAttachSessionState.AMBIGUOUS
 
@@ -632,6 +632,7 @@ def test_attach_timeout_partial_no_progress_and_ack_failure_are_fail_closed() ->
 def _assert_redacted(error: BaseException, sentinel: str) -> None:
     assert sentinel not in str(error)
     assert sentinel not in repr(error)
+    assert sentinel not in repr(error.args)
     assert sentinel not in repr(error.__dict__)
     assert error.__cause__ is None
     assert error.__context__ is None
@@ -675,6 +676,50 @@ def test_attach_metadata_and_sink_failures_have_no_secret_error_chain() -> None:
             nonce_authority=_NonceAuthority(),
         )
     _assert_redacted(sink_raised.value, sentinel)
+
+    class HostileSink:
+        def accept(self, descriptor: TargetDeliveryFieldV1, value: memoryview) -> None:
+            del descriptor, value
+            raise ContainerAttachError(sentinel)
+
+    with pytest.raises(ContainerAttachError) as hostile_sink_raised:
+        consume_container_attach_secret_chunks(
+            _Channel(
+                clock,
+                bytearray(_secret_frame(1, b"a" * 32) + _secret_frame(2, b"b" * 44)),
+            ),
+            protocol=protocol,
+            request=request,
+            claim=_claim(request),
+            sink=HostileSink(),
+            deadline_clock=clock,
+            nonce_authority=_NonceAuthority(),
+        )
+    assert hostile_sink_raised.value.phase == "target_sink"
+    _assert_redacted(hostile_sink_raised.value, sentinel)
+
+
+def test_attach_hostile_eof_reader_phase_is_normalized_and_redacted() -> None:
+    sentinel = "container-attach-eof-secret-sentinel"
+    session, _, request, clock = _claimed_session()
+    session.write_secret_chunks(_Channel(clock), (bytearray(b"a" * 32), bytearray(b"b" * 44)))
+    session.read_terminal_ack(
+        _Channel(
+            clock,
+            bytearray(_frame(ContainerAttachFrameType.TERMINAL_ACK, _metadata(_ack(request)))),
+        )
+    )
+
+    class HostileEofReader:
+        def read(self, count: int, *, deadline: float) -> bytes:
+            del count, deadline
+            raise ContainerAttachError(sentinel)
+
+    with pytest.raises(ContainerAttachError) as raised:
+        session.require_eof(HostileEofReader())
+    assert raised.value.phase == "eof"
+    _assert_redacted(raised.value, sentinel)
+    assert session.state is ContainerAttachSessionState.AMBIGUOUS
 
 
 def test_attach_nonce_authority_failure_blocks_before_secret_read_and_concurrent_claims() -> None:

@@ -632,11 +632,18 @@ def consume_container_attach_secret_chunks(
             )
             if len(buffer) != descriptor.encoded_byte_count:
                 raise _fresh_error("secret_chunk")
-            sink.accept(descriptor, memoryview(buffer))
-        except ContainerAttachError as error:
-            failure_phase = error.phase
+        except ContainerAttachError:
+            failure_phase = "secret_chunk"
         except Exception:
-            failure_phase = "target_sink"
+            failure_phase = "secret_chunk"
+        else:
+            try:
+                sink.accept(descriptor, memoryview(buffer))
+            except Exception:
+                # The sink is a collaborator that may surface arbitrary
+                # exception text or an arbitrary ContainerAttachError phase.
+                # Do not turn either into public boundary metadata.
+                failure_phase = "target_sink"
         finally:
             if buffer is not None:
                 _zeroize(buffer)
@@ -718,8 +725,8 @@ class ContainerAttachDaemonSession:
                 phase="ready",
             )
             _validate_ready(ready, request=self._request)
-        except ContainerAttachError as error:
-            failure_phase = error.phase
+        except ContainerAttachError:
+            failure_phase = "ready"
         if failure_phase is not None or ready is None:
             self._state = ContainerAttachSessionState.AMBIGUOUS
             raise _fresh_error(failure_phase or "ready")
@@ -744,8 +751,8 @@ class ContainerAttachDaemonSession:
                 payload=_canonical_metadata(claim),
                 secret=False,
             )
-        except ContainerAttachError as error:
-            failure_phase = error.phase
+        except ContainerAttachError:
+            failure_phase = "claim"
         if failure_phase is not None:
             self._state = ContainerAttachSessionState.AMBIGUOUS
             raise _fresh_error(failure_phase)
@@ -763,7 +770,6 @@ class ContainerAttachDaemonSession:
             raise _fresh_error("secret_chunks")
         buffers = chunks
         failure_phase: str | None = None
-        claimed = False
         try:
             if self._state is not ContainerAttachSessionState.CLAIM_SENT:
                 raise _fresh_error("state")
@@ -771,34 +777,37 @@ class ContainerAttachDaemonSession:
                 type(chunk) is not bytearray for chunk in chunks
             ):
                 raise _fresh_error("secret_chunks")
-            _claim_nonce(self._nonce_authority, self._request, boundary="daemon_send_v1")
-            claimed = True
+            if any(
+                len(chunk) != descriptor.encoded_byte_count
+                for descriptor, chunk in zip(self._request.fields, chunks, strict=True)
+            ):
+                raise _fresh_error("secret_chunk")
             deadline = _deadline(
                 self._deadline_clock, self._protocol.claim_timeout_seconds, phase="secret_chunk"
             )
+            _claim_nonce(self._nonce_authority, self._request, boundary="daemon_send_v1")
             self._state = ContainerAttachSessionState.CHUNKS_SENT
             for descriptor, chunk in zip(self._request.fields, chunks, strict=True):
-                if len(chunk) != descriptor.encoded_byte_count:
-                    raise _fresh_error("secret_chunk")
-                _write_secret_frame(
-                    writer,
-                    self._deadline_clock,
-                    deadline,
-                    protocol=self._protocol,
-                    ordinal=descriptor.ordinal,
-                    chunk=chunk,
-                )
-        except ContainerAttachError as error:
-            failure_phase = error.phase
-        except Exception:
-            failure_phase = "secret_chunk"
+                try:
+                    _write_secret_frame(
+                        writer,
+                        self._deadline_clock,
+                        deadline,
+                        protocol=self._protocol,
+                        ordinal=descriptor.ordinal,
+                        chunk=chunk,
+                    )
+                except Exception:
+                    # A writer is a collaborator.  Its ContainerAttachError
+                    # phase is not a public protocol field.
+                    failure_phase = "frame_write"
+                    break
         finally:
             for buffer in buffers:
                 if type(buffer) is bytearray:
                     _zeroize(buffer)
         if failure_phase is not None:
-            if claimed or self._state is ContainerAttachSessionState.CHUNKS_SENT:
-                self._state = ContainerAttachSessionState.AMBIGUOUS
+            self._state = ContainerAttachSessionState.AMBIGUOUS
             raise _fresh_error(failure_phase)
 
     def read_terminal_ack(self, reader: AttachDeadlineReader) -> ContainerAttachTerminalAckV1:
@@ -822,8 +831,8 @@ class ContainerAttachDaemonSession:
                 phase="terminal_ack",
             )
             _validate_ack(ack, request=self._request)
-        except ContainerAttachError as error:
-            failure_phase = error.phase
+        except ContainerAttachError:
+            failure_phase = "terminal_ack"
         if failure_phase is not None:
             self._state = ContainerAttachSessionState.AMBIGUOUS
             raise _fresh_error(failure_phase)
@@ -850,8 +859,8 @@ class ContainerAttachDaemonSession:
             _require_before(self._deadline_clock, deadline, phase="eof")
             if type(trailing) is not bytes or trailing != b"":
                 raise _fresh_error("trailing_data")
-        except ContainerAttachError as error:
-            failure_phase = error.phase
+        except ContainerAttachError:
+            failure_phase = "eof"
         except Exception:
             failure_phase = "eof"
         if failure_phase is not None:
