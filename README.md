@@ -463,6 +463,32 @@ A fresh V4 contract will replace this use with output-independent static
 inputs, then bind the full output evidence downstream. V3 will not be
 reinterpreted as that future static profile.
 
+### V4 static-input boundary
+
+`container_attach_static_v4` now models only effect-free,
+allocation-parameterized but wrapper-output-independent target inputs: exact
+value-free URI authorities/delivery grammar, source-only launch/patch inputs,
+a separately rooted profile envelope, signed ticket checks, a non-authorizing
+future-claim intent, and repeatable non-bearer receipt validation. It does not
+implement a wrapper, frame stream, provider read, replay-persistence adapter,
+Engine operation, or runtime effect. A future peer-authenticated executor
+channel must perform durable one-shot receipt redemption before any delivery
+can be considered.
+
+The V4 projection intentionally excludes the full V1 map's allocation
+topology/options/observations and intent aggregates, policy-chain aggregates,
+and artifact, manifest, and image outputs. Exact URI authority/static grammar
+are intentionally retained because target URI construction needs them before
+wrapper output exists. A later closure must verify the signed V1 map and every
+omitted binding alongside an exact V4 projection relation. Its
+`wrapper_source_tree_sha256` is only a source-input commitment: separately
+signed provenance must still establish any source-tree/commit mapping and
+artifact evidence before generated wrapper output can be trusted.
+
+The public V4 interoperability vector uses only RFC 5737 documentation
+addresses. Its PostgreSQL and Valkey port spellings are protocol grammar
+constants (`5432` and `6379`), not deployment endpoints.
+
 ### Remote executor transport boundary
 
 The library now supplies an offline-testable transport boundary for a separately
