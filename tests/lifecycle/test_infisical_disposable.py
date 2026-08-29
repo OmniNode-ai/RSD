@@ -87,6 +87,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     DisposableTransportProfile,
     DockerEngineControlPolicyV1,
     DockerEngineFilteredProjectionV1,
+    DockerImageLocalEvidenceV1,
     DockerImagePolicyV1,
     DockerNamedVolumeMountV1,
     DockerUnixSocketPolicyV1,
@@ -109,6 +110,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     NoHostPublicationGroundworkV1,
     ObservedAllocationAttestationV1,
     ObservedRestoreDatabaseAttestationV1,
+    OciImageResolutionAttestationV1,
     PostgreSQLAllocationRoleStateV1,
     PostgreSQLConnectionUriGrammarV1,
     PostgreSQLControlPolicyV1,
@@ -155,11 +157,13 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     container_bootstrap_wrapper_manifest_sha256,
     container_create_template_sha256,
     docker_engine_fingerprint_sha256,
+    docker_image_policy_binding,
     docker_unix_socket_identity_sha256,
     docker_volume_instance_fingerprint_sha256,
     materialization_intent_sha256,
     observed_allocation_attestation_sha256,
     observed_restore_database_attestation_sha256,
+    oci_image_resolution_attestation_message,
     postgresql_connection_uri_rendered_byte_count,
     runtime_connection_uri_grammar_sha256,
     strict_canonical_allocation_intent,
@@ -191,6 +195,7 @@ _EXECUTOR_ATTESTATION_PUBLIC_BYTES = (
 _EXECUTOR_ATTESTATION_PUBLIC_KEY = base64.b64encode(_EXECUTOR_ATTESTATION_PUBLIC_BYTES).decode(
     "ascii"
 )
+_POLICY_SIGNER_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(b"p" * 32)
 
 
 class _TLSProfileAlias(str):
@@ -408,11 +413,34 @@ def _image(name: str, character: str) -> ImageReferenceV1:
 
 
 def _image_policy(name: str, character: str, *, config_sha256: str) -> DockerImagePolicyV1:
-    return DockerImagePolicyV1(
-        image=_image(name, character),
+    image = _image(name, character)
+    unsigned_attestation = OciImageResolutionAttestationV1(
+        schema_version="rsd.oci-image-resolution-attestation.v1",
+        source_commit=_COMMIT,
+        image=image,
         registry_index_digest_sha256=character * 64,
         linux_amd64_manifest_digest_sha256=_hash(f"{name}-linux-amd64-manifest"),
         config_digest_sha256=config_sha256,
+        platform="linux/amd64",
+        resolved_at=_NOW,
+        signer_key_id="test-signer",
+        signature_base64=_SIGNATURE,
+    )
+    attestation = unsigned_attestation.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                _POLICY_SIGNER_PRIVATE_KEY.sign(
+                    oci_image_resolution_attestation_message(unsigned_attestation)
+                )
+            ).decode("ascii")
+        }
+    )
+    return DockerImagePolicyV1(
+        image=image,
+        registry_index_digest_sha256=character * 64,
+        linux_amd64_manifest_digest_sha256=_hash(f"{name}-linux-amd64-manifest"),
+        config_digest_sha256=config_sha256,
+        resolution_attestation=attestation,
     )
 
 
@@ -614,6 +642,7 @@ def _docker_policy(executor: ExecutorControlPolicyV1) -> DockerEngineControlPoli
             "engine_version",
             "engine_info",
             "image_inspect",
+            "image_manifest_inspect",
             "network_create",
             "network_inspect",
             "volume_create",
@@ -626,8 +655,10 @@ def _docker_policy(executor: ExecutorControlPolicyV1) -> DockerEngineControlPoli
         max_request_bytes=4096,
         max_response_bytes=8192,
         max_hijack_bytes=8192,
+        max_hijack_frames=128,
         request_timeout_seconds=10,
         hijack_timeout_seconds=10,
+        hijack_absolute_timeout_seconds=20,
         created_at=_NOW,
         signer_key_id="test-signer",
         signature_base64=_SIGNATURE,
@@ -932,7 +963,7 @@ def _claim_file_replay_tombstone(
 
 
 def _trusted_signer() -> tuple[TrustedEd25519SignerV1, Ed25519PrivateKey]:
-    key = Ed25519PrivateKey.generate()
+    key = _POLICY_SIGNER_PRIVATE_KEY
     public = key.public_key().public_bytes_raw()
     return (
         TrustedEd25519SignerV1(
@@ -1166,6 +1197,28 @@ def _allocated_resources(intent: AllocationIntentV2) -> AllocatedResourceSetV2:
     )
 
 
+def _control_image_local_evidence(intent: AllocationIntentV2) -> DockerImageLocalEvidenceV1:
+    """Build the value-free two-reference Engine evidence used by allocation tests."""
+
+    image = _postgres_prepared_policy(_executor_policy(intent.plan.topology)).control_image
+    repository = image.image.reference.rsplit("@", 1)[0]
+    return DockerImageLocalEvidenceV1(
+        schema_version="rsd.docker-image-local-evidence.v1",
+        resolution_attestation_sha256=canonical_sha256(image.resolution_attestation),
+        registry_index_reference=image.image,
+        linux_amd64_manifest_reference=ImageReferenceV1(
+            reference=(f"{repository}@sha256:{image.linux_amd64_manifest_digest_sha256}")
+        ),
+        registry_index_digest_sha256=image.registry_index_digest_sha256,
+        linux_amd64_manifest_digest_sha256=image.linux_amd64_manifest_digest_sha256,
+        config_digest_sha256=image.config_digest_sha256,
+        index_reference_inspected=True,
+        platform_manifest_reference_inspected=True,
+        operating_system="linux",
+        architecture="amd64",
+    )
+
+
 def _allocation_receipt(intent: AllocationIntentV2) -> AllocationEffectReceiptV2:
     resources = _allocated_resources(intent)
     unsigned_executor_receipt = AllocationExecutorReceiptV1(
@@ -1183,6 +1236,7 @@ def _allocation_receipt(intent: AllocationIntentV2) -> AllocationEffectReceiptV2
             intent.plan.topology
         ).executor.host_fingerprint_sha256,
         engine=resources.engine,
+        control_image_local_evidence=_control_image_local_evidence(intent),
         allocated_resources=resources,
         allocated_resources_projection_sha256=canonical_sha256(resources),
         engine_operation_journal_sha256=_hash("allocation-engine-operation-journal"),
@@ -1635,6 +1689,7 @@ def _materialization_intent(
         prepared_operation_id: str,
         database_name: str,
         database_oid: int,
+        schema_oid: int,
         owner_role: str,
         owner_role_oid: int,
         application_role: str,
@@ -1653,6 +1708,7 @@ def _materialization_intent(
             system_identifier=observed_postgres.system_identifier,
             database_name=database_name,
             database_oid=database_oid,
+            schema_oid=schema_oid,
             owner_role=owner_role,
             owner_role_oid=owner_role_oid,
             application_role=application_role,
@@ -1671,6 +1727,7 @@ def _materialization_intent(
         prepared_operation_id=postgres_prepared.scram_verifier_installs.primary_database.prepared_operation_id,
         database_name=observed_postgres.database_name,
         database_oid=observed_postgres.database_oid,
+        schema_oid=observed_postgres.schema_oid,
         owner_role=observed_postgres.owner_role,
         owner_role_oid=observed_postgres.owner_role_oid,
         application_role=observed_postgres.application_role,
@@ -1681,6 +1738,7 @@ def _materialization_intent(
         prepared_operation_id=restore_observation.restore_database.prepared_operation_id,
         database_name=restore_observation.restore_database.database_name,
         database_oid=restore_observation.restore_database.database_oid,
+        schema_oid=restore_observation.restore_database.schema_oid,
         owner_role=restore_observation.restore_database.owner_role,
         owner_role_oid=restore_observation.restore_database.owner_role_oid,
         application_role=restore_observation.restore_database.application_role,
@@ -1740,6 +1798,7 @@ def _materialization_intent(
         primary_database=PostgreSQLRuntimeDatabaseIdentityV1(
             database_identity="primary_database",
             observation_binding_sha256=canonical_sha256(observed_postgres),
+            schema_oid=primary_transition.schema_oid,
             login_transition=primary_transition,
             connection_uri=primary_uri,
         ),
@@ -1748,6 +1807,7 @@ def _materialization_intent(
             observation_binding_sha256=observed_restore_database_attestation_sha256(
                 restore_observation
             ),
+            schema_oid=restore_transition.schema_oid,
             login_transition=restore_transition,
             connection_uri=restore_uri,
         ),
@@ -2157,6 +2217,7 @@ def _materialization_context(
             authority=database.connection_uri.authority,
             system_identifier=transition.system_identifier,
             database_oid=transition.database_oid,
+            schema_oid=transition.schema_oid,
             owner_role_oid=transition.owner_role_oid,
             application_role_oid=transition.application_role_oid,
             prepared_operation_id=transition.prepared_operation_id,
@@ -2250,6 +2311,7 @@ def _allocation_context(intent: AllocationIntentV2) -> AllocationExecutionContex
         postgres_prepared_control_policy_sha256=(
             intent.plan.postgres.prepared_control_policy_sha256
         ),
+        expected_control_image_local_evidence=_control_image_local_evidence(intent),
         postgres_allocation_prepared_operation_id="123e4567-e89b-42d3-a456-426614174004",
         postgres_allocation_result_projection_sha256=_hash("postgres-allocation-result"),
         allocation_intent_sha256=allocation_intent_sha256(intent),
@@ -2272,7 +2334,7 @@ def _materialization_receipt(
     def inspection(name: str) -> ContainerBootstrapInspectionV1:
         template = getattr(context.intent.bootstrap_templates, name)
         return ContainerBootstrapInspectionV1(
-            image_policy=template.image_policy,
+            image_policy_binding=docker_image_policy_binding(template.image_policy),
             entrypoint=template.entrypoint,
             command=template.command,
             entrypoint_sha256=template.entrypoint_sha256,
@@ -2319,7 +2381,9 @@ def _materialization_receipt(
             container_id=_hash(f"container-{marker}"),
             image=plan.image,
             config_sha256=plan.config_sha256,
-            image_policy=getattr(context.intent.bootstrap_templates, name).image_policy,
+            image_policy_binding=docker_image_policy_binding(
+                getattr(context.intent.bootstrap_templates, name).image_policy
+            ),
             attachments=(
                 RuntimeNetworkAttachmentV1(
                     network_name=placement.network_name,
@@ -2443,6 +2507,7 @@ def _materialization_receipt(
             system_identifier=transition.system_identifier,
             database_name=transition.database_name,
             database_oid=transition.database_oid,
+            schema_oid=transition.schema_oid,
             owner_role=transition.owner_role,
             owner_role_oid=transition.owner_role_oid,
             application_role=transition.application_role,
@@ -2753,6 +2818,149 @@ def test_restore_database_predecessor_rejects_attacker_oids_staleness_and_substi
             expected_disposal_owner=_OWNER,
             expected_approver_identity=_APPROVER,
             now=_TEST_CLOCK,
+        )
+
+
+def test_restore_schema_oid_is_bound_through_recomputed_transition_and_delivery_map(
+    tmp_path: Path,
+) -> None:
+    """A valid-looking new map cannot change only the restore schema OID."""
+
+    allocation, executor, _ = _allocation_bundle(tmp_path)
+    receipt = _allocation_receipt(allocation)
+    allocation_observation = _allocation_attestation(allocation, receipt)
+    materialization, restore, _, _, _, target_map, _ = _materialization_intent(
+        allocation, executor, receipt, allocation_observation
+    )
+    changed_schema_oid = restore.restore_database.schema_oid + 1
+    changed_restore_transition = (
+        materialization.postgres_login_transitions.restore_database.model_copy(
+            update={"schema_oid": changed_schema_oid}
+        )
+    )
+    changed_transitions = materialization.postgres_login_transitions.model_copy(
+        update={"restore_database": changed_restore_transition}
+    )
+    changed_restore_identity = target_map.database_identities.restore_database.model_copy(
+        update={
+            "schema_oid": changed_schema_oid,
+            "login_transition": changed_restore_transition,
+        }
+    )
+    changed_identities = target_map.database_identities.model_copy(
+        update={"restore_database": changed_restore_identity}
+    )
+    changed_map = target_map.model_copy(update={"database_identities": changed_identities})
+    changed_map_sha256 = target_delivery_map_sha256(changed_map)
+    changed_materialization = materialization.model_copy(
+        update={
+            "postgres_login_transitions": changed_transitions,
+            "target_delivery_map_sha256": changed_map_sha256,
+            "evidence": materialization.evidence.model_copy(
+                update={"target_delivery_map_sha256": changed_map_sha256}
+            ),
+        }
+    )
+    stage = authorization._AllocationStageArtifacts(
+        intent=allocation,
+        receipt=receipt,
+        attestation=allocation_observation,
+    )
+    policy = ReplayAuthorityPolicyV1(
+        schema_version="rsd.replay-authority-policy.v1",
+        service="replay-service",
+        account_prefix="replay-prefix",
+    )
+    with pytest.raises(AuthorizationError, match="materialization_postgres_transition_binding"):
+        authorization._verify_materialization_intent_chain(
+            allocation=stage,
+            intent=changed_materialization.model_copy(
+                update={"replay_policy_sha256": policy.sha256()}
+            ),
+            restore_database_attestation=restore,
+            target_delivery_map=changed_map,
+            replay_policy=policy,
+            expected_disposal_owner=_OWNER,
+            expected_approver_identity=_APPROVER,
+            now=_TEST_CLOCK,
+        )
+
+
+def test_allocation_receipt_rejects_recomputed_local_image_evidence_substitution(
+    tmp_path: Path,
+) -> None:
+    """A signed executor receipt must carry both expected local inspections."""
+
+    intent, _, _ = _allocation_bundle(tmp_path)
+    context = _allocation_context(intent)
+    receipt = _allocation_receipt(intent)
+    altered_evidence = receipt.executor_receipt.control_image_local_evidence.model_copy(
+        update={"resolution_attestation_sha256": _hash("different-oci-resolution")}
+    )
+    unsigned_executor = receipt.executor_receipt.model_copy(
+        update={
+            "control_image_local_evidence": altered_evidence,
+            "signature_base64": _SIGNATURE,
+        }
+    )
+    altered_executor = unsigned_executor.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                _EXECUTOR_ATTESTATION_PRIVATE_KEY.sign(
+                    authorization._allocation_executor_receipt_message(unsigned_executor)
+                )
+            ).decode("ascii")
+        }
+    )
+    altered_receipt = receipt.model_copy(
+        update={
+            "executor_receipt": altered_executor,
+            "executor_receipt_sha256": canonical_sha256(altered_executor),
+        }
+    )
+    with pytest.raises(AuthorizationError, match="allocation_executor_receipt"):
+        authorization._validate_allocation_effect_receipt(context, altered_receipt)
+
+
+def test_prepared_control_artifact_requires_nested_signed_oci_resolution(tmp_path: Path) -> None:
+    """The outer policy signature cannot authenticate a forged resolver proof."""
+
+    _, executor, _ = _allocation_bundle(tmp_path)
+    signer, signing_key = _trusted_signer()
+    policy = _postgres_prepared_policy(executor)
+    unsigned_policy = policy.model_copy(update={"signature_base64": _SIGNATURE})
+    signed_policy = unsigned_policy.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                signing_key.sign(
+                    authorization._postgres_prepared_control_policy_message(unsigned_policy)
+                )
+            ).decode("ascii")
+        }
+    )
+    authorization._verify_postgres_prepared_control_policy_signature(signed_policy, signer=signer)
+
+    forged_resolution = signed_policy.control_image.resolution_attestation.model_copy(
+        update={"signature_base64": _SIGNATURE}
+    )
+    forged_image = signed_policy.control_image.model_copy(
+        update={"resolution_attestation": forged_resolution}
+    )
+    unsigned_forged = signed_policy.model_copy(
+        update={"control_image": forged_image, "signature_base64": _SIGNATURE}
+    )
+    forged_policy = unsigned_forged.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                signing_key.sign(
+                    authorization._postgres_prepared_control_policy_message(unsigned_forged)
+                )
+            ).decode("ascii")
+        }
+    )
+    with pytest.raises(AuthorizationError, match="oci_image_resolution_attestation_signature"):
+        authorization._verify_postgres_prepared_control_policy_signature(
+            forged_policy, signer=signer
         )
 
 
@@ -3324,6 +3532,7 @@ def test_allocation_context_is_value_free_and_non_bearer(tmp_path: Path) -> None
         postgres_prepared_control_policy_sha256=(
             intent.plan.postgres.prepared_control_policy_sha256
         ),
+        expected_control_image_local_evidence=_control_image_local_evidence(intent),
         postgres_allocation_prepared_operation_id="123e4567-e89b-42d3-a456-426614174004",
         postgres_allocation_result_projection_sha256=_hash("postgres-allocation-result"),
         allocation_intent_sha256=allocation_intent_sha256(intent),

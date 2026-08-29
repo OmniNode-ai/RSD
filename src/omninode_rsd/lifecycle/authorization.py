@@ -54,6 +54,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     DisposablePreflightError,
     DisposableTransportProfile,
     DockerEngineControlPolicyV1,
+    DockerImageLocalEvidenceV1,
     ExecutorContainerInspectionV1,
     ExecutorControlPolicyV1,
     ExecutorInstallationIntentV1,
@@ -66,6 +67,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     ObservedAllocationAttestationV1,
     ObservedRestoreDatabaseAttestationV1,
     ObservedRuntimeAttestationV1,
+    OciImageResolutionAttestationV1,
     PostgreSQLConnectionUriGrammarV1,
     PostgreSQLControlPolicyV1,
     PostgreSQLLoginTransitionIntentsV1,
@@ -101,12 +103,15 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     container_attach_request_sha256,
     container_bootstrap_attach_protocol_sha256,
     container_bootstrap_wrapper_manifest_sha256,
+    docker_image_policy_binding,
+    expected_docker_image_local_evidence,
     materialization_effect_receipt_sha256,
     materialization_executor_receipt_message,
     materialization_intent_sha256,
     observed_allocation_attestation_sha256,
     observed_restore_database_attestation_sha256,
     observed_runtime_attestation_sha256,
+    oci_image_resolution_attestation_message,
     start_runtime_effect_receipt_sha256,
     start_runtime_executor_receipt_message,
     start_runtime_intent_sha256,
@@ -855,6 +860,7 @@ class PostgreSQLLoginTransitionProvenance:
     authority: str
     system_identifier: str
     database_oid: int
+    schema_oid: int
     owner_role_oid: int
     application_role_oid: int
     prepared_operation_id: str
@@ -914,6 +920,7 @@ class PostgreSQLLoginTransitionExpectationV1(_Model):
     authority: str
     system_identifier: str = Field(pattern=r"^[0-9]{8,32}$")
     database_oid: int = Field(ge=1)
+    schema_oid: int = Field(ge=1)
     owner_role_oid: int = Field(ge=1)
     application_role_oid: int = Field(ge=1)
     prepared_operation_id: str = Field(pattern=_UUID)
@@ -1210,6 +1217,7 @@ class AllocationExecutionContext:
     docker_engine_control_policy_sha256: str
     postgres_control_expectation: PostgreSQLControlExpectationV1
     postgres_prepared_control_policy_sha256: str
+    expected_control_image_local_evidence: DockerImageLocalEvidenceV1
     postgres_allocation_prepared_operation_id: str
     postgres_allocation_result_projection_sha256: str
     allocation_intent_sha256: str
@@ -2496,6 +2504,40 @@ def _verify_postgres_prepared_control_policy_signature(
         ),
         phase="postgres_prepared_control_policy_signature",
     )
+    resolution = policy.control_image.resolution_attestation
+    _verify_oci_image_resolution_attestation_signature(resolution, signer=signer)
+    try:
+        if resolution.source_commit != policy.source_commit or datetime.fromisoformat(
+            resolution.resolved_at.removesuffix("Z") + "+00:00"
+        ) > datetime.fromisoformat(policy.created_at.removesuffix("Z") + "+00:00"):
+            raise ValueError
+    except ValueError:
+        raise AuthorizationError("postgres_prepared_control_image_resolution") from None
+
+
+def _verify_oci_image_resolution_attestation_signature(
+    attestation: OciImageResolutionAttestationV1,
+    *,
+    signer: TrustedEd25519SignerV1,
+) -> None:
+    """Verify the separate trusted index-to-platform OCI resolution proof."""
+
+    attestation = cast(
+        OciImageResolutionAttestationV1,
+        _canonical_artifact_model(
+            attestation,
+            OciImageResolutionAttestationV1,
+            phase="oci_image_resolution_attestation_signature",
+        ),
+    )
+    _verify_direct_signature(
+        attestation,
+        signer=signer,
+        message=lambda model: oci_image_resolution_attestation_message(
+            cast(OciImageResolutionAttestationV1, model)
+        ),
+        phase="oci_image_resolution_attestation_signature",
+    )
 
 
 def _verify_secret_capability_policy_signature(
@@ -2553,6 +2595,22 @@ def _verify_container_wrapper_manifest_signature(
         ),
         phase="container_wrapper_manifest_signature",
     )
+    for artifact in (
+        manifest.primary_infisical,
+        manifest.primary_valkey,
+        manifest.restore_infisical,
+        manifest.restore_valkey,
+    ):
+        for image_policy in (artifact.base_image_policy, artifact.derived_image_policy):
+            resolution = image_policy.resolution_attestation
+            _verify_oci_image_resolution_attestation_signature(resolution, signer=signer)
+            try:
+                if resolution.source_commit != manifest.source_commit or datetime.fromisoformat(
+                    resolution.resolved_at.removesuffix("Z") + "+00:00"
+                ) > datetime.fromisoformat(manifest.created_at.removesuffix("Z") + "+00:00"):
+                    raise ValueError
+            except ValueError:
+                raise AuthorizationError("container_wrapper_image_resolution") from None
 
 
 def _verify_target_delivery_map_signature(
@@ -3727,6 +3785,7 @@ def _verify_materialization_intent_chain(
         or primary.system_identifier != postgres.system_identifier
         or primary.database_name != postgres.database_name
         or primary.database_oid != postgres.database_oid
+        or primary.schema_oid != postgres.schema_oid
         or primary.owner_role != postgres.owner_role
         or primary.owner_role_oid != postgres.owner_role_oid
         or primary.application_role != postgres.application_role
@@ -3744,6 +3803,7 @@ def _verify_materialization_intent_chain(
         or restore.system_identifier != restore_postgres.system_identifier
         or restore.database_name != restore_postgres.database_name
         or restore.database_oid != restore_postgres.database_oid
+        or restore.schema_oid != restore_postgres.schema_oid
         or restore.owner_role != restore_postgres.owner_role
         or restore.owner_role_oid != restore_postgres.owner_role_oid
         or restore.application_role != restore_postgres.application_role
@@ -8039,6 +8099,8 @@ def _validate_allocation_effect_receipt(
         or executor_receipt.host_fingerprint_sha256
         != context.executor_expectation.host_fingerprint_sha256
         or executor_receipt.engine != resources.engine
+        or executor_receipt.control_image_local_evidence
+        != context.expected_control_image_local_evidence
         or executor_receipt.allocated_resources_projection_sha256 != canonical_sha256(resources)
     ):
         raise AuthorizationError("allocation_executor_receipt")
@@ -8079,7 +8141,7 @@ def _bootstrap_inspection_matches(
     """Compare explicit engine inspection fields; a template digest alone never suffices."""
 
     return (
-        inspection.image_policy == template.image_policy
+        inspection.image_policy_binding == docker_image_policy_binding(template.image_policy)
         and inspection.entrypoint == template.entrypoint
         and inspection.command == template.command
         and inspection.entrypoint_sha256 == template.entrypoint_sha256
@@ -8395,6 +8457,7 @@ def _validate_materialization_effect_receipt(
             or transition_receipt.system_identifier != transition.system_identifier
             or transition_receipt.database_name != transition.database_name
             or transition_receipt.database_oid != transition.database_oid
+            or transition_receipt.schema_oid != transition.schema_oid
             or transition_receipt.owner_role != transition.owner_role
             or transition_receipt.owner_role_oid != transition.owner_role_oid
             or transition_receipt.application_role != transition.application_role
@@ -8411,6 +8474,7 @@ def _validate_materialization_effect_receipt(
             or expectation.database_identity != transition.database_identity
             or expectation.prepared_operation_id != transition.prepared_operation_id
             or expectation.database_oid != transition.database_oid
+            or expectation.schema_oid != transition.schema_oid
             or expectation.owner_role_oid != transition.owner_role_oid
             or expectation.application_role_oid != transition.application_role_oid
             or expectation.application_password_reference_sha256
@@ -8938,6 +9002,7 @@ def _postgres_login_transition_commitment(
         type(provenance.authority) is not str
         or type(provenance.system_identifier) is not str
         or type(provenance.database_oid) is not int
+        or type(provenance.schema_oid) is not int
         or type(provenance.owner_role_oid) is not int
         or type(provenance.application_role_oid) is not int
         or type(provenance.prepared_operation_id) is not str
@@ -8948,6 +9013,7 @@ def _postgres_login_transition_commitment(
         or transition.database_identity != connection.database_identity
         or provenance.system_identifier != transition.system_identifier
         or provenance.database_oid != transition.database_oid
+        or provenance.schema_oid != transition.schema_oid
         or provenance.owner_role_oid != transition.owner_role_oid
         or provenance.application_role_oid != transition.application_role_oid
         or provenance.prepared_operation_id != transition.prepared_operation_id
@@ -8963,6 +9029,7 @@ def _postgres_login_transition_commitment(
         authority=provenance.authority,
         system_identifier=provenance.system_identifier,
         database_oid=provenance.database_oid,
+        schema_oid=provenance.schema_oid,
         owner_role_oid=provenance.owner_role_oid,
         application_role_oid=provenance.application_role_oid,
         prepared_operation_id=provenance.prepared_operation_id,
@@ -9809,6 +9876,9 @@ def _run_allocation_authorization(
                 postgres_control_expectation=final_postgres_expectation,
                 postgres_prepared_control_policy_sha256=canonical_sha256(
                     controls.postgres_prepared
+                ),
+                expected_control_image_local_evidence=expected_docker_image_local_evidence(
+                    controls.postgres_prepared.control_image
                 ),
                 postgres_allocation_prepared_operation_id=(
                     controls.postgres_prepared.operations[0].operation_id

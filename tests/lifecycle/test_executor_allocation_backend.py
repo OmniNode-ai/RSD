@@ -22,11 +22,13 @@ import omninode_rsd.lifecycle.executor_daemon as daemon
 from omninode_rsd.lifecycle.infisical_disposable import (
     DockerEngineControlPolicyV1,
     DockerEngineFilteredProjectionV1,
+    DockerImageLocalEvidenceV1,
     DockerImagePolicyV1,
     DockerUnixSocketPolicyV1,
     EngineIdentityObservationV1,
     ImageReferenceV1,
     NetworkOptionV1,
+    OciImageResolutionAttestationV1,
     PostgreSQLPreparedControlPolicyV2,
     PostgreSQLPreparedOperationV1,
     PostgreSQLScramVerifierInstallsV1,
@@ -180,6 +182,7 @@ def _docker_policy(path: Path) -> DockerEngineControlPolicyV1:
             "engine_version",
             "engine_info",
             "image_inspect",
+            "image_manifest_inspect",
             "network_create",
             "network_inspect",
             "volume_create",
@@ -192,12 +195,25 @@ def _docker_policy(path: Path) -> DockerEngineControlPolicyV1:
         max_request_bytes=65_536,
         max_response_bytes=65_536,
         max_hijack_bytes=65_536,
+        max_hijack_frames=64,
         request_timeout_seconds=1,
         hijack_timeout_seconds=1,
+        hijack_absolute_timeout_seconds=2,
         created_at=_NOW,
         signer_key_id="test-signer",
         signature_base64=_SIGNATURE,
     )
+
+
+def _offline_docker_policy(tmp_path: Path) -> DockerEngineControlPolicyV1:
+    """Build a signed-shape policy for parser-only tests without connecting."""
+
+    path = _socket_path(tmp_path)
+    server = _EngineServer(path, ())
+    try:
+        return _docker_policy(path)
+    finally:
+        server.close()
 
 
 def _client(
@@ -216,11 +232,44 @@ def _client(
 
 
 def _image_policy() -> DockerImagePolicyV1:
+    image = ImageReferenceV1(reference=f"registry.example/control@sha256:{_HEX}")
     return DockerImagePolicyV1(
-        image=ImageReferenceV1(reference=f"registry.example/control@sha256:{_HEX}"),
+        image=image,
         registry_index_digest_sha256=_HEX,
         linux_amd64_manifest_digest_sha256="e" * 64,
         config_digest_sha256="f" * 64,
+        resolution_attestation=OciImageResolutionAttestationV1(
+            schema_version="rsd.oci-image-resolution-attestation.v1",
+            source_commit=_COMMIT,
+            image=image,
+            registry_index_digest_sha256=_HEX,
+            linux_amd64_manifest_digest_sha256="e" * 64,
+            config_digest_sha256="f" * 64,
+            platform="linux/amd64",
+            resolved_at=_NOW,
+            signer_key_id="test-signer",
+            signature_base64=_SIGNATURE,
+        ),
+    )
+
+
+def _local_image_evidence() -> DockerImageLocalEvidenceV1:
+    policy = _image_policy()
+    repository = policy.image.reference.rsplit("@", 1)[0]
+    return DockerImageLocalEvidenceV1(
+        schema_version="rsd.docker-image-local-evidence.v1",
+        resolution_attestation_sha256=allocation.canonical_sha256(policy.resolution_attestation),
+        registry_index_reference=policy.image,
+        linux_amd64_manifest_reference=ImageReferenceV1(
+            reference=(f"{repository}@sha256:{policy.linux_amd64_manifest_digest_sha256}")
+        ),
+        registry_index_digest_sha256=policy.registry_index_digest_sha256,
+        linux_amd64_manifest_digest_sha256=policy.linux_amd64_manifest_digest_sha256,
+        config_digest_sha256=policy.config_digest_sha256,
+        index_reference_inspected=True,
+        platform_manifest_reference_inspected=True,
+        operating_system="linux",
+        architecture="amd64",
     )
 
 
@@ -869,6 +918,7 @@ def test_reconciliation_uses_the_live_session_lease_before_signing() -> None:
             projection=projection_model,
             engine_fingerprint_sha256=docker_engine_fingerprint_sha256(projection_model),
         ),
+        control_image_local_evidence=_local_image_evidence(),
         state=allocation.AllocationReconciliationStateV1.ABSENT,
         observed_network_names=(),
         observed_volume_names=(),
@@ -959,6 +1009,7 @@ def test_reconciliation_receipt_is_signed_but_never_a_resume_grant() -> None:
         schema_version="rsd.allocation-reconciliation-projection.v1",
         allocation_intent_sha256=_hash("intent"),
         engine=engine,
+        control_image_local_evidence=_local_image_evidence(),
         state=allocation.AllocationReconciliationStateV1.ABSENT,
         observed_network_names=(),
         observed_volume_names=(),
@@ -996,3 +1047,219 @@ def test_reconciliation_receipt_is_signed_but_never_a_resume_grant() -> None:
             attestation_key_id="executor-attestation",
             attestation_public_key_base64=base64.b64encode(public).decode("ascii"),
         )
+
+
+def _image_inspect_document(
+    reference: ImageReferenceV1,
+    *,
+    image_id: str | None = None,
+    operating_system: str = "linux",
+    architecture: str = "amd64",
+    repo_digests: object | None = None,
+) -> dict[str, object]:
+    """Return the only filtered Engine fields accepted for one image ref."""
+
+    return {
+        "Id": image_id if image_id is not None else f"sha256:{'f' * 64}",
+        "Os": operating_system,
+        "Architecture": architecture,
+        "RepoDigests": [reference.reference] if repo_digests is None else repo_digests,
+    }
+
+
+def test_image_local_evidence_requires_two_exact_digest_references(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Engine corroborates each digest; it never invents index membership."""
+
+    path = _socket_path(tmp_path)
+    policy = _image_policy()
+    manifest = allocation._UnixDockerEngineClient._manifest_reference(policy)
+    requests: list[bytes] = []
+
+    def index(connection: socket.socket) -> None:
+        requests.append(_read_http_request(connection))
+        connection.sendall(_json_response(200, _image_inspect_document(policy.image)))
+
+    def platform_manifest(connection: socket.socket) -> None:
+        requests.append(_read_http_request(connection))
+        connection.sendall(_json_response(200, _image_inspect_document(manifest)))
+
+    server = _EngineServer(path, (index, platform_manifest))
+    try:
+        client = _client(_docker_policy(path), monkeypatch)
+        assert (
+            client.inspect_image_reference(policy, reference=policy.image) == policy.image.reference
+        )
+        assert client.inspect_image_reference(policy, reference=manifest) == manifest.reference
+        with pytest.raises(allocation.AllocationBackendError, match="control_image"):
+            client.inspect_image_reference(
+                policy,
+                reference=ImageReferenceV1(reference=f"registry.example/control@sha256:{'1' * 64}"),
+            )
+    finally:
+        server.close()
+
+    assert requests[0].startswith(
+        f"GET /v1.44/images/{policy.image.reference}/json HTTP/1.1\r\n".encode("ascii")
+    )
+    assert requests[1].startswith(
+        f"GET /v1.44/images/{manifest.reference}/json HTTP/1.1\r\n".encode("ascii")
+    )
+    evidence = allocation.expected_docker_image_local_evidence(policy)
+    assert evidence.registry_index_reference == policy.image
+    assert evidence.linux_amd64_manifest_reference == manifest
+    # The compact evidence declares this limitation explicitly: trusted signed
+    # OCI resolution, not these Engine documents, proves index membership.
+    assert evidence.resolution_attestation_sha256 == allocation.canonical_sha256(
+        policy.resolution_attestation
+    )
+
+
+@pytest.mark.parametrize(
+    ("document", "description"),
+    (
+        (
+            lambda policy, manifest: _image_inspect_document(manifest, repo_digests=[]),
+            "missing_manifest",
+        ),
+        (
+            lambda policy, manifest: _image_inspect_document(
+                policy.image,
+                image_id=f"sha256:{policy.config_digest_sha256}",
+                repo_digests=[policy.image.reference],
+            ),
+            "right_config_wrong_manifest",
+        ),
+        (
+            lambda policy, manifest: _image_inspect_document(manifest, architecture="arm64"),
+            "multiarch_swap",
+        ),
+        (
+            lambda policy, manifest: _image_inspect_document(
+                manifest,
+                repo_digests=[f"{manifest.reference.rsplit('@', 1)[0]}@sha256:{'1' * 64}"],
+            ),
+            "tag_or_digest_drift",
+        ),
+    ),
+)
+def test_image_manifest_projection_rejects_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    document: Callable[[DockerImagePolicyV1, ImageReferenceV1], dict[str, object]],
+    description: str,
+) -> None:
+    """A correct config digest cannot stand in for the signed manifest ref."""
+
+    path = _socket_path(tmp_path)
+    policy = _image_policy()
+    manifest = allocation._UnixDockerEngineClient._manifest_reference(policy)
+
+    def handler(connection: socket.socket) -> None:
+        _read_http_request(connection)
+        connection.sendall(_json_response(200, document(policy, manifest)))
+
+    server = _EngineServer(path, (handler,))
+    try:
+        with pytest.raises(allocation.AllocationBackendError, match="control_image"):
+            _client(_docker_policy(path), monkeypatch).inspect_image_reference(
+                policy, reference=manifest
+            )
+    finally:
+        server.close()
+    assert description
+
+
+class _HijackConnection:
+    """Deterministic stream fragment source for Engine multiplex parser tests."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+        self.timeouts: list[float] = []
+
+    def settimeout(self, value: float) -> None:
+        self.timeouts.append(value)
+
+    def recv(self, _limit: int) -> bytes:
+        return self._chunks.pop(0) if self._chunks else b""
+
+
+def _multiplex_frame(stream: int, payload: bytes) -> bytes:
+    return bytes((stream, 0, 0, 0)) + len(payload).to_bytes(4, "big") + payload
+
+
+def test_hijack_budgets_count_zero_length_frames_and_redact_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Zero-byte frames and unreturned stderr cannot keep a session alive."""
+
+    policy = _offline_docker_policy(tmp_path).model_copy(
+        update={"max_hijack_bytes": 8, "max_hijack_frames": 2}
+    )
+    client = object.__new__(allocation._UnixDockerEngineClient)
+    client._policy = policy
+    zero_flood = _HijackConnection([_multiplex_frame(1, b"") * 3, b""])
+    with pytest.raises(allocation.AllocationBackendError, match="engine_multiplex"):
+        client._read_multiplex(
+            zero_flood,
+            bytearray(),
+            deadline=allocation._EngineIoDeadline.begin(absolute_timeout=2, idle_timeout=1),
+        )
+
+    marker = b"stderr-secret-sentinel"
+    stderr = _HijackConnection([_multiplex_frame(2, marker), b""])
+    with pytest.raises(allocation.AllocationBackendError, match="engine_multiplex") as raised:
+        client._read_multiplex(
+            stderr,
+            bytearray(),
+            deadline=allocation._EngineIoDeadline.begin(absolute_timeout=2, idle_timeout=1),
+        )
+    assert marker.decode("ascii") not in str(raised.value)
+    assert marker.decode("ascii") not in repr(raised.value)
+    assert zero_flood.timeouts and stderr.timeouts
+    monkeypatch.undo()
+
+
+def test_hijack_absolute_deadline_rejects_continuous_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sub-idle fragments still fail once the policy's absolute cap expires."""
+
+    policy = _offline_docker_policy(tmp_path)
+    client = object.__new__(allocation._UnixDockerEngineClient)
+    client._policy = policy
+    # One frame is delivered in short, successful fragments.  The third
+    # blocking-operation preparation sees the absolute deadline and rejects
+    # before another fragment can extend the stream indefinitely.
+    clock_values = iter((0.0, 0.0, 0.1, 1.1))
+    monkeypatch.setattr(allocation.time, "monotonic", lambda: next(clock_values))
+    deadline = allocation._EngineIoDeadline.begin(absolute_timeout=1, idle_timeout=1)
+    connection = _HijackConnection([b"\x01", b"\x00\x00\x00\x00\x00\x00", b""])
+    with pytest.raises(allocation.AllocationBackendError, match="engine_multiplex"):
+        client._read_multiplex(connection, bytearray(), deadline=deadline)
+
+
+@pytest.mark.parametrize("invalid", (True, float("nan"), float("inf"), float("-inf"), -1.0, 1))
+def test_engine_deadline_rejects_nonfinite_or_nonexact_monotonic_values(
+    monkeypatch: pytest.MonkeyPatch, invalid: object
+) -> None:
+    monkeypatch.setattr(allocation.time, "monotonic", lambda: invalid)
+    with pytest.raises(allocation.AllocationBackendError, match="engine_timeout"):
+        allocation._EngineIoDeadline.begin(absolute_timeout=1, idle_timeout=1)
+
+
+def test_engine_deadline_rejects_clock_regression_during_http_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = object.__new__(allocation._UnixDockerEngineClient)
+    # The first timestamp seeds the deadline; the second begins a read, and
+    # the third moves backwards after the peer made progress.
+    clock_values = iter((2.0, 2.0, 1.5))
+    monkeypatch.setattr(allocation.time, "monotonic", lambda: next(clock_values))
+    deadline = allocation._EngineIoDeadline.begin(absolute_timeout=2, idle_timeout=1)
+    connection = _HijackConnection([b"HTTP/1.1 200 OK\r\n\r\n"])
+    with pytest.raises(allocation.AllocationBackendError, match="engine_timeout"):
+        client._recv_until_headers(connection, deadline=deadline)

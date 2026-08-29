@@ -61,6 +61,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     ContainerBootstrapInspectionV1,
     ContainerSecretSinkV1,
     DockerEngineFilteredProjectionV1,
+    DockerImageLocalEvidenceV1,
     DockerImagePolicyV1,
     DockerNamedVolumeMountV1,
     EngineIdentityObservationV1,
@@ -71,6 +72,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     ImageReferenceV1,
     MaterializationExecutorReceiptV1,
     NoHostPublicationGroundworkV1,
+    OciImageResolutionAttestationV1,
     PostgreSQLGrantObservationV1,
     PostgreSQLRoleObservationV1,
     SecretDeliverySinkV1,
@@ -85,6 +87,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     container_attach_receipt_sha256,
     container_attach_request_sha256,
     docker_engine_fingerprint_sha256,
+    docker_image_policy_binding,
     docker_volume_instance_fingerprint_sha256,
 )
 from omninode_rsd.lifecycle.provider_crypto import (
@@ -95,6 +98,7 @@ from omninode_rsd.lifecycle.transport import CanonicalFrameWriter, read_raw_tran
 
 _NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
 _NOW_TEXT = "2026-08-28T12:00:00Z"
+_SIGNATURE = base64.b64encode(b"0" * 64).decode("ascii")
 _ALLOCATION = "a" * 64
 _UUIDS = (
     "123e4567-e89b-42d3-a456-426614174001",
@@ -879,7 +883,7 @@ def _attach_receipt(
         operation_id=context.operation_id,
         component=cast(Any, component),
         container_id=container_id,
-        derived_image_policy_sha256=canonical_sha256(inspection.image_policy),
+        derived_image_policy_sha256=inspection.image_policy_binding.image_policy_sha256,
         wrapper_manifest_sha256=inspection.wrapper_manifest_sha256,
         wrapper_artifact_binding_sha256=inspection.wrapper_artifact_binding_sha256,
         attach_protocol_sha256=inspection.attach_protocol_sha256,
@@ -951,6 +955,18 @@ def _runtime_inspections(
             registry_index_digest_sha256=marker * 64,
             linux_amd64_manifest_digest_sha256=_hash(component + "-manifest"),
             config_digest_sha256=_hash(component + "-config"),
+            resolution_attestation=OciImageResolutionAttestationV1(
+                schema_version="rsd.oci-image-resolution-attestation.v1",
+                source_commit="a" * 40,
+                image=image,
+                registry_index_digest_sha256=marker * 64,
+                linux_amd64_manifest_digest_sha256=_hash(component + "-manifest"),
+                config_digest_sha256=_hash(component + "-config"),
+                platform="linux/amd64",
+                resolved_at=_NOW_TEXT,
+                signer_key_id="test-signer",
+                signature_base64=_SIGNATURE,
+            ),
         )
         entrypoint = ("/bootstrap",)
         entrypoint_sha256 = hashlib.sha256(
@@ -973,7 +989,7 @@ def _runtime_inspections(
             else ()
         )
         inspection = ContainerBootstrapInspectionV1(
-            image_policy=policy,
+            image_policy_binding=docker_image_policy_binding(policy),
             entrypoint=entrypoint,
             command=(),
             entrypoint_sha256=entrypoint_sha256,
@@ -1200,8 +1216,37 @@ class _AllocationBackend:
         )
         assert context.allocation_operation_id == _UUIDS[1]
         _complete_engine_operation_plan(context.engine_operations, label="allocation")
+        image = ImageReferenceV1(reference=f"registry.example/control@sha256:{'a' * 64}")
+        resolution = OciImageResolutionAttestationV1(
+            schema_version="rsd.oci-image-resolution-attestation.v1",
+            source_commit="a" * 40,
+            image=image,
+            registry_index_digest_sha256="a" * 64,
+            linux_amd64_manifest_digest_sha256="b" * 64,
+            config_digest_sha256="c" * 64,
+            platform="linux/amd64",
+            resolved_at=_NOW_TEXT,
+            signer_key_id="test-signer",
+            signature_base64=_SIGNATURE,
+        )
+        evidence = DockerImageLocalEvidenceV1(
+            schema_version="rsd.docker-image-local-evidence.v1",
+            resolution_attestation_sha256=canonical_sha256(resolution),
+            registry_index_reference=image,
+            linux_amd64_manifest_reference=ImageReferenceV1(
+                reference=f"registry.example/control@sha256:{'b' * 64}"
+            ),
+            registry_index_digest_sha256="a" * 64,
+            linux_amd64_manifest_digest_sha256="b" * 64,
+            config_digest_sha256="c" * 64,
+            index_reference_inspected=True,
+            platform_manifest_reference_inspected=True,
+            operating_system="linux",
+            architecture="amd64",
+        )
         return ExecutorAllocationBackendEvidenceV1(
             engine=engine,
+            control_image_local_evidence=evidence,
             allocated_resources=_allocation_resources(engine),
             engine_operation_journal_sha256=(
                 context.engine_operations.completed_projection_sha256()

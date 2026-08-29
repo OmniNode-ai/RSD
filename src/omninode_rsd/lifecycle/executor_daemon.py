@@ -65,6 +65,7 @@ from omninode_rsd.lifecycle.executor_transport import (
 from omninode_rsd.lifecycle.infisical_disposable import (
     AllocatedResourceSetV2,
     AllocationExecutorReceiptV1,
+    DockerImageLocalEvidenceV1,
     EngineIdentityObservationV1,
     ExecutorIdentityV1,
     MaterializationExecutorReceiptV1,
@@ -1432,6 +1433,7 @@ class ExecutorAllocationBackendEvidenceV1:
     """
 
     engine: EngineIdentityObservationV1
+    control_image_local_evidence: DockerImageLocalEvidenceV1
     allocated_resources: AllocatedResourceSetV2
     engine_operation_journal_sha256: str
     completed_at: str
@@ -2066,6 +2068,7 @@ class ExecutorDaemonSessionEngine:
                 type(evidence) is not ExecutorAllocationBackendEvidenceV1
                 or type(evidence.engine) is not EngineIdentityObservationV1
                 or evidence.engine.engine_fingerprint_sha256 != request.engine_fingerprint_sha256
+                or type(evidence.control_image_local_evidence) is not DockerImageLocalEvidenceV1
                 or type(evidence.allocated_resources) is not AllocatedResourceSetV2
                 or evidence.allocated_resources.engine != evidence.engine
                 or re_fullmatch(_SHA256, evidence.engine_operation_journal_sha256) is None
@@ -2087,6 +2090,7 @@ class ExecutorDaemonSessionEngine:
                 ),
                 host_fingerprint_sha256=request.host_fingerprint_sha256,
                 engine=evidence.engine,
+                control_image_local_evidence=evidence.control_image_local_evidence,
                 allocated_resources=evidence.allocated_resources,
                 allocated_resources_projection_sha256=canonical_sha256(
                     evidence.allocated_resources

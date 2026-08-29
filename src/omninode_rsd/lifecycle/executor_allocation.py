@@ -17,11 +17,13 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import os
 import re
 import socket
 import stat
 import struct
+import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -60,8 +62,10 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     AllocationVolumePlanV1,
     DockerEngineControlPolicyV1,
     DockerEngineFilteredProjectionV1,
+    DockerImageLocalEvidenceV1,
     DockerImagePolicyV1,
     EngineIdentityObservationV1,
+    ImageReferenceV1,
     IsolatedNetworkPlanV1,
     NetworkOptionV1,
     NoHostPublicationGroundworkV1,
@@ -75,6 +79,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     docker_engine_fingerprint_sha256,
     docker_unix_socket_identity_sha256,
     docker_volume_instance_fingerprint_sha256,
+    expected_docker_image_local_evidence,
     strict_canonical_allocation_intent,
 )
 
@@ -650,6 +655,82 @@ class _HttpResponse:
         self.body[:] = b"\x00" * len(self.body)
 
 
+@dataclass(slots=True)
+class _EngineIoDeadline:
+    """One finite, non-regressing absolute deadline for Engine I/O.
+
+    Socket timeouts alone bound an idle peer but permit an attacker to keep a
+    stream alive indefinitely with sub-idle drips.  Every Engine read/write
+    therefore uses this signed-policy-derived absolute deadline as well as
+    the shorter idle socket timeout.  The direct production adapter obtains
+    time only from ``time.monotonic``; test code may patch that module-local
+    function but cannot inject a clock through the backend API.
+    """
+
+    absolute_deadline: float
+    idle_timeout: float
+    _last_observed: float
+
+    @classmethod
+    def begin(cls, *, absolute_timeout: int, idle_timeout: int) -> _EngineIoDeadline:
+        if (
+            type(absolute_timeout) is not int
+            or type(idle_timeout) is not int
+            or absolute_timeout < 1
+            or idle_timeout < 1
+        ):
+            raise AllocationBackendError("engine_timeout")
+        now = cls._read_monotonic(None)
+        deadline = now + float(absolute_timeout)
+        if not math.isfinite(deadline) or deadline <= now:
+            raise AllocationBackendError("engine_timeout")
+        return cls(
+            absolute_deadline=deadline,
+            idle_timeout=float(idle_timeout),
+            _last_observed=now,
+        )
+
+    @staticmethod
+    def _read_monotonic(previous: float | None) -> float:
+        try:
+            value = time.monotonic()
+        except Exception:
+            raise AllocationBackendError("engine_timeout") from None
+        if (
+            type(value) is not float
+            or not math.isfinite(value)
+            or value < 0.0
+            or (previous is not None and value < previous)
+        ):
+            raise AllocationBackendError("engine_timeout")
+        return value
+
+    def _remaining(self) -> float:
+        now = self._read_monotonic(self._last_observed)
+        self._last_observed = now
+        remaining = self.absolute_deadline - now
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise AllocationBackendError("engine_timeout")
+        return remaining
+
+    def prepare(self, connection: socket.socket) -> None:
+        """Apply the lesser absolute/idle limit before one blocking operation."""
+
+        remaining = self._remaining()
+        timeout = min(self.idle_timeout, remaining)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise AllocationBackendError("engine_timeout")
+        try:
+            connection.settimeout(timeout)
+        except OSError:
+            raise AllocationBackendError("engine_timeout") from None
+
+    def progressed(self) -> None:
+        """Observe a completed I/O operation and reject backward/expired time."""
+
+        self._remaining()
+
+
 def _discard_engine_json(value: object | None) -> None:
     """Drop references to every unfiltered decoded Engine value promptly.
 
@@ -752,13 +833,14 @@ class _UnixDockerEngineClient:
         except (OSError, ValueError):
             raise AllocationBackendError("engine_socket") from None
 
-    def _connect(self) -> socket.socket:
+    def _connect(self, deadline: _EngineIoDeadline) -> socket.socket:
         self._assert_socket_identity()
         connection: socket.socket | None = None
         try:
             connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            connection.settimeout(self._policy.request_timeout_seconds)
+            deadline.prepare(connection)
             connection.connect(self._socket_policy.socket_path)
+            deadline.progressed()
             self._assert_socket_identity()
             self._assert_peer_identity(connection)
             return connection
@@ -795,22 +877,34 @@ class _UnixDockerEngineClient:
         except (OSError, ValueError, struct.error):
             raise AllocationBackendError("engine_peer") from None
 
-    def _send(self, connection: socket.socket, value: bytes | bytearray) -> None:
+    def _send(
+        self,
+        connection: socket.socket,
+        value: bytes | bytearray,
+        *,
+        deadline: _EngineIoDeadline,
+    ) -> None:
         try:
+            deadline.prepare(connection)
             connection.sendall(value)
+            deadline.progressed()
         except OSError:
             raise AllocationBackendError("engine_io") from None
 
-    def _recv_until_headers(self, connection: socket.socket) -> tuple[bytes, bytearray]:
+    def _recv_until_headers(
+        self, connection: socket.socket, *, deadline: _EngineIoDeadline
+    ) -> tuple[bytes, bytearray]:
         raw = bytearray()
         try:
             while b"\r\n\r\n" not in raw:
                 if len(raw) >= _MAX_HEADERS:
                     raise ValueError
+                deadline.prepare(connection)
                 piece = connection.recv(min(4096, _MAX_HEADERS - len(raw)))
                 if not piece:
                     raise ValueError
                 raw.extend(piece)
+                deadline.progressed()
             marker = raw.index(b"\r\n\r\n") + 4
             header = bytes(raw[:marker])
             remainder = bytearray(raw[marker:])
@@ -854,18 +948,23 @@ class _UnixDockerEngineClient:
         *,
         initial: bytearray,
         length: int,
+        deadline: _EngineIoDeadline,
     ) -> bytearray:
         if len(initial) > length:
             initial[:] = b"\x00" * len(initial)
             raise AllocationBackendError("engine_framing")
         try:
             while len(initial) < length:
+                deadline.prepare(connection)
                 piece = connection.recv(min(65_536, length - len(initial)))
                 if not piece:
                     raise ValueError
                 initial.extend(piece)
+                deadline.progressed()
             # ``Connection: close`` is mandatory in normal Engine requests.
+            deadline.prepare(connection)
             tail = connection.recv(1)
+            deadline.progressed()
             if tail:
                 raise ValueError
             return initial
@@ -908,12 +1007,18 @@ class _UnixDockerEngineClient:
         response: _HttpResponse | None = None
         completed = False
         try:
-            connection = self._connect()
-            self._send(connection, encoded)
-            raw_header, initial = self._recv_until_headers(connection)
+            deadline = _EngineIoDeadline.begin(
+                absolute_timeout=self._policy.request_timeout_seconds,
+                idle_timeout=self._policy.request_timeout_seconds,
+            )
+            connection = self._connect(deadline)
+            self._send(connection, encoded, deadline=deadline)
+            raw_header, initial = self._recv_until_headers(connection, deadline=deadline)
             status, content_type, length = self._parse_headers(raw_header)
             raw_header = b"\x00" * len(raw_header)
-            data = self._receive_exact(connection, initial=initial, length=length)
+            data = self._receive_exact(
+                connection, initial=initial, length=length, deadline=deadline
+            )
             expected = (expected_status,) if isinstance(expected_status, int) else expected_status
             if status not in expected or content_type != expected_content_type:
                 not_found = (
@@ -1069,28 +1174,78 @@ class _UnixDockerEngineClient:
             raise AllocationBackendError("engine_projection")
         return result
 
-    def assert_image(self, policy: DockerImagePolicyV1) -> None:
+    @staticmethod
+    def _manifest_reference(policy: DockerImagePolicyV1) -> ImageReferenceV1:
+        """Derive the only accepted local platform-manifest RepoDigest."""
+
         if type(policy) is not DockerImagePolicyV1:
             raise AllocationBackendError("control_image")
-        reference = quote(policy.image.reference, safe="@:_-./")
+        try:
+            repository = policy.image.reference.rsplit("@", 1)[0]
+            return ImageReferenceV1(
+                reference=(f"{repository}@sha256:{policy.linux_amd64_manifest_digest_sha256}")
+            )
+        except (TypeError, ValueError):
+            raise AllocationBackendError("control_image") from None
 
-        def parse(response: dict[str, object]) -> None:
+    @staticmethod
+    def _local_image_evidence(policy: DockerImagePolicyV1) -> DockerImageLocalEvidenceV1:
+        """Build the receipt-safe evidence after both local checks succeed."""
+
+        try:
+            return expected_docker_image_local_evidence(policy)
+        except (TypeError, ValueError):
+            raise AllocationBackendError("control_image") from None
+
+    def inspect_image_reference(
+        self,
+        policy: DockerImagePolicyV1,
+        *,
+        reference: ImageReferenceV1,
+    ) -> str:
+        """Prove one exact local RepoDigest resolves to the signed config.
+
+        The index and platform-manifest references are inspected separately.
+        Their membership relationship is deliberately *not* inferred from
+        Engine metadata; the separately signed OCI resolution attestation in
+        ``DockerImagePolicyV1`` carries that trust assertion.
+        """
+
+        if type(policy) is not DockerImagePolicyV1:
+            raise AllocationBackendError("control_image")
+        if type(reference) is not ImageReferenceV1:
+            raise AllocationBackendError("control_image")
+        expected_manifest_reference = self._manifest_reference(policy)
+        if reference not in {policy.image, expected_manifest_reference}:
+            raise AllocationBackendError("control_image")
+        encoded_reference = quote(reference.reference, safe="@:_-./")
+
+        def parse(response: dict[str, object]) -> str:
             try:
                 image_id = response.get("Id")
                 digests = response.get("RepoDigests")
                 if (
                     image_id != f"sha256:{policy.config_digest_sha256}"
+                    or response.get("Os") != "linux"
+                    or response.get("Architecture") != "amd64"
                     or type(digests) is not list
                     or any(type(item) is not str for item in digests)
-                    or policy.image.reference not in cast(list[str], digests)
+                    or tuple(cast(list[str], digests)) != (reference.reference,)
                 ):
                     raise ValueError
+                return reference.reference
             except (ValueError, TypeError):
                 raise AllocationBackendError("control_image") from None
 
-        self._json(
-            method="GET", path=f"{self._api_prefix}/images/{reference}/json", body=None, parse=parse
+        result = self._json(
+            method="GET",
+            path=f"{self._api_prefix}/images/{encoded_reference}/json",
+            body=None,
+            parse=parse,
         )
+        if type(result) is not str or result != reference.reference:
+            raise AllocationBackendError("control_image")
+        return result
 
     def assert_control_container(self, policy: PostgreSQLPreparedControlPolicyV2) -> None:
         control_id = _require_container_id(policy.control_container_id, phase="control_container")
@@ -1407,18 +1562,21 @@ class _UnixDockerEngineClient:
         connection: socket.socket | None = None
         output = bytearray()
         try:
-            connection = self._connect()
-            self._send(connection, request)
-            header, initial = self._recv_until_headers(connection)
+            deadline = _EngineIoDeadline.begin(
+                absolute_timeout=self._policy.hijack_absolute_timeout_seconds,
+                idle_timeout=self._policy.hijack_timeout_seconds,
+            )
+            connection = self._connect(deadline)
+            self._send(connection, request, deadline=deadline)
+            header, initial = self._recv_until_headers(connection, deadline=deadline)
             status, content_type, length = self._parse_hijack_headers(header)
             header = b"\x00" * len(header)
             if status != 101 or content_type != "application/vnd.docker.raw-stream" or length != -1:
                 raise AllocationBackendError("postgres_exec")
-            connection.settimeout(self._policy.hijack_timeout_seconds)
-            self._send(connection, sql)
+            self._send(connection, sql, deadline=deadline)
             with suppress(OSError):
                 connection.shutdown(socket.SHUT_WR)
-            output = self._read_multiplex(connection, initial)
+            output = self._read_multiplex(connection, initial, deadline=deadline)
             self._assert_socket_identity()
             return output
         except AllocationBackendError:
@@ -1458,14 +1616,27 @@ class _UnixDockerEngineClient:
         except (UnicodeDecodeError, ValueError, KeyError):
             raise AllocationBackendError("engine_framing") from None
 
-    def _read_multiplex(self, connection: socket.socket, initial: bytearray) -> bytearray:
+    def _read_multiplex(
+        self,
+        connection: socket.socket,
+        initial: bytearray,
+        *,
+        deadline: _EngineIoDeadline,
+    ) -> bytearray:
         data = bytearray(initial)
         initial[:] = b"\x00" * len(initial)
         stdout = bytearray()
         stderr_seen = False
+        stderr_total = 0
+        total_payload_bytes = 0
+        frame_count = 0
+        max_wire_bytes = self._policy.max_hijack_bytes + (8 * self._policy.max_hijack_frames)
         try:
+            if len(data) > max_wire_bytes:
+                raise ValueError
             while True:
                 while len(data) < 8:
+                    deadline.prepare(connection)
                     piece = connection.recv(4096)
                     if not piece:
                         if not data:
@@ -1474,28 +1645,45 @@ class _UnixDockerEngineClient:
                             return stdout
                         raise ValueError
                     data.extend(piece)
+                    if len(data) > max_wire_bytes:
+                        raise ValueError
+                    deadline.progressed()
                 stream = data[0]
                 if data[1:4] != b"\x00\x00\x00":
                     raise ValueError
                 length = int.from_bytes(data[4:8], "big")
-                if stream not in (1, 2) or length > self._policy.max_hijack_bytes:
+                frame_count += 1
+                if (
+                    stream not in (1, 2)
+                    or frame_count > self._policy.max_hijack_frames
+                    or length > self._policy.max_hijack_bytes
+                    or total_payload_bytes + length > self._policy.max_hijack_bytes
+                ):
                     raise ValueError
                 del data[:8]
                 while len(data) < length:
+                    deadline.prepare(connection)
                     piece = connection.recv(min(65_536, length - len(data)))
                     if not piece:
                         raise ValueError
                     data.extend(piece)
+                    if len(data) > max_wire_bytes:
+                        raise ValueError
+                    deadline.progressed()
                 payload = data[:length]
                 del data[:length]
+                total_payload_bytes += length
                 if stream == 2:
                     stderr_seen = True
+                    stderr_total += len(payload)
+                    if stderr_total > self._policy.max_hijack_bytes:
+                        raise ValueError
                 else:
                     if len(stdout) + len(payload) > self._policy.max_hijack_bytes:
                         raise ValueError
                     stdout.extend(payload)
                 payload[:] = b"\x00" * len(payload)
-        except (OSError, ValueError):
+        except (OSError, ValueError, AllocationBackendError):
             stdout[:] = b"\x00" * len(stdout)
             raise AllocationBackendError("engine_multiplex") from None
         finally:
@@ -1789,6 +1977,7 @@ class AllocationReconciliationProjectionV1(_Model):
     schema_version: Literal["rsd.allocation-reconciliation-projection.v1"]
     allocation_intent_sha256: str = Field(pattern=_SHA256)
     engine: EngineIdentityObservationV1
+    control_image_local_evidence: DockerImageLocalEvidenceV1
     state: AllocationReconciliationStateV1
     observed_network_names: tuple[str, ...] = Field(default=(), max_length=2)
     observed_volume_names: tuple[str, ...] = Field(default=(), max_length=2)
@@ -1989,12 +2178,30 @@ class SealedAllocationBackendV1:
             projection=projection,
             engine_fingerprint_sha256=docker.engine_fingerprint_sha256,
         )
-        _claim_and_complete(
+        index_reference = _claim_and_complete(
             recorder,
             kind=ExecutorEngineOperationKindV1.IMAGE_INSPECT,
             target=ExecutorEngineOperationTargetV1.CONTROL_IMAGE,
-            action=lambda: self._engine.assert_image(prepared.control_image),
+            action=lambda: self._engine.inspect_image_reference(
+                prepared.control_image,
+                reference=prepared.control_image.image,
+            ),
         )
+        manifest_reference = _claim_and_complete(
+            recorder,
+            kind=ExecutorEngineOperationKindV1.IMAGE_MANIFEST_INSPECT,
+            target=ExecutorEngineOperationTargetV1.CONTROL_IMAGE,
+            action=lambda: self._engine.inspect_image_reference(
+                prepared.control_image,
+                reference=self._engine._manifest_reference(prepared.control_image),
+            ),
+        )
+        image_evidence = self._engine._local_image_evidence(prepared.control_image)
+        if (
+            index_reference != image_evidence.registry_index_reference.reference
+            or manifest_reference != image_evidence.linux_amd64_manifest_reference.reference
+        ):
+            raise AllocationBackendError("control_image")
         _claim_and_complete(
             recorder,
             kind=ExecutorEngineOperationKindV1.CONTAINER_INSPECT,
@@ -2091,6 +2298,7 @@ class SealedAllocationBackendV1:
         now = _system_utc_clock().isoformat(timespec="seconds").replace("+00:00", "Z")
         return ExecutorAllocationBackendEvidenceV1(
             engine=engine,
+            control_image_local_evidence=image_evidence,
             allocated_resources=resources,
             engine_operation_journal_sha256=recorder.completed_projection_sha256(),
             completed_at=now,
@@ -2337,6 +2545,24 @@ class SealedAllocationBackendV1:
             projection=projection,
             engine_fingerprint_sha256=self._artifacts.docker.engine_fingerprint_sha256,
         )
+        control_image_evidence = self._engine._local_image_evidence(
+            self._artifacts.postgres_prepared.control_image
+        )
+        index_reference = self._engine.inspect_image_reference(
+            self._artifacts.postgres_prepared.control_image,
+            reference=self._artifacts.postgres_prepared.control_image.image,
+        )
+        manifest_reference = self._engine.inspect_image_reference(
+            self._artifacts.postgres_prepared.control_image,
+            reference=self._engine._manifest_reference(
+                self._artifacts.postgres_prepared.control_image
+            ),
+        )
+        if (
+            index_reference != control_image_evidence.registry_index_reference.reference
+            or manifest_reference != control_image_evidence.linux_amd64_manifest_reference.reference
+        ):
+            raise AllocationBackendError("control_image")
         self._engine.assert_control_container(self._artifacts.postgres_prepared)
         observed_networks: list[str] = []
         observed_volumes: list[str] = []
@@ -2392,6 +2618,7 @@ class SealedAllocationBackendV1:
             schema_version="rsd.allocation-reconciliation-projection.v1",
             allocation_intent_sha256=canonical_sha256(self._artifacts.intent),
             engine=engine,
+            control_image_local_evidence=control_image_evidence,
             state=state,
             observed_network_names=tuple(observed_networks),
             observed_volume_names=tuple(observed_volumes),

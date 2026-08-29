@@ -456,6 +456,7 @@ class ExecutorEngineOperationKindV1(StrEnum):
     ENGINE_VERSION = "engine_version"
     ENGINE_INFO = "engine_info"
     IMAGE_INSPECT = "image_inspect"
+    IMAGE_MANIFEST_INSPECT = "image_manifest_inspect"
     NETWORK_ABSENCE_CHECK = "network_absence_check"
     NETWORK_CREATE = "network_create"
     NETWORK_INSPECT = "network_inspect"
@@ -529,6 +530,10 @@ def _expected_engine_operation_steps(
             step(operation_kind=kind.ENGINE_VERSION, target=target.ENGINE),
             step(operation_kind=kind.ENGINE_INFO, target=target.ENGINE),
             step(operation_kind=kind.IMAGE_INSPECT, target=target.CONTROL_IMAGE),
+            step(
+                operation_kind=kind.IMAGE_MANIFEST_INSPECT,
+                target=target.CONTROL_IMAGE,
+            ),
             step(operation_kind=kind.CONTAINER_INSPECT, target=target.CONTROL_POSTGRES),
             step(
                 operation_kind=kind.POSTGRES_BINARY_EXEC_CREATE,

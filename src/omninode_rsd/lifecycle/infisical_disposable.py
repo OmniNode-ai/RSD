@@ -71,6 +71,9 @@ _MATERIALIZATION_EXECUTOR_RECEIPT_DOMAIN: Final = (
 _START_RUNTIME_EXECUTOR_RECEIPT_DOMAIN: Final = (
     b"omninode-rsd.start-runtime-executor-receipt.ed25519.v2\x00"
 )
+_OCI_IMAGE_RESOLUTION_ATTESTATION_DOMAIN: Final = (
+    b"omninode-rsd.oci-image-resolution-attestation.ed25519.v1\x00"
+)
 
 
 class DisposablePreflightError(RuntimeError):
@@ -1236,6 +1239,67 @@ class ImageConfigBindingV1(_Model):
     config_sha256: str = Field(pattern=_SHA256)
 
 
+class OciImageResolutionAttestationV1(_Model):
+    """Trusted resolution proof for one immutable OCI index chain.
+
+    Docker's Engine API can prove local references and a config image ID, but
+    it does not expose the raw index child descriptor needed to prove index
+    membership.  This separately signed attestation is that explicit trust
+    boundary: it binds a pinned index to the selected linux/amd64 manifest and
+    that manifest's config digest without retaining any raw registry document.
+    """
+
+    schema_version: Literal["rsd.oci-image-resolution-attestation.v1"]
+    source_commit: str = Field(pattern=_COMMIT)
+    image: ImageReferenceV1
+    registry_index_digest_sha256: str = Field(pattern=_SHA256)
+    linux_amd64_manifest_digest_sha256: str = Field(pattern=_SHA256)
+    config_digest_sha256: str = Field(pattern=_SHA256)
+    platform: Literal["linux/amd64"]
+    resolved_at: str
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signature_base64: str = Field(min_length=4, max_length=256)
+
+    @field_validator("resolved_at")
+    @classmethod
+    def canonical_resolved_at(cls, value: str) -> str:
+        _timestamp(value)
+        return value
+
+    @model_validator(mode="after")
+    def exact_immutable_chain(self) -> Self:
+        digest = self.image.reference.rsplit("@", 1)[1].removeprefix("sha256:")
+        values = (
+            self.registry_index_digest_sha256,
+            self.linux_amd64_manifest_digest_sha256,
+            self.config_digest_sha256,
+        )
+        if (
+            digest != self.registry_index_digest_sha256
+            or len(set(values)) != 3
+            or len(_canonical_base64_bytes(self.signature_base64)) != 64
+        ):
+            raise ValueError("OCI image resolution attestation is invalid")
+        return self
+
+
+def oci_image_resolution_attestation_message(
+    attestation: OciImageResolutionAttestationV1,
+) -> bytes:
+    """Return canonical domain-separated bytes for a trusted OCI resolution."""
+
+    attestation = _strict_canonical_model(attestation, OciImageResolutionAttestationV1)
+    try:
+        material = json.dumps(
+            attestation.model_dump(mode="json", exclude={"signature_base64"}, warnings="error"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except Exception:
+        raise ValueError("OCI image resolution attestation is invalid") from None
+    return _OCI_IMAGE_RESOLUTION_ATTESTATION_DOMAIN + material
+
+
 class DockerImagePolicyV1(_Model):
     """The three immutable OCI digests needed to identify a runnable image.
 
@@ -1248,6 +1312,7 @@ class DockerImagePolicyV1(_Model):
     registry_index_digest_sha256: str = Field(pattern=_SHA256)
     linux_amd64_manifest_digest_sha256: str = Field(pattern=_SHA256)
     config_digest_sha256: str = Field(pattern=_SHA256)
+    resolution_attestation: OciImageResolutionAttestationV1
 
     @model_validator(mode="after")
     def exact_oci_chain(self) -> Self:
@@ -1257,9 +1322,155 @@ class DockerImagePolicyV1(_Model):
             self.linux_amd64_manifest_digest_sha256,
             self.config_digest_sha256,
         )
-        if digest != self.registry_index_digest_sha256 or len(set(values)) != 3:
+        attestation = self.resolution_attestation
+        if (
+            digest != self.registry_index_digest_sha256
+            or len(set(values)) != 3
+            or attestation.image != self.image
+            or attestation.registry_index_digest_sha256 != self.registry_index_digest_sha256
+            or attestation.linux_amd64_manifest_digest_sha256
+            != self.linux_amd64_manifest_digest_sha256
+            or attestation.config_digest_sha256 != self.config_digest_sha256
+        ):
             raise ValueError("Docker image policy is not a complete immutable OCI chain")
         return self
+
+
+class DockerImageLocalEvidenceV1(_Model):
+    """Redacted Engine evidence for both signed local OCI references.
+
+    The two local reference checks establish index-reference/config and
+    platform-manifest-reference/config resolution.  The nested trusted OCI
+    resolution attestation is the *only* proof of index membership; Engine
+    metadata is never represented as that proof.
+    """
+
+    schema_version: Literal["rsd.docker-image-local-evidence.v1"]
+    resolution_attestation_sha256: str = Field(pattern=_SHA256)
+    registry_index_reference: ImageReferenceV1
+    linux_amd64_manifest_reference: ImageReferenceV1
+    registry_index_digest_sha256: str = Field(pattern=_SHA256)
+    linux_amd64_manifest_digest_sha256: str = Field(pattern=_SHA256)
+    config_digest_sha256: str = Field(pattern=_SHA256)
+    index_reference_inspected: Literal[True]
+    platform_manifest_reference_inspected: Literal[True]
+    operating_system: Literal["linux"]
+    architecture: Literal["amd64"]
+
+    @model_validator(mode="after")
+    def exact_local_reference_projections(self) -> Self:
+        index_digest = self.registry_index_reference.reference.rsplit("@", 1)[1].removeprefix(
+            "sha256:"
+        )
+        manifest_digest = self.linux_amd64_manifest_reference.reference.rsplit("@", 1)[
+            1
+        ].removeprefix("sha256:")
+        if (
+            index_digest != self.registry_index_digest_sha256
+            or manifest_digest != self.linux_amd64_manifest_digest_sha256
+            or self.registry_index_reference.reference.rsplit("@", 1)[0]
+            != self.linux_amd64_manifest_reference.reference.rsplit("@", 1)[0]
+            or len(
+                {
+                    self.registry_index_digest_sha256,
+                    self.linux_amd64_manifest_digest_sha256,
+                    self.config_digest_sha256,
+                }
+            )
+            != 3
+        ):
+            raise ValueError("Docker local image evidence is invalid")
+        return self
+
+
+class DockerImagePolicyBindingV1(_Model):
+    """Receipt-safe commitment to one verified immutable OCI image policy.
+
+    Runtime executor receipts must prove the exact selected OCI chain without
+    embedding a second copy of the signed resolver attestation.  The full
+    attestation remains inside the descriptor-safely loaded signed policy;
+    this compact projection binds that policy's canonical hash and every
+    identity digest needed to inspect the target container.
+    """
+
+    schema_version: Literal["rsd.docker-image-policy-binding.v1"]
+    image_policy_sha256: str = Field(pattern=_SHA256)
+    resolution_attestation_sha256: str = Field(pattern=_SHA256)
+    image: ImageReferenceV1
+    registry_index_digest_sha256: str = Field(pattern=_SHA256)
+    linux_amd64_manifest_digest_sha256: str = Field(pattern=_SHA256)
+    config_digest_sha256: str = Field(pattern=_SHA256)
+    platform: Literal["linux/amd64"]
+
+    @model_validator(mode="after")
+    def exact_immutable_projection(self) -> Self:
+        index_digest = self.image.reference.rsplit("@", 1)[1].removeprefix("sha256:")
+        if (
+            index_digest != self.registry_index_digest_sha256
+            or len(
+                {
+                    self.image_policy_sha256,
+                    self.resolution_attestation_sha256,
+                    self.registry_index_digest_sha256,
+                    self.linux_amd64_manifest_digest_sha256,
+                    self.config_digest_sha256,
+                }
+            )
+            != 5
+        ):
+            raise ValueError("Docker image policy binding is invalid")
+        return self
+
+
+def docker_image_policy_binding(policy: DockerImagePolicyV1) -> DockerImagePolicyBindingV1:
+    """Return the only receipt-safe projection of a verified image policy."""
+
+    if type(policy) is not DockerImagePolicyV1:
+        raise ValueError("Docker image policy binding is invalid")
+    return DockerImagePolicyBindingV1(
+        schema_version="rsd.docker-image-policy-binding.v1",
+        image_policy_sha256=canonical_sha256(policy),
+        resolution_attestation_sha256=canonical_sha256(policy.resolution_attestation),
+        image=policy.image,
+        registry_index_digest_sha256=policy.registry_index_digest_sha256,
+        linux_amd64_manifest_digest_sha256=policy.linux_amd64_manifest_digest_sha256,
+        config_digest_sha256=policy.config_digest_sha256,
+        platform="linux/amd64",
+    )
+
+
+def expected_docker_image_local_evidence(policy: DockerImagePolicyV1) -> DockerImageLocalEvidenceV1:
+    """Return the exact receipt projection required after both local inspections.
+
+    This is deliberately a pure policy projection.  A concrete Engine adapter
+    must still perform each signed reference inspection before it may report
+    this value; authorizers use the same projection to reject an executor
+    receipt whose selected index, manifest, config, platform, or resolver
+    attestation binding differs from the persisted signed policy.
+    """
+
+    if type(policy) is not DockerImagePolicyV1:
+        raise ValueError("Docker local image evidence is invalid")
+    try:
+        repository = policy.image.reference.rsplit("@", 1)[0]
+        manifest = ImageReferenceV1(
+            reference=f"{repository}@sha256:{policy.linux_amd64_manifest_digest_sha256}"
+        )
+        return DockerImageLocalEvidenceV1(
+            schema_version="rsd.docker-image-local-evidence.v1",
+            resolution_attestation_sha256=canonical_sha256(policy.resolution_attestation),
+            registry_index_reference=policy.image,
+            linux_amd64_manifest_reference=manifest,
+            registry_index_digest_sha256=policy.registry_index_digest_sha256,
+            linux_amd64_manifest_digest_sha256=policy.linux_amd64_manifest_digest_sha256,
+            config_digest_sha256=policy.config_digest_sha256,
+            index_reference_inspected=True,
+            platform_manifest_reference_inspected=True,
+            operating_system="linux",
+            architecture="amd64",
+        )
+    except (TypeError, ValueError):
+        raise ValueError("Docker local image evidence is invalid") from None
 
 
 class _DockerUnixSocketIdentityProjectionV1(_Model):
@@ -1374,6 +1585,7 @@ class DockerEngineControlPolicyV1(_Model):
             "engine_version",
             "engine_info",
             "image_inspect",
+            "image_manifest_inspect",
             "network_create",
             "network_inspect",
             "volume_create",
@@ -1388,8 +1600,10 @@ class DockerEngineControlPolicyV1(_Model):
     max_request_bytes: int = Field(ge=1, le=131_072)
     max_response_bytes: int = Field(ge=1, le=1_048_576)
     max_hijack_bytes: int = Field(ge=1, le=1_048_576)
+    max_hijack_frames: int = Field(ge=1, le=65_536)
     request_timeout_seconds: int = Field(ge=1, le=60)
     hijack_timeout_seconds: int = Field(ge=1, le=60)
+    hijack_absolute_timeout_seconds: int = Field(ge=1, le=300)
     created_at: str
     signer_key_id: str = Field(pattern=_IDENTIFIER)
     signature_base64: str = Field(min_length=4, max_length=256)
@@ -1412,6 +1626,7 @@ class DockerEngineControlPolicyV1(_Model):
             "engine_version",
             "engine_info",
             "image_inspect",
+            "image_manifest_inspect",
             "network_create",
             "network_inspect",
             "volume_create",
@@ -1427,6 +1642,7 @@ class DockerEngineControlPolicyV1(_Model):
             or self.engine_fingerprint_sha256
             != docker_engine_fingerprint_sha256(self.engine_projection)
             or self.max_response_bytes < self.max_request_bytes
+            or self.hijack_absolute_timeout_seconds < self.hijack_timeout_seconds
             or len(_canonical_base64_bytes(self.signature_base64)) != 64
         ):
             raise ValueError("Docker Engine control policy is invalid")
@@ -2356,6 +2572,7 @@ class AllocationExecutorReceiptV1(_Model):
     postgres_prepared_control_policy_sha256: str = Field(pattern=_SHA256)
     host_fingerprint_sha256: str = Field(pattern=_SHA256)
     engine: EngineIdentityObservationV1
+    control_image_local_evidence: DockerImageLocalEvidenceV1
     allocated_resources: AllocatedResourceSetV2
     allocated_resources_projection_sha256: str = Field(pattern=_SHA256)
     engine_operation_journal_sha256: str = Field(pattern=_SHA256)
@@ -2614,6 +2831,7 @@ class PostgreSQLLoginTransitionIntentV1(_Model):
     system_identifier: str = Field(pattern=r"^[0-9]{8,32}$")
     database_name: str = Field(pattern=_IDENTIFIER)
     database_oid: int = Field(ge=1)
+    schema_oid: int = Field(ge=1)
     owner_role: str = Field(pattern=_IDENTIFIER)
     owner_role_oid: int = Field(ge=1)
     application_role: str = Field(pattern=_IDENTIFIER)
@@ -2649,6 +2867,7 @@ class PostgreSQLLoginTransitionReceiptV1(_Model):
     system_identifier: str = Field(pattern=r"^[0-9]{8,32}$")
     database_name: str = Field(pattern=_IDENTIFIER)
     database_oid: int = Field(ge=1)
+    schema_oid: int = Field(ge=1)
     owner_role: str = Field(pattern=_IDENTIFIER)
     owner_role_oid: int = Field(ge=1)
     application_role: str = Field(pattern=_IDENTIFIER)
@@ -2859,6 +3078,7 @@ class PostgreSQLRuntimeDatabaseIdentityV1(_Model):
 
     database_identity: Literal["primary_database", "restore_database"]
     observation_binding_sha256: str = Field(pattern=_SHA256)
+    schema_oid: int = Field(ge=1)
     login_transition: PostgreSQLLoginTransitionIntentV1
     connection_uri: PostgreSQLConnectionUriGrammarV1
 
@@ -2866,6 +3086,7 @@ class PostgreSQLRuntimeDatabaseIdentityV1(_Model):
     def exact_observed_identity(self) -> Self:
         if (
             self.login_transition.database_identity != self.database_identity
+            or self.login_transition.schema_oid != self.schema_oid
             or self.connection_uri.database_identity != self.database_identity
             or self.connection_uri.database_name != self.login_transition.database_name
             or self.connection_uri.application_role != self.login_transition.application_role
@@ -4575,7 +4796,7 @@ class NoHostPublicationEvidenceV1(_Model):
 class ContainerBootstrapInspectionV1(_Model):
     """Explicit engine inspection fields required after a future container start."""
 
-    image_policy: DockerImagePolicyV1
+    image_policy_binding: DockerImagePolicyBindingV1
     entrypoint: tuple[str, ...] = Field(min_length=1, max_length=16)
     command: tuple[str, ...] = Field(default=(), max_length=32)
     entrypoint_sha256: str = Field(pattern=_SHA256)
@@ -4673,7 +4894,7 @@ class RuntimeContainerObservationV1(_Model):
     container_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     image: ImageReferenceV1
     config_sha256: str = Field(pattern=_SHA256)
-    image_policy: DockerImagePolicyV1
+    image_policy_binding: DockerImagePolicyBindingV1
     attachments: tuple[RuntimeNetworkAttachmentV1, ...] = Field(min_length=1, max_length=1)
     no_host_publication: NoHostPublicationEvidenceV1
     inspection: ContainerBootstrapInspectionV1
@@ -4686,8 +4907,8 @@ class RuntimeContainerObservationV1(_Model):
     @model_validator(mode="after")
     def image_chain_is_explicit(self) -> Self:
         if (
-            self.image_policy.image != self.image
-            or self.image_policy.config_digest_sha256 != self.config_sha256
+            self.image_policy_binding.image != self.image
+            or self.image_policy_binding.config_digest_sha256 != self.config_sha256
         ):
             raise ValueError("runtime image identity is invalid")
         return self
@@ -5369,6 +5590,14 @@ def validate_observed_runtime_transition(
         != proposal.candidate.postgres.system_identifier
         or allocation.allocated_resources.postgres.database_oid
         != proposal.candidate.postgres.database_oid
+        or intent.postgres_login_transitions.primary_database.schema_oid
+        != allocation.allocated_resources.postgres.schema_oid
+        or intent.postgres_login_transitions.restore_database.schema_oid
+        != restore_database.restore_database.schema_oid
+        or receipt.postgres_login_transitions.primary_database.schema_oid
+        != intent.postgres_login_transitions.primary_database.schema_oid
+        or receipt.postgres_login_transitions.restore_database.schema_oid
+        != intent.postgres_login_transitions.restore_database.schema_oid
     ):
         raise ValueError("runtime observation transition is invalid")
 

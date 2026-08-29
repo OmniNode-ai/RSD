@@ -15,6 +15,7 @@ secret frame can cross the boundary.
 from __future__ import annotations
 
 import json
+import math
 import struct
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
@@ -39,6 +40,7 @@ _FRAME_VERSION: Final = 1
 _HEADER: Final = struct.Struct("!4sBBI")
 _HEADER_BYTES: Final = _HEADER.size
 _CHUNK_ORDINAL: Final = struct.Struct("!H")
+_ATTACH_DEADLINE_CAPABILITY: Final = object()
 
 
 class ContainerAttachError(RuntimeError):
@@ -76,9 +78,11 @@ class ContainerAttachSessionState(StrEnum):
     REQUEST_SENT = "request_sent"
     READY_RECEIVED = "ready_received"
     CLAIM_SENT = "claim_sent"
+    CLAIM_ATTEMPTED = "claim_attempted"
     CHUNKS_SENT = "chunks_sent"
     TERMINAL_ACK_RECEIVED = "terminal_ack_received"
     CLOSED = "closed"
+    REJECTED = "rejected"
     AMBIGUOUS = "ambiguous"
 
 
@@ -91,13 +95,18 @@ class AttachMonotonicClock(Protocol):
 class AttachDeadlineReader(Protocol):
     """A bounded reader that fails itself once an absolute deadline expires."""
 
-    def read(self, count: int, *, deadline: float) -> bytes: ...
+    def read(self, count: int, *, deadline: ContainerAttachDeadlineV1) -> bytes: ...
 
 
 class AttachDeadlineWriter(Protocol):
     """A bounded writer that fails itself once an absolute deadline expires."""
 
-    def write(self, data: bytes | bytearray | memoryview, *, deadline: float) -> object: ...
+    def write(
+        self,
+        data: bytes | bytearray | memoryview,
+        *,
+        deadline: ContainerAttachDeadlineV1,
+    ) -> object: ...
 
 
 class ContainerAttachNonceClaimResult(StrEnum):
@@ -106,6 +115,15 @@ class ContainerAttachNonceClaimResult(StrEnum):
     CLAIMED = "claimed"
     REPLAYED = "replayed"
     UNAVAILABLE = "unavailable"
+
+
+class _NonceClaimAmbiguous(Exception):
+    """A durable claim may have committed before its collaborator failed.
+
+    This internal marker deliberately carries no collaborator exception.  The
+    public boundary turns it into a fixed, value-free error only after leaving
+    the collaborator's exception scope.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,9 +139,17 @@ class ContainerAttachNonceClaimV1:
 
 
 class ContainerAttachNonceAuthority(Protocol):
-    """Durable atomic replay authority required before secret delivery."""
+    """Durable atomic replay authority required before secret delivery.
 
-    def claim_once(self, claim: ContainerAttachNonceClaimV1) -> ContainerAttachNonceClaimResult: ...
+    The attached daemon must honor the supplied absolute deadline.  A future
+    production UDS adapter must implement this with cancellation-capable I/O;
+    the framing contract does not pretend that an arbitrary blocking Python
+    collaborator can be forcibly timed out.
+    """
+
+    def claim_once(
+        self, claim: ContainerAttachNonceClaimV1, *, deadline: ContainerAttachDeadlineV1
+    ) -> ContainerAttachNonceClaimResult: ...
 
 
 class ContainerAttachSecretSink(Protocol):
@@ -135,6 +161,109 @@ class ContainerAttachSecretSink(Protocol):
 def _zeroize(buffer: bytearray) -> None:
     for index in range(len(buffer)):
         buffer[index] = 0
+
+
+def _zeroize_discoverable_buffers(value: object, *, _seen: set[int] | None = None) -> None:
+    """Best-effort scrub exact mutable buffers in rejected runtime shapes.
+
+    ``write_secret_chunks`` has an exact-tuple public contract, but Python
+    callers can still pass a list or a malformed nested collection at runtime.
+    Rejecting that input must not strand a readily discoverable ``bytearray``
+    containing a secret.  Traverse only built-in, non-callback container
+    shapes; arbitrary iterables are intentionally not invoked during an error
+    path.  Immutable ``bytes`` are never mutated.
+    """
+
+    seen = set() if _seen is None else _seen
+    identity = id(value)
+    if identity in seen:
+        return
+    seen.add(identity)
+    if type(value) is bytearray:
+        _zeroize(value)
+        return
+    if type(value) in {list, tuple}:
+        for item in cast(list[object] | tuple[object, ...], value):
+            _zeroize_discoverable_buffers(item, _seen=seen)
+        return
+    if type(value) is dict:
+        for key, item in cast(dict[object, object], value).items():
+            _zeroize_discoverable_buffers(key, _seen=seen)
+            _zeroize_discoverable_buffers(item, _seen=seen)
+
+
+def _valid_monotonic(value: object) -> bool:
+    """Accept only a finite exact float from the deadline clock."""
+
+    return type(value) is float and math.isfinite(value) and value >= 0.0
+
+
+class _MonotonicGuard:
+    """Reject non-finite or backward clock observations within one session."""
+
+    __slots__ = ("_clock", "_last")
+
+    def __init__(self, clock: AttachMonotonicClock) -> None:
+        self._clock = clock
+        self._last: float | None = None
+
+    def now(self, *, phase: str) -> float:
+        failed = False
+        value = 0.0
+        try:
+            value = self._clock.monotonic()
+        except Exception:
+            failed = True
+        if failed or not _valid_monotonic(value) or (self._last is not None and value < self._last):
+            raise _fresh_error(phase)
+        self._last = value
+        return value
+
+
+class ContainerAttachDeadlineV1:
+    """Opaque, non-extendable deadline capability for one attach phase.
+
+    Public collaborators receive this capability rather than a mutable or
+    caller-selected float.  They can obtain only the current remaining budget
+    for a cancellation-capable operation; they cannot construct, extend, or
+    substitute an absolute deadline.  The framing layer still checks before
+    and after every collaborator call, so a non-cooperative blocking adapter
+    fails closed when it eventually returns.  A production UDS adapter must
+    use ``remaining_seconds`` with nonblocking/select/cancellation I/O.
+    """
+
+    __slots__ = ("__expires_at", "__guard")
+
+    def __init__(
+        self,
+        guard: _MonotonicGuard,
+        expires_at: float,
+        *,
+        _capability: object,
+    ) -> None:
+        if _capability is not _ATTACH_DEADLINE_CAPABILITY:
+            raise TypeError("container attach deadline is internally issued")
+        self.__guard = guard
+        self.__expires_at = expires_at
+
+    def _require_before(self, *, phase: str) -> float:
+        now = self.__guard.now(phase=phase)
+        if now >= self.__expires_at:
+            raise _fresh_error(phase)
+        remaining = self.__expires_at - now
+        if not _valid_monotonic(remaining) or remaining <= 0.0:
+            raise _fresh_error(phase)
+        return remaining
+
+    def _issued_by(self, guard: _MonotonicGuard) -> bool:
+        """Allow the framing layer to bind a token to its issuing session."""
+
+        return self.__guard is guard
+
+    def remaining_seconds(self) -> float:
+        """Return the current budget for a bounded collaborator operation."""
+
+        return self._require_before(phase="deadline")
 
 
 def _canonical_metadata(model: BaseModel) -> bytes:
@@ -214,33 +343,51 @@ def _strict_model[ModelType: BaseModel](
     return canonical
 
 
-def _deadline(clock: AttachMonotonicClock, seconds: int, *, phase: str) -> float:
+def _deadline(clock: _MonotonicGuard, seconds: int, *, phase: str) -> ContainerAttachDeadlineV1:
     failed = False
     now = 0.0
     try:
-        now = clock.monotonic()
+        now = clock.now(phase=phase)
     except Exception:
         failed = True
-    if failed or type(now) is not float or now < 0.0:
+    if failed or not _valid_monotonic(now):
         raise _fresh_error(phase)
-    return now + float(seconds)
+    deadline = now + float(seconds)
+    if not _valid_monotonic(deadline) or deadline < now:
+        raise _fresh_error(phase)
+    return ContainerAttachDeadlineV1(
+        clock,
+        deadline,
+        _capability=_ATTACH_DEADLINE_CAPABILITY,
+    )
 
 
-def _require_before(clock: AttachMonotonicClock, deadline: float, *, phase: str) -> None:
+def _require_before(
+    clock: _MonotonicGuard,
+    deadline: ContainerAttachDeadlineV1,
+    *,
+    phase: str,
+) -> None:
     failed = False
-    now = 0.0
     try:
-        now = clock.monotonic()
+        if type(deadline) is not ContainerAttachDeadlineV1:
+            raise ValueError
+        # The capability is issued by this exact session guard.  No caller can
+        # pass a deadline minted from a different clock/session to extend an
+        # operation's signed phase budget.
+        if not deadline._issued_by(clock):
+            raise ValueError
+        deadline._require_before(phase=phase)
     except Exception:
         failed = True
-    if failed or type(now) is not float or now < 0.0 or now >= deadline:
+    if failed:
         raise _fresh_error(phase)
 
 
 def _read_exact(
     reader: AttachDeadlineReader,
-    clock: AttachMonotonicClock,
-    deadline: float,
+    clock: _MonotonicGuard,
+    deadline: ContainerAttachDeadlineV1,
     count: int,
     *,
     mutable: bool,
@@ -274,8 +421,8 @@ def _read_exact(
 
 def _write(
     writer: AttachDeadlineWriter,
-    clock: AttachMonotonicClock,
-    deadline: float,
+    clock: _MonotonicGuard,
+    deadline: ContainerAttachDeadlineV1,
     data: bytes | bytearray | memoryview,
     *,
     phase: str,
@@ -294,8 +441,8 @@ def _write(
 
 def _write_frame(
     writer: AttachDeadlineWriter,
-    clock: AttachMonotonicClock,
-    deadline: float,
+    clock: _MonotonicGuard,
+    deadline: ContainerAttachDeadlineV1,
     *,
     protocol: ContainerBootstrapAttachProtocolV1,
     frame_type: ContainerAttachFrameType,
@@ -314,8 +461,8 @@ def _write_frame(
 
 def _read_frame(
     reader: AttachDeadlineReader,
-    clock: AttachMonotonicClock,
-    deadline: float,
+    clock: _MonotonicGuard,
+    deadline: ContainerAttachDeadlineV1,
     *,
     protocol: ContainerBootstrapAttachProtocolV1,
     expected_type: ContainerAttachFrameType,
@@ -350,8 +497,8 @@ def _read_frame(
 
 def _read_metadata[ModelType: BaseModel](
     reader: AttachDeadlineReader,
-    clock: AttachMonotonicClock,
-    deadline: float,
+    clock: _MonotonicGuard,
+    deadline: ContainerAttachDeadlineV1,
     *,
     protocol: ContainerBootstrapAttachProtocolV1,
     frame_type: ContainerAttachFrameType,
@@ -381,8 +528,8 @@ def _read_metadata[ModelType: BaseModel](
 
 def _write_secret_frame(
     writer: AttachDeadlineWriter,
-    clock: AttachMonotonicClock,
-    deadline: float,
+    clock: _MonotonicGuard,
+    deadline: ContainerAttachDeadlineV1,
     *,
     protocol: ContainerBootstrapAttachProtocolV1,
     ordinal: int,
@@ -403,8 +550,8 @@ def _write_secret_frame(
 
 def _read_secret_chunk(
     reader: AttachDeadlineReader,
-    clock: AttachMonotonicClock,
-    deadline: float,
+    clock: _MonotonicGuard,
+    deadline: ContainerAttachDeadlineV1,
     *,
     protocol: ContainerBootstrapAttachProtocolV1,
     expected_ordinal: int,
@@ -486,12 +633,13 @@ def read_container_attach_request(
     """
 
     checked_protocol, checked_expected = _require_protocol_and_request(protocol, expected_request)
+    deadline_guard = _MonotonicGuard(deadline_clock)
     deadline = _deadline(
-        deadline_clock, checked_protocol.ready_timeout_seconds, phase="attach_request"
+        deadline_guard, checked_protocol.ready_timeout_seconds, phase="attach_request"
     )
     incoming = _read_metadata(
         reader,
-        deadline_clock,
+        deadline_guard,
         deadline,
         protocol=checked_protocol,
         frame_type=ContainerAttachFrameType.REQUEST,
@@ -581,17 +729,17 @@ def _claim_nonce(
     request: ContainerAttachRequestV1,
     *,
     boundary: str,
-) -> None:
+    deadline: ContainerAttachDeadlineV1,
+) -> ContainerAttachNonceClaimResult:
     outcome: ContainerAttachNonceClaimResult | None = None
     failed = False
     try:
-        outcome = authority.claim_once(_nonce_claim(request, boundary=boundary))
+        outcome = authority.claim_once(_nonce_claim(request, boundary=boundary), deadline=deadline)
     except Exception:
         failed = True
-    if failed or outcome is ContainerAttachNonceClaimResult.UNAVAILABLE:
-        raise _fresh_error("nonce_authority")
-    if outcome is not ContainerAttachNonceClaimResult.CLAIMED:
-        raise _fresh_error("replay")
+    if failed or type(outcome) is not ContainerAttachNonceClaimResult:
+        raise _NonceClaimAmbiguous
+    return outcome
 
 
 def consume_container_attach_secret_chunks(
@@ -615,17 +763,34 @@ def consume_container_attach_secret_chunks(
     checked_protocol, checked_request = _require_protocol_and_request(protocol, request)
     checked_claim = _strict_model(claim, ContainerAttachClaimV1, phase="claim")
     _validate_claim(checked_claim, request=checked_request)
+    deadline_guard = _MonotonicGuard(deadline_clock)
     deadline = _deadline(
-        deadline_clock, checked_protocol.claim_timeout_seconds, phase="secret_chunk"
+        deadline_guard, checked_protocol.claim_timeout_seconds, phase="secret_chunk"
     )
-    _claim_nonce(nonce_authority, checked_request, boundary="container_receive_v1")
+    nonce_claim_ambiguous = False
+    nonce_outcome: ContainerAttachNonceClaimResult | None = None
+    try:
+        nonce_outcome = _claim_nonce(
+            nonce_authority,
+            checked_request,
+            boundary="container_receive_v1",
+            deadline=deadline,
+        )
+    except _NonceClaimAmbiguous:
+        nonce_claim_ambiguous = True
+    if nonce_claim_ambiguous:
+        raise _fresh_error("nonce_authority")
+    if nonce_outcome is ContainerAttachNonceClaimResult.UNAVAILABLE:
+        raise _fresh_error("nonce_authority")
+    if nonce_outcome is not ContainerAttachNonceClaimResult.CLAIMED:
+        raise _fresh_error("replay")
     failure_phase: str | None = None
     for descriptor in checked_request.fields:
         buffer: bytearray | None = None
         try:
             buffer = _read_secret_chunk(
                 reader,
-                deadline_clock,
+                deadline_guard,
                 deadline,
                 protocol=checked_protocol,
                 expected_ordinal=descriptor.ordinal,
@@ -662,7 +827,7 @@ class ContainerAttachDaemonSession:
     retry, resume, adoption, or replay path.
     """
 
-    __slots__ = ("_deadline_clock", "_nonce_authority", "_protocol", "_request", "_state")
+    __slots__ = ("_deadline_guard", "_nonce_authority", "_protocol", "_request", "_state")
 
     def __init__(
         self,
@@ -673,7 +838,7 @@ class ContainerAttachDaemonSession:
         nonce_authority: ContainerAttachNonceAuthority,
     ) -> None:
         self._protocol, self._request = _require_protocol_and_request(protocol, request)
-        self._deadline_clock = deadline_clock
+        self._deadline_guard = _MonotonicGuard(deadline_clock)
         self._nonce_authority = nonce_authority
         self._state = ContainerAttachSessionState.NEW
 
@@ -693,11 +858,11 @@ class ContainerAttachDaemonSession:
         if self._state is not ContainerAttachSessionState.NEW:
             raise _fresh_error("state")
         deadline = _deadline(
-            self._deadline_clock, self._protocol.ready_timeout_seconds, phase="request"
+            self._deadline_guard, self._protocol.ready_timeout_seconds, phase="request"
         )
         _write_frame(
             writer,
-            self._deadline_clock,
+            self._deadline_guard,
             deadline,
             protocol=self._protocol,
             frame_type=ContainerAttachFrameType.REQUEST,
@@ -710,14 +875,14 @@ class ContainerAttachDaemonSession:
         if self._state is not ContainerAttachSessionState.REQUEST_SENT:
             raise _fresh_error("state")
         deadline = _deadline(
-            self._deadline_clock, self._protocol.ready_timeout_seconds, phase="ready"
+            self._deadline_guard, self._protocol.ready_timeout_seconds, phase="ready"
         )
         failure_phase: str | None = None
         ready: ContainerAttachReadyV1 | None = None
         try:
             ready = _read_metadata(
                 reader,
-                self._deadline_clock,
+                self._deadline_guard,
                 deadline,
                 protocol=self._protocol,
                 frame_type=ContainerAttachFrameType.READY,
@@ -738,13 +903,13 @@ class ContainerAttachDaemonSession:
             raise _fresh_error("state")
         claim = _expected_claim(self._request)
         deadline = _deadline(
-            self._deadline_clock, self._protocol.claim_timeout_seconds, phase="claim"
+            self._deadline_guard, self._protocol.claim_timeout_seconds, phase="claim"
         )
         failure_phase: str | None = None
         try:
             _write_frame(
                 writer,
-                self._deadline_clock,
+                self._deadline_guard,
                 deadline,
                 protocol=self._protocol,
                 frame_type=ContainerAttachFrameType.CLAIM,
@@ -767,9 +932,13 @@ class ContainerAttachDaemonSession:
         """Stream mutable chunks once, in signed order, then zeroize all input."""
 
         if type(chunks) is not tuple:
+            _zeroize_discoverable_buffers(chunks)
             raise _fresh_error("secret_chunks")
         buffers = chunks
         failure_phase: str | None = None
+        replayed = False
+        nonce_claim_ambiguous = False
+        nonce_outcome: ContainerAttachNonceClaimResult | None = None
         try:
             if self._state is not ContainerAttachSessionState.CLAIM_SENT:
                 raise _fresh_error("state")
@@ -782,30 +951,59 @@ class ContainerAttachDaemonSession:
                 for descriptor, chunk in zip(self._request.fields, chunks, strict=True)
             ):
                 raise _fresh_error("secret_chunk")
-            deadline = _deadline(
-                self._deadline_clock, self._protocol.claim_timeout_seconds, phase="secret_chunk"
-            )
-            _claim_nonce(self._nonce_authority, self._request, boundary="daemon_send_v1")
-            self._state = ContainerAttachSessionState.CHUNKS_SENT
-            for descriptor, chunk in zip(self._request.fields, chunks, strict=True):
+            deadline: ContainerAttachDeadlineV1 | None = None
+            try:
+                deadline = _deadline(
+                    self._deadline_guard,
+                    self._protocol.claim_timeout_seconds,
+                    phase="secret_chunk",
+                )
+            except ContainerAttachError:
+                failure_phase = "secret_chunk"
+            if failure_phase is not None or deadline is None:
+                self._state = ContainerAttachSessionState.AMBIGUOUS
+            else:
+                # A claim call may have committed before its collaborator
+                # raises. Only an exact returned ticket can advance delivery.
+                self._state = ContainerAttachSessionState.CLAIM_ATTEMPTED
                 try:
-                    _write_secret_frame(
-                        writer,
-                        self._deadline_clock,
-                        deadline,
-                        protocol=self._protocol,
-                        ordinal=descriptor.ordinal,
-                        chunk=chunk,
+                    nonce_outcome = _claim_nonce(
+                        self._nonce_authority,
+                        self._request,
+                        boundary="daemon_send_v1",
+                        deadline=deadline,
                     )
-                except Exception:
-                    # A writer is a collaborator.  Its ContainerAttachError
-                    # phase is not a public protocol field.
-                    failure_phase = "frame_write"
-                    break
+                except _NonceClaimAmbiguous:
+                    nonce_claim_ambiguous = True
+                if nonce_claim_ambiguous or (
+                    nonce_outcome is ContainerAttachNonceClaimResult.UNAVAILABLE
+                ):
+                    self._state = ContainerAttachSessionState.AMBIGUOUS
+                    failure_phase = "nonce_authority"
+                elif nonce_outcome is not ContainerAttachNonceClaimResult.CLAIMED:
+                    self._state = ContainerAttachSessionState.REJECTED
+                    replayed = True
+                else:
+                    self._state = ContainerAttachSessionState.CHUNKS_SENT
+                    for descriptor, chunk in zip(self._request.fields, chunks, strict=True):
+                        try:
+                            _write_secret_frame(
+                                writer,
+                                self._deadline_guard,
+                                deadline,
+                                protocol=self._protocol,
+                                ordinal=descriptor.ordinal,
+                                chunk=chunk,
+                            )
+                        except Exception:
+                            # A writer is a collaborator. Its
+                            # ContainerAttachError phase is not a public field.
+                            failure_phase = "frame_write"
+                            break
         finally:
-            for buffer in buffers:
-                if type(buffer) is bytearray:
-                    _zeroize(buffer)
+            _zeroize_discoverable_buffers(buffers)
+        if replayed:
+            raise _fresh_error("replay")
         if failure_phase is not None:
             self._state = ContainerAttachSessionState.AMBIGUOUS
             raise _fresh_error(failure_phase)
@@ -815,15 +1013,15 @@ class ContainerAttachDaemonSession:
             raise _fresh_error("state")
         failure_phase: str | None = None
         ack: ContainerAttachTerminalAckV1 | None = None
-        deadline = _deadline(
-            self._deadline_clock,
-            self._protocol.terminal_ack_timeout_seconds,
-            phase="terminal_ack",
-        )
         try:
+            deadline = _deadline(
+                self._deadline_guard,
+                self._protocol.terminal_ack_timeout_seconds,
+                phase="terminal_ack",
+            )
             ack = _read_metadata(
                 reader,
-                self._deadline_clock,
+                self._deadline_guard,
                 deadline,
                 protocol=self._protocol,
                 frame_type=ContainerAttachFrameType.TERMINAL_ACK,
@@ -848,15 +1046,15 @@ class ContainerAttachDaemonSession:
         if self._state is not ContainerAttachSessionState.TERMINAL_ACK_RECEIVED:
             raise _fresh_error("state")
         failure_phase: str | None = None
-        deadline = _deadline(
-            self._deadline_clock,
-            self._protocol.terminal_ack_timeout_seconds,
-            phase="eof",
-        )
         try:
-            _require_before(self._deadline_clock, deadline, phase="eof")
+            deadline = _deadline(
+                self._deadline_guard,
+                self._protocol.terminal_ack_timeout_seconds,
+                phase="eof",
+            )
+            _require_before(self._deadline_guard, deadline, phase="eof")
             trailing = reader.read(1, deadline=deadline)
-            _require_before(self._deadline_clock, deadline, phase="eof")
+            _require_before(self._deadline_guard, deadline, phase="eof")
             if type(trailing) is not bytes or trailing != b"":
                 raise _fresh_error("trailing_data")
         except ContainerAttachError:
