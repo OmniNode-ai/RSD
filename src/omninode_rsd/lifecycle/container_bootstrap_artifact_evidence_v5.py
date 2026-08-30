@@ -21,7 +21,7 @@ import binascii
 import hashlib
 import json
 import re
-from typing import Final, Literal, NoReturn, Self, cast
+from typing import Any, Final, Literal, NoReturn, Self, cast
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -73,6 +73,10 @@ _DOMAIN_ATTESTATION_HASH: Final = (
 )
 _DOMAIN_CLOSURE: Final = b"omninode-rsd.container-bootstrap-artifact-evidence-closure.sha256.v5\x00"
 _DOMAIN_CONTEXT: Final = b"omninode-rsd.container-bootstrap-artifact-evidence-context.sha256.v5\x00"
+_DOMAIN_ACCEPTANCE_HASH: Final = (
+    b"omninode-rsd.container-bootstrap-artifact-evidence-acceptance.sha256.v5\x00"
+)
+_MISSING_MODEL_STATE: Final = object()
 _COMPONENTS: Final = (
     "primary_infisical",
     "primary_valkey",
@@ -660,6 +664,41 @@ class ContainerBootstrapArtifactEvidenceAcceptanceV5(_Model):
             raise ValueError("acceptance is invalid")
         return value
 
+    @classmethod
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: Any) -> Self:
+        """Construct only a complete, exact acceptance record."""
+        declared_fields = set(cls.model_fields)
+        if (
+            set(values) != declared_fields
+            or (_fields_set is not None and type(_fields_set) is not set)
+            or (_fields_set is not None and _fields_set != declared_fields)
+        ):
+            raise ValueError("acceptance is invalid")
+        return super().model_construct(_fields_set=declared_fields, **values)
+
+
+def _strict_acceptance(
+    acceptance: ContainerBootstrapArtifactEvidenceAcceptanceV5,
+) -> ContainerBootstrapArtifactEvidenceAcceptanceV5:
+    """Reject in-memory state that canonical JSON would otherwise omit."""
+    if type(acceptance) is not ContainerBootstrapArtifactEvidenceAcceptanceV5:
+        raise ValueError("acceptance is invalid")
+    model_state = getattr(acceptance, "__dict__", _MISSING_MODEL_STATE)
+    extra_state = getattr(acceptance, "__pydantic_extra__", _MISSING_MODEL_STATE)
+    private_state = getattr(acceptance, "__pydantic_private__", _MISSING_MODEL_STATE)
+    fields_set = getattr(acceptance, "__pydantic_fields_set__", _MISSING_MODEL_STATE)
+    if (
+        type(model_state) is not dict
+        or set(cast(dict[str, object], model_state))
+        != set(ContainerBootstrapArtifactEvidenceAcceptanceV5.model_fields)
+        or extra_state is not None
+        or private_state is not None
+        or type(fields_set) is not set
+        or fields_set != set(ContainerBootstrapArtifactEvidenceAcceptanceV5.model_fields)
+    ):
+        raise ValueError("acceptance is invalid")
+    return _strict(acceptance, ContainerBootstrapArtifactEvidenceAcceptanceV5)
+
 
 def strict_canonical_container_bootstrap_build_worker_trust_policy_v5(
     policy: ContainerBootstrapBuildWorkerTrustPolicyV5,
@@ -754,6 +793,36 @@ def parse_container_bootstrap_artifact_evidence_closure_v5_canonical_json(
     try:
         return _parse(payload, ContainerBootstrapArtifactEvidenceClosureV5)
     except ValueError:
+        _fail()
+
+
+def container_bootstrap_artifact_evidence_acceptance_v5_canonical_json(
+    acceptance: ContainerBootstrapArtifactEvidenceAcceptanceV5,
+) -> bytes:
+    try:
+        return _canonical(_strict_acceptance(acceptance))
+    except (TypeError, ValueError):
+        _fail()
+
+
+def parse_container_bootstrap_artifact_evidence_acceptance_v5_canonical_json(
+    payload: bytes,
+) -> ContainerBootstrapArtifactEvidenceAcceptanceV5:
+    try:
+        return _strict_acceptance(_parse(payload, ContainerBootstrapArtifactEvidenceAcceptanceV5))
+    except ValueError:
+        _fail()
+
+
+def container_bootstrap_artifact_evidence_acceptance_v5_sha256(
+    acceptance: ContainerBootstrapArtifactEvidenceAcceptanceV5,
+) -> str:
+    try:
+        return _hash(
+            _DOMAIN_ACCEPTANCE_HASH,
+            _strict_acceptance(acceptance),
+        )
+    except (TypeError, ValueError):
         _fail()
 
 

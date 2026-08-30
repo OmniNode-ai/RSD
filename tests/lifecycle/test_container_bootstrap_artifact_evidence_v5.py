@@ -711,3 +711,137 @@ def test_v5_worker_closure_canonical_parser_rejects_noncanonical_and_oversize() 
         )
     with pytest.raises(evidence.ContainerBootstrapArtifactEvidenceV5Error):
         evidence.parse_container_bootstrap_artifact_evidence_closure_v5_canonical_json(b'{"x":1.0}')
+
+
+def test_v5_acceptance_canonical_serialization_is_strict_and_domain_separated() -> None:
+    closure, policy, profile_envelope, profile_anchor, _ = _closure()
+    acceptance = _validate(closure, policy, profile_envelope, profile_anchor)
+    payload = evidence.container_bootstrap_artifact_evidence_acceptance_v5_canonical_json(
+        acceptance
+    )
+
+    assert (
+        evidence.parse_container_bootstrap_artifact_evidence_acceptance_v5_canonical_json(payload)
+        == acceptance
+    )
+    assert (
+        evidence.container_bootstrap_artifact_evidence_acceptance_v5_canonical_json(
+            _validate(closure, policy, profile_envelope, profile_anchor)
+        )
+        == payload
+    )
+    assert evidence.container_bootstrap_artifact_evidence_acceptance_v5_sha256(acceptance) == (
+        hashlib.sha256(
+            b"omninode-rsd.container-bootstrap-artifact-evidence-acceptance.sha256.v5\0" + payload
+        ).hexdigest()
+    )
+    assert evidence.container_bootstrap_artifact_evidence_acceptance_v5_sha256(acceptance) != (
+        hashlib.sha256(payload).hexdigest()
+    )
+
+    valid_constructed = evidence.ContainerBootstrapArtifactEvidenceAcceptanceV5.model_construct(
+        **acceptance.model_dump(mode="python")
+    )
+    assert (
+        evidence.container_bootstrap_artifact_evidence_acceptance_v5_canonical_json(
+            valid_constructed
+        )
+        == payload
+    )
+    with pytest.raises(ValueError):
+        evidence.ContainerBootstrapArtifactEvidenceAcceptanceV5.model_construct(
+            **{**acceptance.model_dump(mode="python"), "unexpected": True}
+        )
+
+    constructed = evidence.ContainerBootstrapArtifactEvidenceAcceptanceV5.model_construct(
+        **{**acceptance.model_dump(mode="python"), "non_authorizing": 1}
+    )
+    copied_with_extra = acceptance.model_copy(update={"unexpected": True})
+    manual_extra = acceptance.model_copy()
+    manual_extra.__dict__["unexpected"] = True
+    constructed_with_extra = (
+        evidence.ContainerBootstrapArtifactEvidenceAcceptanceV5.model_construct(
+            **acceptance.model_dump(mode="python")
+        )
+    )
+    constructed_with_extra.__dict__["unexpected"] = True
+    pydantic_extra = acceptance.model_copy()
+    object.__setattr__(pydantic_extra, "__pydantic_extra__", {"unexpected": True})
+    empty_pydantic_extra = acceptance.model_copy()
+    object.__setattr__(empty_pydantic_extra, "__pydantic_extra__", {})
+    private_metadata = acceptance.model_copy()
+    object.__setattr__(private_metadata, "__pydantic_private__", {"unexpected": True})
+    empty_private_metadata = acceptance.model_copy()
+    object.__setattr__(empty_private_metadata, "__pydantic_private__", {})
+    missing_field_set = acceptance.model_copy()
+    missing_field_set.__pydantic_fields_set__.remove("attach_allowed")
+    unexpected_field_set = acceptance.model_copy()
+    unexpected_field_set.__pydantic_fields_set__.add("unexpected")
+    for candidate in (
+        closure,
+        constructed,
+        copied_with_extra,
+        manual_extra,
+        constructed_with_extra,
+        pydantic_extra,
+        empty_pydantic_extra,
+        private_metadata,
+        empty_private_metadata,
+        missing_field_set,
+        unexpected_field_set,
+    ):
+        for operation in (
+            evidence.container_bootstrap_artifact_evidence_acceptance_v5_canonical_json,
+            evidence.container_bootstrap_artifact_evidence_acceptance_v5_sha256,
+        ):
+            with pytest.raises(evidence.ContainerBootstrapArtifactEvidenceV5Error):
+                operation(candidate)  # type: ignore[arg-type]
+
+    for malformed in (
+        payload + b" ",
+        payload.replace(b'"schema_version"', b'"schema\\u005fversion"', 1),
+        payload[:-1] + b',"extra":false}',
+        b'{"closure_sha256":"' + b"a" * 64 + b'","closure_sha256":"' + b"a" * 64 + b'"}',
+        b'{"x":1.0}',
+        b"{" + b'"x":0,' * 100_000 + b'"y":0}',
+    ):
+        with pytest.raises(evidence.ContainerBootstrapArtifactEvidenceV5Error):
+            evidence.parse_container_bootstrap_artifact_evidence_acceptance_v5_canonical_json(
+                malformed
+            )
+
+
+@pytest.mark.parametrize(
+    "internal_attribute",
+    (
+        "__pydantic_extra__",
+        "__pydantic_private__",
+        "__pydantic_fields_set__",
+        "__dict__",
+    ),
+)
+def test_v5_acceptance_deleted_internal_state_fails_closed(internal_attribute: str) -> None:
+    closure, policy, profile_envelope, profile_anchor, _ = _closure()
+    candidate = _validate(closure, policy, profile_envelope, profile_anchor).model_copy()
+    object.__delattr__(candidate, internal_attribute)
+
+    for operation in (
+        evidence.container_bootstrap_artifact_evidence_acceptance_v5_canonical_json,
+        evidence.container_bootstrap_artifact_evidence_acceptance_v5_sha256,
+    ):
+        with pytest.raises(evidence.ContainerBootstrapArtifactEvidenceV5Error):
+            operation(candidate)
+
+
+def test_v5_acceptance_wrong_type_rejects_before_attribute_access() -> None:
+    class HostileWrongType:
+        def __getattribute__(self, _name: str) -> object:
+            raise AssertionError("wrong-type attribute access must not occur")
+
+    hostile = HostileWrongType()
+    for operation in (
+        evidence.container_bootstrap_artifact_evidence_acceptance_v5_canonical_json,
+        evidence.container_bootstrap_artifact_evidence_acceptance_v5_sha256,
+    ):
+        with pytest.raises(evidence.ContainerBootstrapArtifactEvidenceV5Error):
+            operation(hostile)  # type: ignore[arg-type]
