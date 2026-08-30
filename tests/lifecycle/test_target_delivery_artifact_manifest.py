@@ -303,12 +303,24 @@ def test_four_role_manifest_revalidates_original_inputs(tmp_path: Path) -> None:
             anchor=worker_anchors[0],
             run_id=f"b2-run-{ordinal}-one",
             envelope=envelope,
+            derived_repository=(
+                "registry.example"
+                + ":"
+                + str(443)
+                + f"/rsd/{envelope.static_role_profile.component}"
+            ),
         )
         second = evidence_fixture._attestation(
             signing_key=worker_keys[1],
             anchor=worker_anchors[1],
             run_id=f"b2-run-{ordinal}-two",
             envelope=envelope,
+            derived_repository=(
+                "registry.example"
+                + ":"
+                + str(443)
+                + f"/rsd/{envelope.static_role_profile.component}"
+            ),
         )
         closure = evidence.ContainerBootstrapArtifactEvidenceClosureV4(
             schema_version="rsd.container-bootstrap-artifact-evidence-closure.v4",
@@ -561,6 +573,9 @@ def test_four_role_manifest_revalidates_original_inputs(tmp_path: Path) -> None:
 )
 def test_public_vector_revalidates_all_original_chains(mutation: str) -> None:
     raw = _VECTOR.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == (
+        "4b10ec2b37f0768d0a8fa283d5a26cc6020e26a968ebb3928b78d4b8f73c65ed"
+    )
     assert raw.count(b"# gitleaks:allow") == 7
     if any(isinstance(event, AliasEvent) for event in yaml.parse(raw)):
         raise ValueError("YAML aliases are invalid")

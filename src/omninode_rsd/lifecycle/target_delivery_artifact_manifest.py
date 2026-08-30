@@ -37,6 +37,11 @@ from omninode_rsd.lifecycle.container_bootstrap_artifact_evidence_v4 import (
     validate_container_bootstrap_artifact_evidence_closure_v4,
 )
 from omninode_rsd.lifecycle.infisical_disposable import TargetDeliveryMapV1
+from omninode_rsd.lifecycle.oci_repository import (
+    oci_repository_reference_v1,
+    validate_oci_repository_reference_v1,
+    validate_oci_repository_v1,
+)
 from omninode_rsd.lifecycle.target_delivery_map_projection_binding import (
     TargetDeliveryMapProjectionBindingTrustPolicyV1,
     TargetDeliveryMapProjectionBindingV1,
@@ -289,8 +294,8 @@ class TargetDeliveryArtifactSourceSummaryV1(_Model):
 
 class TargetDeliveryArtifactOciSummaryV1(_Model):
     schema_version: Literal["rsd.target-delivery-artifact-oci-summary.v1"]
-    derived_repository: str = Field(min_length=1, max_length=240)
-    derived_reference: str = Field(min_length=80, max_length=280)
+    derived_repository: str = Field(max_length=240)
+    derived_reference: str = Field(max_length=312)
     base_image_policy_sha256: str = Field(pattern=_SHA256)
     base_resolution_attestation_sha256: str = Field(pattern=_SHA256)
     base_registry_index_digest_sha256: str = Field(pattern=_SHA256)
@@ -319,11 +324,25 @@ class TargetDeliveryArtifactOciSummaryV1(_Model):
     cmd_count: int = Field(ge=0, le=64)
     cmd_byte_count: int = Field(ge=2, le=16_640)
 
+    @field_validator("derived_repository")
+    @classmethod
+    def canonical_repository(cls, value: str) -> str:
+        return validate_oci_repository_v1(value)
+
+    @field_validator("derived_reference")
+    @classmethod
+    def canonical_reference(cls, value: str) -> str:
+        return validate_oci_repository_reference_v1(value)
+
     @model_validator(mode="after")
     def coherent_local_sequences(self) -> Self:
         if (
             self.diff_id_count != self.layer_count
             or self.wrapper_layer_ordinal != self.layer_count - 1
+            or self.derived_reference
+            != oci_repository_reference_v1(
+                self.derived_repository, self.linux_amd64_manifest_digest_sha256
+            )
         ):
             raise ValueError("OCI summary is invalid")
         return self
