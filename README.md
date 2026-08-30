@@ -248,6 +248,52 @@ Only `validate_target_delivery_field_matrix_v1` repeats original-evidence
 validation and the caller-pinned signature check. No production consumer,
 callback, or effect API accepts serializer output or acceptance as permission.
 
+## Authored contract set
+
+`src/omninode_rsd/lifecycle/lab_delegation_contract_set.yaml` is an authored
+delivery topology expressed in this package's own vocabulary. It holds only
+authored facts: provider reference identities, the two isolated lane networks
+and their component placements, the PostgreSQL database and role identifiers,
+and the labels behind each opaque upstream commitment. Every canonical
+commitment - reference digests, rendered URI byte counts, material
+fingerprints, the map signature - is recomputed at validation time, and no
+secret value appears in the file. Each secret is named only by its provider
+reference.
+
+Validate it offline:
+
+```sh
+uv run rsd-validate-lab-delegation-contracts
+uv run rsd-validate-lab-delegation-contracts --overlay <addresses.yaml>
+```
+
+The script performs no network, database, container, or provider access. It
+builds and signs a complete `TargetDeliveryMapV1`, verifies that signature
+under a locally generated pinned anchor, projects the ten C0 field rows and
+four directed application dependencies the map implies, and prints an ordered
+transcript of three outcome classes:
+
+- `PASS` - a validator accepted a structure it actually constrains, and the
+  line names the constraint
+- `UNBOUND` - a value the vocabulary accepts without binding it to anything
+  real, so a green run is not evidence about that value
+- `BLOCKED` - a stage that cannot run offline, with the exact missing input
+
+Committed addresses use the documentation ranges, because
+`scripts/ci/validate_public_release.py` rejects any other address in a
+committed file. An operator-owned PostgreSQL authority is therefore supplied at
+validation time through `--overlay`, whose YAML replaces the `addresses` map:
+
+```yaml
+addresses:
+  postgresql_authority: postgresql://<ip-literal>:<port>
+```
+
+`tests/lifecycle/test_lab_delegation_contract_set.py` covers the set from both
+sides. Five wrong contracts and one unpinned signature must be rejected; three
+further cases pass deliberately and record exactly which authored values the
+map binds to nothing.
+
 ## Phase-B authorization
 
 Phase-B has two non-interchangeable authorization stages. Phase-A remains a
