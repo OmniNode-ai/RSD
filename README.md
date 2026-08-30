@@ -186,6 +186,35 @@ builder identities may repeat across roles: each closure still independently
 requires distinct A/B builders, but the same pair may build more than one
 role.
 
+## Phase-B2 V2 target-delivery artifact manifest
+
+`target_delivery_artifact_manifest_v2` revalidates original V4 profile
+envelopes, B1 V1 map-to-projection-to-profile bindings, and one original V5
+two-worker closure for each fixed role. One common caller-pinned B1 V1 policy
+governs only the map-to-projection-to-profile relation and its common V4
+profile root. Four distinct caller-pinned V5 policies govern the four V5
+closures; the V2 signature binds every role and ordinal to its exact V5 policy
+hash, policy ID, epoch, and independence domain. V5 policy provenance is never
+inferred from B1's embedded legacy V4 worker policy.
+
+The four V5 policy IDs and independence domains, all eight worker key IDs,
+public keys, fingerprints, worker identities, authority identities, and run
+IDs are globally distinct. Physical builder identities remain role-local
+assertions: each role requires independent A/B builders, while the same A/B
+builder pair may be reused across roles. V2 requires one common full source
+summary, profile root, and canonical derived OCI repository. OCI repositories
+and role references are worker-asserted diagnostic commitments only; they do
+not authenticate a pull/deploy namespace or authorize a pull, deployment, or
+runtime action.
+
+V2 carries only the redacted V5 OCI-config descriptor media type, digest, and
+size plus commitments and size/count summaries for OCI `Config.User`,
+`Config.WorkingDir`, and `Config.Env`; it carries no raw runtime config, layer
+bytes, or archive bytes. Its manifest and acceptance are
+non-authorizing: every effect boolean is false, there is no operation nonce,
+timestamp, freshness decision, deployment claim, or B1-to-B2 authorization
+back-edge, and later phases must repeat original-evidence validation.
+
 ## Phase-B authorization
 
 Phase-B has two non-interchangeable authorization stages. Phase-A remains a
