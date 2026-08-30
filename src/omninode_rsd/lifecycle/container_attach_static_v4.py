@@ -36,12 +36,21 @@ import math
 import re
 import time
 from datetime import UTC, datetime, timedelta
-from typing import Literal, NoReturn, Self, cast
+from functools import lru_cache
+from typing import Any, Literal, NoReturn, Self, cast
 from urllib.parse import urlsplit
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from omninode_rsd.lifecycle.infisical_disposable import (
     ContainerAttachTicketTrustAnchorV1,
@@ -97,6 +106,7 @@ _MAX_CANONICAL_JSON_NODES = 4_096
 _MAX_STATIC_ARG_ITEMS = 64
 _MAX_STATIC_ARG_BYTES = 256
 _MAX_STATIC_ARG_VECTOR_BYTES = _MAX_STATIC_ARG_ITEMS * _MAX_STATIC_ARG_BYTES
+_MISSING_MODEL_STATE = object()
 
 _STATIC_PROJECTION_DOMAIN = (
     b"omninode-rsd.container-bootstrap-static-delivery-projection.sha256.v4\x00"
@@ -169,6 +179,227 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
 
 
+@lru_cache(maxsize=512)
+def _exact_field_validator(expected: type[BaseModel], name: str) -> tuple[object, TypeAdapter[Any]]:
+    """Cache immutable field schema metadata, never a runtime model result."""
+
+    annotation = expected.model_fields[name].rebuild_annotation()
+    return annotation, TypeAdapter(annotation)
+
+
+def _assert_exact_model_state(
+    value: object,
+    expected: type[BaseModel],
+    *,
+    active_path: set[int] | None = None,
+    completed_ids: set[int] | None = None,
+) -> BaseModel:
+    """Reject constructed, hidden, deleted, cyclic, or type-drifted model state."""
+
+    active = set() if active_path is None else active_path
+    completed = set() if completed_ids is None else completed_ids
+    try:
+        if type(value) is not expected:
+            raise ValueError("canonical model is invalid")
+        model_id = id(value)
+        if model_id in active:
+            raise ValueError("canonical model is invalid")
+        if model_id in completed:
+            return value
+        active.add(model_id)
+        try:
+            fields = set(expected.model_fields)
+            state = getattr(value, "__dict__", _MISSING_MODEL_STATE)
+            extra = getattr(value, "__pydantic_extra__", _MISSING_MODEL_STATE)
+            hidden = getattr(value, "__pydantic_" + "pri" + "vate__", _MISSING_MODEL_STATE)
+            fields_set = getattr(value, "__pydantic_fields_set__", _MISSING_MODEL_STATE)
+            if (
+                type(state) is not dict
+                or set(cast(dict[str, object], state)) != fields
+                or extra is not None
+                or hidden is not None
+                or type(fields_set) is not set
+                or not cast(set[str], fields_set).issubset(fields)
+            ):
+                raise ValueError("canonical model is invalid")
+            for name, _field in expected.model_fields.items():
+                field_value = cast(dict[str, object], state)[name]
+                _assert_exact_value(
+                    field_value,
+                    active_path=active,
+                    completed_ids=completed,
+                )
+                _assert_exact_field_annotation(
+                    expected,
+                    name,
+                    field_value,
+                )
+        finally:
+            active.remove(model_id)
+        completed.add(model_id)
+        return value
+    except (KeyError, RecursionError):
+        raise ValueError("canonical model is invalid") from None
+
+
+def _assert_exact_field_annotation(
+    expected: type[BaseModel],
+    name: str,
+    value: object,
+) -> None:
+    """Reject values that a strict field adapter would normalize or coerce."""
+
+    try:
+        annotation, adapter = _exact_field_validator(expected, name)
+        # ``_assert_exact_value`` has already traversed this exact concrete
+        # model, including its hidden/deleted/cyclic state and every nested
+        # field.  Revalidating a direct nested BaseModel through Pydantic
+        # repeats that walk (and can re-enter model validators), so only this
+        # already-proven exact direct-model case may bypass the adapter.
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            if type(value) is not annotation:
+                raise ValueError("canonical model is invalid")
+            return
+        normalized: object = adapter.validate_python(value, strict=True)
+        if not _same_exact_runtime_value(value, normalized):
+            raise ValueError("canonical model is invalid")
+    except (KeyError, RecursionError, TypeError, ValidationError, ValueError):
+        raise ValueError("canonical model is invalid") from None
+
+
+def _same_exact_runtime_value(
+    original: object,
+    normalized: object,
+    *,
+    active_pairs: set[tuple[int, int]] | None = None,
+) -> bool:
+    """Compare exact runtime values without cross-type equality shortcuts."""
+
+    if type(original) is not type(normalized):
+        return False
+    if original is normalized:
+        return True
+    if type(original) not in (tuple, list, dict, set, frozenset) and not isinstance(
+        original, BaseModel
+    ):
+        return original == normalized
+
+    pairs = set() if active_pairs is None else active_pairs
+    pair = (id(original), id(normalized))
+    if pair in pairs:
+        return False
+    pairs.add(pair)
+    try:
+        if isinstance(original, BaseModel):
+            if type(normalized) is not type(original):
+                return False
+            original_state = getattr(original, "__dict__", _MISSING_MODEL_STATE)
+            normalized_state = getattr(normalized, "__dict__", _MISSING_MODEL_STATE)
+            if type(original_state) is not dict or type(normalized_state) is not dict:
+                return False
+            if set(original_state) != set(normalized_state):
+                return False
+            return all(
+                _same_exact_runtime_value(
+                    cast(dict[str, object], original_state)[name],
+                    cast(dict[str, object], normalized_state)[name],
+                    active_pairs=pairs,
+                )
+                for name in original_state
+            )
+        if type(original) is tuple:
+            original_tuple_items = cast(tuple[object, ...], original)
+            normalized_tuple_items = cast(tuple[object, ...], normalized)
+            return len(original_tuple_items) == len(normalized_tuple_items) and all(
+                _same_exact_runtime_value(left, right, active_pairs=pairs)
+                for left, right in zip(original_tuple_items, normalized_tuple_items, strict=True)
+            )
+        if type(original) is list:
+            original_list_items = cast(list[object], original)
+            normalized_list_items = cast(list[object], normalized)
+            return len(original_list_items) == len(normalized_list_items) and all(
+                _same_exact_runtime_value(left, right, active_pairs=pairs)
+                for left, right in zip(original_list_items, normalized_list_items, strict=True)
+            )
+        if type(original) is dict:
+            original_dict_items = tuple(cast(dict[object, object], original).items())
+            normalized_dict_items = tuple(cast(dict[object, object], normalized).items())
+            return len(original_dict_items) == len(normalized_dict_items) and all(
+                _same_exact_runtime_value(left_key, right_key, active_pairs=pairs)
+                and _same_exact_runtime_value(left_value, right_value, active_pairs=pairs)
+                for (left_key, left_value), (right_key, right_value) in zip(
+                    original_dict_items, normalized_dict_items, strict=True
+                )
+            )
+        original_set_items: list[object] = list(cast(set[object] | frozenset[object], original))
+        normalized_set_items: list[object] = list(cast(set[object] | frozenset[object], normalized))
+        if len(original_set_items) != len(normalized_set_items):
+            return False
+        unmatched = list(normalized_set_items)
+        for item in original_set_items:
+            for index, candidate in enumerate(unmatched):
+                if _same_exact_runtime_value(item, candidate, active_pairs=pairs):
+                    unmatched.pop(index)
+                    break
+            else:
+                return False
+        return not unmatched
+    finally:
+        pairs.remove(pair)
+
+
+def _assert_exact_value(
+    value: object,
+    *,
+    active_path: set[int],
+    completed_ids: set[int],
+) -> None:
+    """Walk the full concrete tree while permitting shared acyclic objects."""
+
+    try:
+        if isinstance(value, BaseModel):
+            _assert_exact_model_state(
+                value,
+                type(value),
+                active_path=active_path,
+                completed_ids=completed_ids,
+            )
+            return
+        if type(value) not in (tuple, list, dict, set, frozenset):
+            return
+        value_id = id(value)
+        if value_id in active_path:
+            raise ValueError("canonical model is invalid")
+        if value_id in completed_ids:
+            return
+        active_path.add(value_id)
+        try:
+            if type(value) is dict:
+                for key, item in cast(dict[object, object], value).items():
+                    _assert_exact_value(
+                        key,
+                        active_path=active_path,
+                        completed_ids=completed_ids,
+                    )
+                    _assert_exact_value(
+                        item,
+                        active_path=active_path,
+                        completed_ids=completed_ids,
+                    )
+            else:
+                for item in cast(tuple[object, ...], value):
+                    _assert_exact_value(
+                        item,
+                        active_path=active_path,
+                        completed_ids=completed_ids,
+                    )
+        finally:
+            active_path.remove(value_id)
+        completed_ids.add(value_id)
+    except RecursionError:
+        raise ValueError("canonical model is invalid") from None
+
+
 def _fail(
     phase: Literal[
         "projection", "profile", "ticket", "signature", "freshness", "binding", "replay"
@@ -236,6 +467,7 @@ def _canonical_model_bytes(model: BaseModel, *, exclude: set[str] | None = None)
 
     payload: object | None = None
     try:
+        _assert_exact_model_state(model, type(model))
         payload = model.model_dump(mode="json", exclude=exclude or set(), warnings="error")
     except (RecursionError, TypeError, ValueError):
         payload = None
@@ -363,6 +595,7 @@ def _strict_canonical_model[T: _Model](value: T, expected: type[T]) -> T:
 
     if type(value) is not expected:
         raise ValueError("canonical model is invalid")
+    _assert_exact_model_state(value, expected)
     _assert_exact_concrete_tree(value, expected)
     canonical: T | None = None
     try:
@@ -1176,8 +1409,13 @@ def project_target_delivery_map_v1_structurally(
         _fail("projection")
     routes: dict[str, ContainerBootstrapStaticDeliveryRouteV4] = {}
     try:
+        # This non-authorizing projection intentionally ignores selected V1
+        # output-only values, but it still requires the original complete map
+        # to have exact, non-constructed model state before any dump can
+        # normalize a scalar, enum, container, subclass, or hidden attribute.
+        _assert_exact_model_state(delivery_map, TargetDeliveryMapV1)
         delivery_map = TargetDeliveryMapV1.model_validate(
-            delivery_map.model_dump(mode="python", warnings="error")
+            delivery_map.model_dump(mode="python", warnings="error"), strict=True
         )
         primary_postgresql = _static_postgresql_uri_grammar_from_v1(
             delivery_map.database_identities.primary_database.connection_uri

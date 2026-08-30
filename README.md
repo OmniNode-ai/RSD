@@ -215,6 +215,39 @@ non-authorizing: every effect boolean is false, there is no operation nonce,
 timestamp, freshness decision, deployment claim, or B1-to-B2 authorization
 back-edge, and later phases must repeat original-evidence validation.
 
+## Field-delivery matrix
+
+`target_delivery_field_matrix_v1` is the C0 public offline milestone: a signed,
+opaque projection over original B2 V2 inputs. It reruns B2 V2 validation on
+every call and accepts no upstream acceptance as input. The matrix has exactly
+ten ordered one-shot field declarations (five per primary/restore lane) and a
+separate four-edge `ApplicationDependencyRelationV1` allowlist for Infisical to
+its same-lane PostgreSQL and Valkey dependencies. Rows contain only field/sink
+identifiers and typed opaque reference, derivation, topology, and authority
+commitments—never a provider identity, secret, URI, endpoint, environment
+mapping, or runtime receipt.
+
+The per-edge transport declaration is only an offline topology/reference
+claim. It neither proves TLS, listener behavior, flow enforcement, or
+no-egress, nor admits an undeclared edge. The signed matrix and its diagnostic
+acceptance keep delivery, network, build, pull, materialization, attach, and
+effect permissions false; a later authorization must revalidate the original
+evidence and prove any live behavior separately.
+
+`TargetDeliveryFieldMatrixRowV1` and `ApplicationDependencyRelationV1` are
+matrix-nested, non-authoritative fragments. There is intentionally no public
+standalone row or relation canonical/parser/hash boundary. Full-matrix helpers
+operate only on the signed matrix's local shape; the validator is the sole
+source/context/authentication boundary for this offline contract.
+
+The full-matrix canonical/parser/message/hash helpers are shape and
+canonical-byte operations used to compose signatures. They do not bind the
+original map, B1, V5, or B2 evidence, authenticate source context, or grant a
+permission; their outputs and the diagnostic acceptance are never authority.
+Only `validate_target_delivery_field_matrix_v1` repeats original-evidence
+validation and the caller-pinned signature check. No production consumer,
+callback, or effect API accepts serializer output or acceptance as permission.
+
 ## Phase-B authorization
 
 Phase-B has two non-interchangeable authorization stages. Phase-A remains a

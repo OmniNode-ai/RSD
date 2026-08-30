@@ -77,6 +77,7 @@ from omninode_rsd.lifecycle.infisical_disposable import (
     ContainerBootstrapEnvironmentConstructionPolicyV2,
     ContainerBootstrapStaticEnvironmentEntryV2,
     ContainerBootstrapStaticEnvironmentV2,
+    ProviderReferencesV2,
     canonical_sha256,
     container_bootstrap_environment_construction_policy_sha256,
     container_bootstrap_valkey_static_configuration_sha256,
@@ -1183,6 +1184,65 @@ def test_output_only_v1_map_mutations_do_not_change_projection_or_profile(tmp_pa
         container_bootstrap_static_role_profile_v4_sha256(bundle["profile"])
         == bundle["profile"].profile_sha256
     )
+
+
+def test_structural_projection_rejects_hostile_v1_map_state_before_dump(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    delivery_map = cast(Any, bundle["controls"])["delivery_map"]
+    references = delivery_map.provider_references
+    encryption_reference = references.encryption_key
+    target = delivery_map.primary_infisical
+    field = target.fields[0]
+
+    class HostileInt(int):
+        pass
+
+    class HostileProviderReferences(ProviderReferencesV2):
+        pass
+
+    int_subclass_reference = encryption_reference.model_copy(update={"version": HostileInt(1)})
+    int_subclass_references = references.model_copy(
+        update={"encryption_key": int_subclass_reference}
+    )
+    int_subclass_map = delivery_map.model_copy(
+        update={"provider_references": int_subclass_references}
+    )
+    scalar_reference = encryption_reference.model_copy(update={"version": 1.0})
+    scalar_references = references.model_copy(update={"encryption_key": scalar_reference})
+    scalar_map = delivery_map.model_copy(update={"provider_references": scalar_references})
+    enum_field = field.model_copy(update={"value_kind": field.value_kind.value})
+    enum_target = target.model_copy(update={"fields": (enum_field, *target.fields[1:])})
+    enum_map = delivery_map.model_copy(update={"primary_infisical": enum_target})
+    container_map = delivery_map.model_copy(
+        update={"material_fingerprints": list(delivery_map.material_fingerprints)}
+    )
+    subclassed_references = HostileProviderReferences.model_validate(
+        references.model_dump(mode="python"), strict=True
+    )
+    subclass_map = delivery_map.model_copy(update={"provider_references": subclassed_references})
+    hidden_map = delivery_map.model_copy()
+    object.__setattr__(hidden_map, "hidden", "must-not-leak")
+    deleted_map = delivery_map.model_copy()
+    object.__delattr__(deleted_map, "created_at")
+    constructed_fields = delivery_map.model_dump(mode="python")
+    constructed_fields.pop("created_at")
+    constructed_map = type(delivery_map).model_construct(**constructed_fields)
+
+    for hostile in (
+        int_subclass_map,
+        scalar_map,
+        enum_map,
+        container_map,
+        subclass_map,
+        hidden_map,
+        deleted_map,
+        constructed_map,
+    ):
+        with pytest.raises(ContainerAttachStaticV4Error) as error:
+            project_target_delivery_map_v1_structurally(hostile)
+        assert error.value.phase == "projection"
+        assert str(error.value) == "container attach V4 verification failed"
+        assert "must-not-leak" not in str(error.value)
 
 
 def test_v1_observed_operation_binding_does_not_enter_static_v4_projection(
@@ -2435,6 +2495,96 @@ def test_recursive_exact_types_reject_nested_subclass_and_stale_profile_copy(
         static_v4.container_bootstrap_static_delivery_route_v4_sha256(subclassed_route)
     with pytest.raises(ContainerAttachStaticV4Error):
         container_bootstrap_static_role_profile_v4_sha256(stale_profile)
+
+
+def test_projection_canonical_boundary_rejects_hostile_model_copy_state(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    projection = cast(ContainerBootstrapStaticDeliveryProjectionV4, bundle["projection"])
+    route = projection.primary_infisical
+    field = route.fields[0]
+
+    class HostileDeliveryRoute(ContainerBootstrapStaticDeliveryRouteV4):
+        pass
+
+    zero_flag = projection.model_copy(update={"generated_wrapper_output_bound": 0})
+    one_flag = projection.model_copy(update={"allocation_parameterized": 1})
+    float_grammar = projection.primary_valkey_connection_uri.model_copy(
+        update={"password_encoded_byte_count": 43.0}
+    )
+    float_projection = projection.model_copy(
+        update={"primary_valkey_connection_uri": float_grammar}
+    )
+    list_route = route.model_copy(update={"fields": list(route.fields)})
+    list_projection = projection.model_copy(update={"primary_infisical": list_route})
+    enum_field = field.model_copy(update={"value_kind": field.value_kind.value})
+    enum_route = route.model_copy(update={"fields": (enum_field, *route.fields[1:])})
+    enum_projection = projection.model_copy(update={"primary_infisical": enum_route})
+    subclassed_route = HostileDeliveryRoute.model_validate(
+        route.model_dump(mode="python"), strict=True
+    )
+    subclass_projection = projection.model_copy(update={"primary_infisical": subclassed_route})
+    hidden_projection = projection.model_copy()
+    object.__setattr__(hidden_projection, "hidden", "x")
+    deleted_projection = projection.model_copy()
+    object.__delattr__(deleted_projection, "generated_wrapper_output_bound")
+    cyclic_projection = projection.model_copy()
+    object.__setattr__(cyclic_projection, "primary_infisical", cyclic_projection)
+    constructed_projection = ContainerBootstrapStaticDeliveryProjectionV4.model_construct(
+        **{
+            **projection.model_dump(mode="python"),
+            "generated_wrapper_output_bound": 0,
+        }
+    )
+
+    for hostile in (
+        zero_flag,
+        one_flag,
+        float_projection,
+        list_projection,
+        enum_projection,
+        subclass_projection,
+        hidden_projection,
+        deleted_projection,
+        cyclic_projection,
+        constructed_projection,
+    ):
+        for helper in (
+            container_bootstrap_static_delivery_projection_v4_canonical_json,
+            container_bootstrap_static_delivery_projection_v4_sha256,
+        ):
+            with pytest.raises(ContainerAttachStaticV4Error) as error:
+                helper(hostile)
+            assert error.value.phase == "projection"
+            assert str(error.value) == "container attach V4 verification failed"
+
+    serialized = json.dumps(
+        zero_flag.model_dump(mode="json"),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("ascii")
+    with pytest.raises(ContainerAttachStaticV4Error) as parser_error:
+        parse_container_bootstrap_static_delivery_projection_v4_canonical_json(serialized)
+    assert parser_error.value.phase == "projection"
+    assert str(parser_error.value) == "container attach V4 verification failed"
+
+    stale_profile = bundle["profile"].model_copy(update={"static_delivery_projection": zero_flag})
+    stale_envelope = bundle["profile_envelope"].model_copy(
+        update={"static_role_profile": stale_profile}
+    )
+    with pytest.raises(ContainerAttachStaticV4Error) as message_error:
+        container_bootstrap_static_role_profile_envelope_v4_canonical_message(stale_envelope)
+    assert message_error.value.phase == "profile"
+    assert str(message_error.value) == "container attach V4 verification failed"
+
+    preimage = bundle["profile"].static_patch_preimage
+    optional_defaults = ContainerBootstrapStaticPatchPreimageV4(
+        **preimage.model_dump(mode="python", exclude_none=True)
+    )
+    assert container_bootstrap_static_patch_preimage_v4_sha256(optional_defaults) == (
+        container_bootstrap_static_patch_preimage_v4_sha256(preimage)
+    )
 
 
 def test_static_models_reject_secret_sentinel_and_never_render_a_target_value(
