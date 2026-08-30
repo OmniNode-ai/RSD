@@ -145,8 +145,9 @@ equality with both supplied projection and profile projection. Each signed B1
 relation is also bound to one exact verified profile hash, profile-envelope
 hash, profile-root fingerprint, component/role, and selected-route hash plus
 ordinal. The shared projection is therefore not a profile selector: Phase B2
-must carry four distinct per-role B1 bindings and acceptances, one for each
-profile route. Its acceptance is non-portable: build, materialization, attach,
+must carry four distinct per-role B1 bindings and original Phase-A closures,
+one for each profile route, then recompute their non-authorizing acceptances.
+Its acceptance is non-portable: build, materialization, attach,
 and effect permissions are all false.
 
 This is signature-and-structural-relation validation only. It does **not**
@@ -157,6 +158,33 @@ before admitting any effect. The signed map hash is always the fully signed V1
 map hash; no draft or body-only map hash is accepted. The V4 profile remains
 output independent: B1 never adds a relation, map hash, artifact, or output
 field to it.
+
+## Phase-B2 target-delivery artifact manifest
+
+`target_delivery_artifact_manifest` is an offline, signed aggregation of the
+four fixed components, in this order: `primary_infisical`, `primary_valkey`,
+`restore_infisical`, and `restore_valkey`.  A role input contains only its
+original signed V4 profile envelope, B1 relation, and Phase-A two-worker
+closure.  B2 accepts no caller-supplied B1 or Phase-A acceptance: on every
+call it reruns both validators with the one caller-pinned B1 policy, profile
+root, and Phase-A worker policy before reconstructing the manifest fields and
+checking its signature under a distinct caller-pinned manifest root.
+
+The manifest contains compact source and OCI sequence commitments/counts,
+rather than canonical OCI sidecars or potentially large arrays. It is bounded
+to 64 KiB; its 16 KiB unsigned acceptance is explicitly non-portable and all
+of its build, materialization, attach, effect, and evidence-effect booleans
+are false. Later phases must revalidate the original four role inputs.
+
+The common B1 policy and one profile root are intentionally reused for all
+four separately signed profiles; independent per-role profile roots require a
+future B1 interface and are not silently supported. B2 performs no source or
+artifact collection, OCI inspection, engine interaction, provider access,
+runtime action, callback, attachment, or durable redemption.
+Exactly eight build run IDs are required across the four closures. Physical
+builder identities may repeat across roles: each closure still independently
+requires distinct A/B builders, but the same pair may build more than one
+role.
 
 ## Phase-B authorization
 
