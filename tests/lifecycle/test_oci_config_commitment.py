@@ -162,6 +162,59 @@ def test_verification_rejects_forged_deserialized_claim() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "field",
+    (
+        "oci_config_descriptor_size",
+        "runtime_uid",
+        "runtime_gid",
+        "user_byte_count",
+        "working_dir_byte_count",
+        "environment_entry_count",
+        "environment_rendered_byte_count",
+    ),
+)
+def test_verification_rejects_constructed_boolean_integer_aliases(field: str) -> None:
+    payload = _payload()
+    descriptor_media_type, descriptor_digest, descriptor_size = _descriptor(payload)
+    exact = _derive(payload)
+    constructed_fields = exact.model_dump()
+    constructed_fields[field] = True
+    forged = commitment.PhaseAV5ExpandedOciConfigCommitmentClaimV1.model_construct(
+        **constructed_fields
+    )
+
+    with pytest.raises(commitment.OciConfigCommitmentError):
+        commitment.verify_phase_a_v5_expanded_oci_config_claim_v1(
+            payload, descriptor_media_type, descriptor_digest, descriptor_size, forged
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("oci_config_descriptor_size", "not-an-integer"),
+        ("runtime_uid", 12345.0),
+        ("user_commitment_sha256", 7),
+        ("non_authorizing", 1),
+        ("reserved_delivery_env_names_absent", 1),
+    ),
+)
+def test_verification_rejects_constructed_malformed_claim_types(field: str, value: object) -> None:
+    payload = _payload()
+    descriptor_media_type, descriptor_digest, descriptor_size = _descriptor(payload)
+    constructed_fields = _derive(payload).model_dump()
+    constructed_fields[field] = value
+    forged = commitment.PhaseAV5ExpandedOciConfigCommitmentClaimV1.model_construct(
+        **constructed_fields
+    )
+
+    with pytest.raises(commitment.OciConfigCommitmentError):
+        commitment.verify_phase_a_v5_expanded_oci_config_claim_v1(
+            payload, descriptor_media_type, descriptor_digest, descriptor_size, forged
+        )
+
+
 def test_rejects_current_v4_two_key_oci_config_by_design() -> None:
     config = _config()
     raw_config = _image_config(config)

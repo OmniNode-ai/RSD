@@ -101,6 +101,38 @@ class PhaseAV5ExpandedOciConfigCommitmentClaimV1(_ClaimModel):
     reserved_delivery_env_names_absent: Literal[True]
 
 
+_CLAIM_STRING_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "schema_version",
+        "signed_worker_attestation_scope",
+        "oci_config_descriptor_media_type",
+        "oci_config_descriptor_digest",
+        "user_commitment_sha256",
+        "working_dir_commitment_sha256",
+        "environment_sequence_commitment_sha256",
+        "environment_names_commitment_sha256",
+        "reserved_delivery_env_policy_commitment_sha256",
+    }
+)
+_CLAIM_INTEGER_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "oci_config_descriptor_size",
+        "runtime_uid",
+        "runtime_gid",
+        "user_byte_count",
+        "working_dir_byte_count",
+        "environment_entry_count",
+        "environment_rendered_byte_count",
+    }
+)
+_CLAIM_BOOLEAN_FIELDS: Final[frozenset[str]] = frozenset(
+    {"non_authorizing", "reserved_delivery_env_names_absent"}
+)
+_CLAIM_FIELD_NAMES: Final[frozenset[str]] = (
+    _CLAIM_STRING_FIELDS | _CLAIM_INTEGER_FIELDS | _CLAIM_BOOLEAN_FIELDS
+)
+
+
 def _fail() -> NoReturn:
     raise OciConfigCommitmentError()
 
@@ -400,6 +432,35 @@ def derive_phase_a_v5_expanded_oci_config_claim_v1(
     )
 
 
+def _strictly_reparse_claim(
+    claim: object,
+) -> PhaseAV5ExpandedOciConfigCommitmentClaimV1:
+    """Reject bypassed Pydantic construction before canonical claim comparison."""
+
+    if type(claim) is not PhaseAV5ExpandedOciConfigCommitmentClaimV1:
+        _fail()
+    raw_claim = claim.__dict__
+    if (
+        type(raw_claim) is not dict
+        or len(raw_claim) != len(_CLAIM_FIELD_NAMES)
+        or set(raw_claim) != _CLAIM_FIELD_NAMES
+        or claim.__pydantic_extra__ is not None
+    ):
+        _fail()
+    if (
+        any(type(raw_claim[field]) is not str for field in _CLAIM_STRING_FIELDS)
+        or any(type(raw_claim[field]) is not int for field in _CLAIM_INTEGER_FIELDS)
+        or any(type(raw_claim[field]) is not bool for field in _CLAIM_BOOLEAN_FIELDS)
+    ):
+        _fail()
+    try:
+        return PhaseAV5ExpandedOciConfigCommitmentClaimV1.model_validate(
+            {field: raw_claim[field] for field in _CLAIM_FIELD_NAMES}, strict=True
+        )
+    except ValueError:
+        _fail()
+
+
 def verify_phase_a_v5_expanded_oci_config_claim_v1(
     raw_config_bytes: bytes,
     expected_config_descriptor_media_type: str,
@@ -415,6 +476,9 @@ def verify_phase_a_v5_expanded_oci_config_claim_v1(
         expected_config_descriptor_digest,
         expected_config_descriptor_size,
     )
-    if type(claim) is not PhaseAV5ExpandedOciConfigCommitmentClaimV1 or claim != derived:
+    reparsed = _strictly_reparse_claim(claim)
+    if _canonical_json(reparsed.model_dump(mode="json")) != _canonical_json(
+        derived.model_dump(mode="json")
+    ):
         _fail()
     return derived
