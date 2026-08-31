@@ -151,7 +151,7 @@ def test_schema_anchor_and_parser_are_fixed_public_resources() -> None:
 def test_verifier_rejects_non_datetime_clocks_with_a_contract_error(invalid_now: object) -> None:
     """An invalid caller clock must fail closed through the public error boundary."""
 
-    with pytest.raises(ExecutableGrantVerificationError, match="must be an exact datetime"):
+    with pytest.raises(ExecutableGrantVerificationError, match="must be a datetime"):
         verify_signed_executable_grant_v2(
             json.dumps(_valid_wire()), now=cast(datetime, invalid_now)
         )

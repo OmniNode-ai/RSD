@@ -383,7 +383,7 @@ def _normalize_verification_timestamp(now: datetime) -> datetime:
     """Return an exact, UTC-normalized caller clock or fail through the public boundary."""
 
     if type(now) is not datetime:
-        raise ExecutableGrantVerificationError("verification timestamp must be an exact datetime")
+        raise ExecutableGrantVerificationError("verification timestamp must be a datetime")
     try:
         if now.tzinfo is None or now.utcoffset() != UTC.utcoffset(now):
             raise ExecutableGrantVerificationError(
