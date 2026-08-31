@@ -12,13 +12,16 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from jsonschema import Draft202012Validator, FormatChecker
 from omninode_grant_verifier import (
+    ExecutableGrantMaterialV2,
     ExecutableGrantVerificationError,
+    SingleAttemptPostureV2,
     parse_signed_executable_grant_v2,
     public_grant_trust_anchor_v1,
     signed_executable_grant_v2_json_schema,
     signed_executable_grant_v2_vectors,
     verify_signed_executable_grant_v2,
 )
+from pydantic import ValidationError
 
 _VERIFIER_FORMAT_CHECKER = FormatChecker()
 
@@ -174,6 +177,70 @@ def test_parser_maps_invalid_utf8_to_the_public_error_taxonomy() -> None:
 
     with pytest.raises(ExecutableGrantVerificationError, match="strict JSON"):
         parse_signed_executable_grant_v2(b"\xff")
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    (
+        ("authorization_material.grant.posture.attempt_count", True),
+        ("authorization_material.grant.posture.attempt_count", 1.0),
+        ("authorization_material.grant.expected_output_event_index", False),
+        ("authorization_material.grant.expected_output_event_index", 0.0),
+    ),
+)
+def test_parser_rejects_non_integer_json_literals_at_signed_integer_fields(
+    path: str, value: object
+) -> None:
+    """Boolean and float JSON values must not become signed integer semantics."""
+
+    candidate = _valid_wire()
+    _set_path(candidate, path, value)
+    with pytest.raises(ExecutableGrantVerificationError, match="fixed contract"):
+        parse_signed_executable_grant_v2(json.dumps(candidate))
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("attempt_count", "1e0"),
+        ("expected_output_event_index", "-0"),
+    ),
+)
+def test_parser_rejects_noncanonical_json_integer_spellings(field: str, replacement: str) -> None:
+    """Signatures bind canonical integer facts, never JSON lexical aliases."""
+
+    wire = json.dumps(_valid_wire(), separators=(",", ":"))
+    original = f'"{field}":' + ("1" if field == "attempt_count" else "0")
+    candidate = wire.replace(original, f'"{field}":{replacement}', 1)
+    assert candidate != wire
+    with pytest.raises(ExecutableGrantVerificationError, match=r"strict JSON|fixed contract"):
+        parse_signed_executable_grant_v2(candidate)
+
+
+@pytest.mark.parametrize("value", (True, 1.0))
+def test_public_single_attempt_type_rejects_non_integer_literals(value: object) -> None:
+    """Direct consumers receive the same exact integer boundary as the wire parser."""
+
+    with pytest.raises(ValidationError, match="JSON integer"):
+        SingleAttemptPostureV2.model_validate(
+            {
+                "attempt_count": value,
+                "retry_disposition": "forbidden",
+                "fallback_used": False,
+                "recovery_disposition": "report-only",
+            }
+        )
+
+
+@pytest.mark.parametrize("value", (False, 0.0))
+def test_public_output_index_type_rejects_non_integer_literals(value: object) -> None:
+    """Direct consumers cannot create a grant with a coerced output index."""
+
+    parsed = parse_signed_executable_grant_v2(json.dumps(_valid_wire()))
+    data = parsed.authorization_material.grant.model_dump(mode="python")
+    data["expected_output_event_index"] = value
+    with pytest.raises(ValidationError, match="JSON integer"):
+        ExecutableGrantMaterialV2.model_validate(data)
 
 
 def test_parser_contains_deep_json_recursion_in_the_public_error_taxonomy() -> None:

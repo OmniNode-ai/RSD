@@ -18,7 +18,7 @@ from uuid import UUID
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 _SHA256 = r"^[0-9a-f]{64}$"
 _IDENTIFIER = r"^[a-z][a-z0-9-]{1,63}$"
@@ -91,6 +91,22 @@ def _normalize(value: object) -> object:
     raise TypeError(f"unsupported canonical value: {type(value).__name__}")
 
 
+def _require_exact_json_integer(value: object) -> int:
+    """Reject non-integer JSON values before literal matching can coerce them."""
+
+    if type(value) is not int:
+        raise ValueError("value must be a JSON integer")
+    return value
+
+
+def _parse_canonical_json_integer(value: str) -> int:
+    """Reject the one JSON integer spelling that loses its lexical identity."""
+
+    if value == "-0":
+        raise ValueError("JSON integer must not be negative zero")
+    return int(value)
+
+
 def canonical_executable_grant_json(value: object) -> bytes:
     """Return the one deterministic JSON representation used by this contract."""
 
@@ -114,6 +130,11 @@ class SingleAttemptPostureV2(_ContractModel):
     retry_disposition: Literal["forbidden"]
     fallback_used: Literal[False]
     recovery_disposition: Literal["report-only"]
+
+    @field_validator("attempt_count", mode="before")
+    @classmethod
+    def _validate_attempt_count_type(cls, value: object) -> int:
+        return _require_exact_json_integer(value)
 
 
 class ExecutableGrantMaterialV2(_ContractModel):
@@ -139,6 +160,11 @@ class ExecutableGrantMaterialV2(_ContractModel):
     issued_at: datetime
     not_before: datetime
     expires_at: datetime
+
+    @field_validator("expected_output_event_index", mode="before")
+    @classmethod
+    def _validate_expected_output_event_index_type(cls, value: object) -> int:
+        return _require_exact_json_integer(value)
 
     @model_validator(mode="after")
     def _validate_lifetime_and_identities(self) -> Self:
@@ -367,7 +393,11 @@ def parse_signed_executable_grant_v2(wire: str | bytes | bytearray) -> SignedExe
             "signed executable grant wire is not strict JSON"
         ) from exc
     try:
-        raw: Any = json.loads(wire_bytes, object_pairs_hook=_reject_duplicate_keys)
+        raw: Any = json.loads(
+            wire_bytes,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_int=_parse_canonical_json_integer,
+        )
     except (TypeError, UnicodeDecodeError, ValueError, RecursionError, json.JSONDecodeError) as exc:
         raise ExecutableGrantVerificationError(
             "signed executable grant wire is not strict JSON"
