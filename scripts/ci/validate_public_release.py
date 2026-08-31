@@ -41,13 +41,51 @@ ALLOWED_TOP_LEVEL: Final[frozenset[str]] = frozenset(
         "LICENSE",
         "README.md",
         "pyproject.toml",
+        "public_verifier",
         "scripts",
         "src",
         "tests",
         "uv.lock",
     }
 )
+PUBLIC_VERIFIER_FILES: Final[frozenset[tuple[str, ...]]] = frozenset(
+    {
+        ("public_verifier", "pyproject.toml"),
+        ("public_verifier", "uv.lock"),
+        ("public_verifier", "src", "omninode_grant_verifier", "__init__.py"),
+        (
+            "public_verifier",
+            "src",
+            "omninode_grant_verifier",
+            "resources",
+            "executable_grant_v2_trust_anchor.json",
+        ),
+        (
+            "public_verifier",
+            "src",
+            "omninode_grant_verifier",
+            "resources",
+            "signed_executable_grant_v2.schema.json",
+        ),
+        (
+            "public_verifier",
+            "src",
+            "omninode_grant_verifier",
+            "resources",
+            "signed_executable_grant_v2.vectors.json",
+        ),
+        ("public_verifier", "tests", "test_signed_executable_grant_v2.py"),
+        ("public_verifier", "tests", "test_signed_executable_grant_v2_release.py"),
+    }
+)
 ALLOWED_SOURCE_SUBSYSTEM: Final[str] = "lifecycle"
+PUBLIC_GRANT_RESOURCES: Final[frozenset[str]] = frozenset(
+    {
+        "executable_grant_v2_trust_anchor.json",
+        "signed_executable_grant_v2.schema.json",
+        "signed_executable_grant_v2.vectors.json",
+    }
+)
 VALIDATOR_PATH: Final[Path] = Path("scripts/ci/validate_public_release.py")
 
 MARKER_RE = re.compile(
@@ -178,6 +216,8 @@ def _is_allowed_directory(path: Path) -> bool:
     parts = path.parts
     if not parts:
         return True
+    if parts[0] == "public_verifier":
+        return any(entry[: len(parts)] == parts for entry in PUBLIC_VERIFIER_FILES)
     if len(parts) == 1:
         return parts[0] in {".github", "scripts", "src", "tests"}
     if parts[:2] == (".github", "workflows"):
@@ -187,7 +227,11 @@ def _is_allowed_directory(path: Path) -> bool:
     if parts == ("src", "omninode_rsd"):
         return True
     if parts[:3] == ("src", "omninode_rsd", ALLOWED_SOURCE_SUBSYSTEM):
-        return len(parts) == 3 or parts[3:] in {("postgres",), ("postgres", "migrations")}
+        return len(parts) == 3 or parts[3:] in {
+            ("postgres",),
+            ("postgres", "migrations"),
+            ("resources",),
+        }
     if parts[:2] == ("tests", "lifecycle"):
         return len(parts) == 2
     return False
@@ -195,6 +239,8 @@ def _is_allowed_directory(path: Path) -> bool:
 
 def _is_allowed_file(path: Path) -> bool:
     parts = path.parts
+    if parts and parts[0] == "public_verifier":
+        return parts in PUBLIC_VERIFIER_FILES
     if len(parts) == 1:
         return parts[0] in ALLOWED_TOP_LEVEL - {".github", "scripts", "src", "tests"}
     if parts[:2] == (".github", "workflows") and path.suffix == ".yml":
@@ -211,7 +257,7 @@ def _is_allowed_file(path: Path) -> bool:
             or (
                 len(parts) == 4
                 and parts[2] == ALLOWED_SOURCE_SUBSYSTEM
-                and path.suffix in {".py", ".yaml"}
+                and path.suffix in {".py", ".json", ".yaml"}
             )
             or (
                 len(parts) == 5
@@ -222,6 +268,11 @@ def _is_allowed_file(path: Path) -> bool:
                 len(parts) == 6
                 and parts[2:5] == (ALLOWED_SOURCE_SUBSYSTEM, "postgres", "migrations")
                 and path.suffix in {".py", ".sql"}
+            )
+            or (
+                len(parts) == 5
+                and parts[2:4] == (ALLOWED_SOURCE_SUBSYSTEM, "resources")
+                and parts[4] in PUBLIC_GRANT_RESOURCES
             )
         )
     if parts[:2] == ("tests", "lifecycle"):

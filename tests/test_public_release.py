@@ -154,6 +154,14 @@ def test_rejects_unallowlisted_top_level_and_source_subsystem(tmp_path: Path) ->
     assert "src/omninode_rsd/transport" in paths
 
 
+def test_rejects_unallowlisted_standalone_verifier_member(tmp_path: Path) -> None:
+    findings = _write(tmp_path, "public_verifier/notes.txt", "unexpected\n")
+    assert any(
+        item.path == "public_verifier/notes.txt" and item.rule == "path_allowlist"
+        for item in findings
+    )
+
+
 @pytest.mark.parametrize(
     "relative",
     (
