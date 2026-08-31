@@ -80,3 +80,97 @@ def test_schema_anchor_and_parser_are_fixed_public_resources() -> None:
     assert anchor.issuer_key_id == "omninode-rsd-public-grant-authority"
     with pytest.raises(ExecutableGrantVerificationError, match="strict JSON"):
         parse_signed_executable_grant_v2('{"schema_version":"x","schema_version":"y"}')
+
+
+def _assert_closed_object(
+    schema: object,
+    *,
+    fields: frozenset[str],
+) -> dict[str, object]:
+    assert type(schema) is dict
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == fields
+    properties = schema["properties"]
+    assert type(properties) is dict
+    assert set(properties) == fields
+    return properties
+
+
+def test_published_json_schema_covers_every_fixed_signed_grant_field() -> None:
+    """Keep the public schema closed and structurally aligned with the verifier DTO."""
+
+    schema = signed_executable_grant_v2_json_schema()
+    root = _assert_closed_object(
+        schema,
+        fields=frozenset(
+            {
+                "schema_version",
+                "authorization_material",
+                "authorization_digest",
+                "signature_octets",
+            }
+        ),
+    )
+    authorization = _assert_closed_object(
+        root["authorization_material"],
+        fields=frozenset(
+            {
+                "schema_version",
+                "domain",
+                "issuer_key_id",
+                "issuer_key_fingerprint_sha256",
+                "grant",
+            }
+        ),
+    )
+    grant = _assert_closed_object(
+        authorization["grant"],
+        fields=frozenset(
+            {
+                "schema_version",
+                "dispatch_policy",
+                "grant_id",
+                "envelope_id",
+                "activation_id",
+                "correlation_id",
+                "nonce_sha256",
+                "pins",
+                "tenant_id",
+                "backend_id",
+                "served_model_id",
+                "posture",
+                "expected_output_topic",
+                "expected_output_event_class",
+                "expected_output_event_index",
+                "issued_at",
+                "not_before",
+                "expires_at",
+            }
+        ),
+    )
+    _assert_closed_object(
+        grant["pins"],
+        fields=frozenset(
+            {
+                "artifact_sha256",
+                "rendered_contract_sha256",
+                "request_sha256",
+            }
+        ),
+    )
+    posture = _assert_closed_object(
+        grant["posture"],
+        fields=frozenset(
+            {
+                "attempt_count",
+                "retry_disposition",
+                "fallback_used",
+                "recovery_disposition",
+            }
+        ),
+    )
+    assert posture["attempt_count"] == {"const": 1}
+    assert posture["retry_disposition"] == {"const": "forbidden"}
+    assert posture["fallback_used"] == {"const": False}
+    assert posture["recovery_disposition"] == {"const": "report-only"}
