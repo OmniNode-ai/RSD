@@ -12,6 +12,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from jsonschema import Draft202012Validator, FormatChecker
 from omninode_grant_verifier import (
+    MAX_SIGNED_EXECUTABLE_GRANT_V2_WIRE_BYTES,
     ExecutableGrantVerificationError,
     parse_signed_executable_grant_v2,
     public_grant_trust_anchor_v1,
@@ -135,6 +136,29 @@ def test_schema_anchor_and_parser_are_fixed_public_resources() -> None:
     assert anchor.issuer_key_id == "omninode-rsd-public-grant-authority"
     with pytest.raises(ExecutableGrantVerificationError, match="strict JSON"):
         parse_signed_executable_grant_v2('{"schema_version":"x","schema_version":"y"}')
+
+
+@pytest.mark.parametrize("wire", (" ", b" ", bytearray(b" ")))
+def test_parser_applies_one_fixed_wire_size_limit_before_json_decoding(
+    wire: str | bytes | bytearray,
+) -> None:
+    """All supported wire forms share the same byte-oriented admission boundary."""
+
+    padding = MAX_SIGNED_EXECUTABLE_GRANT_V2_WIRE_BYTES + 1
+    oversized = wire * padding
+    with pytest.raises(ExecutableGrantVerificationError, match="exceeds size limit"):
+        parse_signed_executable_grant_v2(oversized)
+
+
+def test_parser_contains_deep_json_recursion_in_the_public_error_taxonomy() -> None:
+    """A bounded hostile JSON shape cannot leak a raw decoder or traversal error."""
+
+    depth = 4_096
+    valid_wire = json.dumps(_valid_wire(), separators=(",", ":")).encode("utf-8")
+    wire = b'{"unexpected":' + b"[" * depth + b"]" * depth + b"," + valid_wire[1:]
+    assert len(wire) <= MAX_SIGNED_EXECUTABLE_GRANT_V2_WIRE_BYTES
+    with pytest.raises(ExecutableGrantVerificationError, match="fixed contract"):
+        parse_signed_executable_grant_v2(wire)
 
 
 @pytest.mark.parametrize(
