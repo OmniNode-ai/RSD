@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "omninode-grant-verifier"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["cryptography>=44,<47", "pydantic>=2.10,<3"]
+dependencies = ["cryptography>=50,<51", "pydantic>=2.10,<3"]
 
 [dependency-groups]
 dev = ["pytest>=8.3,<10", "ruff>=0.9,<1", "mypy>=1.13,<2"]
