@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -101,6 +102,16 @@ def test_schema_anchor_and_parser_are_fixed_public_resources() -> None:
     assert anchor.issuer_key_id == "omninode-rsd-public-grant-authority"
     with pytest.raises(ExecutableGrantVerificationError, match="strict JSON"):
         parse_signed_executable_grant_v2('{"schema_version":"x","schema_version":"y"}')
+
+
+@pytest.mark.parametrize("invalid_now", (None, "2030-01-01T00:00:00Z", 0))
+def test_verifier_rejects_non_datetime_clocks_with_a_contract_error(invalid_now: object) -> None:
+    """An invalid caller clock must fail closed through the public error boundary."""
+
+    with pytest.raises(ExecutableGrantVerificationError, match="must be a datetime"):
+        verify_signed_executable_grant_v2(
+            json.dumps(_valid_wire()), now=cast(datetime, invalid_now)
+        )
 
 
 def _assert_closed_object(

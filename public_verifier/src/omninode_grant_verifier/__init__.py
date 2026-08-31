@@ -386,6 +386,8 @@ def verify_signed_executable_grant_v2(
 ) -> SignedExecutableGrantV2:
     """Parse and verify a grant against the fixed package trust anchor."""
 
+    if not isinstance(now, datetime):
+        raise ExecutableGrantVerificationError("verification timestamp must be a datetime")
     if now.tzinfo is None or now.utcoffset() != UTC.utcoffset(now):
         raise ExecutableGrantVerificationError("verification timestamp must be UTC timezone-aware")
     grant = parse_signed_executable_grant_v2(wire)
