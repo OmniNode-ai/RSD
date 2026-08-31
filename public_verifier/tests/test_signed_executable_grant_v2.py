@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from jsonschema import Draft202012Validator, FormatChecker
 from omninode_grant_verifier import (
     ExecutableGrantVerificationError,
     parse_signed_executable_grant_v2,
@@ -16,6 +17,19 @@ from omninode_grant_verifier import (
     signed_executable_grant_v2_vectors,
     verify_signed_executable_grant_v2,
 )
+
+_VERIFIER_FORMAT_CHECKER = FormatChecker()
+
+
+@_VERIFIER_FORMAT_CHECKER.checks("date-time")
+def _is_verifier_datetime(value: object) -> bool:
+    if type(value) is not str:
+        return True
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
 
 
 def _set_path(document: dict[str, object], path: str, value: object) -> None:
@@ -39,6 +53,13 @@ def _wire_for_vector(vector: dict[str, object], base: dict[str, object]) -> dict
         assert type(patch) is list and len(patch) == 2 and isinstance(patch[0], str)
         _set_path(result, patch[0], patch[1])
     return result
+
+
+def _valid_wire() -> dict[str, object]:
+    vectors = signed_executable_grant_v2_vectors()
+    wire = vectors["base_wire"]
+    assert type(wire) is dict
+    return deepcopy(wire)
 
 
 def test_vectors_reach_their_declared_verification_stages() -> None:
@@ -174,3 +195,64 @@ def test_published_json_schema_covers_every_fixed_signed_grant_field() -> None:
     assert posture["retry_disposition"] == {"const": "forbidden"}
     assert posture["fallback_used"] == {"const": False}
     assert posture["recovery_disposition"] == {"const": "report-only"}
+    for field in ("grant_id", "envelope_id", "activation_id", "correlation_id"):
+        field_schema = grant[field]
+        assert type(field_schema) is dict
+        assert field_schema["format"] == "uuid"
+    for field in ("issued_at", "not_before", "expires_at"):
+        field_schema = grant[field]
+        assert type(field_schema) is dict
+        assert field_schema["format"] == "date-time"
+
+
+def _schema_errors(wire: object) -> list[str]:
+    validator = Draft202012Validator(
+        signed_executable_grant_v2_json_schema(), format_checker=_VERIFIER_FORMAT_CHECKER
+    )
+    return [error.message for error in validator.iter_errors(wire)]
+
+
+def test_published_json_schema_enforces_the_verifier_wire_value_shapes() -> None:
+    """The published schema rejects shapes the verifier's strict parser rejects."""
+
+    valid = _valid_wire()
+    assert _schema_errors(valid) == []
+
+    invalid_cases: tuple[tuple[str, str, object], ...] = (
+        ("impossible-date", "authorization_material.grant.issued_at", "2030-02-30T00:00:00Z"),
+        ("impossible-time", "authorization_material.grant.not_before", "2030-01-01T25:00:00Z"),
+        ("offset-not-z", "authorization_material.grant.expires_at", "2030-01-01T00:01:00+00:00"),
+        ("malformed-uuid", "authorization_material.grant.grant_id", "not-a-uuid"),
+        (
+            "noncanonical-uuid",
+            "authorization_material.grant.envelope_id",
+            "40000000-0000-4000-8000-00000000000A",
+        ),
+        ("wrong-type", "signature_octets", "not-an-octet-array"),
+    )
+    for case_id, path, value in invalid_cases:
+        candidate = _valid_wire()
+        _set_path(candidate, path, value)
+        assert _schema_errors(candidate), case_id
+        with pytest.raises(ExecutableGrantVerificationError, match="fixed contract"):
+            parse_signed_executable_grant_v2(json.dumps(candidate))
+
+    extra = _valid_wire()
+    grant = extra["authorization_material"]
+    assert type(grant) is dict
+    material = grant["grant"]
+    assert type(material) is dict
+    material["unexpected"] = True
+    assert _schema_errors(extra)
+    with pytest.raises(ExecutableGrantVerificationError, match="fixed contract"):
+        parse_signed_executable_grant_v2(json.dumps(extra))
+
+    missing = _valid_wire()
+    material = missing["authorization_material"]
+    assert type(material) is dict
+    grant = material["grant"]
+    assert type(grant) is dict
+    del grant["nonce_sha256"]
+    assert _schema_errors(missing)
+    with pytest.raises(ExecutableGrantVerificationError, match="fixed contract"):
+        parse_signed_executable_grant_v2(json.dumps(missing))

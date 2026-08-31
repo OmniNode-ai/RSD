@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from hashlib import sha256
 from importlib.resources import files
+from re import fullmatch
 from typing import Annotated, Any, Final, Literal, Self
 from uuid import UUID
 
@@ -24,6 +25,8 @@ _IDENTIFIER = r"^[a-z][a-z0-9-]{1,63}$"
 _MODEL_IDENTIFIER = r"^[a-z][a-z0-9._-]{1,127}$"
 _TOPIC = r"^[a-z][a-z0-9-]*(?:[.][a-z][a-z0-9-]*)+$"
 _EVENT_CLASS = r"^Model[A-Za-z0-9]*$"
+_UUID_WIRE = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+_UTC_WIRE_DATETIME = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:[.][0-9]{1,6})?Z$"
 _RESOURCE_ROOT: Final = "resources/"
 
 PUBLIC_TRUST_ANCHOR_RESOURCE: Final = "resources/executable_grant_v2_trust_anchor.json"
@@ -37,7 +40,7 @@ PUBLIC_TRUST_ANCHOR_SHA256: Final = (
     "e8dcf17ac21033324f6aafd49495f1b84987c3ffac90932ffa82bbad5e769999"
 )
 SIGNED_EXECUTABLE_GRANT_V2_SCHEMA_SHA256: Final = (
-    "563cdab1f52df6321dd19985b1613f78c85e40db353656d3b70cd4b9ca9ead54"
+    "72f86c3141050473812e134f5f60ef357f72f87de7aa9f2b5c8b446a2e42e209"
 )
 SIGNED_EXECUTABLE_GRANT_V2_VECTORS_SHA256: Final = (
     "3059dcfc045867b5ffdc50ac2e6145b24db0a085c0423ec7b2998dea5f6b7f85"
@@ -226,8 +229,12 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
 
 def _decode_wire_value(name: str, value: object) -> object:
     if name in _UUID_FIELDS and type(value) is str:
+        if fullmatch(_UUID_WIRE, value) is None:
+            raise ValueError(f"{name} must be a canonical UUID")
         return UUID(value)
     if name in _DATETIME_FIELDS and type(value) is str:
+        if fullmatch(_UTC_WIRE_DATETIME, value) is None:
+            raise ValueError(f"{name} must be a canonical UTC timestamp")
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     if type(value) is dict:
         return {key: _decode_wire_value(key, item) for key, item in value.items()}
