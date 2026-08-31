@@ -174,6 +174,7 @@ def test_rejects_planned_runtime_implementation_subtrees(tmp_path: Path, relativ
 
     assert any(item.path == "runtime" and item.rule == "path_allowlist" for item in findings)
 
+
 def test_allows_postgres_lifecycle_package_paths(tmp_path: Path) -> None:
     _write(tmp_path, "src/omninode_rsd/lifecycle/postgres/__init__.py", "")
     findings = _write(

@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-_APPROVED_BASE = "562091ea4f1d3f9720605d6a2ebda3a70c070ed2"
+_APPROVED_BASE = "1de48ae29331ba888bd6cf3ede891cf8aec73eb9"
 _RESOURCES = (
     "omninode_grant_verifier/resources/executable_grant_v2_trust_anchor.json",
     "omninode_grant_verifier/resources/signed_executable_grant_v2.schema.json",
