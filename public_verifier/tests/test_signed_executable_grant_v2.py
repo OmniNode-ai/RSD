@@ -12,7 +12,6 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from jsonschema import Draft202012Validator, FormatChecker
 from omninode_grant_verifier import (
-    MAX_SIGNED_EXECUTABLE_GRANT_V2_WIRE_BYTES,
     ExecutableGrantVerificationError,
     parse_signed_executable_grant_v2,
     public_grant_trust_anchor_v1,
@@ -138,25 +137,51 @@ def test_schema_anchor_and_parser_are_fixed_public_resources() -> None:
         parse_signed_executable_grant_v2('{"schema_version":"x","schema_version":"y"}')
 
 
-@pytest.mark.parametrize("wire", (" ", b" ", bytearray(b" ")))
-def test_parser_applies_one_fixed_wire_size_limit_before_json_decoding(
-    wire: str | bytes | bytearray,
-) -> None:
-    """All supported wire forms share the same byte-oriented admission boundary."""
+def test_parser_preserves_large_schema_valid_digest_bound_wire_compatibility() -> None:
+    """Wire transport size is not a verifier contract bound."""
 
-    padding = MAX_SIGNED_EXECUTABLE_GRANT_V2_WIRE_BYTES + 1
-    oversized = wire * padding
-    with pytest.raises(ExecutableGrantVerificationError, match="exceeds size limit"):
-        parse_signed_executable_grant_v2(oversized)
+    candidate = _valid_wire()
+    parsed = parse_signed_executable_grant_v2(json.dumps(candidate))
+    large_topic = "a." * 10_000 + "a"
+    large_event_class = "Model" + "A" * 20_000
+    material = parsed.authorization_material.model_copy(
+        update={
+            "grant": parsed.authorization_material.grant.model_copy(
+                update={
+                    "expected_output_topic": large_topic,
+                    "expected_output_event_class": large_event_class,
+                }
+            )
+        }
+    )
+    authorization = candidate["authorization_material"]
+    assert type(authorization) is dict
+    grant = authorization["grant"]
+    assert type(grant) is dict
+    grant["expected_output_topic"] = large_topic
+    grant["expected_output_event_class"] = large_event_class
+    candidate["authorization_digest"] = material.authorization_digest()
+    encoded = json.dumps(candidate, separators=(",", ":"))
+    assert len(encoded.encode("utf-8")) > 16_384
+    assert _schema_errors(candidate) == []
+    reparsed = parse_signed_executable_grant_v2(encoded)
+    assert reparsed.authorization_material.grant.expected_output_topic == large_topic
+    assert reparsed.authorization_material.grant.expected_output_event_class == large_event_class
+
+
+def test_parser_maps_invalid_utf8_to_the_public_error_taxonomy() -> None:
+    """Malformed byte input cannot leak a decoder-specific exception."""
+
+    with pytest.raises(ExecutableGrantVerificationError, match="strict JSON"):
+        parse_signed_executable_grant_v2(b"\xff")
 
 
 def test_parser_contains_deep_json_recursion_in_the_public_error_taxonomy() -> None:
-    """A bounded hostile JSON shape cannot leak a raw decoder or traversal error."""
+    """A hostile JSON shape cannot leak a raw decoder or traversal error."""
 
     depth = 4_096
     valid_wire = json.dumps(_valid_wire(), separators=(",", ":")).encode("utf-8")
     wire = b'{"unexpected":' + b"[" * depth + b"]" * depth + b"," + valid_wire[1:]
-    assert len(wire) <= MAX_SIGNED_EXECUTABLE_GRANT_V2_WIRE_BYTES
     with pytest.raises(ExecutableGrantVerificationError, match="fixed contract"):
         parse_signed_executable_grant_v2(wire)
 

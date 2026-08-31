@@ -45,7 +45,6 @@ SIGNED_EXECUTABLE_GRANT_V2_SCHEMA_SHA256: Final = (
 SIGNED_EXECUTABLE_GRANT_V2_VECTORS_SHA256: Final = (
     "3059dcfc045867b5ffdc50ac2e6145b24db0a085c0423ec7b2998dea5f6b7f85"
 )
-MAX_SIGNED_EXECUTABLE_GRANT_V2_WIRE_BYTES: Final = 16_384
 
 _UUID_FIELDS: Final = frozenset({"grant_id", "envelope_id", "activation_id", "correlation_id"})
 _DATETIME_FIELDS: Final = frozenset({"issued_at", "not_before", "expires_at"})
@@ -367,8 +366,6 @@ def parse_signed_executable_grant_v2(wire: str | bytes | bytearray) -> SignedExe
         raise ExecutableGrantVerificationError(
             "signed executable grant wire is not strict JSON"
         ) from exc
-    if len(wire_bytes) > MAX_SIGNED_EXECUTABLE_GRANT_V2_WIRE_BYTES:
-        raise ExecutableGrantVerificationError("signed executable grant wire exceeds size limit")
     try:
         raw: Any = json.loads(wire_bytes, object_pairs_hook=_reject_duplicate_keys)
     except (TypeError, UnicodeDecodeError, ValueError, RecursionError, json.JSONDecodeError) as exc:
@@ -442,7 +439,6 @@ def verify_signed_executable_grant_v2(
 
 
 __all__ = [
-    "MAX_SIGNED_EXECUTABLE_GRANT_V2_WIRE_BYTES",
     "PUBLIC_TRUST_ANCHOR_RESOURCE",
     "PUBLIC_TRUST_ANCHOR_SHA256",
     "SIGNED_EXECUTABLE_GRANT_V2_SCHEMA_RESOURCE",
