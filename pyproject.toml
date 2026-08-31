@@ -19,6 +19,7 @@ dependencies = [
 rsd-infisical-disposable-lifecycle = "omninode_rsd.lifecycle.infisical_disposable:main"
 rsd-executor-installation-render = "omninode_rsd.lifecycle.executor_installation:main"
 rsd-lifecycle-authorize = "omninode_rsd.lifecycle.authorization:main"
+rsd-validate-lab-delegation-contracts = "omninode_rsd.lifecycle.lab_delegation_contract_set:main"
 
 [dependency-groups]
 dev = [
