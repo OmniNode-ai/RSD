@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -20,6 +21,38 @@ from omninode_grant_verifier import (
 )
 
 _VERIFIER_FORMAT_CHECKER = FormatChecker()
+
+
+class _DatetimeSubclass(datetime):
+    """A datetime subclass must not cross the exact public clock boundary."""
+
+
+class _DatetimeSpoof:
+    @property
+    def __class__(self) -> type[datetime]:
+        return datetime
+
+
+class _RaisingTzinfo(tzinfo):
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return None
+
+    def tzname(self, dt: datetime | None) -> str | None:
+        return "raising"
+
+    def utcoffset(self, dt: datetime | None) -> timedelta | None:
+        raise RuntimeError("hostile timezone")
+
+
+class _InvalidOffsetTzinfo(tzinfo):
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return None
+
+    def tzname(self, dt: datetime | None) -> str | None:
+        return "invalid-offset"
+
+    def utcoffset(self, dt: datetime | None) -> timedelta | None:
+        return cast(timedelta, "not-a-timedelta")
 
 
 @_VERIFIER_FORMAT_CHECKER.checks("date-time")
@@ -104,14 +137,56 @@ def test_schema_anchor_and_parser_are_fixed_public_resources() -> None:
         parse_signed_executable_grant_v2('{"schema_version":"x","schema_version":"y"}')
 
 
-@pytest.mark.parametrize("invalid_now", (None, "2030-01-01T00:00:00Z", 0))
+@pytest.mark.parametrize(
+    "invalid_now",
+    (
+        None,
+        "2030-01-01T00:00:00Z",
+        0,
+        MagicMock(spec=datetime),
+        _DatetimeSpoof(),
+        _DatetimeSubclass(2030, 1, 1, tzinfo=UTC),
+    ),
+)
 def test_verifier_rejects_non_datetime_clocks_with_a_contract_error(invalid_now: object) -> None:
     """An invalid caller clock must fail closed through the public error boundary."""
 
-    with pytest.raises(ExecutableGrantVerificationError, match="must be a datetime"):
+    with pytest.raises(ExecutableGrantVerificationError, match="must be an exact datetime"):
         verify_signed_executable_grant_v2(
             json.dumps(_valid_wire()), now=cast(datetime, invalid_now)
         )
+
+
+@pytest.mark.parametrize(
+    ("invalid_now", "message"),
+    (
+        (datetime(2030, 1, 1), "must be UTC timezone-aware"),
+        (
+            datetime(2030, 1, 1, tzinfo=timezone(timedelta(hours=1))),
+            "must be UTC timezone-aware",
+        ),
+        (datetime(2030, 1, 1, tzinfo=_RaisingTzinfo()), "timestamp is invalid"),
+        (datetime(2030, 1, 1, tzinfo=_InvalidOffsetTzinfo()), "timestamp is invalid"),
+    ),
+)
+def test_verifier_contains_hostile_or_non_utc_builtin_datetime_values(
+    invalid_now: datetime, message: str
+) -> None:
+    """A built-in datetime's attached timezone cannot escape the public error boundary."""
+
+    with pytest.raises(ExecutableGrantVerificationError, match=message):
+        verify_signed_executable_grant_v2(json.dumps(_valid_wire()), now=invalid_now)
+
+
+@pytest.mark.parametrize(
+    "now",
+    (
+        datetime(2030, 1, 1, tzinfo=UTC),
+        datetime(2030, 1, 1, tzinfo=timezone(timedelta(0))),
+    ),
+)
+def test_verifier_accepts_canonical_utc_clocks(now: datetime) -> None:
+    assert verify_signed_executable_grant_v2(json.dumps(_valid_wire()), now=now)
 
 
 def _assert_closed_object(

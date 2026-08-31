@@ -379,6 +379,23 @@ def parse_signed_executable_grant_v2(wire: str | bytes | bytearray) -> SignedExe
         ) from exc
 
 
+def _normalize_verification_timestamp(now: datetime) -> datetime:
+    """Return an exact, UTC-normalized caller clock or fail through the public boundary."""
+
+    if type(now) is not datetime:
+        raise ExecutableGrantVerificationError("verification timestamp must be an exact datetime")
+    try:
+        if now.tzinfo is None or now.utcoffset() != UTC.utcoffset(now):
+            raise ExecutableGrantVerificationError(
+                "verification timestamp must be UTC timezone-aware"
+            )
+        return now.astimezone(UTC)
+    except ExecutableGrantVerificationError:
+        raise
+    except Exception as exc:
+        raise ExecutableGrantVerificationError("verification timestamp is invalid") from exc
+
+
 def verify_signed_executable_grant_v2(
     wire: str | bytes | bytearray,
     *,
@@ -386,10 +403,7 @@ def verify_signed_executable_grant_v2(
 ) -> SignedExecutableGrantV2:
     """Parse and verify a grant against the fixed package trust anchor."""
 
-    if not isinstance(now, datetime):
-        raise ExecutableGrantVerificationError("verification timestamp must be a datetime")
-    if now.tzinfo is None or now.utcoffset() != UTC.utcoffset(now):
-        raise ExecutableGrantVerificationError("verification timestamp must be UTC timezone-aware")
+    verified_at = _normalize_verification_timestamp(now)
     grant = parse_signed_executable_grant_v2(wire)
     anchor = public_grant_trust_anchor_v1()
     material = grant.authorization_material
@@ -401,7 +415,6 @@ def verify_signed_executable_grant_v2(
         raise ExecutableGrantVerificationError(
             "grant issuer fingerprint does not match the public trust anchor"
         )
-    verified_at = now.astimezone(UTC)
     lifecycle = material.grant
     issued_at = lifecycle.issued_at.astimezone(UTC)
     not_before = lifecycle.not_before.astimezone(UTC)
