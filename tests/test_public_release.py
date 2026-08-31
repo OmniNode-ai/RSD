@@ -154,6 +154,27 @@ def test_rejects_unallowlisted_top_level_and_source_subsystem(tmp_path: Path) ->
     assert "src/omninode_rsd/transport" in paths
 
 
+def test_rejects_unallowlisted_standalone_verifier_member(tmp_path: Path) -> None:
+    findings = _write(tmp_path, "public_verifier/notes.txt", "unexpected\n")
+    assert any(
+        item.path == "public_verifier/notes.txt" and item.rule == "path_allowlist"
+        for item in findings
+    )
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "runtime/container_bootstrap/manifest.toml",
+        "runtime/oci/containerfile",
+    ),
+)
+def test_rejects_planned_runtime_implementation_subtrees(tmp_path: Path, relative: str) -> None:
+    findings = _write(tmp_path, relative, "planned artifact\n")
+
+    assert any(item.path == "runtime" and item.rule == "path_allowlist" for item in findings)
+
+
 def test_allows_postgres_lifecycle_package_paths(tmp_path: Path) -> None:
     _write(tmp_path, "src/omninode_rsd/lifecycle/postgres/__init__.py", "")
     findings = _write(

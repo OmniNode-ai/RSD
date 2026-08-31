@@ -1,0 +1,158 @@
+{
+  "$id": "urn:omninode-rsd:signed-executable-grant:v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "authorization_material",
+    "authorization_digest",
+    "signature_octets"
+  ],
+  "properties": {
+    "schema_version": {"const": "omninode-rsd.signed-executable-grant.v2"},
+    "authorization_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "signature_octets": {
+      "type": "array",
+      "minItems": 64,
+      "maxItems": 64,
+      "items": {"type": "integer", "minimum": 0, "maximum": 255}
+    },
+    "authorization_material": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "domain",
+        "issuer_key_id",
+        "issuer_key_fingerprint_sha256",
+        "grant"
+      ],
+      "properties": {
+        "schema_version": {"const": "omninode-rsd.grant-authorization-material.v2"},
+        "domain": {"const": "omninode-rsd.signed-executable-grant.v2"},
+        "issuer_key_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,63}$"
+        },
+        "issuer_key_fingerprint_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "grant": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version",
+            "dispatch_policy",
+            "grant_id",
+            "envelope_id",
+            "activation_id",
+            "correlation_id",
+            "nonce_sha256",
+            "pins",
+            "tenant_id",
+            "backend_id",
+            "served_model_id",
+            "posture",
+            "expected_output_topic",
+            "expected_output_event_class",
+            "expected_output_event_index",
+            "issued_at",
+            "not_before",
+            "expires_at"
+          ],
+          "properties": {
+            "schema_version": {
+              "const": "omninode-rsd.executable-grant-material.v2"
+            },
+            "dispatch_policy": {"const": "backend-pinned-single-attempt.v1"},
+            "grant_id": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "envelope_id": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "activation_id": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "correlation_id": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "nonce_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "pins": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "artifact_sha256",
+                "rendered_contract_sha256",
+                "request_sha256"
+              ],
+              "properties": {
+                "artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "rendered_contract_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "request_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              }
+            },
+            "tenant_id": {"type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$"},
+            "backend_id": {"type": "string", "pattern": "^[a-z][a-z0-9-]{1,63}$"},
+            "served_model_id": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9._-]{1,127}$"
+            },
+            "posture": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "attempt_count",
+                "retry_disposition",
+                "fallback_used",
+                "recovery_disposition"
+              ],
+              "properties": {
+                "attempt_count": {"const": 1},
+                "retry_disposition": {"const": "forbidden"},
+                "fallback_used": {"const": false},
+                "recovery_disposition": {"const": "report-only"}
+              }
+            },
+            "expected_output_topic": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]*(?:[.][a-z][a-z0-9-]*)+$"
+            },
+            "expected_output_event_class": {
+              "type": "string",
+              "pattern": "^Model[A-Za-z0-9]*$"
+            },
+            "expected_output_event_index": {"const": 0},
+            "issued_at": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:[.][0-9]{1,6})?Z$"
+            },
+            "not_before": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:[.][0-9]{1,6})?Z$"
+            },
+            "expires_at": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:[.][0-9]{1,6})?Z$"
+            }
+          }
+        }
+      }
+    }
+  }
+}

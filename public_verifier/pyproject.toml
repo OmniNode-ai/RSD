@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "omninode-grant-verifier"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["cryptography>=50,<51", "pydantic>=2.10,<3"]
+
+[dependency-groups]
+dev = ["pytest>=8.3,<10", "ruff>=0.9,<1", "mypy>=1.13,<2", "jsonschema>=4.23,<5"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/omninode_grant_verifier"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/omninode_grant_verifier/resources/executable_grant_v2_trust_anchor.json" = "omninode_grant_verifier/resources/executable_grant_v2_trust_anchor.json"
+"src/omninode_grant_verifier/resources/signed_executable_grant_v2.schema.json" = "omninode_grant_verifier/resources/signed_executable_grant_v2.schema.json"
+"src/omninode_grant_verifier/resources/signed_executable_grant_v2.vectors.json" = "omninode_grant_verifier/resources/signed_executable_grant_v2.vectors.json"
