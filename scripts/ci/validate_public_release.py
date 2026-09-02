@@ -223,7 +223,7 @@ def _is_allowed_directory(path: Path) -> bool:
     if parts[0] == "public_verifier":
         return any(entry[: len(parts)] == parts for entry in PUBLIC_VERIFIER_FILES)
     if len(parts) == 1:
-        return parts[0] in {".github", "config", "scripts", "src", "tests"}
+        return parts[0] in {".github", "scripts", "src", "tests"}
     if parts[:2] == (".github", "workflows"):
         return len(parts) == 2
     if parts[:2] == ("scripts", "ci"):

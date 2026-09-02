@@ -172,7 +172,6 @@ def test_allows_only_the_delegated_request_safe_slice_files(tmp_path: Path, rela
 @pytest.mark.parametrize(
     "relative",
     (
-        "config/delegation-overlay.yaml",
         "src/omninode_rsd/delegation_extra.py",
         "tests/test_delegation_extra.py",
     ),
@@ -181,6 +180,14 @@ def test_rejects_delegated_request_safe_slice_adjacent_paths(tmp_path: Path, rel
     findings = _write(tmp_path, relative, "unexpected artifact\n")
 
     assert any(item.path == relative and item.rule == "path_allowlist" for item in findings)
+
+
+def test_rejects_unallowlisted_top_level_config_directory(tmp_path: Path) -> None:
+    (tmp_path / "config").mkdir()
+
+    findings = scan_tree(tmp_path)
+
+    assert any(item.path == "config" and item.rule == "path_allowlist" for item in findings)
 
 
 def test_rejects_unallowlisted_standalone_verifier_member(tmp_path: Path) -> None:

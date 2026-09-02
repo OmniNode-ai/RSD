@@ -466,34 +466,11 @@ wheels = [
 ]
 
 [[package]]
-name = "omninode-grant-verifier"
-version = "0.1.0"
-source = { editable = "public_verifier" }
-dependencies = [
-    { name = "cryptography" },
-    { name = "pydantic" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "cryptography", specifier = ">=50,<51" },
-    { name = "pydantic", specifier = ">=2.10,<3" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "jsonschema", specifier = ">=4.23,<5" },
-    { name = "mypy", specifier = ">=1.13,<2" },
-    { name = "pytest", specifier = ">=8.3,<10" },
-    { name = "ruff", specifier = ">=0.9,<1" },
-]
-
-[[package]]
 name = "omninode-rsd"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "omninode-grant-verifier" },
+    { name = "cryptography" },
     { name = "pydantic" },
     { name = "pyyaml" },
 ]
@@ -510,7 +487,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "omninode-grant-verifier", editable = "public_verifier" },
+    { name = "cryptography", specifier = ">=50,<51" },
     { name = "pydantic", specifier = ">=2.10,<3" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
 ]
