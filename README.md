@@ -83,6 +83,15 @@ uv run ruff format --check src/ tests/
 uv run ruff check src/ tests/
 ```
 
+`omninode-rsd` depends exactly on `omninode-grant-verifier` 0.1.0. The verifier
+distribution exclusively owns the `omninode_grant_verifier` import package; the
+root wheel does not include it. The two local public artifacts are not a
+self-contained third-party dependency bundle: ordinary runtime dependencies
+continue to require normal package-index or cache resolution. The external
+paired-publication gate is that `omninode-grant-verifier==0.1.0` must be
+published and accessible wherever `omninode-rsd==0.1.0` is published, or both
+artifacts must be supplied together by the release process.
+
 The PostgreSQL integration suite is opt-in. It runs only with
 `--postgres-integration` and an externally injected
 `postgres_lifecycle_connection_factory` fixture for a fresh disposable isolated

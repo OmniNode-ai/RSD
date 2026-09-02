@@ -10,9 +10,16 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
+  "omninode-grant-verifier==0.1.0",
   "pydantic>=2.10,<3",
   "PyYAML>=6.0,<7",
 ]
+
+[tool.uv.sources]
+omninode-grant-verifier = { workspace = true }
+
+[tool.uv.workspace]
+members = ["public_verifier"]
 
 [dependency-groups]
 dev = [
@@ -29,6 +36,9 @@ packages = ["src/omninode_rsd"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql" = "omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql"
+
+[tool.hatch.build.targets.sdist]
+exclude = ["public_verifier"]
 
 [tool.hatch.build.targets.sdist.force-include]
 "src/omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql" = "src/omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql"
@@ -50,3 +60,4 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 python_version = "3.12"
 strict = true
 packages = ["omninode_rsd"]
+mypy_path = ["public_verifier/src"]

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import shutil
+import subprocess
 import sys
+import tarfile
+import zipfile
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -14,6 +20,15 @@ sys.modules[_SPEC.name] = _VALIDATOR
 _SPEC.loader.exec_module(_VALIDATOR)
 scan_tree = _VALIDATOR.scan_tree
 validate_tree = _VALIDATOR.validate_tree
+
+_ROOT = Path(__file__).parents[1]
+_VERIFIER_ROOT = _ROOT / "public_verifier"
+_VERIFIER_VERSION = "0.1.0"
+_VERIFIER_RESOURCES = (
+    "executable_grant_v2_trust_anchor.json",
+    "signed_executable_grant_v2.schema.json",
+    "signed_executable_grant_v2.vectors.json",
+)
 
 _MIT_LICENSE = """\\
 MIT License
@@ -40,11 +55,11 @@ SOFTWARE.
 """
 
 
-def _write(tmp_path: Path, relative: str, content: str) -> list:
+def _write(tmp_path: Path, relative: str, content: str) -> list[Any]:
     target = tmp_path / relative
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
-    return scan_tree(tmp_path)
+    return cast(list[Any], scan_tree(tmp_path))
 
 
 def _marker(name: str) -> str:
@@ -61,6 +76,288 @@ def _marker(name: str) -> str:
 
 def _address(*parts: str) -> str:
     return "".join(parts)
+
+
+def _run_command(cwd: Path, *command: str) -> str:
+    completed = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
+    if completed.returncode:
+        raise AssertionError(
+            f"command failed: {command!r}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+        )
+    return completed.stdout
+
+
+def _single_artifact(directory: Path, suffix: str) -> Path:
+    artifacts = tuple(directory.glob(f"*{suffix}"))
+    assert len(artifacts) == 1
+    return artifacts[0]
+
+
+def _installed_records(interpreter: Path, cwd: Path) -> dict[str, list[str]]:
+    code = """
+import csv
+import json
+from importlib.metadata import distribution
+
+records = {}
+for name in ("omninode-rsd", "omninode-grant-verifier"):
+    record = distribution(name).read_text("RECORD")
+    assert record is not None
+    records[name] = [row[0] for row in csv.reader(record.splitlines())]
+print(json.dumps(records, sort_keys=True))
+"""
+    output = _run_command(cwd, str(interpreter), "-I", "-c", code)
+    return cast(dict[str, list[str]], json.loads(output))
+
+
+def _installed_smoke(interpreter: Path, cwd: Path) -> None:
+    code = f"""
+import json
+import omninode_grant_verifier
+import omninode_rsd
+import sysconfig
+from datetime import UTC, datetime
+from importlib.resources import files
+from pathlib import Path
+
+from omninode_grant_verifier import signed_executable_grant_v2_vectors
+from omninode_rsd.delegation import PublicGrantVerifierAdapter, load_canonical_delegation_overlay
+from omninode_rsd.lifecycle.postgres import discover_lifecycle_migrations
+
+site_packages = Path(sysconfig.get_paths()["purelib"]).resolve()
+repository = Path({_ROOT.as_posix()!r}).resolve()
+for package in (omninode_rsd, omninode_grant_verifier):
+    package_path = Path(package.__file__).resolve()
+    assert package_path.is_relative_to(site_packages)
+    assert not package_path.is_relative_to(repository)
+resources = files("omninode_grant_verifier").joinpath("resources")
+assert Path(resources).resolve().is_relative_to(site_packages)
+assert not Path(resources).resolve().is_relative_to(repository)
+for resource_name in {_VERIFIER_RESOURCES!r}:
+    resource = resources.joinpath(resource_name)
+    assert Path(resource).resolve().is_relative_to(site_packages)
+    assert not Path(resource).resolve().is_relative_to(repository)
+    assert resource.read_bytes()
+vectors = signed_executable_grant_v2_vectors()
+base_wire = vectors["base_wire"]
+assert type(base_wire) is dict
+facts = PublicGrantVerifierAdapter(
+    trusted_clock=lambda: datetime(2030, 1, 1, tzinfo=UTC)
+)(json.dumps(base_wire, separators=(",", ":")).encode())
+assert facts.tenant_id == "public-demo"
+assert not load_canonical_delegation_overlay().execute_enabled
+assert discover_lifecycle_migrations()[0].version == 1
+"""
+    _run_command(cwd, str(interpreter), "-I", "-c", code)
+
+
+def _installed_verifier_smoke(interpreter: Path, cwd: Path) -> None:
+    code = """
+from importlib.metadata import PackageNotFoundError, distribution
+from importlib.resources import files
+
+from omninode_grant_verifier import signed_executable_grant_v2_vectors
+
+try:
+    distribution("omninode-rsd")
+except PackageNotFoundError:
+    pass
+else:
+    raise AssertionError("root distribution remained installed")
+assert files("omninode_grant_verifier").joinpath(
+    "resources", "signed_executable_grant_v2.vectors.json"
+).read_bytes()
+assert type(signed_executable_grant_v2_vectors()["base_wire"]) is dict
+"""
+    _run_command(cwd, str(interpreter), "-I", "-c", code)
+
+
+def _assert_public_distributions_absent(interpreter: Path, cwd: Path) -> None:
+    code = """
+from importlib.metadata import PackageNotFoundError, distribution
+
+for name in ("omninode-rsd", "omninode-grant-verifier"):
+    try:
+        distribution(name)
+    except PackageNotFoundError:
+        continue
+    raise AssertionError(f"{name} must not be part of the third-party runtime closure")
+"""
+    _run_command(cwd, str(interpreter), "-I", "-c", code)
+
+
+def _install_local_wheel(
+    uv: str, interpreter: Path, local_artifacts: Path, artifact: Path, cwd: Path
+) -> None:
+    """Install one locally built public artifact without resolving dependencies."""
+    _run_command(
+        cwd,
+        uv,
+        "pip",
+        "install",
+        "--offline",
+        "--no-index",
+        "--no-cache",
+        "--no-deps",
+        "--find-links",
+        str(local_artifacts),
+        "--python",
+        str(interpreter),
+        str(artifact),
+    )
+
+
+def test_paired_public_artifacts_have_isolated_install_ownership(tmp_path: Path) -> None:
+    """Prove local artifact ownership after uv prepares the locked third-party closure."""
+    uv = shutil.which("uv")
+    assert uv is not None
+    root_sdist_dir = tmp_path / "root-sdist"
+    root_wheel_dir = tmp_path / "root-wheel"
+    verifier_sdist_dir = tmp_path / "verifier-sdist"
+    verifier_wheel_dir = tmp_path / "verifier-wheel"
+    local_artifacts = tmp_path / "local-artifacts"
+    environment = tmp_path / "environment"
+    neutral_cwd = tmp_path / "neutral-cwd"
+    locked_runtime_closure = tmp_path / "locked-runtime-closure.txt"
+    for directory in (
+        root_sdist_dir,
+        root_wheel_dir,
+        verifier_sdist_dir,
+        verifier_wheel_dir,
+        local_artifacts,
+        neutral_cwd,
+    ):
+        directory.mkdir()
+
+    _run_command(_ROOT, uv, "build", "--offline", "--sdist", "--out-dir", str(root_sdist_dir))
+    _run_command(
+        tmp_path,
+        uv,
+        "build",
+        "--offline",
+        "--wheel",
+        "--out-dir",
+        str(root_wheel_dir),
+        str(_single_artifact(root_sdist_dir, ".tar.gz")),
+    )
+    _run_command(
+        _VERIFIER_ROOT,
+        uv,
+        "build",
+        "--offline",
+        "--sdist",
+        "--out-dir",
+        str(verifier_sdist_dir),
+    )
+    _run_command(
+        tmp_path,
+        uv,
+        "build",
+        "--offline",
+        "--wheel",
+        "--out-dir",
+        str(verifier_wheel_dir),
+        str(_single_artifact(verifier_sdist_dir, ".tar.gz")),
+    )
+
+    root_wheel = _single_artifact(root_wheel_dir, ".whl")
+    verifier_wheel = _single_artifact(verifier_wheel_dir, ".whl")
+    with tarfile.open(_single_artifact(root_sdist_dir, ".tar.gz")) as archive:
+        root_sdist_members = frozenset(member.name for member in archive.getmembers())
+    assert not any("/public_verifier/" in member for member in root_sdist_members)
+
+    with zipfile.ZipFile(root_wheel) as archive:
+        root_members = frozenset(archive.namelist())
+        metadata_name = next(name for name in root_members if name.endswith(".dist-info/METADATA"))
+        metadata = archive.read(metadata_name).decode("utf-8")
+    assert f"Requires-Dist: omninode-grant-verifier=={_VERIFIER_VERSION}" in metadata
+    assert not any(member.startswith("omninode_grant_verifier/") for member in root_members)
+
+    with zipfile.ZipFile(verifier_wheel) as archive:
+        verifier_members = frozenset(archive.namelist())
+    assert any(member.startswith("omninode_grant_verifier/") for member in verifier_members)
+    assert not any(member.startswith("omninode_rsd/") for member in verifier_members)
+
+    root_local_wheel = local_artifacts / root_wheel.name
+    verifier_local_wheel = local_artifacts / verifier_wheel.name
+    shutil.copy2(root_wheel, root_local_wheel)
+    shutil.copy2(verifier_wheel, verifier_local_wheel)
+    assert frozenset(path.name for path in local_artifacts.iterdir()) == {
+        root_wheel.name,
+        verifier_wheel.name,
+    }
+
+    # uv exports the frozen lock's third-party runtime closure, excluding both local projects.
+    _run_command(
+        _ROOT,
+        uv,
+        "export",
+        "--frozen",
+        "--no-dev",
+        "--no-editable",
+        "--no-emit-local",
+        "--format",
+        "requirements-txt",
+        "--output-file",
+        str(locked_runtime_closure),
+    )
+    assert locked_runtime_closure.read_bytes()
+
+    _run_command(tmp_path, uv, "venv", "--offline", "--python", "3.12", str(environment))
+    interpreter = environment / "bin" / "python"
+    # This is deliberately normal uv index/cache installation: only ordinary third-party
+    # runtime dependencies belong to the lock-derived closure.
+    _run_command(
+        neutral_cwd,
+        uv,
+        "pip",
+        "install",
+        "--require-hashes",
+        "--python",
+        str(interpreter),
+        "--requirements",
+        str(locked_runtime_closure),
+    )
+    _assert_public_distributions_absent(interpreter, neutral_cwd)
+
+    # The two public artifacts must come only from their freshly built local wheel paths.
+    _install_local_wheel(uv, interpreter, local_artifacts, verifier_local_wheel, neutral_cwd)
+    _install_local_wheel(uv, interpreter, local_artifacts, root_local_wheel, neutral_cwd)
+    _installed_smoke(interpreter, neutral_cwd)
+
+    records = _installed_records(interpreter, neutral_cwd)
+    root_records = set(records["omninode-rsd"])
+    verifier_records = set(records["omninode-grant-verifier"])
+    assert root_records.isdisjoint(verifier_records)
+    assert any(path.startswith("omninode_rsd/") for path in root_records)
+    assert not any(path.startswith("omninode_grant_verifier/") for path in root_records)
+    assert any(path.startswith("omninode_grant_verifier/") for path in verifier_records)
+    assert not any(path.startswith("omninode_rsd/") for path in verifier_records)
+
+    _run_command(
+        neutral_cwd,
+        uv,
+        "pip",
+        "uninstall",
+        "--offline",
+        "--python",
+        str(interpreter),
+        "omninode-rsd",
+    )
+    _installed_verifier_smoke(interpreter, neutral_cwd)
+    _run_command(
+        neutral_cwd,
+        uv,
+        "pip",
+        "uninstall",
+        "--offline",
+        "--python",
+        str(interpreter),
+        "omninode-grant-verifier",
+    )
+    _install_local_wheel(uv, interpreter, local_artifacts, verifier_local_wheel, neutral_cwd)
+    _install_local_wheel(uv, interpreter, local_artifacts, root_local_wheel, neutral_cwd)
+    _installed_smoke(interpreter, neutral_cwd)
 
 
 @pytest.mark.parametrize(
@@ -152,6 +449,41 @@ def test_rejects_unallowlisted_top_level_and_source_subsystem(tmp_path: Path) ->
     paths = {item.path for item in findings if item.rule == "path_allowlist"}
     assert "infra" in paths
     assert "src/omninode_rsd/transport" in paths
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "src/omninode_rsd/delegation.py",
+        "src/omninode_rsd/delegation-overlay.yaml",
+        "tests/test_delegation.py",
+    ),
+)
+def test_allows_only_the_delegated_request_safe_slice_files(tmp_path: Path, relative: str) -> None:
+    findings = _write(tmp_path, relative, "safe artifact\n")
+
+    assert findings == []
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "src/omninode_rsd/delegation_extra.py",
+        "tests/test_delegation_extra.py",
+    ),
+)
+def test_rejects_delegated_request_safe_slice_adjacent_paths(tmp_path: Path, relative: str) -> None:
+    findings = _write(tmp_path, relative, "unexpected artifact\n")
+
+    assert any(item.path == relative and item.rule == "path_allowlist" for item in findings)
+
+
+def test_rejects_unallowlisted_top_level_config_directory(tmp_path: Path) -> None:
+    (tmp_path / "config").mkdir()
+
+    findings = scan_tree(tmp_path)
+
+    assert any(item.path == "config" and item.rule == "path_allowlist" for item in findings)
 
 
 def test_rejects_unallowlisted_standalone_verifier_member(tmp_path: Path) -> None:

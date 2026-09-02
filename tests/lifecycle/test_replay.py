@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from datetime import timedelta
+from typing import NoReturn
 from uuid import UUID
 
 import pytest
@@ -55,24 +57,24 @@ class _EvilUUID(UUID):
 
 
 class _HostileTuple(tuple[LifecycleEvent, ...]):
-    def __iter__(self) -> object:
+    def __iter__(self) -> Iterator[LifecycleEvent]:
         raise RuntimeError("tuple iteration must not run")
 
     def __len__(self) -> int:
         raise RuntimeError("tuple length must not run")
 
-    def __getitem__(self, index: object) -> object:
+    def __getitem__(self, index: object) -> NoReturn:
         raise RuntimeError("tuple indexing must not run")
 
 
 class _HostileList(list[LifecycleEvent]):
-    def __iter__(self) -> object:
+    def __iter__(self) -> Iterator[LifecycleEvent]:
         raise RuntimeError("list iteration must not run")
 
     def __len__(self) -> int:
         raise RuntimeError("list length must not run")
 
-    def __getitem__(self, index: object) -> object:
+    def __getitem__(self, index: object) -> NoReturn:
         raise RuntimeError("list indexing must not run")
 
 
@@ -92,7 +94,7 @@ def test_verifier_accepts_canonical_artifact_and_list_snapshot_without_mutation(
     event_list = list(events)
     replay = replay_lifecycle(events)
 
-    assert verify_lifecycle_replay(event_list, replay) is None
+    verify_lifecycle_replay(event_list, replay)
     assert event_list == list(events)
     assert replay == replay_lifecycle(events)
 
@@ -102,7 +104,7 @@ def test_verifier_accepts_exact_tuple_snapshot_without_mutation() -> None:
     replay = replay_lifecycle(events)
 
     assert type(events) is tuple
-    assert verify_lifecycle_replay(events, replay) is None
+    verify_lifecycle_replay(events, replay)
     assert events == event_stream()
 
 
@@ -120,7 +122,7 @@ def test_verifier_rejects_empty_input() -> None:
         verify_lifecycle_replay((), replay_lifecycle(event_stream()))
 
 
-@pytest.mark.parametrize("events", ((event for event in ()), set()))
+@pytest.mark.parametrize("events", (iter(()), set[object]()))
 def test_verifier_rejects_non_snapshot_containers(events: object) -> None:
     with pytest.raises(LifecycleReplayInputError, match=r"^replay input must be a tuple or list$"):
         verify_lifecycle_replay(events, replay_lifecycle(event_stream()))  # type: ignore[arg-type]
