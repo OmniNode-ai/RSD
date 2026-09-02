@@ -158,8 +158,8 @@ def test_rejects_unallowlisted_top_level_and_source_subsystem(tmp_path: Path) ->
 @pytest.mark.parametrize(
     "relative",
     (
-        "config/delegation-overlay.yaml",
         "src/omninode_rsd/delegation.py",
+        "src/omninode_rsd/delegation-overlay.yaml",
         "tests/test_delegation.py",
     ),
 )
@@ -172,7 +172,7 @@ def test_allows_only_the_delegated_request_safe_slice_files(tmp_path: Path, rela
 @pytest.mark.parametrize(
     "relative",
     (
-        "config/another-overlay.yaml",
+        "config/delegation-overlay.yaml",
         "src/omninode_rsd/delegation_extra.py",
         "tests/test_delegation_extra.py",
     ),

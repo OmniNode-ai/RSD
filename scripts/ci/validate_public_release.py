@@ -88,8 +88,8 @@ PUBLIC_GRANT_RESOURCES: Final[frozenset[str]] = frozenset(
 )
 DELEGATED_REQUEST_SAFE_SLICE_FILES: Final[frozenset[tuple[str, ...]]] = frozenset(
     {
-        ("config", "delegation-overlay.yaml"),
         ("src", "omninode_rsd", "delegation.py"),
+        ("src", "omninode_rsd", "delegation-overlay.yaml"),
         ("tests", "test_delegation.py"),
     }
 )

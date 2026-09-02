@@ -1,30 +1,26 @@
 from __future__ import annotations
 
+import inspect
 import json
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
 from omninode_grant_verifier import signed_executable_grant_v2_vectors
 from pydantic import ValidationError
 
+import omninode_rsd.delegation as delegation
 from omninode_rsd.delegation import (
     AtomicClaimPort,
     ClaimDisposition,
     DelegatedGrantClaim,
     DelegatedRequest,
     DelegatedRequestIngress,
-    DelegationOverlay,
     DelegationSubmissionState,
     DispatchPort,
-    GrantVerifier,
+    PublicGrantVerifierAdapter,
     VerifiedGrantFacts,
-    canonical_delegation_overlay_path,
-    create_public_grant_verifier,
     load_canonical_delegation_overlay,
-    load_delegation_overlay,
 )
 from omninode_rsd.lifecycle import (
     InMemoryEventLog,
@@ -45,7 +41,7 @@ def _valid_wire() -> bytes:
 
 
 def _facts() -> VerifiedGrantFacts:
-    return create_public_grant_verifier(trusted_clock=lambda: _NOW)(_valid_wire())
+    return PublicGrantVerifierAdapter(trusted_clock=lambda: _NOW)(_valid_wire())
 
 
 def _request(facts: VerifiedGrantFacts | None = None) -> DelegatedRequest:
@@ -65,13 +61,25 @@ def _request(facts: VerifiedGrantFacts | None = None) -> DelegatedRequest:
     )
 
 
-def _enabled_policy(facts: VerifiedGrantFacts | None = None) -> DelegationOverlay:
-    facts = _facts() if facts is None else facts
-    return DelegationOverlay(
-        schema_version="rsd.delegation-overlay.v1",
-        execute_enabled=True,
-        route_ref="logical://delegation/public-demo",
-        model_ref=facts.model_id,
+def _enabled_overlay_bytes(facts: VerifiedGrantFacts) -> bytes:
+    return (
+        "\n".join(
+            (
+                'schema_version: "rsd.delegation-overlay.v1"',
+                "execute_enabled: true",
+                'route_ref: "logical://delegation/public-demo"',
+                f'model_ref: "{facts.model_id}"',
+            )
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _enable_canonical_overlay(monkeypatch: pytest.MonkeyPatch, facts: VerifiedGrantFacts) -> None:
+    monkeypatch.setattr(
+        delegation,
+        "_canonical_delegation_overlay_bytes",
+        lambda: _enabled_overlay_bytes(facts),
     )
 
 
@@ -145,62 +153,54 @@ class _RecordingLog:
 
 
 def _ingress(
-    verifier: GrantVerifier,
     claim: AtomicClaimPort,
     dispatch: DispatchPort,
     log: _RecordingLog | None = None,
-    *,
-    policy: DelegationOverlay | None = None,
 ) -> DelegatedRequestIngress:
     return DelegatedRequestIngress(
-        verify_grant=verifier,
+        trusted_clock=lambda: _NOW,
         claim_port=claim,
         dispatch_port=dispatch,
         event_log=_RecordingLog() if log is None else log,
         event_ingress=LifecycleEventIngress(),
-        policy=policy,
     )
 
 
-def test_canonical_overlay_is_immutable_and_default_ingress_rejects_before_any_call() -> None:
+def test_public_ingress_has_no_policy_or_verifier_substitution_surface() -> None:
+    parameters = inspect.signature(DelegatedRequestIngress).parameters
+
+    assert {"policy", "verify_grant", "verifier", "overlay"}.isdisjoint(parameters)
+    assert not hasattr(DelegatedRequestIngress, "from_canonical_public_verifier")
+    assert not hasattr(delegation, "load_delegation_overlay")
+    assert not hasattr(delegation, "canonical_delegation_overlay_path")
+
+
+def test_canonical_overlay_is_immutable_packaged_authority() -> None:
     overlay = load_canonical_delegation_overlay()
-    assert canonical_delegation_overlay_path() == Path("config/delegation-overlay.yaml").resolve()
+
     assert not overlay.execute_enabled
     with pytest.raises(ValidationError):
         overlay.execute_enabled = True
 
-    calls = 0
 
-    def verifier(_: bytes) -> VerifiedGrantFacts:
-        nonlocal calls
-        calls += 1
+def test_disabled_canonical_policy_rejects_before_every_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facts = _facts()
+
+    def fail_verifier(_: PublicGrantVerifierAdapter, __: bytes) -> VerifiedGrantFacts:
         raise AssertionError("disabled policy must reject before verification")
 
+    monkeypatch.setattr(PublicGrantVerifierAdapter, "__call__", fail_verifier)
     claim, dispatch, log = _Claim(), _Dispatch(), _RecordingLog()
-    result = _ingress(cast(GrantVerifier, verifier), claim, dispatch, log).submit(_request(), None)
+
+    result = _ingress(claim, dispatch, log).submit(_request(facts), _valid_wire())
 
     assert result.state is DelegationSubmissionState.REJECTED_NOT_CLAIMED
-    assert calls == claim.calls == dispatch.calls == log.ingest_calls == 0
+    assert claim.calls == dispatch.calls == log.ingest_calls == 0
 
 
-def test_overlay_loader_preserves_execute_flag_for_the_composition_policy(tmp_path: Path) -> None:
-    overlay_path = tmp_path / "delegation-overlay.yaml"
-    overlay_path.write_text(
-        "\n".join(
-            (
-                'schema_version: "rsd.delegation-overlay.v1"',
-                "execute_enabled: true",
-                'route_ref: "logical://delegation/public-demo"',
-                'model_ref: "model-public-v2"',
-            )
-        ),
-        encoding="utf-8",
-    )
-
-    assert load_delegation_overlay(overlay_path).execute_enabled
-
-
-def test_public_verifier_adapter_uses_the_required_clock_and_projects_full_identity() -> None:
+def test_public_verifier_adapter_projects_full_identity() -> None:
     facts = _facts()
 
     assert (
@@ -235,35 +235,30 @@ def test_public_verifier_adapter_uses_the_required_clock_and_projects_full_ident
         ("expected_output_event_index", 1),
     ),
 )
-def test_every_request_fact_mismatch_rejects_before_persistence_claim_or_dispatch(
-    field: str, replacement: object
+def test_every_request_fact_mismatch_rejects_before_lifecycle_claim_or_dispatch(
+    monkeypatch: pytest.MonkeyPatch, field: str, replacement: object
 ) -> None:
     facts = _facts()
+    _enable_canonical_overlay(monkeypatch, facts)
     request = _request(facts).model_copy(update={field: replacement})
     claim, dispatch, log = _Claim(), _Dispatch(), _RecordingLog()
 
-    result = _ingress(lambda _: facts, claim, dispatch, log, policy=_enabled_policy(facts)).submit(
-        request,
-        b"grant",
-    )
+    result = _ingress(claim, dispatch, log).submit(request, _valid_wire())
 
     assert result.state is DelegationSubmissionState.REJECTED_NOT_CLAIMED
     assert claim.calls == dispatch.calls == log.ingest_calls == 0
 
 
-def test_claim_receives_full_verified_identity_and_lifecycle_ingest_orders_all_boundaries() -> None:
+def test_claim_receives_full_verified_identity_and_lifecycle_ingest_orders_all_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     facts = _facts()
-    request = _request()
+    _enable_canonical_overlay(monkeypatch, facts)
+    request = _request(facts)
     order: list[str] = []
     claim, dispatch, log = _Claim(order=order), _Dispatch(order=order), _RecordingLog(order=order)
 
-    result = _ingress(
-        lambda _: facts,
-        claim,
-        dispatch,
-        log,
-        policy=_enabled_policy(facts),
-    ).submit(request, b"grant")
+    result = _ingress(claim, dispatch, log).submit(request, _valid_wire())
 
     assert result.state is DelegationSubmissionState.SUCCEEDED
     assert order == [
@@ -289,116 +284,85 @@ def test_claim_receives_full_verified_identity_and_lifecycle_ingest_orders_all_b
     assert events[1].prior_event_hash == events[0].event_hash
 
 
-def test_preclaim_persistence_failure_is_terminal_without_claim_or_dispatch() -> None:
+def test_preclaim_persistence_failure_is_terminal_without_claim_or_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     facts = _facts()
+    _enable_canonical_overlay(monkeypatch, facts)
     claim, dispatch, log = _Claim(), _Dispatch(), _RecordingLog(fail_on_ingest=1)
 
-    result = _ingress(
-        lambda _: facts,
-        claim,
-        dispatch,
-        log,
-        policy=_enabled_policy(facts),
-    ).submit(_request(facts), b"grant")
+    result = _ingress(claim, dispatch, log).submit(_request(facts), _valid_wire())
 
     assert result.state is DelegationSubmissionState.PRECLAIM_PERSISTENCE_FAILED
     assert claim.calls == dispatch.calls == 0
 
 
-def test_claim_uncertainty_is_terminal_without_postclaim_persistence_or_dispatch() -> None:
+def test_claim_uncertainty_is_terminal_without_postclaim_persistence_or_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     facts = _facts()
+    _enable_canonical_overlay(monkeypatch, facts)
     claim = _Claim(error=OSError("claim connection outcome is unknown"))
     dispatch, log = _Dispatch(), _RecordingLog()
 
-    result = _ingress(
-        lambda _: facts,
-        claim,
-        dispatch,
-        log,
-        policy=_enabled_policy(facts),
-    ).submit(_request(facts), b"grant")
+    result = _ingress(claim, dispatch, log).submit(_request(facts), _valid_wire())
 
     assert result.state is DelegationSubmissionState.CLAIM_UNCERTAIN
     assert claim.calls == 1 and dispatch.calls == 0 and log.ingest_calls == 1
 
 
-@pytest.mark.parametrize(
-    ("disposition", "expected"),
-    (
-        (ClaimDisposition.CLAIMED, DelegationSubmissionState.CLAIMED_PERSISTENCE_FAILED),
-        (
-            ClaimDisposition.NOT_CLAIMED,
-            DelegationSubmissionState.NOT_CLAIMED_PERSISTENCE_FAILED,
-        ),
-    ),
-)
-def test_postclaim_persistence_failure_is_terminal_and_never_dispatches(
-    disposition: ClaimDisposition, expected: DelegationSubmissionState
+def test_claimed_persistence_uncertainty_is_terminal_and_never_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     facts = _facts()
-    claim, dispatch, log = _Claim(disposition), _Dispatch(), _RecordingLog(fail_on_ingest=2)
+    _enable_canonical_overlay(monkeypatch, facts)
+    claim, dispatch, log = _Claim(), _Dispatch(), _RecordingLog(fail_on_ingest=2)
 
-    result = _ingress(
-        lambda _: facts,
-        claim,
-        dispatch,
-        log,
-        policy=_enabled_policy(facts),
-    ).submit(_request(facts), b"grant")
+    result = _ingress(claim, dispatch, log).submit(_request(facts), _valid_wire())
 
-    assert result.state is expected
+    assert result.state is DelegationSubmissionState.CLAIMED_PERSISTENCE_UNCERTAIN
     assert claim.calls == 1 and dispatch.calls == 0 and log.ingest_calls == 2
 
 
-def test_not_claimed_is_persisted_and_never_dispatched() -> None:
+def test_not_claimed_has_an_explicit_outcome_and_leaves_the_lifecycle_unadvanced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     facts = _facts()
+    _enable_canonical_overlay(monkeypatch, facts)
     claim, dispatch, log = _Claim(ClaimDisposition.NOT_CLAIMED), _Dispatch(), _RecordingLog()
 
-    result = _ingress(
-        lambda _: facts,
-        claim,
-        dispatch,
-        log,
-        policy=_enabled_policy(facts),
-    ).submit(_request(facts), b"grant")
+    result = _ingress(claim, dispatch, log).submit(_request(facts), _valid_wire())
 
-    assert result.state is DelegationSubmissionState.REJECTED_NOT_CLAIMED
+    assert result.state is DelegationSubmissionState.NOT_CLAIMED
     assert claim.calls == 1 and dispatch.calls == 0
     assert [event.event_type for event in log.events_for(facts.correlation_id)] == [
         LifecycleEventType.RUN_CREATED,
-        LifecycleEventType.WORK_FAILED,
     ]
 
 
-def test_dispatch_failure_reports_uncertainty_and_never_retries_the_same_run() -> None:
+def test_dispatch_failure_reports_uncertainty_and_never_retries_the_same_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     facts = _facts()
+    _enable_canonical_overlay(monkeypatch, facts)
     claim, dispatch, log = _Claim(), _Dispatch(error=OSError("dispatch timed out")), _RecordingLog()
-    ingress = _ingress(
-        lambda _: facts,
-        claim,
-        dispatch,
-        log,
-        policy=_enabled_policy(facts),
-    )
+    ingress = _ingress(claim, dispatch, log)
 
-    first = ingress.submit(_request(facts), b"grant")
-    second = ingress.submit(_request(facts), b"grant")
+    first = ingress.submit(_request(facts), _valid_wire())
+    second = ingress.submit(_request(facts), _valid_wire())
 
     assert first.state is DelegationSubmissionState.DISPATCH_UNCERTAIN
     assert second.state is DelegationSubmissionState.PRECLAIM_PERSISTENCE_FAILED
     assert claim.calls == dispatch.calls == 1
 
 
-def test_absent_or_invalid_grant_never_persists_claims_or_dispatches() -> None:
+def test_absent_or_invalid_grant_never_persists_claims_or_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     facts = _facts()
+    _enable_canonical_overlay(monkeypatch, facts)
     claim, dispatch, log = _Claim(), _Dispatch(), _RecordingLog()
-    ingress = _ingress(
-        cast(GrantVerifier, lambda _: (_ for _ in ()).throw(ValueError("invalid grant"))),
-        claim,
-        dispatch,
-        log,
-        policy=_enabled_policy(facts),
-    )
+    ingress = _ingress(claim, dispatch, log)
 
     absent = ingress.submit(_request(facts), None)
     invalid = ingress.submit(_request(facts), b"grant")

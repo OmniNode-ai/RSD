@@ -32,11 +32,9 @@ dev = [
 packages = ["src/omninode_rsd"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"config/delegation-overlay.yaml" = "omninode_rsd/delegation-overlay.yaml"
 "src/omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql" = "omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql"
 
 [tool.hatch.build.targets.sdist.force-include]
-"config/delegation-overlay.yaml" = "src/omninode_rsd/delegation-overlay.yaml"
 "src/omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql" = "src/omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql"
 
 [tool.pytest.ini_options]

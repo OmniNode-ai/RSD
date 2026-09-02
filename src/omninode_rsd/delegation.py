@@ -1,4 +1,4 @@
-"""Fail-closed delegated-request orchestration with injected authority seams."""
+"""Fail-closed delegated-request orchestration with packaged authority."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from hashlib import sha256
-from pathlib import Path
+from importlib.resources import files
 from typing import Literal, Protocol
 from uuid import UUID
 
@@ -58,32 +58,26 @@ class DelegationOverlay(_DelegationModel):
     model_ref: str = Field(pattern=_MODEL_IDENTIFIER)
 
 
-def canonical_delegation_overlay_path() -> Path:
-    """Return the one tracked source policy or its bundled package equivalent."""
-
-    bundled = Path(__file__).with_name("delegation-overlay.yaml")
-    if bundled.is_file():
-        return bundled
-    return Path(__file__).parents[2] / "config" / "delegation-overlay.yaml"
-
-
-def load_delegation_overlay(path: Path) -> DelegationOverlay:
-    """Parse an immutable delegation policy without ambient configuration."""
+def _canonical_delegation_overlay_bytes() -> bytes:
+    """Read the one authority artifact shipped with this package."""
 
     try:
-        value = yaml.safe_load(path.read_bytes())
-    except (OSError, yaml.YAMLError) as error:
+        return files("omninode_rsd").joinpath("delegation-overlay.yaml").read_bytes()
+    except (ModuleNotFoundError, OSError) as error:
+        raise ValueError("delegation overlay is unavailable") from error
+
+
+def load_canonical_delegation_overlay() -> DelegationOverlay:
+    """Load the immutable policy authoritative for the production ingress."""
+
+    try:
+        value = yaml.safe_load(_canonical_delegation_overlay_bytes())
+    except yaml.YAMLError as error:
         raise ValueError("delegation overlay is unavailable") from error
     try:
         return DelegationOverlay.model_validate(value)
     except (TypeError, ValidationError) as error:
         raise ValueError("delegation overlay is invalid") from error
-
-
-def load_canonical_delegation_overlay() -> DelegationOverlay:
-    """Load the policy authoritative for the production composition path."""
-
-    return load_delegation_overlay(canonical_delegation_overlay_path())
 
 
 class VerifiedGrantFacts(_DelegationModel):
@@ -162,12 +156,6 @@ class VerifiedGrantFacts(_DelegationModel):
 type TrustedClock = Callable[[], datetime]
 
 
-class GrantVerifier(Protocol):
-    """A verifier that returns normalized facts, never an opaque wire blob."""
-
-    def __call__(self, grant_wire: bytes) -> VerifiedGrantFacts: ...
-
-
 class PublicGrantVerifierAdapter:
     """Typed adapter from the fixed-anchor public verifier to ingress facts."""
 
@@ -180,12 +168,6 @@ class PublicGrantVerifierAdapter:
             now=self._trusted_clock(),
         )
         return VerifiedGrantFacts.from_signed_executable_grant(signed_grant)
-
-
-def create_public_grant_verifier(*, trusted_clock: TrustedClock) -> GrantVerifier:
-    """Build the public-verifier adapter with an explicitly injected trusted clock."""
-
-    return PublicGrantVerifierAdapter(trusted_clock=trusted_clock)
 
 
 class DelegatedGrantClaim(_DelegationModel):
@@ -221,8 +203,8 @@ class DelegationSubmissionState(StrEnum):
     REJECTED_NOT_CLAIMED = "rejected_not_claimed"
     PRECLAIM_PERSISTENCE_FAILED = "preclaim_persistence_failed"
     CLAIM_UNCERTAIN = "claim_uncertain"
-    NOT_CLAIMED_PERSISTENCE_FAILED = "not_claimed_persistence_failed"
-    CLAIMED_PERSISTENCE_FAILED = "claimed_persistence_failed"
+    NOT_CLAIMED = "not_claimed"
+    CLAIMED_PERSISTENCE_UNCERTAIN = "claimed_persistence_uncertain"
     DISPATCH_UNCERTAIN = "dispatch_uncertain"
     SUCCEEDED = "succeeded"
 
@@ -235,7 +217,6 @@ class DelegationSubmissionResult:
 
 
 _REQUEST_FIELD_NAMES = frozenset(DelegatedRequest.model_fields)
-_POLICY_FIELD_NAMES = frozenset(DelegationOverlay.model_fields)
 _FACT_FIELD_NAMES = frozenset(VerifiedGrantFacts.model_fields)
 
 
@@ -249,20 +230,6 @@ def _validated_request(value: object) -> DelegatedRequest | None:
         return None
     try:
         return DelegatedRequest.model_validate(values)
-    except ValidationError:
-        return None
-
-
-def _validated_policy(value: object) -> DelegationOverlay | None:
-    values = strict_model_values(
-        value,
-        expected_type=DelegationOverlay,
-        field_names=_POLICY_FIELD_NAMES,
-    )
-    if values is None:
-        return None
-    try:
-        return DelegationOverlay.model_validate(values)
     except ValidationError:
         return None
 
@@ -282,48 +249,23 @@ def _validated_facts(value: object) -> VerifiedGrantFacts | None:
 
 
 class DelegatedRequestIngress:
-    """Persist intent, atomically claim, persist result, then attempt one dispatch."""
+    """Use packaged authority, then persist, claim, and attempt one dispatch."""
 
     def __init__(
         self,
-        *,
-        verify_grant: GrantVerifier,
-        claim_port: AtomicClaimPort,
-        dispatch_port: DispatchPort,
-        event_log: LifecycleEventLog,
-        event_ingress: LifecycleEventIngress,
-        policy: DelegationOverlay | None = None,
-    ) -> None:
-        selected_policy = load_canonical_delegation_overlay() if policy is None else policy
-        validated_policy = _validated_policy(selected_policy)
-        if validated_policy is None:
-            raise ValueError("delegation policy is invalid")
-        self._verify_grant = verify_grant
-        self._claim_port = claim_port
-        self._dispatch_port = dispatch_port
-        self._event_log = event_log
-        self._event_ingress = event_ingress
-        self._policy = validated_policy
-
-    @classmethod
-    def from_canonical_public_verifier(
-        cls,
         *,
         trusted_clock: TrustedClock,
         claim_port: AtomicClaimPort,
         dispatch_port: DispatchPort,
         event_log: LifecycleEventLog,
         event_ingress: LifecycleEventIngress,
-    ) -> DelegatedRequestIngress:
-        """Compose the fixed public verifier with the canonical immutable policy."""
-
-        return cls(
-            verify_grant=create_public_grant_verifier(trusted_clock=trusted_clock),
-            claim_port=claim_port,
-            dispatch_port=dispatch_port,
-            event_log=event_log,
-            event_ingress=event_ingress,
-        )
+    ) -> None:
+        self._policy = load_canonical_delegation_overlay()
+        self._verify_grant = PublicGrantVerifierAdapter(trusted_clock=trusted_clock)
+        self._claim_port = claim_port
+        self._dispatch_port = dispatch_port
+        self._event_log = event_log
+        self._event_ingress = event_ingress
 
     def submit(
         self, request: DelegatedRequest, grant_wire: bytes | None
@@ -363,34 +305,20 @@ class DelegatedRequestIngress:
             return self._result(DelegationSubmissionState.CLAIM_UNCERTAIN)
         if type(disposition) is not ClaimDisposition:
             return self._result(DelegationSubmissionState.CLAIM_UNCERTAIN)
+        if disposition is ClaimDisposition.NOT_CLAIMED:
+            return self._result(DelegationSubmissionState.NOT_CLAIMED)
+        postclaim_detail = f"delegated grant {facts.grant_id} claimed; authorization recorded"
         try:
             self._event_log.ingest(
                 LifecycleEventIntent(
                     run_id=validated_request.run_id,
-                    event_type=(
-                        LifecycleEventType.WORK_STARTED
-                        if disposition is ClaimDisposition.CLAIMED
-                        else LifecycleEventType.WORK_FAILED
-                    ),
-                    detail=(
-                        f"delegated grant {facts.grant_id} "
-                        + (
-                            "claimed; dispatch authorization recorded"
-                            if disposition is ClaimDisposition.CLAIMED
-                            else "was not claimed"
-                        )
-                    ),
+                    event_type=LifecycleEventType.WORK_STARTED,
+                    detail=postclaim_detail,
                 ),
                 self._event_ingress,
             )
         except Exception:
-            return self._result(
-                DelegationSubmissionState.CLAIMED_PERSISTENCE_FAILED
-                if disposition is ClaimDisposition.CLAIMED
-                else DelegationSubmissionState.NOT_CLAIMED_PERSISTENCE_FAILED
-            )
-        if disposition is ClaimDisposition.NOT_CLAIMED:
-            return self._result(DelegationSubmissionState.REJECTED_NOT_CLAIMED)
+            return self._result(DelegationSubmissionState.CLAIMED_PERSISTENCE_UNCERTAIN)
         try:
             self._dispatch_port.dispatch(claim)
         except Exception:

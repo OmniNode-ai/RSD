@@ -7,7 +7,11 @@ from typing import cast
 
 import pytest
 
-from omninode_rsd.lifecycle.models import LifecycleEventType
+from omninode_rsd.lifecycle.models import (
+    ALLOWED_LIFECYCLE_TRANSITIONS,
+    LifecycleEventType,
+    LifecycleState,
+)
 from omninode_rsd.lifecycle.projection import empty_projection
 from omninode_rsd.lifecycle.reducer import reduce_lifecycle_event
 from omninode_rsd.lifecycle.validation import (
@@ -24,12 +28,18 @@ def test_bundled_description_matches_models() -> None:
 
     assert type(description) is dict
     assert description["schema_version"] == "rsd.lifecycle-description.v1"
-    assert len(cast(list[object], description["transitions"])) == 5
+    assert len(cast(list[object], description["transitions"])) == 4
     assert description["states"] == ["INITIAL", "CREATED", "ACTIVE", "COMPLETED", "FAILED"]
     assert list(description) == ["schema_version", "states", "transitions"]
     assert len(description) == 3
     description["states"].append("MUTATED")
     assert description["states"][-1] == "MUTATED"
+
+
+def test_created_runs_cannot_be_failed_without_starting_work() -> None:
+    assert (LifecycleState.CREATED, LifecycleEventType.WORK_FAILED) not in (
+        ALLOWED_LIFECYCLE_TRANSITIONS
+    )
 
 
 def test_description_accepts_reordered_valid_yaml(tmp_path: Path) -> None:
@@ -41,7 +51,6 @@ transitions:
   - {event_type: WORK_FAILED, source_state: ACTIVE, target_state: FAILED}
   - {event_type: WORK_COMPLETED, source_state: ACTIVE, target_state: COMPLETED}
   - {event_type: WORK_STARTED, source_state: CREATED, target_state: ACTIVE}
-  - {event_type: WORK_FAILED, source_state: CREATED, target_state: FAILED}
   - {event_type: RUN_CREATED, source_state: INITIAL, target_state: CREATED}
 """,
         encoding="utf-8",
@@ -205,7 +214,6 @@ def test_every_declared_transition_reduces() -> None:
     for events in (
         event_stream(),
         event_stream(LifecycleEventType.WORK_FAILED),
-        event_stream(fail_before_start=True),
     ):
         projection = empty_projection(events[0].run_id)
         for event in events:
