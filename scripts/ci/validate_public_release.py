@@ -86,6 +86,13 @@ PUBLIC_GRANT_RESOURCES: Final[frozenset[str]] = frozenset(
         "signed_executable_grant_v2.vectors.json",
     }
 )
+DELEGATED_REQUEST_SAFE_SLICE_FILES: Final[frozenset[tuple[str, ...]]] = frozenset(
+    {
+        ("config", "delegation-overlay.yaml"),
+        ("src", "omninode_rsd", "delegation.py"),
+        ("tests", "test_delegation.py"),
+    }
+)
 VALIDATOR_PATH: Final[Path] = Path("scripts/ci/validate_public_release.py")
 
 MARKER_RE = re.compile(
@@ -216,7 +223,7 @@ def _is_allowed_directory(path: Path) -> bool:
     if parts[0] == "public_verifier":
         return any(entry[: len(parts)] == parts for entry in PUBLIC_VERIFIER_FILES)
     if len(parts) == 1:
-        return parts[0] in {".github", "scripts", "src", "tests"}
+        return parts[0] in {".github", "config", "scripts", "src", "tests"}
     if parts[:2] == (".github", "workflows"):
         return len(parts) == 2
     if parts[:2] == ("scripts", "ci"):
@@ -238,6 +245,8 @@ def _is_allowed_file(path: Path) -> bool:
     parts = path.parts
     if parts and parts[0] == "public_verifier":
         return parts in PUBLIC_VERIFIER_FILES
+    if parts in DELEGATED_REQUEST_SAFE_SLICE_FILES:
+        return True
     if len(parts) == 1:
         return parts[0] in ALLOWED_TOP_LEVEL - {".github", "scripts", "src", "tests"}
     if parts == (".github", "workflows", "test.yml"):

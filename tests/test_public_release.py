@@ -154,6 +154,34 @@ def test_rejects_unallowlisted_top_level_and_source_subsystem(tmp_path: Path) ->
     assert "src/omninode_rsd/transport" in paths
 
 
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "config/delegation-overlay.yaml",
+        "src/omninode_rsd/delegation.py",
+        "tests/test_delegation.py",
+    ),
+)
+def test_allows_only_the_delegated_request_safe_slice_files(tmp_path: Path, relative: str) -> None:
+    findings = _write(tmp_path, relative, "safe artifact\n")
+
+    assert findings == []
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "config/another-overlay.yaml",
+        "src/omninode_rsd/delegation_extra.py",
+        "tests/test_delegation_extra.py",
+    ),
+)
+def test_rejects_delegated_request_safe_slice_adjacent_paths(tmp_path: Path, relative: str) -> None:
+    findings = _write(tmp_path, relative, "unexpected artifact\n")
+
+    assert any(item.path == relative and item.rule == "path_allowlist" for item in findings)
+
+
 def test_rejects_unallowlisted_standalone_verifier_member(tmp_path: Path) -> None:
     findings = _write(tmp_path, "public_verifier/notes.txt", "unexpected\n")
     assert any(

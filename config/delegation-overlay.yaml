@@ -1,0 +1,5 @@
+---
+schema_version: "rsd.delegation-overlay.v1"
+execute_enabled: false
+route_ref: "logical://delegation/qwen3.8-27b"
+model_ref: "Qwen/Qwen3.8-27B"
