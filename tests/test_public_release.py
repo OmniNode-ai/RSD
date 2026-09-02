@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -40,11 +41,11 @@ SOFTWARE.
 """
 
 
-def _write(tmp_path: Path, relative: str, content: str) -> list:
+def _write(tmp_path: Path, relative: str, content: str) -> list[Any]:
     target = tmp_path / relative
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
-    return scan_tree(tmp_path)
+    return cast(list[Any], scan_tree(tmp_path))
 
 
 def _marker(name: str) -> str:

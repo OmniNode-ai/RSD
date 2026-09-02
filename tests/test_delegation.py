@@ -1,102 +1,407 @@
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
+from typing import cast
+from uuid import UUID, uuid4
 
 import pytest
+from omninode_grant_verifier import signed_executable_grant_v2_vectors
+from pydantic import ValidationError
 
 from omninode_rsd.delegation import (
+    AtomicClaimPort,
+    ClaimDisposition,
+    DelegatedGrantClaim,
     DelegatedRequest,
     DelegatedRequestIngress,
+    DelegationOverlay,
+    DelegationSubmissionState,
+    DispatchPort,
+    GrantVerifier,
     VerifiedGrantFacts,
+    canonical_delegation_overlay_path,
+    create_public_grant_verifier,
+    load_canonical_delegation_overlay,
     load_delegation_overlay,
 )
-from omninode_rsd.lifecycle import InMemoryEventLog, LifecycleEventIngress
+from omninode_rsd.lifecycle import (
+    InMemoryEventLog,
+    LifecycleEvent,
+    LifecycleEventIngress,
+    LifecycleEventIntent,
+    LifecycleEventType,
+)
+
+_NOW = datetime(2030, 1, 1, tzinfo=UTC)
 
 
-def _request() -> DelegatedRequest:
+def _valid_wire() -> bytes:
+    vectors = signed_executable_grant_v2_vectors()
+    base = vectors["base_wire"]
+    assert type(base) is dict
+    return json.dumps(base, separators=(",", ":")).encode("utf-8")
+
+
+def _facts() -> VerifiedGrantFacts:
+    return create_public_grant_verifier(trusted_clock=lambda: _NOW)(_valid_wire())
+
+
+def _request(facts: VerifiedGrantFacts | None = None) -> DelegatedRequest:
+    facts = _facts() if facts is None else facts
     return DelegatedRequest(
-        run_id=uuid4(),
-        request_sha256="a" * 64,
-        artifact_sha256="b" * 64,
-        model_id="Qwen/Qwen3.8-27B",
+        run_id=facts.correlation_id,
+        request_sha256=facts.request_sha256,
+        artifact_sha256=facts.artifact_sha256,
+        rendered_contract_sha256=facts.rendered_contract_sha256,
+        tenant_id=facts.tenant_id,
+        backend_id=facts.backend_id,
+        model_id=facts.model_id,
+        route_ref="logical://delegation/public-demo",
+        expected_output_topic=facts.expected_output_topic,
+        expected_output_event_class=facts.expected_output_event_class,
+        expected_output_event_index=facts.expected_output_event_index,
     )
 
 
-class _Claim:
-    def __init__(self, result: bool = True) -> None:
-        self.result, self.calls = result, 0
+def _enabled_policy(facts: VerifiedGrantFacts | None = None) -> DelegationOverlay:
+    facts = _facts() if facts is None else facts
+    return DelegationOverlay(
+        schema_version="rsd.delegation-overlay.v1",
+        execute_enabled=True,
+        route_ref="logical://delegation/public-demo",
+        model_ref=facts.model_id,
+    )
 
-    def claim(self, request: DelegatedRequest, facts: VerifiedGrantFacts) -> bool:
-        self.calls += 1
-        return self.result
 
-
-class _Dispatch:
-    def __init__(self) -> None:
+class _Claim(AtomicClaimPort):
+    def __init__(
+        self,
+        disposition: ClaimDisposition = ClaimDisposition.CLAIMED,
+        *,
+        order: list[str] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.disposition = disposition
+        self.order = order
+        self.error = error
         self.calls = 0
+        self.claims: list[DelegatedGrantClaim] = []
 
-    def dispatch(self, request: DelegatedRequest) -> None:
+    def claim(self, claim: DelegatedGrantClaim) -> ClaimDisposition:
         self.calls += 1
+        self.claims.append(claim)
+        if self.order is not None:
+            self.order.append("claim")
+        if self.error is not None:
+            raise self.error
+        return self.disposition
+
+
+class _Dispatch(DispatchPort):
+    def __init__(self, *, order: list[str] | None = None, error: Exception | None = None) -> None:
+        self.order = order
+        self.error = error
+        self.calls = 0
+        self.claims: list[DelegatedGrantClaim] = []
+
+    def dispatch(self, claim: DelegatedGrantClaim) -> None:
+        self.calls += 1
+        self.claims.append(claim)
+        if self.order is not None:
+            self.order.append("dispatch")
+        if self.error is not None:
+            raise self.error
+
+
+class _RecordingLog:
+    def __init__(
+        self, *, order: list[str] | None = None, fail_on_ingest: int | None = None
+    ) -> None:
+        self._log = InMemoryEventLog()
+        self._order = order
+        self._fail_on_ingest = fail_on_ingest
+        self.ingest_calls = 0
+
+    def append(self, event: LifecycleEvent) -> None:
+        self._log.append(event)
+
+    def ingest(
+        self,
+        intent: LifecycleEventIntent | dict[str, object],
+        builder: LifecycleEventIngress,
+    ) -> LifecycleEvent:
+        self.ingest_calls += 1
+        if self._order is not None:
+            event_type = intent.event_type if type(intent) is LifecycleEventIntent else "unknown"
+            self._order.append(f"ingest:{event_type}")
+        if self._fail_on_ingest == self.ingest_calls:
+            raise OSError("durable lifecycle store is unavailable")
+        return self._log.ingest(intent, builder)
+
+    def events_for(self, run_id: UUID) -> tuple[LifecycleEvent, ...]:
+        return self._log.events_for(run_id)
 
 
 def _ingress(
-    verifier: object,
-    claim: _Claim,
-    dispatch: _Dispatch,
-    log: InMemoryEventLog | object | None = None,
+    verifier: GrantVerifier,
+    claim: AtomicClaimPort,
+    dispatch: DispatchPort,
+    log: _RecordingLog | None = None,
+    *,
+    policy: DelegationOverlay | None = None,
 ) -> DelegatedRequestIngress:
     return DelegatedRequestIngress(
         verify_grant=verifier,
         claim_port=claim,
         dispatch_port=dispatch,
-        event_log=log or InMemoryEventLog(),
+        event_log=_RecordingLog() if log is None else log,
         event_ingress=LifecycleEventIngress(),
-    )  # type: ignore[arg-type]
+        policy=policy,
+    )
+
+
+def test_canonical_overlay_is_immutable_and_default_ingress_rejects_before_any_call() -> None:
+    overlay = load_canonical_delegation_overlay()
+    assert canonical_delegation_overlay_path() == Path("config/delegation-overlay.yaml").resolve()
+    assert not overlay.execute_enabled
+    with pytest.raises(ValidationError):
+        overlay.execute_enabled = True
+
+    calls = 0
+
+    def verifier(_: bytes) -> VerifiedGrantFacts:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("disabled policy must reject before verification")
+
+    claim, dispatch, log = _Claim(), _Dispatch(), _RecordingLog()
+    result = _ingress(cast(GrantVerifier, verifier), claim, dispatch, log).submit(_request(), None)
+
+    assert result.state is DelegationSubmissionState.REJECTED_NOT_CLAIMED
+    assert calls == claim.calls == dispatch.calls == log.ingest_calls == 0
+
+
+def test_overlay_loader_preserves_execute_flag_for_the_composition_policy(tmp_path: Path) -> None:
+    overlay_path = tmp_path / "delegation-overlay.yaml"
+    overlay_path.write_text(
+        "\n".join(
+            (
+                'schema_version: "rsd.delegation-overlay.v1"',
+                "execute_enabled: true",
+                'route_ref: "logical://delegation/public-demo"',
+                'model_ref: "model-public-v2"',
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_delegation_overlay(overlay_path).execute_enabled
+
+
+def test_public_verifier_adapter_uses_the_required_clock_and_projects_full_identity() -> None:
+    facts = _facts()
+
+    assert (
+        facts.authorization_digest
+        == "e03cc6144006dafba4e7bc085ca5511e3f40b5ab9b73f3c28b0dbb3a60368d2d"
+    )
+    assert facts.grant_id == UUID("40000000-0000-4000-8000-000000000001")
+    assert facts.nonce_sha256 == "1" * 64
+    assert facts.tenant_id == "public-demo" and facts.backend_id == "provider-alpha"
+    assert facts.model_id == "model-public-v2"
+    assert facts.dispatch_policy == "backend-pinned-single-attempt.v1"
+    assert facts.expected_output_topic == "events.public.grant.completed.v2"
+    assert facts.expected_output_event_class == "ModelPublicGrantCompleted"
+    assert facts.attempt_count == 1
+    assert facts.retry_disposition == "forbidden"
+    assert not facts.fallback_used and facts.recovery_disposition == "report-only"
 
 
 @pytest.mark.parametrize(
-    "wire, facts",
-    [
-        (None, None),
-        (b"x", VerifiedGrantFacts("x" * 64, "b" * 64, "Qwen/Qwen3.8-27B")),
-        (b"x", VerifiedGrantFacts("a" * 64, "b" * 64, "other")),
-        (b"x", VerifiedGrantFacts("a" * 64, "b" * 64, "Qwen/Qwen3.8-27B", True)),
-    ],
+    ("field", "replacement"),
+    (
+        ("run_id", uuid4()),
+        ("request_sha256", "a" * 64),
+        ("artifact_sha256", "b" * 64),
+        ("rendered_contract_sha256", "c" * 64),
+        ("tenant_id", "other-tenant"),
+        ("backend_id", "other-backend"),
+        ("model_id", "model-other-v2"),
+        ("route_ref", "logical://delegation/other"),
+        ("expected_output_topic", "events.public.other.v2"),
+        ("expected_output_event_class", "ModelOtherCompleted"),
+        ("expected_output_event_index", 1),
+    ),
 )
-def test_grant_absence_or_mismatch_never_claims_or_dispatches(
-    wire: bytes | None, facts: VerifiedGrantFacts | None
+def test_every_request_fact_mismatch_rejects_before_persistence_claim_or_dispatch(
+    field: str, replacement: object
 ) -> None:
-    claim, dispatch = _Claim(), _Dispatch()
-    verifier = (
-        (lambda _: facts)
-        if facts is not None
-        else (lambda _: (_ for _ in ()).throw(ValueError("bad")))
+    facts = _facts()
+    request = _request(facts).model_copy(update={field: replacement})
+    claim, dispatch, log = _Claim(), _Dispatch(), _RecordingLog()
+
+    result = _ingress(lambda _: facts, claim, dispatch, log, policy=_enabled_policy(facts)).submit(
+        request,
+        b"grant",
     )
-    assert not _ingress(verifier, claim, dispatch).submit(_request(), wire)
+
+    assert result.state is DelegationSubmissionState.REJECTED_NOT_CLAIMED
+    assert claim.calls == dispatch.calls == log.ingest_calls == 0
+
+
+def test_claim_receives_full_verified_identity_and_lifecycle_ingest_orders_all_boundaries() -> None:
+    facts = _facts()
+    request = _request()
+    order: list[str] = []
+    claim, dispatch, log = _Claim(order=order), _Dispatch(order=order), _RecordingLog(order=order)
+
+    result = _ingress(
+        lambda _: facts,
+        claim,
+        dispatch,
+        log,
+        policy=_enabled_policy(facts),
+    ).submit(request, b"grant")
+
+    assert result.state is DelegationSubmissionState.SUCCEEDED
+    assert order == [
+        "ingest:RUN_CREATED",
+        "claim",
+        "ingest:WORK_STARTED",
+        "dispatch",
+    ]
+    assert claim.calls == dispatch.calls == 1
+    assert claim.claims == dispatch.claims
+    submitted = claim.claims[0]
+    assert submitted.grant == facts
+    assert submitted.grant.grant_id == facts.grant_id
+    assert submitted.grant.nonce_sha256 == facts.nonce_sha256
+    assert submitted.grant.authorization_digest == facts.authorization_digest
+    assert submitted.grant.signature_sha256 == facts.signature_sha256
+    assert submitted.request == request and submitted.policy.route_ref == request.route_ref
+    events = log.events_for(request.run_id)
+    assert [(event.sequence, event.event_type) for event in events] == [
+        (1, LifecycleEventType.RUN_CREATED),
+        (2, LifecycleEventType.WORK_STARTED),
+    ]
+    assert events[1].prior_event_hash == events[0].event_hash
+
+
+def test_preclaim_persistence_failure_is_terminal_without_claim_or_dispatch() -> None:
+    facts = _facts()
+    claim, dispatch, log = _Claim(), _Dispatch(), _RecordingLog(fail_on_ingest=1)
+
+    result = _ingress(
+        lambda _: facts,
+        claim,
+        dispatch,
+        log,
+        policy=_enabled_policy(facts),
+    ).submit(_request(facts), b"grant")
+
+    assert result.state is DelegationSubmissionState.PRECLAIM_PERSISTENCE_FAILED
     assert claim.calls == dispatch.calls == 0
 
 
-def test_claim_failure_or_persistence_failure_never_dispatches() -> None:
-    request, dispatch = _request(), _Dispatch()
-    facts = VerifiedGrantFacts(request.request_sha256, request.artifact_sha256, request.model_id)
-    assert not _ingress(lambda _: facts, _Claim(False), dispatch).submit(request, b"grant")
+def test_claim_uncertainty_is_terminal_without_postclaim_persistence_or_dispatch() -> None:
+    facts = _facts()
+    claim = _Claim(error=OSError("claim connection outcome is unknown"))
+    dispatch, log = _Dispatch(), _RecordingLog()
 
-    class _FailLog:
-        def append(self, event: object) -> None:
-            raise OSError("unavailable")
+    result = _ingress(
+        lambda _: facts,
+        claim,
+        dispatch,
+        log,
+        policy=_enabled_policy(facts),
+    ).submit(_request(facts), b"grant")
 
-    assert not _ingress(lambda _: facts, _Claim(), dispatch, _FailLog()).submit(request, b"grant")
-    assert dispatch.calls == 0
+    assert result.state is DelegationSubmissionState.CLAIM_UNCERTAIN
+    assert claim.calls == 1 and dispatch.calls == 0 and log.ingest_calls == 1
 
 
-def test_success_claims_persists_then_dispatches_once() -> None:
-    request, claim, dispatch = _request(), _Claim(), _Dispatch()
-    facts = VerifiedGrantFacts(request.request_sha256, request.artifact_sha256, request.model_id)
-    assert _ingress(lambda _: facts, claim, dispatch).submit(request, b"grant")
+@pytest.mark.parametrize(
+    ("disposition", "expected"),
+    (
+        (ClaimDisposition.CLAIMED, DelegationSubmissionState.CLAIMED_PERSISTENCE_FAILED),
+        (
+            ClaimDisposition.NOT_CLAIMED,
+            DelegationSubmissionState.NOT_CLAIMED_PERSISTENCE_FAILED,
+        ),
+    ),
+)
+def test_postclaim_persistence_failure_is_terminal_and_never_dispatches(
+    disposition: ClaimDisposition, expected: DelegationSubmissionState
+) -> None:
+    facts = _facts()
+    claim, dispatch, log = _Claim(disposition), _Dispatch(), _RecordingLog(fail_on_ingest=2)
+
+    result = _ingress(
+        lambda _: facts,
+        claim,
+        dispatch,
+        log,
+        policy=_enabled_policy(facts),
+    ).submit(_request(facts), b"grant")
+
+    assert result.state is expected
+    assert claim.calls == 1 and dispatch.calls == 0 and log.ingest_calls == 2
+
+
+def test_not_claimed_is_persisted_and_never_dispatched() -> None:
+    facts = _facts()
+    claim, dispatch, log = _Claim(ClaimDisposition.NOT_CLAIMED), _Dispatch(), _RecordingLog()
+
+    result = _ingress(
+        lambda _: facts,
+        claim,
+        dispatch,
+        log,
+        policy=_enabled_policy(facts),
+    ).submit(_request(facts), b"grant")
+
+    assert result.state is DelegationSubmissionState.REJECTED_NOT_CLAIMED
+    assert claim.calls == 1 and dispatch.calls == 0
+    assert [event.event_type for event in log.events_for(facts.correlation_id)] == [
+        LifecycleEventType.RUN_CREATED,
+        LifecycleEventType.WORK_FAILED,
+    ]
+
+
+def test_dispatch_failure_reports_uncertainty_and_never_retries_the_same_run() -> None:
+    facts = _facts()
+    claim, dispatch, log = _Claim(), _Dispatch(error=OSError("dispatch timed out")), _RecordingLog()
+    ingress = _ingress(
+        lambda _: facts,
+        claim,
+        dispatch,
+        log,
+        policy=_enabled_policy(facts),
+    )
+
+    first = ingress.submit(_request(facts), b"grant")
+    second = ingress.submit(_request(facts), b"grant")
+
+    assert first.state is DelegationSubmissionState.DISPATCH_UNCERTAIN
+    assert second.state is DelegationSubmissionState.PRECLAIM_PERSISTENCE_FAILED
     assert claim.calls == dispatch.calls == 1
 
 
-def test_canonical_overlay_is_disabled_and_topology_free() -> None:
-    overlay = load_delegation_overlay(Path("config/delegation-overlay.yaml"))
-    assert not overlay.execute_enabled and overlay.route_ref == "logical://delegation/qwen3.8-27b"
+def test_absent_or_invalid_grant_never_persists_claims_or_dispatches() -> None:
+    facts = _facts()
+    claim, dispatch, log = _Claim(), _Dispatch(), _RecordingLog()
+    ingress = _ingress(
+        cast(GrantVerifier, lambda _: (_ for _ in ()).throw(ValueError("invalid grant"))),
+        claim,
+        dispatch,
+        log,
+        policy=_enabled_policy(facts),
+    )
+
+    absent = ingress.submit(_request(facts), None)
+    invalid = ingress.submit(_request(facts), b"grant")
+
+    assert absent.state is invalid.state is DelegationSubmissionState.REJECTED_NOT_CLAIMED
+    assert claim.calls == dispatch.calls == log.ingest_calls == 0

@@ -19,6 +19,8 @@ EVENT_IDS = (
 
 def event_stream(
     last_event: LifecycleEventType = LifecycleEventType.WORK_COMPLETED,
+    *,
+    fail_before_start: bool = False,
 ) -> tuple[LifecycleEvent, ...]:
     """Create a deterministic valid stream ending in the requested work event."""
 
@@ -41,9 +43,13 @@ def event_stream(
     log = InMemoryEventLog()
     builder = LifecycleEventIngress(event_id_factory=event_id, clock=clock)
     event_types = (
-        LifecycleEventType.RUN_CREATED,
-        LifecycleEventType.WORK_STARTED,
-        last_event,
+        (LifecycleEventType.RUN_CREATED, LifecycleEventType.WORK_FAILED)
+        if fail_before_start
+        else (
+            LifecycleEventType.RUN_CREATED,
+            LifecycleEventType.WORK_STARTED,
+            last_event,
+        )
     )
     return tuple(
         log.ingest(

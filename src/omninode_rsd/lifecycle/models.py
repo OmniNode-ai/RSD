@@ -92,6 +92,7 @@ ALLOWED_LIFECYCLE_TRANSITIONS: Mapping[
     {
         (LifecycleState.INITIAL, LifecycleEventType.RUN_CREATED): LifecycleState.CREATED,
         (LifecycleState.CREATED, LifecycleEventType.WORK_STARTED): LifecycleState.ACTIVE,
+        (LifecycleState.CREATED, LifecycleEventType.WORK_FAILED): LifecycleState.FAILED,
         (LifecycleState.ACTIVE, LifecycleEventType.WORK_COMPLETED): LifecycleState.COMPLETED,
         (LifecycleState.ACTIVE, LifecycleEventType.WORK_FAILED): LifecycleState.FAILED,
     }

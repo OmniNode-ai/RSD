@@ -146,6 +146,8 @@ def test_pending_migrations_types_each_manifest_drift_category(
 
 
 def test_discovery_rejects_duplicate_migration_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    from importlib import resources
+
     import omninode_rsd.lifecycle.postgres.migrations as migrations
 
     class Resource:
@@ -159,7 +161,7 @@ def test_discovery_rejects_duplicate_migration_names(monkeypatch: pytest.MonkeyP
         def iterdir(self) -> tuple[Resource, Resource]:
             return (Resource("001_duplicate.sql"), Resource("002_duplicate.sql"))
 
-    monkeypatch.setattr(migrations.resources, "files", lambda _: Root())
+    monkeypatch.setattr(resources, "files", lambda _: Root())
     with pytest.raises(MigrationDiscoveryError, match="duplicate lifecycle migration name"):
         migrations.discover_lifecycle_migrations()
 

@@ -10,9 +10,13 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
+  "omninode-grant-verifier",
   "pydantic>=2.10,<3",
   "PyYAML>=6.0,<7",
 ]
+
+[tool.uv.sources]
+omninode-grant-verifier = { path = "public_verifier", editable = true }
 
 [dependency-groups]
 dev = [
@@ -28,9 +32,11 @@ dev = [
 packages = ["src/omninode_rsd"]
 
 [tool.hatch.build.targets.wheel.force-include]
+"config/delegation-overlay.yaml" = "omninode_rsd/delegation-overlay.yaml"
 "src/omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql" = "omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql"
 
 [tool.hatch.build.targets.sdist.force-include]
+"config/delegation-overlay.yaml" = "src/omninode_rsd/delegation-overlay.yaml"
 "src/omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql" = "src/omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql"
 
 [tool.pytest.ini_options]
@@ -50,3 +56,4 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 python_version = "3.12"
 strict = true
 packages = ["omninode_rsd"]
+mypy_path = ["public_verifier/src"]

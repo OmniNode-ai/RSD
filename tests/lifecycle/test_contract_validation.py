@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -23,7 +24,7 @@ def test_bundled_description_matches_models() -> None:
 
     assert type(description) is dict
     assert description["schema_version"] == "rsd.lifecycle-description.v1"
-    assert len(description["transitions"]) == 4
+    assert len(cast(list[object], description["transitions"])) == 5
     assert description["states"] == ["INITIAL", "CREATED", "ACTIVE", "COMPLETED", "FAILED"]
     assert list(description) == ["schema_version", "states", "transitions"]
     assert len(description) == 3
@@ -40,6 +41,7 @@ transitions:
   - {event_type: WORK_FAILED, source_state: ACTIVE, target_state: FAILED}
   - {event_type: WORK_COMPLETED, source_state: ACTIVE, target_state: COMPLETED}
   - {event_type: WORK_STARTED, source_state: CREATED, target_state: ACTIVE}
+  - {event_type: WORK_FAILED, source_state: CREATED, target_state: FAILED}
   - {event_type: RUN_CREATED, source_state: INITIAL, target_state: CREATED}
 """,
         encoding="utf-8",
@@ -47,7 +49,8 @@ transitions:
 
     description = load_lifecycle_description(path)
 
-    assert description["transitions"][0]["event_type"] == "WORK_FAILED"
+    transitions = cast(list[dict[str, str]], description["transitions"])
+    assert transitions[0]["event_type"] == "WORK_FAILED"
 
 
 @pytest.mark.parametrize(
@@ -199,7 +202,11 @@ transitions:
 
 def test_every_declared_transition_reduces() -> None:
     reduced_transitions = set[tuple[str, str, str]]()
-    for events in (event_stream(), event_stream(LifecycleEventType.WORK_FAILED)):
+    for events in (
+        event_stream(),
+        event_stream(LifecycleEventType.WORK_FAILED),
+        event_stream(fail_before_start=True),
+    ):
         projection = empty_projection(events[0].run_id)
         for event in events:
             source_state = projection.state
@@ -210,8 +217,9 @@ def test_every_declared_transition_reduces() -> None:
 
     path = Path(__file__).parents[2] / "src/omninode_rsd/lifecycle/lifecycle_contract.yaml"
     description = load_lifecycle_description(path)
+    transitions = cast(list[dict[str, str]], description["transitions"])
     expected_transitions = {
         (transition["source_state"], transition["event_type"], transition["target_state"])
-        for transition in description["transitions"]
+        for transition in transitions
     }
     assert reduced_transitions == expected_transitions

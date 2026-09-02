@@ -6,6 +6,7 @@ import json
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from uuid import UUID
 
 import pytest
@@ -22,6 +23,7 @@ from omninode_rsd.lifecycle.postgres import (
     LifecycleStoreUnavailableError,
     PostgresLifecycleEventLog,
 )
+from omninode_rsd.lifecycle.postgres.store import PostgresConnectionFactory
 
 from .support import EVENT_IDS, RUN_ID, event_stream
 
@@ -95,7 +97,7 @@ class _Connection(AbstractContextManager["_Connection"]):
         if normalized.startswith("INSERT INTO rsd_canary.lifecycle_events"):
             (
                 event_id,
-                run_id,
+                event_run_id_value,
                 sequence,
                 occurred_at,
                 event_type,
@@ -104,7 +106,7 @@ class _Connection(AbstractContextManager["_Connection"]):
                 event_hash,
                 payload,
             ) = params
-            event_run_id = _uuid(run_id)
+            event_run_id = _uuid(event_run_id_value)
             self._database.events.setdefault(event_run_id, []).append(
                 {
                     "event_id": event_id,
@@ -167,7 +169,7 @@ def _builder(event_id: UUID) -> LifecycleEventIngress:
 
 
 def _store(database: _Database) -> PostgresLifecycleEventLog:
-    return PostgresLifecycleEventLog(_ConnectionFactory(database))
+    return PostgresLifecycleEventLog(cast(PostgresConnectionFactory, _ConnectionFactory(database)))
 
 
 def test_ingest_uses_one_advisory_locked_transaction_and_projects_durable_state() -> None:

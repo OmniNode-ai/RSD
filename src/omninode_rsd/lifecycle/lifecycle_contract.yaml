@@ -12,6 +12,9 @@ transitions:
   - event_type: WORK_STARTED
     source_state: CREATED
     target_state: ACTIVE
+  - event_type: WORK_FAILED
+    source_state: CREATED
+    target_state: FAILED
   - event_type: WORK_COMPLETED
     source_state: ACTIVE
     target_state: COMPLETED
