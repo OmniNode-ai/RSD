@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import shutil
+import subprocess
 import sys
+import tarfile
+import zipfile
 from pathlib import Path
 from typing import Any, cast
 
@@ -15,6 +20,15 @@ sys.modules[_SPEC.name] = _VALIDATOR
 _SPEC.loader.exec_module(_VALIDATOR)
 scan_tree = _VALIDATOR.scan_tree
 validate_tree = _VALIDATOR.validate_tree
+
+_ROOT = Path(__file__).parents[1]
+_VERIFIER_ROOT = _ROOT / "public_verifier"
+_VERIFIER_VERSION = "0.1.0"
+_VERIFIER_RESOURCES = (
+    "executable_grant_v2_trust_anchor.json",
+    "signed_executable_grant_v2.schema.json",
+    "signed_executable_grant_v2.vectors.json",
+)
 
 _MIT_LICENSE = """\\
 MIT License
@@ -62,6 +76,215 @@ def _marker(name: str) -> str:
 
 def _address(*parts: str) -> str:
     return "".join(parts)
+
+
+def _run_command(cwd: Path, *command: str) -> str:
+    completed = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
+    if completed.returncode:
+        raise AssertionError(
+            f"command failed: {command!r}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+        )
+    return completed.stdout
+
+
+def _single_artifact(directory: Path, suffix: str) -> Path:
+    artifacts = tuple(directory.glob(f"*{suffix}"))
+    assert len(artifacts) == 1
+    return artifacts[0]
+
+
+def _installed_records(interpreter: Path) -> dict[str, list[str]]:
+    code = """
+import csv
+import json
+from importlib.metadata import distribution
+
+records = {}
+for name in ("omninode-rsd", "omninode-grant-verifier"):
+    record = distribution(name).read_text("RECORD")
+    assert record is not None
+    records[name] = [row[0] for row in csv.reader(record.splitlines())]
+print(json.dumps(records, sort_keys=True))
+"""
+    output = _run_command(_ROOT, str(interpreter), "-c", code)
+    return cast(dict[str, list[str]], json.loads(output))
+
+
+def _installed_smoke(interpreter: Path) -> None:
+    code = f"""
+import json
+from datetime import UTC, datetime
+from importlib.resources import files
+
+from omninode_grant_verifier import signed_executable_grant_v2_vectors
+from omninode_rsd.delegation import PublicGrantVerifierAdapter, load_canonical_delegation_overlay
+from omninode_rsd.lifecycle.postgres import discover_lifecycle_migrations
+
+resources = files("omninode_grant_verifier").joinpath("resources")
+for resource_name in {_VERIFIER_RESOURCES!r}:
+    assert resources.joinpath(resource_name).read_bytes()
+vectors = signed_executable_grant_v2_vectors()
+base_wire = vectors["base_wire"]
+assert type(base_wire) is dict
+facts = PublicGrantVerifierAdapter(
+    trusted_clock=lambda: datetime(2030, 1, 1, tzinfo=UTC)
+)(json.dumps(base_wire, separators=(",", ":")).encode())
+assert facts.tenant_id == "public-demo"
+assert not load_canonical_delegation_overlay().execute_enabled
+assert discover_lifecycle_migrations()[0].version == 1
+"""
+    _run_command(_ROOT, str(interpreter), "-c", code)
+
+
+def _installed_verifier_smoke(interpreter: Path) -> None:
+    code = """
+from importlib.metadata import PackageNotFoundError, distribution
+from importlib.resources import files
+
+from omninode_grant_verifier import signed_executable_grant_v2_vectors
+
+try:
+    distribution("omninode-rsd")
+except PackageNotFoundError:
+    pass
+else:
+    raise AssertionError("root distribution remained installed")
+assert files("omninode_grant_verifier").joinpath(
+    "resources", "signed_executable_grant_v2.vectors.json"
+).read_bytes()
+assert type(signed_executable_grant_v2_vectors()["base_wire"]) is dict
+"""
+    _run_command(_ROOT, str(interpreter), "-c", code)
+
+
+def test_offline_release_bundle_owns_disjoint_distribution_files(tmp_path: Path) -> None:
+    """Build and exercise the paired public artifacts without an index."""
+    uv = shutil.which("uv")
+    assert uv is not None
+    root_sdist_dir = tmp_path / "root-sdist"
+    root_wheel_dir = tmp_path / "root-wheel"
+    verifier_sdist_dir = tmp_path / "verifier-sdist"
+    verifier_wheel_dir = tmp_path / "verifier-wheel"
+    wheelhouse = tmp_path / "wheelhouse"
+    environment = tmp_path / "environment"
+    for directory in (
+        root_sdist_dir,
+        root_wheel_dir,
+        verifier_sdist_dir,
+        verifier_wheel_dir,
+        wheelhouse,
+    ):
+        directory.mkdir()
+
+    _run_command(_ROOT, uv, "build", "--offline", "--sdist", "--out-dir", str(root_sdist_dir))
+    _run_command(
+        tmp_path,
+        uv,
+        "build",
+        "--offline",
+        "--wheel",
+        "--out-dir",
+        str(root_wheel_dir),
+        str(_single_artifact(root_sdist_dir, ".tar.gz")),
+    )
+    _run_command(
+        _VERIFIER_ROOT,
+        uv,
+        "build",
+        "--offline",
+        "--sdist",
+        "--out-dir",
+        str(verifier_sdist_dir),
+    )
+    _run_command(
+        tmp_path,
+        uv,
+        "build",
+        "--offline",
+        "--wheel",
+        "--out-dir",
+        str(verifier_wheel_dir),
+        str(_single_artifact(verifier_sdist_dir, ".tar.gz")),
+    )
+
+    root_wheel = _single_artifact(root_wheel_dir, ".whl")
+    verifier_wheel = _single_artifact(verifier_wheel_dir, ".whl")
+    with tarfile.open(_single_artifact(root_sdist_dir, ".tar.gz")) as archive:
+        root_sdist_members = frozenset(member.name for member in archive.getmembers())
+    assert not any("/public_verifier/" in member for member in root_sdist_members)
+
+    with zipfile.ZipFile(root_wheel) as archive:
+        root_members = frozenset(archive.namelist())
+        metadata_name = next(name for name in root_members if name.endswith(".dist-info/METADATA"))
+        metadata = archive.read(metadata_name).decode("utf-8")
+    assert f"Requires-Dist: omninode-grant-verifier=={_VERIFIER_VERSION}" in metadata
+    assert not any(member.startswith("omninode_grant_verifier/") for member in root_members)
+
+    with zipfile.ZipFile(verifier_wheel) as archive:
+        verifier_members = frozenset(archive.namelist())
+    assert any(member.startswith("omninode_grant_verifier/") for member in verifier_members)
+    assert not any(member.startswith("omninode_rsd/") for member in verifier_members)
+
+    shutil.copy2(root_wheel, wheelhouse / root_wheel.name)
+    shutil.copy2(verifier_wheel, wheelhouse / verifier_wheel.name)
+    assert frozenset(path.name for path in wheelhouse.iterdir()) == {
+        root_wheel.name,
+        verifier_wheel.name,
+    }
+
+    _run_command(tmp_path, uv, "venv", "--offline", "--python", "3.12", str(environment))
+    interpreter = environment / "bin" / "python"
+    install_root = (
+        uv,
+        "pip",
+        "install",
+        "--offline",
+        "--find-links",
+        str(wheelhouse),
+        "--python",
+        str(interpreter),
+        str(wheelhouse / root_wheel.name),
+    )
+    _run_command(tmp_path, *install_root)
+    _installed_smoke(interpreter)
+
+    records = _installed_records(interpreter)
+    root_records = set(records["omninode-rsd"])
+    verifier_records = set(records["omninode-grant-verifier"])
+    assert root_records.isdisjoint(verifier_records)
+    assert any(path.startswith("omninode_rsd/") for path in root_records)
+    assert not any(path.startswith("omninode_grant_verifier/") for path in root_records)
+    assert any(path.startswith("omninode_grant_verifier/") for path in verifier_records)
+    assert not any(path.startswith("omninode_rsd/") for path in verifier_records)
+
+    _run_command(
+        tmp_path, uv, "pip", "uninstall", "--offline", "--python", str(interpreter), "omninode-rsd"
+    )
+    _installed_verifier_smoke(interpreter)
+    _run_command(
+        tmp_path,
+        uv,
+        "pip",
+        "uninstall",
+        "--offline",
+        "--python",
+        str(interpreter),
+        "omninode-grant-verifier",
+    )
+    _run_command(
+        tmp_path,
+        uv,
+        "pip",
+        "install",
+        "--offline",
+        "--find-links",
+        str(wheelhouse),
+        "--python",
+        str(interpreter),
+        str(wheelhouse / verifier_wheel.name),
+    )
+    _run_command(tmp_path, *install_root)
+    _installed_smoke(interpreter)
 
 
 @pytest.mark.parametrize(

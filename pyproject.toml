@@ -10,10 +10,16 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
-  "cryptography>=50,<51",
+  "omninode-grant-verifier==0.1.0",
   "pydantic>=2.10,<3",
   "PyYAML>=6.0,<7",
 ]
+
+[tool.uv.sources]
+omninode-grant-verifier = { workspace = true }
+
+[tool.uv.workspace]
+members = ["public_verifier"]
 
 [dependency-groups]
 dev = [
@@ -26,22 +32,15 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = [
-  "src/omninode_rsd",
-  "public_verifier/src/omninode_grant_verifier",
-]
+packages = ["src/omninode_rsd"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"public_verifier/src/omninode_grant_verifier/resources/executable_grant_v2_trust_anchor.json" = "omninode_grant_verifier/resources/executable_grant_v2_trust_anchor.json"
-"public_verifier/src/omninode_grant_verifier/resources/signed_executable_grant_v2.schema.json" = "omninode_grant_verifier/resources/signed_executable_grant_v2.schema.json"
-"public_verifier/src/omninode_grant_verifier/resources/signed_executable_grant_v2.vectors.json" = "omninode_grant_verifier/resources/signed_executable_grant_v2.vectors.json"
 "src/omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql" = "omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql"
 
+[tool.hatch.build.targets.sdist]
+exclude = ["public_verifier"]
+
 [tool.hatch.build.targets.sdist.force-include]
-"public_verifier/src/omninode_grant_verifier/__init__.py" = "public_verifier/src/omninode_grant_verifier/__init__.py"
-"public_verifier/src/omninode_grant_verifier/resources/executable_grant_v2_trust_anchor.json" = "public_verifier/src/omninode_grant_verifier/resources/executable_grant_v2_trust_anchor.json"
-"public_verifier/src/omninode_grant_verifier/resources/signed_executable_grant_v2.schema.json" = "public_verifier/src/omninode_grant_verifier/resources/signed_executable_grant_v2.schema.json"
-"public_verifier/src/omninode_grant_verifier/resources/signed_executable_grant_v2.vectors.json" = "public_verifier/src/omninode_grant_verifier/resources/signed_executable_grant_v2.vectors.json"
 "src/omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql" = "src/omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql"
 
 [tool.pytest.ini_options]
