@@ -93,7 +93,7 @@ def _single_artifact(directory: Path, suffix: str) -> Path:
     return artifacts[0]
 
 
-def _installed_records(interpreter: Path) -> dict[str, list[str]]:
+def _installed_records(interpreter: Path, cwd: Path) -> dict[str, list[str]]:
     code = """
 import csv
 import json
@@ -106,23 +106,38 @@ for name in ("omninode-rsd", "omninode-grant-verifier"):
     records[name] = [row[0] for row in csv.reader(record.splitlines())]
 print(json.dumps(records, sort_keys=True))
 """
-    output = _run_command(_ROOT, str(interpreter), "-c", code)
+    output = _run_command(cwd, str(interpreter), "-I", "-c", code)
     return cast(dict[str, list[str]], json.loads(output))
 
 
-def _installed_smoke(interpreter: Path) -> None:
+def _installed_smoke(interpreter: Path, cwd: Path) -> None:
     code = f"""
 import json
+import omninode_grant_verifier
+import omninode_rsd
+import sysconfig
 from datetime import UTC, datetime
 from importlib.resources import files
+from pathlib import Path
 
 from omninode_grant_verifier import signed_executable_grant_v2_vectors
 from omninode_rsd.delegation import PublicGrantVerifierAdapter, load_canonical_delegation_overlay
 from omninode_rsd.lifecycle.postgres import discover_lifecycle_migrations
 
+site_packages = Path(sysconfig.get_paths()["purelib"]).resolve()
+repository = Path({_ROOT.as_posix()!r}).resolve()
+for package in (omninode_rsd, omninode_grant_verifier):
+    package_path = Path(package.__file__).resolve()
+    assert package_path.is_relative_to(site_packages)
+    assert not package_path.is_relative_to(repository)
 resources = files("omninode_grant_verifier").joinpath("resources")
+assert Path(resources).resolve().is_relative_to(site_packages)
+assert not Path(resources).resolve().is_relative_to(repository)
 for resource_name in {_VERIFIER_RESOURCES!r}:
-    assert resources.joinpath(resource_name).read_bytes()
+    resource = resources.joinpath(resource_name)
+    assert Path(resource).resolve().is_relative_to(site_packages)
+    assert not Path(resource).resolve().is_relative_to(repository)
+    assert resource.read_bytes()
 vectors = signed_executable_grant_v2_vectors()
 base_wire = vectors["base_wire"]
 assert type(base_wire) is dict
@@ -133,10 +148,10 @@ assert facts.tenant_id == "public-demo"
 assert not load_canonical_delegation_overlay().execute_enabled
 assert discover_lifecycle_migrations()[0].version == 1
 """
-    _run_command(_ROOT, str(interpreter), "-c", code)
+    _run_command(cwd, str(interpreter), "-I", "-c", code)
 
 
-def _installed_verifier_smoke(interpreter: Path) -> None:
+def _installed_verifier_smoke(interpreter: Path, cwd: Path) -> None:
     code = """
 from importlib.metadata import PackageNotFoundError, distribution
 from importlib.resources import files
@@ -154,25 +169,63 @@ assert files("omninode_grant_verifier").joinpath(
 ).read_bytes()
 assert type(signed_executable_grant_v2_vectors()["base_wire"]) is dict
 """
-    _run_command(_ROOT, str(interpreter), "-c", code)
+    _run_command(cwd, str(interpreter), "-I", "-c", code)
 
 
-def test_offline_release_bundle_owns_disjoint_distribution_files(tmp_path: Path) -> None:
-    """Build and exercise the paired public artifacts without an index."""
+def _assert_public_distributions_absent(interpreter: Path, cwd: Path) -> None:
+    code = """
+from importlib.metadata import PackageNotFoundError, distribution
+
+for name in ("omninode-rsd", "omninode-grant-verifier"):
+    try:
+        distribution(name)
+    except PackageNotFoundError:
+        continue
+    raise AssertionError(f"{name} must not be part of the third-party runtime closure")
+"""
+    _run_command(cwd, str(interpreter), "-I", "-c", code)
+
+
+def _install_local_wheel(
+    uv: str, interpreter: Path, local_artifacts: Path, artifact: Path, cwd: Path
+) -> None:
+    """Install one locally built public artifact without resolving dependencies."""
+    _run_command(
+        cwd,
+        uv,
+        "pip",
+        "install",
+        "--offline",
+        "--no-index",
+        "--no-cache",
+        "--no-deps",
+        "--find-links",
+        str(local_artifacts),
+        "--python",
+        str(interpreter),
+        str(artifact),
+    )
+
+
+def test_paired_public_artifacts_have_isolated_install_ownership(tmp_path: Path) -> None:
+    """Prove local artifact ownership after uv prepares the locked third-party closure."""
     uv = shutil.which("uv")
     assert uv is not None
     root_sdist_dir = tmp_path / "root-sdist"
     root_wheel_dir = tmp_path / "root-wheel"
     verifier_sdist_dir = tmp_path / "verifier-sdist"
     verifier_wheel_dir = tmp_path / "verifier-wheel"
-    wheelhouse = tmp_path / "wheelhouse"
+    local_artifacts = tmp_path / "local-artifacts"
     environment = tmp_path / "environment"
+    neutral_cwd = tmp_path / "neutral-cwd"
+    locked_runtime_closure = tmp_path / "locked-runtime-closure.txt"
     for directory in (
         root_sdist_dir,
         root_wheel_dir,
         verifier_sdist_dir,
         verifier_wheel_dir,
-        wheelhouse,
+        local_artifacts,
+        neutral_cwd,
     ):
         directory.mkdir()
 
@@ -225,30 +278,54 @@ def test_offline_release_bundle_owns_disjoint_distribution_files(tmp_path: Path)
     assert any(member.startswith("omninode_grant_verifier/") for member in verifier_members)
     assert not any(member.startswith("omninode_rsd/") for member in verifier_members)
 
-    shutil.copy2(root_wheel, wheelhouse / root_wheel.name)
-    shutil.copy2(verifier_wheel, wheelhouse / verifier_wheel.name)
-    assert frozenset(path.name for path in wheelhouse.iterdir()) == {
+    root_local_wheel = local_artifacts / root_wheel.name
+    verifier_local_wheel = local_artifacts / verifier_wheel.name
+    shutil.copy2(root_wheel, root_local_wheel)
+    shutil.copy2(verifier_wheel, verifier_local_wheel)
+    assert frozenset(path.name for path in local_artifacts.iterdir()) == {
         root_wheel.name,
         verifier_wheel.name,
     }
 
+    # uv exports the frozen lock's third-party runtime closure, excluding both local projects.
+    _run_command(
+        _ROOT,
+        uv,
+        "export",
+        "--frozen",
+        "--no-dev",
+        "--no-editable",
+        "--no-emit-local",
+        "--format",
+        "requirements-txt",
+        "--output-file",
+        str(locked_runtime_closure),
+    )
+    assert locked_runtime_closure.read_bytes()
+
     _run_command(tmp_path, uv, "venv", "--offline", "--python", "3.12", str(environment))
     interpreter = environment / "bin" / "python"
-    install_root = (
+    # This is deliberately normal uv index/cache installation: only ordinary third-party
+    # runtime dependencies belong to the lock-derived closure.
+    _run_command(
+        neutral_cwd,
         uv,
         "pip",
         "install",
-        "--offline",
-        "--find-links",
-        str(wheelhouse),
+        "--require-hashes",
         "--python",
         str(interpreter),
-        str(wheelhouse / root_wheel.name),
+        "--requirements",
+        str(locked_runtime_closure),
     )
-    _run_command(tmp_path, *install_root)
-    _installed_smoke(interpreter)
+    _assert_public_distributions_absent(interpreter, neutral_cwd)
 
-    records = _installed_records(interpreter)
+    # The two public artifacts must come only from their freshly built local wheel paths.
+    _install_local_wheel(uv, interpreter, local_artifacts, verifier_local_wheel, neutral_cwd)
+    _install_local_wheel(uv, interpreter, local_artifacts, root_local_wheel, neutral_cwd)
+    _installed_smoke(interpreter, neutral_cwd)
+
+    records = _installed_records(interpreter, neutral_cwd)
     root_records = set(records["omninode-rsd"])
     verifier_records = set(records["omninode-grant-verifier"])
     assert root_records.isdisjoint(verifier_records)
@@ -258,11 +335,18 @@ def test_offline_release_bundle_owns_disjoint_distribution_files(tmp_path: Path)
     assert not any(path.startswith("omninode_rsd/") for path in verifier_records)
 
     _run_command(
-        tmp_path, uv, "pip", "uninstall", "--offline", "--python", str(interpreter), "omninode-rsd"
+        neutral_cwd,
+        uv,
+        "pip",
+        "uninstall",
+        "--offline",
+        "--python",
+        str(interpreter),
+        "omninode-rsd",
     )
-    _installed_verifier_smoke(interpreter)
+    _installed_verifier_smoke(interpreter, neutral_cwd)
     _run_command(
-        tmp_path,
+        neutral_cwd,
         uv,
         "pip",
         "uninstall",
@@ -271,20 +355,9 @@ def test_offline_release_bundle_owns_disjoint_distribution_files(tmp_path: Path)
         str(interpreter),
         "omninode-grant-verifier",
     )
-    _run_command(
-        tmp_path,
-        uv,
-        "pip",
-        "install",
-        "--offline",
-        "--find-links",
-        str(wheelhouse),
-        "--python",
-        str(interpreter),
-        str(wheelhouse / verifier_wheel.name),
-    )
-    _run_command(tmp_path, *install_root)
-    _installed_smoke(interpreter)
+    _install_local_wheel(uv, interpreter, local_artifacts, verifier_local_wheel, neutral_cwd)
+    _install_local_wheel(uv, interpreter, local_artifacts, root_local_wheel, neutral_cwd)
+    _installed_smoke(interpreter, neutral_cwd)
 
 
 @pytest.mark.parametrize(
