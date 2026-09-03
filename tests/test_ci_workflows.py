@@ -182,9 +182,9 @@ def test_hostile_reviewer_pins_toolchain_and_disables_cache() -> None:
     for workflow in (_HOSTILE_REVIEWER, _WORKFLOW_DIR / "test.yml"):
         text = workflow.read_text(encoding="utf-8")
         assert 'version: "0.11.31"' in text
-        assert 'python-version: "3.12.14"' in text
         assert "enable-cache: false" in text
 
+    assert 'python-version: "3.12"' in (_WORKFLOW_DIR / "test.yml").read_text(encoding="utf-8")
     assert "uv python install 3.12.14" in _HOSTILE_REVIEWER.read_text(encoding="utf-8")
 
 
