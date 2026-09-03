@@ -112,6 +112,7 @@ URL_RE = re.compile(
 INTERNAL_HOST_RE = re.compile(
     r"(?i)(?<![a-z0-9-])(?:[a-z0-9-]+[.])+(?:local|lan|internal|corp|home|intranet)(?![a-z0-9-])"
 )
+GITHUB_SECRET_REFERENCE_RE = re.compile(r"\$\{\{\s*secrets\.[a-z0-9_]+\s*\}\}", re.IGNORECASE)
 SHORTHAND_HOST_RE = re.compile(
     r"(?i)(?<![a-z0-9-])(?:[a-z0-9_-]+[.])+(?:200|201)(?::\d{1,5})?(?![a-z0-9-])"
 )
@@ -139,7 +140,9 @@ DOCUMENTATION_NETWORKS: Final[tuple[tuple[IPv4Address | IPv6Address, int], ...]]
     (IPv6Address("2001:db8::"), 32),
 )
 SAFE_HOSTS: Final[frozenset[str]] = frozenset({"localhost", "127.0.0.1", "::1"})
-SAFE_PUBLIC_BADGE_HOSTS: Final[frozenset[str]] = frozenset({"img.shields.io"})
+SAFE_PUBLIC_HOSTS: Final[frozenset[str]] = frozenset(
+    {"api.github.com", "github.com", "img.shields.io"}
+)
 SAFE_DOCUMENTATION_SUFFIXES: Final[tuple[str, ...]] = (
     ".example.com",
     ".example.invalid",
@@ -249,9 +252,13 @@ def _is_allowed_file(path: Path) -> bool:
         return True
     if len(parts) == 1:
         return parts[0] in ALLOWED_TOP_LEVEL - {".github", "scripts", "src", "tests"}
-    if parts == (".github", "workflows", "test.yml"):
+    if parts[:2] == (".github", "workflows") and path.suffix == ".yml":
         return True
-    if parts == VALIDATOR_PATH.parts:
+    if parts in {
+        VALIDATOR_PATH.parts,
+        ("scripts", "ci", "parse_hostile_review.py"),
+        ("scripts", "ci", "fetch_hostile_review_input.py"),
+    }:
         return True
     if parts[:2] == ("src", "omninode_rsd"):
         return (
@@ -279,12 +286,15 @@ def _is_allowed_file(path: Path) -> bool:
         )
     if parts[:2] == ("tests", "lifecycle"):
         return len(parts) == 3 and path.suffix == ".py"
-    return parts == ("tests", "test_public_release.py")
+    return parts in {
+        ("tests", "test_public_release.py"),
+        ("tests", "test_ci_workflows.py"),
+    }
 
 
 def _is_safe_host(host: str) -> bool:
     normalized = host.strip("[]").rstrip(".").lower()
-    if normalized in SAFE_HOSTS | SAFE_PUBLIC_BADGE_HOSTS or normalized in {
+    if normalized in SAFE_HOSTS | SAFE_PUBLIC_HOSTS or normalized in {
         "example.com",
         "example.invalid",
         "example.test",
@@ -328,7 +338,21 @@ def _scan_line(
     add_matches(ENV_REFERENCE_RE, "environment_reference", "environment file reference")
     add_matches(OLD_IDENTIFIER_RE, "legacy_identifier", "legacy private-project identifier")
     add_matches(ABSOLUTE_WORKSPACE_RE, "absolute_workspace_path", "absolute local workspace path")
-    add_matches(INTERNAL_HOST_RE, "internal_hostname", "internal or mDNS hostname suffix")
+    # GitHub Actions secret references contain a dotted identifier such as
+    # ``secrets.LOCAL_LLM_SHARED_SECRET``.  The scanner must not misclassify
+    # that syntax as an internal hostname; the secret value is never present
+    # in the checked-in workflow.
+    without_secret_references = GITHUB_SECRET_REFERENCE_RE.sub("SECRET_REFERENCE", line)
+    for match in INTERNAL_HOST_RE.finditer(without_secret_references):
+        findings.append(
+            _finding(
+                path,
+                line_number,
+                match.start() + 1,
+                "internal_hostname",
+                "internal or mDNS hostname suffix",
+            )
+        )
     for match in SHORTHAND_HOST_RE.finditer(line):
         token = match.group(0).split(":", 1)[0]
         try:

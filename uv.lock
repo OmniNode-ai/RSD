@@ -543,6 +543,7 @@ name = "omninode-rsd"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "omninode-grant-verifier" },
     { name = "pydantic" },
     { name = "pyyaml" },
@@ -560,6 +561,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=50,<51" },
     { name = "omninode-grant-verifier", editable = "public_verifier" },
     { name = "pydantic", specifier = ">=2.10,<3" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
