@@ -296,8 +296,8 @@ postgres:
 `tests/lifecycle/test_lab_delegation_contract_set.py` covers the set from both
 sides. Six wrong contracts, one unpinned signature, a material fingerprint
 whose receipt binding is changed, and each PostgreSQL identity/OID receipt
-mismatch must be rejected. The receipt checks remain value-free and do not
-claim live database reachability.
+mismatch must be rejected. The receipts are pinned to signed, value-free
+evidence and do not claim live database reachability.
 
 ## Phase-B authorization
 

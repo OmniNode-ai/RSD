@@ -3,7 +3,7 @@
 # This file holds ONLY authored facts. Every canonical commitment (provider
 # reference digests, URI byte-count grammars, and the map signature) is
 # recomputed by scripts/validate_lab_delegation_contracts.py. Material
-# fingerprints are checked against the value-free receipt below.
+# fingerprints are checked against the signed, value-free receipt below.
 # Nothing here is a secret: each secret is named by a provider reference whose
 # value lives in the external secret store and never in this repository.
 #
@@ -105,8 +105,8 @@ valkey:
 
 # --- PostgreSQL delivery ----------------------------------------------------
 # The public value-free receipts below pin the authored identity/OID set to a
-# canonical receipt before it enters the target map. They do not claim live
-# database reachability or post-provisioning state.
+# signed canonical receipt before it enters the target map. They do not claim
+# live database reachability or post-provisioning state.
 postgres:
   # The connection authority supplied above must equal this lane declaration.
   lane_authority: *postgresql_lane_authority
@@ -184,9 +184,9 @@ postgres:
 # produced by earlier stages. Offline, none of those artifacts exist, so the
 # validator derives each digest from the domain label below and reports it as
 # an UNBOUND commitment. The material and PostgreSQL observation receipts are
-# the exceptions: their independently authored bindings are checked before
-# they enter the map, so a changed label, identity, OID, or receipt value fails
-# closed.
+# the exceptions: their pinned signatures and independently authored bindings
+# are checked before they enter the map, so a changed label, identity, OID, or
+# receipt value fails closed.
 unbound_commitments:
   source_commit_label: onex-lab-delegation-source-commit
   allocation_intent_label: onex-lab-delegation-allocation-intent
