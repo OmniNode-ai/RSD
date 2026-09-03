@@ -205,6 +205,15 @@ def _wrong_observation_receipt_database_oid(contract_set: dict[str, Any]) -> Non
     contract_set["postgres"]["observation_receipts"]["primary_database"]["database_oid"] = 999_995
 
 
+def _coordinated_observed_database_oid(contract_set: dict[str, Any]) -> None:
+    contract_set["postgres"]["primary"]["observed"]["database_oid"] = 999_994
+    contract_set["postgres"]["observation_receipts"]["primary_database"]["database_oid"] = 999_994
+
+
+def _unexpected_observation_receipt_key(contract_set: dict[str, Any]) -> None:
+    contract_set["postgres"]["observation_receipts"]["primary_database"]["unexpected"] = "ignored"
+
+
 def test_rejects_postgres_authority_outside_the_declared_lane() -> None:
     with pytest.raises(ValueError, match="PostgreSQL authority must match the declared lane"):
         _build(_wrong_postgres_port)
@@ -234,6 +243,8 @@ def test_rejects_a_material_fingerprint_not_bound_by_its_receipt(
         _invented_observed_application_role_oid,
         _invented_observed_system_identifier,
         _wrong_observation_receipt_database_oid,
+        _coordinated_observed_database_oid,
+        _unexpected_observation_receipt_key,
     ],
 )
 def test_rejects_an_observed_identity_not_bound_by_its_receipt(

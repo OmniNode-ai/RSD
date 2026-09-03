@@ -58,6 +58,13 @@ _MATERIAL_FINGERPRINT_RECEIPT_SIGNER_PUBLIC_KEY_BASE64: Final[str] = (
 _MATERIAL_FINGERPRINT_RECEIPT_DOMAIN: Final[bytes] = (
     b"omninode-rsd.lab-delegation-material-fingerprint-receipt.v1\x00"
 )
+_POSTGRES_OBSERVATION_RECEIPT_SIGNER_KEY_ID: Final[str] = "rsd-lab-postgres-observation-v1"
+_POSTGRES_OBSERVATION_RECEIPT_SIGNER_PUBLIC_KEY_BASE64: Final[str] = (
+    "JsjgeJAi37MzuwZ9mWkllEB9AYsuo+iFgWcKo8/FlQA="
+)
+_POSTGRES_OBSERVATION_RECEIPT_DOMAIN: Final[bytes] = (
+    b"omninode-rsd.lab-delegation-postgres-observation-receipt.v1\x00"
+)
 
 
 class Report:
@@ -296,6 +303,18 @@ def _topology(authored: dict[str, Any], report: Report) -> core.AllocationTopolo
     return topology
 
 
+def _postgres_observation_receipt_message(
+    receipt: core.PostgreSQLLoginTransitionReceiptV1,
+) -> bytes:
+    """Return the exact domain-separated value-free receipt bytes to verify."""
+
+    return _POSTGRES_OBSERVATION_RECEIPT_DOMAIN + json.dumps(
+        receipt.model_dump(mode="json", warnings="error"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def _postgres_observation_receipt(
     *,
     authored: dict[str, Any],
@@ -304,9 +323,21 @@ def _postgres_observation_receipt(
     """Bind one authored PostgreSQL identity to its value-free receipt."""
 
     receipts = authored.get("observation_receipts")
-    if type(receipts) is not dict or type(receipts.get(identity)) is not dict:
+    signatures = authored.get("observation_receipt_signatures")
+    if (
+        type(receipts) is not dict
+        or type(receipts.get(identity)) is not dict
+        or type(signatures) is not dict
+        or type(signatures.get(identity)) is not dict
+    ):
         raise ValueError("PostgreSQL observation receipt is required")
     raw = receipts[identity]
+    signature = signatures[identity]
+    if set(raw) != set(core.PostgreSQLLoginTransitionReceiptV1.model_fields) or set(signature) != {
+        "signer_key_id",
+        "signature_base64",
+    }:
+        raise ValueError("PostgreSQL observation receipt is invalid")
     try:
         receipt = core.PostgreSQLLoginTransitionReceiptV1(
             schema_version=raw["schema_version"],
@@ -328,7 +359,19 @@ def _postgres_observation_receipt(
             application_can_login=raw["application_can_login"],
             application_password_verifier_installed=raw["application_password_verifier_installed"],
         )
-    except (KeyError, TypeError, ValueError):
+        if (
+            signature["signer_key_id"] != _POSTGRES_OBSERVATION_RECEIPT_SIGNER_KEY_ID
+            or type(signature["signature_base64"]) is not str
+        ):
+            raise ValueError
+        signature_bytes = base64.b64decode(signature["signature_base64"], validate=True)
+        if base64.b64encode(signature_bytes).decode("ascii") != signature["signature_base64"]:
+            raise ValueError
+        signer = Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(_POSTGRES_OBSERVATION_RECEIPT_SIGNER_PUBLIC_KEY_BASE64, validate=True)
+        )
+        signer.verify(signature_bytes, _postgres_observation_receipt_message(receipt))
+    except (InvalidSignature, KeyError, TypeError, ValueError):
         raise ValueError("PostgreSQL observation receipt is invalid") from None
 
     return receipt

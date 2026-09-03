@@ -171,6 +171,13 @@ postgres:
       owner_password_absent: true
       application_can_login: true
       application_password_verifier_installed: true
+  observation_receipt_signatures:
+    primary_database:
+      signer_key_id: rsd-lab-postgres-observation-v1
+      signature_base64: rVV3kW0YzznaW5mOVG2JUdv9biX/4BjZG8ff9pCQ5Vz1R/17hZMb43epN00gSZ70H2hB9qSqHG8KTgkKGt6DDw==
+    restore_database:
+      signer_key_id: rsd-lab-postgres-observation-v1
+      signature_base64: xitQYygFcqoxWIIop/Qy+bIYZ36Thbg0fq4zkkfavGq+eCzbJVTGJQquO0DIjqfuPNitCGuqJAcC6AGIQ40gBA==
 
 # --- Upstream commitments ---------------------------------------------------
 # TargetDeliveryMapV1 carries these as opaque SHA-256 commitments to artifacts
