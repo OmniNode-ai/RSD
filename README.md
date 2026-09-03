@@ -294,10 +294,10 @@ postgres:
 ```
 
 `tests/lifecycle/test_lab_delegation_contract_set.py` covers the set from both
-sides. Six wrong contracts, one unpinned signature, and a material fingerprint
-whose receipt binding is changed must be rejected. The remaining observed-OID
-case passes deliberately and records the value that this Gap 2 slice still
-does not bind; OMN-17408 Gap 3 owns that follow-up.
+sides. Six wrong contracts, one unpinned signature, a material fingerprint
+whose receipt binding is changed, and each PostgreSQL identity/OID receipt
+mismatch must be rejected. The receipt checks remain value-free and do not
+claim live database reachability.
 
 ## Phase-B authorization
 

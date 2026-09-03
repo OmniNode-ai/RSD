@@ -104,9 +104,9 @@ valkey:
   restore_database_index: 0
 
 # --- PostgreSQL delivery ----------------------------------------------------
-# `*_oid` and `system_identifier` are POST-PROVISIONING OBSERVATIONS. They
-# cannot be known when this contract is authored; the values below are declared
-# intent and the validator reports them as unproven observations.
+# The public value-free receipts below pin the authored identity/OID set to a
+# canonical receipt before it enters the target map. They do not claim live
+# database reachability or post-provisioning state.
 postgres:
   # The connection authority supplied above must equal this lane declaration.
   lane_authority: *postgresql_lane_authority
@@ -132,14 +132,54 @@ postgres:
   scram:
     iterations: 4096
     salt_bytes: 16
+  observation_receipts:
+    primary_database:
+      schema_version: rsd.postgresql-login-transition-receipt.v1
+      database_identity: primary_database
+      prepared_operation_id: 4e6f3c1a-0b2d-4e8f-9a1b-2c3d4e5f6a7b
+      system_identifier: "70000000000000000000"
+      database_name: onex-delivery-primary
+      database_oid: 101
+      schema_oid: 102
+      owner_role: onex-delivery-primary-owner
+      owner_role_oid: 103
+      application_role: onex-delivery-primary-app
+      application_role_oid: 104
+      application_password_reference_sha256: a0c15d9ed6acb142bb126545e0cbcd66b0bfc5bb94a9fb1bae5635be3397ac76
+      prepared_control_policy_sha256: b4cf5fade26af4649e26d25ff458b6d9c2e917fb0cd2412fdfdebb1e1ff9be03
+      prepared_operation_result_sha256: d5d25993ea534e0c26b28f45c67e123020af2b0b14de00ba9acf5c5236998bbe
+      owner_can_login: false
+      owner_password_absent: true
+      application_can_login: true
+      application_password_verifier_installed: true
+    restore_database:
+      schema_version: rsd.postgresql-login-transition-receipt.v1
+      database_identity: restore_database
+      prepared_operation_id: 5f7a4d2b-1c3e-4f9a-8b2c-3d4e5f6a7b8c
+      system_identifier: "70000000000000000000"
+      database_name: onex-delivery-restore
+      database_oid: 201
+      schema_oid: 202
+      owner_role: onex-delivery-restore-owner
+      owner_role_oid: 203
+      application_role: onex-delivery-restore-app
+      application_role_oid: 204
+      application_password_reference_sha256: a0c15d9ed6acb142bb126545e0cbcd66b0bfc5bb94a9fb1bae5635be3397ac76
+      prepared_control_policy_sha256: b4cf5fade26af4649e26d25ff458b6d9c2e917fb0cd2412fdfdebb1e1ff9be03
+      prepared_operation_result_sha256: cc5d38c6915872cc76384746ed223a5f131788a2373e8c80a5ccbaf45e9602c4
+      owner_can_login: false
+      owner_password_absent: true
+      application_can_login: true
+      application_password_verifier_installed: true
 
 # --- Upstream commitments ---------------------------------------------------
 # TargetDeliveryMapV1 carries these as opaque SHA-256 commitments to artifacts
 # produced by earlier stages. Offline, none of those artifacts exist, so the
 # validator derives each digest from the domain label below and reports it as
-# an UNBOUND commitment. The material fingerprint receipt is the one exception:
-# its independently authored reference/fingerprint pairs are checked before
-# they enter the map, so a changed label or receipt value fails closed.
+# an UNBOUND commitment. The material and PostgreSQL observation receipts are
+# the exceptions: their independently authored bindings are checked before
+# they enter the map, so a changed label, identity, OID, or receipt value fails
+# closed.
 unbound_commitments:
   source_commit_label: onex-lab-delegation-source-commit
   allocation_intent_label: onex-lab-delegation-allocation-intent
@@ -157,9 +197,6 @@ unbound_commitments:
     primary_valkey: onex-lab-delegation-wrapper-primary-valkey
     restore_infisical: onex-lab-delegation-wrapper-restore-infisical
     restore_valkey: onex-lab-delegation-wrapper-restore-valkey
-  observation_binding_labels:
-    primary_database: onex-lab-delegation-observation-primary
-    restore_database: onex-lab-delegation-observation-restore
   prepared_operation_ids:
     primary_database: 4e6f3c1a-0b2d-4e8f-9a1b-2c3d4e5f6a7b
     restore_database: 5f7a4d2b-1c3e-4f9a-8b2c-3d4e5f6a7b8c

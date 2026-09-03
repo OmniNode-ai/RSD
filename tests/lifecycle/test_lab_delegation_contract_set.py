@@ -1,9 +1,8 @@
 """Positive and negative coverage for the authored lab-delegation contract set.
 
 The negative cases exist so a green validation is never mistaken for a proof of
-the topology: each one names a specific wrong contract and asserts whether the
-library rejects it. The remaining ``accepts`` case is deliberate — it records
-the observation value that this Gap 2 slice does not bind to anything real.
+the topology: each one names a specific wrong contract and asserts that the
+library rejects it.
 """
 
 from __future__ import annotations
@@ -186,6 +185,26 @@ def _invented_observed_oid(contract_set: dict[str, Any]) -> None:
     contract_set["postgres"]["primary"]["observed"]["database_oid"] = 999_999
 
 
+def _invented_observed_schema_oid(contract_set: dict[str, Any]) -> None:
+    contract_set["postgres"]["primary"]["observed"]["schema_oid"] = 999_998
+
+
+def _invented_observed_owner_role_oid(contract_set: dict[str, Any]) -> None:
+    contract_set["postgres"]["primary"]["observed"]["owner_role_oid"] = 999_997
+
+
+def _invented_observed_application_role_oid(contract_set: dict[str, Any]) -> None:
+    contract_set["postgres"]["primary"]["observed"]["application_role_oid"] = 999_996
+
+
+def _invented_observed_system_identifier(contract_set: dict[str, Any]) -> None:
+    contract_set["postgres"]["system_identifier"] = "90000000000000000000"
+
+
+def _wrong_observation_receipt_database_oid(contract_set: dict[str, Any]) -> None:
+    contract_set["postgres"]["observation_receipts"]["primary_database"]["database_oid"] = 999_995
+
+
 def test_rejects_postgres_authority_outside_the_declared_lane() -> None:
     with pytest.raises(ValueError, match="PostgreSQL authority must match the declared lane"):
         _build(_wrong_postgres_port)
@@ -206,14 +225,19 @@ def test_rejects_a_material_fingerprint_not_bound_by_its_receipt(
         _build(mutate)
 
 
-def test_accepts_an_observed_oid_the_contract_vocabulary_does_not_bind() -> None:
-    """This passes until OMN-17408 Gap 3 supplies an observation receipt."""
-
-    delivery_map, anchor = _build(_invented_observed_oid)
-
-    assert (
-        map_signing.verify_target_delivery_map_v1_signature(
-            delivery_map=delivery_map, signer_trust_anchor=anchor
-        ).schema_version
-        == "rsd.target-delivery-map.v1"
-    )
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _invented_observed_oid,
+        _invented_observed_schema_oid,
+        _invented_observed_owner_role_oid,
+        _invented_observed_application_role_oid,
+        _invented_observed_system_identifier,
+        _wrong_observation_receipt_database_oid,
+    ],
+)
+def test_rejects_an_observed_identity_not_bound_by_its_receipt(
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    with pytest.raises(ValueError, match="PostgreSQL observation receipt"):
+        _build(mutate)

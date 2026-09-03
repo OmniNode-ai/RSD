@@ -296,6 +296,70 @@ def _topology(authored: dict[str, Any], report: Report) -> core.AllocationTopolo
     return topology
 
 
+def _postgres_observation_receipt(
+    *,
+    authored: dict[str, Any],
+    identity: str,
+) -> core.PostgreSQLLoginTransitionReceiptV1:
+    """Bind one authored PostgreSQL identity to its value-free receipt."""
+
+    receipts = authored.get("observation_receipts")
+    if type(receipts) is not dict or type(receipts.get(identity)) is not dict:
+        raise ValueError("PostgreSQL observation receipt is required")
+    raw = receipts[identity]
+    try:
+        receipt = core.PostgreSQLLoginTransitionReceiptV1(
+            schema_version=raw["schema_version"],
+            database_identity=raw["database_identity"],
+            prepared_operation_id=raw["prepared_operation_id"],
+            system_identifier=raw["system_identifier"],
+            database_name=raw["database_name"],
+            database_oid=raw["database_oid"],
+            schema_oid=raw["schema_oid"],
+            owner_role=raw["owner_role"],
+            owner_role_oid=raw["owner_role_oid"],
+            application_role=raw["application_role"],
+            application_role_oid=raw["application_role_oid"],
+            application_password_reference_sha256=raw["application_password_reference_sha256"],
+            prepared_control_policy_sha256=raw["prepared_control_policy_sha256"],
+            prepared_operation_result_sha256=raw["prepared_operation_result_sha256"],
+            owner_can_login=raw["owner_can_login"],
+            owner_password_absent=raw["owner_password_absent"],
+            application_can_login=raw["application_can_login"],
+            application_password_verifier_installed=raw["application_password_verifier_installed"],
+        )
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("PostgreSQL observation receipt is invalid") from None
+
+    return receipt
+
+
+def _postgres_observation_receipt_matches(
+    receipt: core.PostgreSQLLoginTransitionReceiptV1,
+    transition: core.PostgreSQLLoginTransitionIntentV1,
+) -> bool:
+    return (
+        receipt.database_identity == transition.database_identity
+        and receipt.prepared_operation_id == transition.prepared_operation_id
+        and receipt.system_identifier == transition.system_identifier
+        and receipt.database_name == transition.database_name
+        and receipt.database_oid == transition.database_oid
+        and receipt.schema_oid == transition.schema_oid
+        and receipt.owner_role == transition.owner_role
+        and receipt.owner_role_oid == transition.owner_role_oid
+        and receipt.application_role == transition.application_role
+        and receipt.application_role_oid == transition.application_role_oid
+        and receipt.application_password_reference_sha256
+        == transition.application_password_reference_sha256
+        and receipt.prepared_control_policy_sha256 == transition.prepared_control_policy_sha256
+        and receipt.owner_can_login == transition.owner_can_login
+        and receipt.owner_password_absent == transition.owner_password_absent
+        and receipt.application_can_login == transition.application_can_login
+        and receipt.application_password_verifier_installed
+        == transition.application_password_verifier_installed
+    )
+
+
 def _postgres(
     *,
     authored: dict[str, Any],
@@ -306,6 +370,7 @@ def _postgres(
     report: Report,
 ) -> core.PostgreSQLRuntimeDatabaseIdentitiesV1:
     identities: dict[str, core.PostgreSQLRuntimeDatabaseIdentityV1] = {}
+    receipts: dict[str, core.PostgreSQLLoginTransitionReceiptV1] = {}
     password_reference = references["postgres_application_password"]
     for identity, lane in (("primary_database", "primary"), ("restore_database", "restore")):
         spec = authored[lane]
@@ -375,9 +440,11 @@ def _postgres(
             logging_allowed=False,
             public_artifact_allowed=False,
         )
+        receipt = _postgres_observation_receipt(authored=authored, identity=identity)
+        receipts[identity] = receipt
         identities[identity] = core.PostgreSQLRuntimeDatabaseIdentityV1(
             database_identity=cast(Any, identity),
-            observation_binding_sha256=_digest(commitments["observation_binding_labels"][identity]),
+            observation_binding_sha256=core.canonical_sha256(receipt),
             schema_oid=int(observed["schema_oid"]),
             login_transition=transition,
             connection_uri=grammar,
@@ -385,6 +452,11 @@ def _postgres(
     if any(database.connection_uri.authority != lane_authority for database in identities.values()):
         raise ValueError("PostgreSQL authority must match the declared lane")
     result = core.PostgreSQLRuntimeDatabaseIdentitiesV1(**identities)
+    if any(
+        not _postgres_observation_receipt_matches(receipt, identities[identity].login_transition)
+        for identity, receipt in receipts.items()
+    ):
+        raise ValueError("PostgreSQL observation receipt does not match transition")
     report.ok(
         "PostgreSQL identities proved the owner role can never log in, the "
         "owner password is absent, the verifier install is bound to the same "
@@ -398,10 +470,16 @@ def _postgres(
         f"byte count ({identities['primary_database'].connection_uri.rendered_uri_byte_count} "
         "bytes primary) without ever assembling the URI"
     )
+    report.ok(
+        "PostgreSQLLoginTransitionReceiptV1 bound each database name, system "
+        "identifier, database/schema/role OIDs, role identities, operation id, "
+        "and login-state flags to the exact transition before its canonical "
+        "receipt digest entered the runtime identity"
+    )
     report.unbound(
-        "database_oid / schema_oid / role OIDs / system_identifier are "
-        "post-provisioning observations. They are authored here as intent and "
-        "the map binds them to no observation receipt"
+        "the PostgreSQL observation receipts are authored value-free evidence "
+        "only: they prove no live database reachability or post-provisioning "
+        "state; a later effect receipt must still be independently verified"
     )
     return result
 
