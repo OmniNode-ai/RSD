@@ -255,10 +255,11 @@ delivery topology expressed in this package's own vocabulary. It holds only
 authored facts: provider reference identities, the two isolated lane networks
 and their component placements, the PostgreSQL database and role identifiers,
 and the labels behind each opaque upstream commitment. Every canonical
-commitment - reference digests, rendered URI byte counts, material
-fingerprints, the map signature - is recomputed at validation time, and no
-secret value appears in the file. Each secret is named only by its provider
-reference.
+commitment - reference digests, rendered URI byte counts, and the map
+signature - is recomputed at validation time. Material fingerprints are
+checked against the authored value-free receipt and its provider-reference
+bindings before entering the map. No secret value appears in the file; each
+secret is named only by its provider reference.
 
 Validate it offline:
 
@@ -293,9 +294,10 @@ postgres:
 ```
 
 `tests/lifecycle/test_lab_delegation_contract_set.py` covers the set from both
-sides. Six wrong contracts and one unpinned signature must be rejected; two
-further cases pass deliberately and record exactly which authored values the
-map binds to nothing.
+sides. Six wrong contracts, one unpinned signature, and a material fingerprint
+whose receipt binding is changed must be rejected. The remaining observed-OID
+case passes deliberately and records the value that this Gap 2 slice still
+does not bind; OMN-17408 Gap 3 owns that follow-up.
 
 ## Phase-B authorization
 

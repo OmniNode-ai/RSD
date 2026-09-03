@@ -2,8 +2,8 @@
 
 The negative cases exist so a green validation is never mistaken for a proof of
 the topology: each one names a specific wrong contract and asserts whether the
-library rejects it. The two ``accepts`` cases are deliberate — they record
-values the contract vocabulary does not bind to anything real.
+library rejects it. The remaining ``accepts`` case is deliberate — it records
+the observation value that this Gap 2 slice does not bind to anything real.
 """
 
 from __future__ import annotations
@@ -168,6 +168,12 @@ def _invented_material_fingerprint(contract_set: dict[str, Any]) -> None:
     )
 
 
+def _wrong_material_fingerprint_receipt(contract_set: dict[str, Any]) -> None:
+    contract_set["unbound_commitments"]["material_fingerprint_receipt"]["fingerprints"][
+        "encryption_key"
+    ] = "f" * 64
+
+
 def _invented_observed_oid(contract_set: dict[str, Any]) -> None:
     contract_set["postgres"]["primary"]["observed"]["database_oid"] = 999_999
 
@@ -178,18 +184,20 @@ def test_rejects_postgres_authority_outside_the_declared_lane() -> None:
 
 
 @pytest.mark.parametrize(
-    ("mutate", "unbound_value"),
-    [
-        (_invented_material_fingerprint, "a provider material fingerprint"),
-        (_invented_observed_oid, "an observed database OID"),
-    ],
+    "mutate",
+    [_invented_material_fingerprint, _wrong_material_fingerprint_receipt],
 )
-def test_accepts_values_the_contract_vocabulary_does_not_bind(
-    mutate: Callable[[dict[str, Any]], None], unbound_value: str
+def test_rejects_a_material_fingerprint_not_bound_by_its_receipt(
+    mutate: Callable[[dict[str, Any]], None],
 ) -> None:
-    """These pass on purpose. Each records a value nothing in the map constrains."""
+    with pytest.raises(ValueError, match="material fingerprint receipt"):
+        _build(mutate)
 
-    delivery_map, anchor = _build(mutate)
+
+def test_accepts_an_observed_oid_the_contract_vocabulary_does_not_bind() -> None:
+    """This passes until OMN-17408 Gap 3 supplies an observation receipt."""
+
+    delivery_map, anchor = _build(_invented_observed_oid)
 
     assert (
         map_signing.verify_target_delivery_map_v1_signature(

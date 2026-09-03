@@ -1,8 +1,9 @@
 # Authored facts for one intended offline-validated delivery topology.
 #
 # This file holds ONLY authored facts. Every canonical commitment (provider
-# reference digests, URI byte-count grammars, material fingerprints, the map
-# signature) is recomputed by scripts/validate_lab_delegation_contracts.py.
+# reference digests, URI byte-count grammars, and the map signature) is
+# recomputed by scripts/validate_lab_delegation_contracts.py. Material
+# fingerprints are checked against the value-free receipt below.
 # Nothing here is a secret: each secret is named by a provider reference whose
 # value lives in the external secret store and never in this repository.
 #
@@ -136,8 +137,9 @@ postgres:
 # TargetDeliveryMapV1 carries these as opaque SHA-256 commitments to artifacts
 # produced by earlier stages. Offline, none of those artifacts exist, so the
 # validator derives each digest from the domain label below and reports it as
-# an UNBOUND commitment. The map validator checks only that three of them are
-# mutually distinct; it does not bind any of them to a real artifact.
+# an UNBOUND commitment. The material fingerprint receipt is the one exception:
+# its independently authored reference/fingerprint pairs are checked before
+# they enter the map, so a changed label or receipt value fails closed.
 unbound_commitments:
   source_commit_label: onex-lab-delegation-source-commit
   allocation_intent_label: onex-lab-delegation-allocation-intent
@@ -167,5 +169,19 @@ unbound_commitments:
     primary_valkey_password: onex-lab-delegation-material-primary-valkey
     restore_valkey_password: onex-lab-delegation-material-restore-valkey
     postgres_application_password: onex-lab-delegation-material-postgres-application
+  material_fingerprint_receipt:
+    schema_version: rsd.lab-delegation-material-fingerprint-receipt.v1
+    references:
+      encryption_key: d970e9dac373fd960f27dbb94c940e01ec963807c284edac4e00188817d7305c
+      auth_secret: d5685da774c8b28eddcdf044dad8197887db6654a6c70c4fb86921fee332ff48
+      primary_valkey_password: cef8577eb9c06535b6e869e3e5eef3d807f1a5dfb6ee409180e2c4e3af4c462d
+      restore_valkey_password: d08bc54faf00057957be1cdbc537be727fbccf11213d5ccb036b9ebdd8fd3e56
+      postgres_application_password: a0c15d9ed6acb142bb126545e0cbcd66b0bfc5bb94a9fb1bae5635be3397ac76
+    fingerprints:
+      encryption_key: bad7b0d869a3a0efd1552b47d2583fd467adfa89534f7896144f6c431f00f6e1
+      auth_secret: cde8df9a4c2b519c82ff356b3317602ed8a25652e3b12a939d1865f7e9b2c17f
+      primary_valkey_password: 12a5955f0933159edad270f5de851600d62d00f401c25f14be5bd16a89fac88e
+      restore_valkey_password: 1f9a3b8021f205429f10f9fc8c445b0cde896d5c0a525f9e1513392e21215813
+      postgres_application_password: 492bde29bf672394485b27ae70fce08c8a998af0347b12ef73791a15dccbbf7e
 
 created_at: "2026-08-30T00:00:00Z"

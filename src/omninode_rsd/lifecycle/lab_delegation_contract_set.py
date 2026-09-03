@@ -40,6 +40,13 @@ _COMPONENTS: Final[tuple[str, ...]] = (
     "restore_infisical",
     "restore_valkey",
 )
+_MATERIAL_PURPOSES: Final[tuple[str, ...]] = (
+    "encryption_key",
+    "auth_secret",
+    "primary_valkey_password",
+    "restore_valkey_password",
+    "postgres_application_password",
+)
 
 
 class Report:
@@ -140,6 +147,46 @@ def _provider_references(
         "existence: any well-formed identifier tuple validates"
     )
     return references, {name: value.reference_sha256 for name, value in built.items()}
+
+
+def _material_fingerprint_receipt(
+    *, commitments: dict[str, Any], reference_digests: dict[str, str]
+) -> dict[str, str]:
+    """Require authored fingerprint labels to match their value-free receipt."""
+
+    receipt = commitments.get("material_fingerprint_receipt")
+    labels = commitments.get("material_fingerprint_labels")
+    if type(receipt) is not dict or type(labels) is not dict:
+        raise ValueError("material fingerprint receipt is required")
+    if receipt.get("schema_version") != "rsd.lab-delegation-material-fingerprint-receipt.v1":
+        raise ValueError("material fingerprint receipt is invalid")
+    receipt_references = receipt.get("references")
+    receipt_fingerprints = receipt.get("fingerprints")
+    if type(receipt_references) is not dict or type(receipt_fingerprints) is not dict:
+        raise ValueError("material fingerprint receipt is invalid")
+    expected_keys = set(_MATERIAL_PURPOSES)
+    if (
+        set(labels) != expected_keys
+        or set(receipt_references) != expected_keys
+        or set(receipt_fingerprints) != expected_keys
+    ):
+        raise ValueError("material fingerprint receipt is invalid")
+
+    fingerprints: dict[str, str] = {}
+    for purpose in _MATERIAL_PURPOSES:
+        label = labels[purpose]
+        reference = receipt_references[purpose]
+        fingerprint = receipt_fingerprints[purpose]
+        if (
+            type(label) is not str
+            or type(reference) is not str
+            or type(fingerprint) is not str
+            or reference != reference_digests[purpose]
+            or fingerprint != _digest(label)
+        ):
+            raise ValueError("material fingerprint receipt does not match authored material")
+        fingerprints[purpose] = fingerprint
+    return fingerprints
 
 
 def _topology(authored: dict[str, Any], report: Report) -> core.AllocationTopologyV2:
@@ -365,10 +412,9 @@ def _delivery_map(
     report: Report,
 ) -> tuple[core.TargetDeliveryMapV1, map_signing.TargetDeliveryMapSignerTrustAnchorV1]:
     commitments = contract_set["unbound_commitments"]
-    fingerprints = {
-        purpose: _digest(label)
-        for purpose, label in commitments["material_fingerprint_labels"].items()
-    }
+    fingerprints = _material_fingerprint_receipt(
+        commitments=commitments, reference_digests=reference_digests
+    )
     material = cast(
         tuple[Any, Any, Any, Any, Any],
         tuple(
@@ -576,9 +622,10 @@ def _delivery_map(
         "both cache authorities equal their lane's allocated static address"
     )
     report.unbound(
-        "material fingerprints are free 64-hex values. The map requires only "
-        "that the five are distinct and match the fields that cite them, so "
-        "they commit to no real provider material"
+        "the material fingerprint receipt is authored value-free evidence only: "
+        "it binds each fingerprint to its provider reference and contract-set "
+        "label, but proves no provider store, existence, or possession; Phase B "
+        "must still verify the signed provider-material attestation"
     )
     report.unbound(
         "source_commit, allocation_intent, wrapper_manifest, attach_protocol, "
