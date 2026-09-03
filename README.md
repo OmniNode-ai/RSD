@@ -282,15 +282,18 @@ transcript of three outcome classes:
 Committed addresses use the documentation ranges, because
 `scripts/ci/validate_public_release.py` rejects any other address in a
 committed file. An operator-owned PostgreSQL authority is therefore supplied at
-validation time through `--overlay`, whose YAML replaces the `addresses` map:
+validation time through `--overlay`. The overlay must declare both the supplied
+connection authority and the PostgreSQL lane authority it must match:
 
 ```yaml
 addresses:
   postgresql_authority: postgresql://<ip-literal>:<port>
+postgres:
+  lane_authority: postgresql://<ip-literal>:<port>
 ```
 
 `tests/lifecycle/test_lab_delegation_contract_set.py` covers the set from both
-sides. Five wrong contracts and one unpinned signature must be rejected; three
+sides. Six wrong contracts and one unpinned signature must be rejected; two
 further cases pass deliberately and record exactly which authored values the
 map binds to nothing.
 

@@ -2,7 +2,7 @@
 
 The negative cases exist so a green validation is never mistaken for a proof of
 the topology: each one names a specific wrong contract and asserts whether the
-library rejects it. The three ``accepts`` cases are deliberate — they record
+library rejects it. The two ``accepts`` cases are deliberate — they record
 values the contract vocabulary does not bind to anything real.
 """
 
@@ -32,6 +32,7 @@ def _build(mutate: Callable[[dict[str, Any]], None] | None = None) -> Any:
     databases = harness._postgres(
         authored=contract_set["postgres"],
         authority=contract_set["addresses"]["postgresql_authority"],
+        lane_authority=contract_set["postgres"]["lane_authority"],
         references=digests,
         commitments=contract_set["unbound_commitments"],
         report=report,
@@ -171,10 +172,14 @@ def _invented_observed_oid(contract_set: dict[str, Any]) -> None:
     contract_set["postgres"]["primary"]["observed"]["database_oid"] = 999_999
 
 
+def test_rejects_postgres_authority_outside_the_declared_lane() -> None:
+    with pytest.raises(ValueError, match="PostgreSQL authority must match the declared lane"):
+        _build(_wrong_postgres_port)
+
+
 @pytest.mark.parametrize(
     ("mutate", "unbound_value"),
     [
-        (_wrong_postgres_port, "the PostgreSQL authority port"),
         (_invented_material_fingerprint, "a provider material fingerprint"),
         (_invented_observed_oid, "an observed database OID"),
     ],

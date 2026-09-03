@@ -21,7 +21,7 @@ purpose: offline_authored_facts_for_one_intended_delivery_topology
 # operator address with `--overlay`; the committed default is documentation
 # range so the file remains publishable.
 addresses:
-  postgresql_authority: postgresql://203.0.113.40:5432
+  postgresql_authority: &postgresql_lane_authority postgresql://203.0.113.40:5432
 
 # --- Provider references ----------------------------------------------------
 # Version-pinned metadata only. `reference_sha256` is derived from
@@ -107,6 +107,8 @@ valkey:
 # cannot be known when this contract is authored; the values below are declared
 # intent and the validator reports them as unproven observations.
 postgres:
+  # The connection authority supplied above must equal this lane declaration.
+  lane_authority: *postgresql_lane_authority
   system_identifier: "70000000000000000000"
   primary:
     database_name: onex-delivery-primary

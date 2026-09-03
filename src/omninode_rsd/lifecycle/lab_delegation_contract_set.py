@@ -97,9 +97,19 @@ def _apply_overlay(contract_set: dict[str, Any], overlay_path: Path | None) -> s
     if overlay_path is None:
         return "committed documentation-range default"
     overlay = yaml.safe_load(overlay_path.read_text(encoding="utf-8"))
-    if not isinstance(overlay, dict) or "addresses" not in overlay:
-        raise SystemExit(f"{overlay_path}: overlay must define `addresses`")
+    if (
+        not isinstance(overlay, dict)
+        or not isinstance(overlay.get("addresses"), dict)
+        or not isinstance(overlay.get("postgres"), dict)
+        or "postgresql_authority" not in overlay["addresses"]
+        or "lane_authority" not in overlay["postgres"]
+    ):
+        raise SystemExit(
+            f"{overlay_path}: overlay must define `addresses.postgresql_authority` "
+            "and `postgres.lane_authority`"
+        )
     contract_set["addresses"].update(overlay["addresses"])
+    contract_set["postgres"].update(overlay["postgres"])
     return f"overlay {overlay_path.name}"
 
 
@@ -177,6 +187,7 @@ def _postgres(
     *,
     authored: dict[str, Any],
     authority: str,
+    lane_authority: str,
     references: dict[str, str],
     commitments: dict[str, Any],
     report: Report,
@@ -258,6 +269,8 @@ def _postgres(
             login_transition=transition,
             connection_uri=grammar,
         )
+    if any(database.connection_uri.authority != lane_authority for database in identities.values()):
+        raise ValueError("PostgreSQL authority must match the declared lane")
     result = core.PostgreSQLRuntimeDatabaseIdentitiesV1(**identities)
     report.ok(
         "PostgreSQL identities proved the owner role can never log in, the "
@@ -266,15 +279,11 @@ def _postgres(
         "primary and restore lanes share no name, OID, role, or operation id"
     )
     report.ok(
-        "PostgreSQLConnectionUriGrammarV1 accepted the authority only as a "
+        "PostgreSQLConnectionUriGrammarV1 required both authorities to equal "
+        "the declared PostgreSQL lane and accepted that authority only as a "
         f"canonical scheme+IP-literal+port triple and recomputed its rendered "
         f"byte count ({identities['primary_database'].connection_uri.rendered_uri_byte_count} "
         "bytes primary) without ever assembling the URI"
-    )
-    report.unbound(
-        "the PostgreSQL authority is cross-checked against nothing: any "
-        "reachable-or-not IP and any port validate identically, so a wrong "
-        "port is indistinguishable from a right one at this layer"
     )
     report.unbound(
         "database_oid / schema_oid / role OIDs / system_identifier are "
@@ -609,6 +618,7 @@ def main(argv: list[str] | None = None) -> int:
     databases = _postgres(
         authored=contract_set["postgres"],
         authority=contract_set["addresses"]["postgresql_authority"],
+        lane_authority=contract_set["postgres"]["lane_authority"],
         references=reference_digests,
         commitments=contract_set["unbound_commitments"],
         report=report,
