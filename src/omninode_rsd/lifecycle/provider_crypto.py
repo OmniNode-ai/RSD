@@ -1415,10 +1415,23 @@ class _MaterialRandomSource(Protocol):
     def fill(self, destination: bytearray) -> None: ...
 
 
+class _SecurityRandomLibrary(Protocol):
+    """Typed callable surface used after Security.framework symbol setup."""
+
+    def SecRandomCopyBytes(
+        self,
+        random: ctypes.c_void_p,
+        count: int,
+        buffer: ctypes.c_void_p,
+    ) -> int: ...
+
+
 class _MacOSSecurityRandom:
     """Direct ``SecRandomCopyBytes`` adapter; no subprocess or ambient input."""
 
     _ERR_SEC_SUCCESS: Final = 0
+    _security: _SecurityRandomLibrary
+    _default: ctypes.c_void_p
 
     def __init__(self) -> None:
         if sys.platform != "darwin":
@@ -1436,7 +1449,7 @@ class _MacOSSecurityRandom:
             raise ProviderCryptoError("material_generator") from None
         if default is None:
             raise ProviderCryptoError("material_generator")
-        self._security = security
+        self._security = cast(_SecurityRandomLibrary, security)
         self._default = ctypes.c_void_p(default)
 
     def fill(self, destination: bytearray) -> None:
@@ -1718,6 +1731,15 @@ class _MacOSGenericPasswordStore:
     _ERR_SEC_DUPLICATE_ITEM: Final = -25299
     _ERR_SEC_ITEM_NOT_FOUND: Final = -25300
     _UTF8: Final = 0x08000100
+    _class: int
+    _generic_password: int
+    _service: int
+    _account: int
+    _value_data: int
+    _return_data: int
+    _match_limit: int
+    _match_limit_one: int
+    _boolean_true: int
 
     def __init__(self) -> None:
         if sys.platform != "darwin":
