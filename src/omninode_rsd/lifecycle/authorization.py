@@ -1951,6 +1951,15 @@ class _SecurityFrameworkGenericPasswordStore:
     _ERR_SEC_SUCCESS: Final = 0
     _ERR_SEC_DUPLICATE_ITEM: Final = -25299
     _UTF8: Final = 0x08000100
+    _class: int
+    _generic_password: int
+    _service: int
+    _account: int
+    _value_data: int
+    _return_data: int
+    _match_limit: int
+    _match_limit_one: int
+    _boolean_true: int
 
     def __init__(self) -> None:
         if sys.platform != "darwin":
