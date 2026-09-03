@@ -183,5 +183,7 @@ unbound_commitments:
       primary_valkey_password: 12a5955f0933159edad270f5de851600d62d00f401c25f14be5bd16a89fac88e
       restore_valkey_password: 1f9a3b8021f205429f10f9fc8c445b0cde896d5c0a525f9e1513392e21215813
       postgres_application_password: 492bde29bf672394485b27ae70fce08c8a998af0347b12ef73791a15dccbbf7e
+    signer_key_id: rsd-lab-material-receipt-v1
+    signature_base64: XygJbOg+6iptnUxJIymsa8a8ltJgNbJEJ/Ouvr1xiptLZtqLxxAW7Cj4bUT1Mr7VmngP577RZdu3B3hDCVtfCw==
 
 created_at: "2026-08-30T00:00:00Z"

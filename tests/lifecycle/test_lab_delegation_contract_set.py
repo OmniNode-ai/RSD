@@ -174,6 +174,14 @@ def _wrong_material_fingerprint_receipt(contract_set: dict[str, Any]) -> None:
     ] = "f" * 64
 
 
+def _coordinated_invented_material_fingerprint(contract_set: dict[str, Any]) -> None:
+    label = "an-invented-label-and-coordinated-receipt-replacement"
+    contract_set["unbound_commitments"]["material_fingerprint_labels"]["encryption_key"] = label
+    contract_set["unbound_commitments"]["material_fingerprint_receipt"]["fingerprints"][
+        "encryption_key"
+    ] = harness._digest(label)
+
+
 def _invented_observed_oid(contract_set: dict[str, Any]) -> None:
     contract_set["postgres"]["primary"]["observed"]["database_oid"] = 999_999
 
@@ -185,7 +193,11 @@ def test_rejects_postgres_authority_outside_the_declared_lane() -> None:
 
 @pytest.mark.parametrize(
     "mutate",
-    [_invented_material_fingerprint, _wrong_material_fingerprint_receipt],
+    [
+        _invented_material_fingerprint,
+        _wrong_material_fingerprint_receipt,
+        _coordinated_invented_material_fingerprint,
+    ],
 )
 def test_rejects_a_material_fingerprint_not_bound_by_its_receipt(
     mutate: Callable[[dict[str, Any]], None],

@@ -27,7 +27,8 @@ from pathlib import Path
 from typing import Any, Final, cast
 
 import yaml
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 from omninode_rsd.lifecycle import infisical_disposable as core
 from omninode_rsd.lifecycle import target_delivery_field_matrix_v1 as matrix_v1
@@ -46,6 +47,16 @@ _MATERIAL_PURPOSES: Final[tuple[str, ...]] = (
     "primary_valkey_password",
     "restore_valkey_password",
     "postgres_application_password",
+)
+_MATERIAL_FINGERPRINT_RECEIPT_SCHEMA_VERSION: Final[str] = (
+    "rsd.lab-delegation-material-fingerprint-receipt.v1"
+)
+_MATERIAL_FINGERPRINT_RECEIPT_SIGNER_KEY_ID: Final[str] = "rsd-lab-material-receipt-v1"
+_MATERIAL_FINGERPRINT_RECEIPT_SIGNER_PUBLIC_KEY_BASE64: Final[str] = (
+    "fsNCknz8FE3GagV7dnwgM+s8DqzKGWkGBi/gQPMvVcc="
+)
+_MATERIAL_FINGERPRINT_RECEIPT_DOMAIN: Final[bytes] = (
+    b"omninode-rsd.lab-delegation-material-fingerprint-receipt.v1\x00"
 )
 
 
@@ -149,6 +160,27 @@ def _provider_references(
     return references, {name: value.reference_sha256 for name, value in built.items()}
 
 
+def _material_fingerprint_receipt_message(
+    *,
+    schema_version: str,
+    references: dict[str, Any],
+    fingerprints: dict[str, Any],
+    signer_key_id: str,
+) -> bytes:
+    """Return the exact domain-separated value-free receipt bytes to verify."""
+
+    return _MATERIAL_FINGERPRINT_RECEIPT_DOMAIN + json.dumps(
+        {
+            "fingerprints": fingerprints,
+            "references": references,
+            "schema_version": schema_version,
+            "signer_key_id": signer_key_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def _material_fingerprint_receipt(
     *, commitments: dict[str, Any], reference_digests: dict[str, str]
 ) -> dict[str, str]:
@@ -158,11 +190,26 @@ def _material_fingerprint_receipt(
     labels = commitments.get("material_fingerprint_labels")
     if type(receipt) is not dict or type(labels) is not dict:
         raise ValueError("material fingerprint receipt is required")
-    if receipt.get("schema_version") != "rsd.lab-delegation-material-fingerprint-receipt.v1":
+    if set(receipt) != {
+        "schema_version",
+        "references",
+        "fingerprints",
+        "signer_key_id",
+        "signature_base64",
+    }:
+        raise ValueError("material fingerprint receipt is invalid")
+    if receipt.get("schema_version") != _MATERIAL_FINGERPRINT_RECEIPT_SCHEMA_VERSION:
         raise ValueError("material fingerprint receipt is invalid")
     receipt_references = receipt.get("references")
     receipt_fingerprints = receipt.get("fingerprints")
-    if type(receipt_references) is not dict or type(receipt_fingerprints) is not dict:
+    signer_key_id = receipt.get("signer_key_id")
+    signature_base64 = receipt.get("signature_base64")
+    if (
+        type(receipt_references) is not dict
+        or type(receipt_fingerprints) is not dict
+        or signer_key_id != _MATERIAL_FINGERPRINT_RECEIPT_SIGNER_KEY_ID
+        or type(signature_base64) is not str
+    ):
         raise ValueError("material fingerprint receipt is invalid")
     expected_keys = set(_MATERIAL_PURPOSES)
     if (
@@ -171,6 +218,25 @@ def _material_fingerprint_receipt(
         or set(receipt_fingerprints) != expected_keys
     ):
         raise ValueError("material fingerprint receipt is invalid")
+
+    try:
+        signature = base64.b64decode(signature_base64, validate=True)
+        if base64.b64encode(signature).decode("ascii") != signature_base64:
+            raise ValueError
+        signer = Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(_MATERIAL_FINGERPRINT_RECEIPT_SIGNER_PUBLIC_KEY_BASE64, validate=True)
+        )
+        signer.verify(
+            signature,
+            _material_fingerprint_receipt_message(
+                schema_version=receipt["schema_version"],
+                references=receipt_references,
+                fingerprints=receipt_fingerprints,
+                signer_key_id=signer_key_id,
+            ),
+        )
+    except (InvalidSignature, ValueError):
+        raise ValueError("material fingerprint receipt signature is invalid") from None
 
     fingerprints: dict[str, str] = {}
     for purpose in _MATERIAL_PURPOSES:

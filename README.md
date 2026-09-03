@@ -257,7 +257,7 @@ and their component placements, the PostgreSQL database and role identifiers,
 and the labels behind each opaque upstream commitment. Every canonical
 commitment - reference digests, rendered URI byte counts, and the map
 signature - is recomputed at validation time. Material fingerprints are
-checked against the authored value-free receipt and its provider-reference
+checked against the signed, value-free receipt and its provider-reference
 bindings before entering the map. No secret value appears in the file; each
 secret is named only by its provider reference.
 
