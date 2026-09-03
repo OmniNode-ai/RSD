@@ -107,11 +107,26 @@ def _test_functions(tree: ast.Module) -> dict[str, ast.FunctionDef]:
     }
 
 
+def _portable_ast_dump(value: object) -> str:
+    """Match Python 3.13's empty-field omission on older interpreters."""
+
+    if isinstance(value, ast.AST):
+        fields = []
+        for name, item in ast.iter_fields(value):
+            if item is None and not (isinstance(value, ast.Constant) and name == "value"):
+                continue
+            if isinstance(item, list) and not item:
+                continue
+            fields.append(f"{name}={_portable_ast_dump(item)}")
+        return f"{type(value).__name__}({', '.join(fields)})"
+    if isinstance(value, list):
+        return "[" + ", ".join(_portable_ast_dump(item) for item in value) + "]"
+    return repr(value)
+
+
 def _body_hashes(source: str, node: ast.FunctionDef) -> tuple[str, str]:
     body = ast.Module(body=node.body, type_ignores=[])
-    ast_hash = hashlib.sha256(
-        ast.dump(body, annotate_fields=True, include_attributes=False).encode("utf-8")
-    ).hexdigest()
+    ast_hash = hashlib.sha256(_portable_ast_dump(body).encode("utf-8")).hexdigest()
     end = node.body[-1].end_lineno
     assert end is not None
     body_source = "".join(source.splitlines(keepends=True)[node.body[0].lineno - 1 : end])
