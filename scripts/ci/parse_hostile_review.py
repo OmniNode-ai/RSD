@@ -20,10 +20,23 @@ from typing import Final
 from uuid import UUID
 
 MULTI_RESULT_FIELDS: Final[frozenset[str]] = frozenset(
-    {"models_attempted", "models_succeeded", "models_failed", "results", "total_findings"}
+    {
+        "models_attempted",
+        "models_succeeded",
+        "models_failed",
+        "results",
+        "total_findings",
+    }
 )
 PER_MODEL_RESULT_FIELDS: Final[frozenset[str]] = frozenset(
-    {"model", "prompt_version", "success", "error", "findings", "result_count"}
+    {
+        "model",
+        "prompt_version",
+        "success",
+        "error",
+        "findings",
+        "result_count",
+    }
 )
 FINDING_FIELDS: Final[frozenset[str]] = frozenset(
     {
@@ -133,7 +146,12 @@ def _validate_finding(raw_finding: object) -> dict[str, object]:
         not isinstance(line_end, int) or isinstance(line_end, bool) or line_end <= 0
     ):
         raise ValueError("line_end must be null or a positive integer")
-    for field in ("tool_name", "tool_version", "normalized_message", "raw_message"):
+    for field in (
+        "tool_name",
+        "tool_version",
+        "normalized_message",
+        "raw_message",
+    ):
         _require_nonempty_string(finding[field], field)
     commit_sha = _require_nonempty_string(finding["commit_sha_observed"], "commit_sha_observed")
     if not 7 <= len(commit_sha) <= 40:
@@ -160,6 +178,7 @@ def _validate_finding(raw_finding: object) -> dict[str, object]:
 
 def parse_review_result(raw_json: str) -> ReviewSummary:
     """Parse one exact ``ModelMultiReviewResult`` JSON document."""
+
     try:
         raw_result = json.loads(raw_json)
     except json.JSONDecodeError as json_error:
@@ -183,7 +202,11 @@ def parse_review_result(raw_json: str) -> ReviewSummary:
         raise ValueError("results must be a non-empty list")
     parsed_results: list[tuple[str, bool, int, list[dict[str, object]]]] = []
     for raw_model_result in raw_results:
-        model_result = _require_keys(raw_model_result, PER_MODEL_RESULT_FIELDS, "per-model result")
+        model_result = _require_keys(
+            raw_model_result,
+            PER_MODEL_RESULT_FIELDS,
+            "per-model result",
+        )
         model = _require_model_name(model_result["model"], "model")
         _require_nonempty_string(model_result["prompt_version"], "prompt_version")
         success = model_result["success"]
@@ -217,8 +240,8 @@ def parse_review_result(raw_json: str) -> ReviewSummary:
     if len(succeeded) < 2:
         raise ValueError("at least two models must succeed for a full review")
 
-    expected_total = sum(count for _, success, count, _ in parsed_results if success)
     total_findings = _require_nonnegative_integer(result["total_findings"], "total_findings")
+    expected_total = sum(count for _, success, count, _ in parsed_results if success)
     if total_findings != expected_total:
         raise ValueError("total_findings disagrees with successful per-model results")
     blocking_count = sum(

@@ -11,9 +11,15 @@ requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
   "omninode-grant-verifier==0.1.0",
+  "cryptography>=50,<51",
   "pydantic>=2.10,<3",
   "PyYAML>=6.0,<7",
 ]
+
+[project.scripts]
+rsd-infisical-disposable-lifecycle = "omninode_rsd.lifecycle.infisical_disposable:main"
+rsd-executor-installation-render = "omninode_rsd.lifecycle.executor_installation:main"
+rsd-lifecycle-authorize = "omninode_rsd.lifecycle.authorization:main"
 
 [tool.uv.sources]
 omninode-grant-verifier = { workspace = true }

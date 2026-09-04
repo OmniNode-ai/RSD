@@ -252,10 +252,7 @@ def _is_allowed_file(path: Path) -> bool:
         return True
     if len(parts) == 1:
         return parts[0] in ALLOWED_TOP_LEVEL - {".github", "scripts", "src", "tests"}
-    if parts in {
-        (".github", "workflows", "test.yml"),
-        (".github", "workflows", "hostile-reviewer.yml"),
-    }:
+    if parts[:2] == (".github", "workflows") and path.suffix == ".yml":
         return True
     if parts in {
         VALIDATOR_PATH.parts,
