@@ -21,6 +21,7 @@ from omninode_rsd.delegation import (
     DispatchPort,
     PublicGrantVerifierAdapter,
     VerifiedGrantFacts,
+    delegation_claim_binding_sha256,
     load_canonical_delegation_overlay,
 )
 from omninode_rsd.lifecycle import (
@@ -255,10 +256,20 @@ def test_postgres_claim_adapter_binds_all_semantic_claim_material_not_transport_
         update={"request": request.model_copy(update={"tenant_id": "other-tenant"})}
     )
     assert adapter.claim(semantic_change) is ClaimDisposition.CLAIMED
+    request_pin_changed = claim.model_copy(
+        update={"request": request.model_copy(update={"request_sha256": "a" * 64})}
+    )
+    assert adapter.claim(request_pin_changed) is ClaimDisposition.CLAIMED
 
     assert store.identities[0].authorization_digest == facts.authorization_digest
+    assert store.identities[0].claim_binding_sha256 == delegation_claim_binding_sha256(
+        request=request,
+        grant=facts,
+        policy=load_canonical_delegation_overlay(),
+    )
     assert store.identities[0].claim_binding_sha256 == store.identities[1].claim_binding_sha256
     assert store.identities[0].claim_binding_sha256 != store.identities[2].claim_binding_sha256
+    assert store.identities[0].claim_binding_sha256 != store.identities[3].claim_binding_sha256
 
 
 def test_postgres_claim_adapter_rejects_constructed_scalar_subclass_before_store() -> None:

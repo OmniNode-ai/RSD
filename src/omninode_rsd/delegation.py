@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from omninode_rsd.lifecycle import LifecycleEventIngress, LifecycleEventIntent, LifecycleEventType
 from omninode_rsd.lifecycle.event_log import LifecycleEventLog
+from omninode_rsd.lifecycle.hashing import canonical_hash
 from omninode_rsd.lifecycle.models import strict_model_values
 
 _SHA256 = r"^[0-9a-f]{64}$"
@@ -176,6 +177,31 @@ class DelegatedGrantClaim(_DelegationModel):
     request: DelegatedRequest
     grant: VerifiedGrantFacts
     policy: DelegationOverlay
+
+
+def delegation_claim_binding_sha256(
+    *,
+    request: DelegatedRequest,
+    grant: VerifiedGrantFacts,
+    policy: DelegationOverlay,
+) -> str:
+    """Return the one durable identity binding for a verified delegation claim.
+
+    Callers must first enforce exact public model types. The complete signed
+    request pin is deliberately part of this durable binding. A dispatch
+    envelope therefore never embeds this digest: it validates separately as
+    the exact preimage of that pin, avoiding a self-referential hash cycle.
+    """
+
+    return canonical_hash(
+        {
+            "schema_version": "rsd.delegation-claim-binding.v1",
+            "authorization_domain": grant.authorization_domain,
+            "request": request,
+            "grant": grant.model_dump(mode="python", exclude={"signature_sha256"}),
+            "policy": policy,
+        }
+    )
 
 
 class ClaimDisposition(StrEnum):

@@ -27,8 +27,9 @@ from omninode_rsd.delegation import (
     DelegatedRequest,
     DelegationOverlay,
     VerifiedGrantFacts,
+    delegation_claim_binding_sha256,
 )
-from omninode_rsd.lifecycle.hashing import canonical_hash, canonical_json
+from omninode_rsd.lifecycle.hashing import canonical_json
 from omninode_rsd.lifecycle.models import strict_model_values
 
 _SHA256 = r"^[0-9a-f]{64}$"
@@ -90,7 +91,6 @@ class DispatchRequestEnvelopeV1(_DispatchModel):
 
     schema_version: Literal["rsd.dispatch-request-envelope.v1"]
     authorization_digest: str = Field(pattern=_SHA256)
-    claim_binding_sha256: str = Field(pattern=_SHA256)
     backend_id: str = Field(pattern=_IDENTIFIER)
     model_id: str = Field(pattern=_MODEL_IDENTIFIER)
     route_ref: str = Field(pattern=_ROUTE_REF)
@@ -215,7 +215,6 @@ def _strict_envelope(value: object) -> DispatchRequestEnvelopeV1:
     scalar_values = (
         values["schema_version"],
         values["authorization_digest"],
-        values["claim_binding_sha256"],
         values["backend_id"],
         values["model_id"],
         values["route_ref"],
@@ -341,7 +340,10 @@ def _canonical_bytes(model: BaseModel) -> bytes:
 def canonical_dispatch_request_envelope_bytes(envelope: DispatchRequestEnvelopeV1) -> bytes:
     """Return the only accepted preimage for the signed request hash."""
 
-    return _canonical_bytes(_strict_envelope(envelope))
+    raw = _canonical_bytes(_strict_envelope(envelope))
+    if len(raw) > _MAX_REQUEST_ENVELOPE_BYTES:
+        raise DispatchRequestEnvelopeError("dispatch request envelope exceeds the allowed bound")
+    return raw
 
 
 def parse_dispatch_request_envelope(raw: bytes) -> DispatchRequestEnvelopeV1:
@@ -360,30 +362,6 @@ def parse_dispatch_request_envelope(raw: bytes) -> DispatchRequestEnvelopeV1:
     return envelope
 
 
-def dispatch_claim_binding_sha256(claim: DelegatedGrantClaim) -> str:
-    """Hash semantic authorization facts other than the self-referential request pin.
-
-    The exact request-envelope bytes are separately compared with
-    ``request_sha256``.  Including that pin here would make an envelope carry
-    a hash of bytes that themselves carry this binding, an unsatisfiable hash
-    cycle.  The pair of this digest and the separately verified request hash
-    therefore binds every claim field exactly once.
-    """
-
-    request, grant, policy = _strict_claim(claim)
-    return canonical_hash(
-        {
-            "schema_version": "rsd.dispatch-claim-binding.v1",
-            "authorization_digest": grant.authorization_digest,
-            "request": request.model_dump(mode="python", exclude={"request_sha256"}),
-            "grant": grant.model_dump(
-                mode="python", exclude={"signature_sha256", "request_sha256"}
-            ),
-            "policy": policy,
-        }
-    )
-
-
 def validate_dispatch_request_envelope(
     raw: bytes, claim: DelegatedGrantClaim
 ) -> DispatchRequestEnvelopeV1:
@@ -400,7 +378,6 @@ def validate_dispatch_request_envelope(
     if (
         sha256(raw).hexdigest() != request.request_sha256
         or envelope.authorization_digest != grant.authorization_digest
-        or envelope.claim_binding_sha256 != dispatch_claim_binding_sha256(claim)
         or envelope.backend_id != request.backend_id
         or envelope.model_id != request.model_id
         or envelope.route_ref != request.route_ref
@@ -482,7 +459,8 @@ def verify_dispatch_outcome_attestation(
     now = _require_utc(trusted_clock(), error_type=DispatchOutcomeSignatureError)
     if (
         attestation.authorization_digest != grant.authorization_digest
-        or attestation.claim_binding_sha256 != dispatch_claim_binding_sha256(claim)
+        or attestation.claim_binding_sha256
+        != delegation_claim_binding_sha256(request=request, grant=grant, policy=policy)
         or attestation.backend_id != request.backend_id
         or attestation.model_id != request.model_id
         or attestation.route_ref != request.route_ref

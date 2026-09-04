@@ -14,8 +14,8 @@ from omninode_rsd.delegation import (
     DelegatedRequest,
     DelegationOverlay,
     VerifiedGrantFacts,
+    delegation_claim_binding_sha256,
 )
-from omninode_rsd.lifecycle.hashing import canonical_hash
 from omninode_rsd.lifecycle.models import strict_model_values
 from omninode_rsd.lifecycle.postgres.claim_store import (
     DelegationClaimIdentityV1,
@@ -40,14 +40,10 @@ class PostgresAtomicClaimPort(AtomicClaimPort):
         identity = DelegationClaimIdentityV1(
             schema_version="rsd.delegation-claim-identity.v1",
             authorization_digest=grant.authorization_digest,
-            claim_binding_sha256=canonical_hash(
-                {
-                    "schema_version": "rsd.delegation-claim-binding.v1",
-                    "authorization_domain": grant.authorization_domain,
-                    "request": request,
-                    "grant": grant.model_dump(mode="python", exclude={"signature_sha256"}),
-                    "policy": policy,
-                }
+            claim_binding_sha256=delegation_claim_binding_sha256(
+                request=request,
+                grant=grant,
+                policy=policy,
             ),
         )
         result = self._store.claim(identity)

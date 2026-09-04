@@ -12,14 +12,13 @@ from uuid import UUID, uuid4
 import pytest
 import yaml
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from omninode_grant_verifier import signed_executable_grant_v2_vectors
 
 from omninode_rsd.delegation import (
     DelegatedGrantClaim,
     DelegatedRequest,
     DelegationOverlay,
-    PublicGrantVerifierAdapter,
     VerifiedGrantFacts,
+    delegation_claim_binding_sha256,
 )
 from omninode_rsd.lifecycle.dispatch_attestation import (
     DispatchOutcomeAttestationV1,
@@ -35,7 +34,6 @@ from omninode_rsd.lifecycle.dispatch_attestation import (
     OpenAIChatCompletionRequestV1,
     OpenAIChatMessageV1,
     canonical_dispatch_request_envelope_bytes,
-    dispatch_claim_binding_sha256,
     dispatch_outcome_attestation_message,
     parse_dispatch_outcome_attestation,
     parse_dispatch_request_envelope,
@@ -48,7 +46,7 @@ _NOW = datetime(2030, 1, 1, tzinfo=UTC)
 _VECTOR = (
     Path(__file__).parents[2] / "src/omninode_rsd/lifecycle/dispatch_attestation_public_vector.yaml"
 )
-_VECTOR_SHA256 = "8146536f3d6bc0d2d532b450915df50863751e06a5f4f6901d118573ba01cb9d"
+_VECTOR_SHA256 = "00976ab4037742d5e36909ff83d687bab2fdb1cb8b75d0a4e0ae0ece2643e027"
 
 
 class _ReplayAuthority(DispatchOutcomeReplayAuthority):
@@ -73,12 +71,39 @@ class _AmbiguousReplayAuthority(DispatchOutcomeReplayAuthority):
         raise OSError("replay authority unavailable")
 
 
-def _facts() -> VerifiedGrantFacts:
-    vectors = signed_executable_grant_v2_vectors()
-    base_wire = vectors["base_wire"]
-    assert type(base_wire) is dict
-    return PublicGrantVerifierAdapter(trusted_clock=lambda: _NOW)(
-        json.dumps(base_wire, separators=(",", ":")).encode("utf-8")
+def _synthetic_facts(*, request_sha256: str) -> VerifiedGrantFacts:
+    """Return explicit unsigned facts for the synthetic public vector only."""
+
+    return VerifiedGrantFacts.model_construct(
+        signed_schema_version="omninode-rsd.signed-executable-grant.v2",
+        authorization_schema_version="omninode-rsd.grant-authorization-material.v2",
+        authorization_domain="omninode-rsd.signed-executable-grant.v2",
+        authorization_digest="1" * 64,
+        signature_sha256="2" * 64,
+        issuer_key_id="synthetic-issuer",
+        issuer_key_fingerprint_sha256="3" * 64,
+        grant_id=UUID("10000000-0000-4000-8000-000000000001"),
+        envelope_id=UUID("10000000-0000-4000-8000-000000000002"),
+        activation_id=UUID("10000000-0000-4000-8000-000000000003"),
+        correlation_id=UUID("10000000-0000-4000-8000-000000000004"),
+        nonce_sha256="4" * 64,
+        request_sha256=request_sha256,
+        artifact_sha256="5" * 64,
+        rendered_contract_sha256="6" * 64,
+        tenant_id="synthetic-tenant",
+        backend_id="synthetic-backend",
+        model_id="synthetic-model-v1",
+        dispatch_policy="backend-pinned-single-attempt.v1",
+        attempt_count=1,
+        retry_disposition="forbidden",
+        fallback_used=False,
+        recovery_disposition="report-only",
+        expected_output_topic="events.synthetic.completed.v1",
+        expected_output_event_class="ModelSyntheticCompleted",
+        expected_output_event_index=0,
+        issued_at=datetime(2029, 1, 1, tzinfo=UTC),
+        not_before=datetime(2029, 1, 1, tzinfo=UTC),
+        expires_at=datetime(2031, 1, 1, tzinfo=UTC),
     )
 
 
@@ -108,17 +133,11 @@ def _policy(facts: VerifiedGrantFacts) -> DelegationOverlay:
 
 
 def _claim_and_envelope() -> tuple[DelegatedGrantClaim, bytes]:
-    facts = _facts()
-    initial_request = _request(facts, request_sha256="0" * 64)
-    initial_claim = DelegatedGrantClaim(
-        request=initial_request,
-        grant=facts,
-        policy=_policy(facts),
-    )
+    facts = _synthetic_facts(request_sha256="0" * 64)
+    initial_request = _request(facts, request_sha256=facts.request_sha256)
     envelope = DispatchRequestEnvelopeV1(
         schema_version="rsd.dispatch-request-envelope.v1",
         authorization_digest=facts.authorization_digest,
-        claim_binding_sha256=dispatch_claim_binding_sha256(initial_claim),
         backend_id=facts.backend_id,
         model_id=facts.model_id,
         route_ref=initial_request.route_ref,
@@ -131,14 +150,22 @@ def _claim_and_envelope() -> tuple[DelegatedGrantClaim, bytes]:
         ),
     )
     raw = canonical_dispatch_request_envelope_bytes(envelope)
-    final_request = _request(facts, request_sha256=sha256(raw).hexdigest())
+    final_facts = _synthetic_facts(request_sha256=sha256(raw).hexdigest())
+    final_request = _request(final_facts, request_sha256=final_facts.request_sha256)
     final_claim = DelegatedGrantClaim(
         request=final_request,
-        grant=facts.model_copy(update={"request_sha256": final_request.request_sha256}),
-        policy=_policy(facts),
+        grant=final_facts,
+        policy=_policy(final_facts),
     )
-    assert dispatch_claim_binding_sha256(final_claim) == envelope.claim_binding_sha256
     return final_claim, raw
+
+
+def _claim_binding(claim: DelegatedGrantClaim) -> str:
+    return delegation_claim_binding_sha256(
+        request=claim.request,
+        grant=claim.grant,
+        policy=claim.policy,
+    )
 
 
 def _anchor(private_key: Ed25519PrivateKey) -> DispatchOutcomeTrustAnchorV1:
@@ -165,7 +192,7 @@ def _attestation_bytes(
         schema_version="rsd.dispatch-outcome-attestation.v1",
         attestation_id=uuid4() if attestation_id is None else attestation_id,
         authorization_digest=claim.grant.authorization_digest,
-        claim_binding_sha256=dispatch_claim_binding_sha256(claim),
+        claim_binding_sha256=_claim_binding(claim),
         backend_id=claim.request.backend_id,
         model_id=claim.request.model_id,
         route_ref=claim.request.route_ref,
@@ -196,7 +223,7 @@ def test_canonical_request_envelope_is_the_exact_signed_request_preimage() -> No
 
     assert result.request.model_id == claim.request.model_id
     assert sha256(raw).hexdigest() == claim.request.request_sha256
-    assert result.claim_binding_sha256 == dispatch_claim_binding_sha256(claim)
+    assert _claim_binding(claim) != ""
 
 
 def test_public_vector_verifies_the_complete_request_and_outcome_contract() -> None:
@@ -214,7 +241,7 @@ def test_public_vector_verifies_the_complete_request_and_outcome_contract() -> N
         "trust_anchor",
     }
     assert loaded["schema_version"] == "rsd.dispatch-attestation-public-vector.v1"
-    assert loaded["purpose"] == "synthetic_offline_request_and_authenticated_outcome"
+    assert loaded["purpose"] == "synthetic_unsigned_claim_facts_request_and_authenticated_outcome"
     assert type(loaded["request_envelope_base64"]) is str
     assert type(loaded["request_envelope_sha256"]) is str
     assert type(loaded["outcome_attestation_base64_segments"]) is list
@@ -253,6 +280,27 @@ def test_public_vector_verifies_the_complete_request_and_outcome_contract() -> N
 def test_request_envelope_rejects_invalid_or_oversize_bytes(raw: bytes) -> None:
     with pytest.raises(DispatchRequestEnvelopeError):
         parse_dispatch_request_envelope(raw)
+
+
+def test_canonical_request_serializer_rejects_an_aggregate_oversize_envelope() -> None:
+    claim, _ = _claim_and_envelope()
+    envelope = DispatchRequestEnvelopeV1(
+        schema_version="rsd.dispatch-request-envelope.v1",
+        authorization_digest=claim.grant.authorization_digest,
+        backend_id=claim.request.backend_id,
+        model_id=claim.request.model_id,
+        route_ref=claim.request.route_ref,
+        request=OpenAIChatCompletionRequestV1(
+            schema_version="rsd.openai-chat-completion-request.v1",
+            model_id=claim.request.model_id,
+            messages=(OpenAIChatMessageV1(role="user", content="x" * 16_384),) * 32,
+            max_output_tokens=64,
+            stream=False,
+        ),
+    )
+
+    with pytest.raises(DispatchRequestEnvelopeError, match="allowed bound"):
+        canonical_dispatch_request_envelope_bytes(envelope)
 
 
 def test_request_envelope_rejects_noncanonical_and_unknown_shapes() -> None:

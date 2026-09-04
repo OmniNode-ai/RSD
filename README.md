@@ -78,10 +78,11 @@ Its `DispatchRequestEnvelopeV1` fixes a bounded, non-streaming
 OpenAI-compatible chat-completions request shape. The exact canonical ASCII
 JSON envelope is the preimage of the already-verified grant's
 `request_sha256`; validation also binds the complete remaining delegated
-claim, authorization digest, backend, model, and route. The request pin is
-excluded from the companion claim-binding digest solely to avoid a
-self-referential hash cycle; the digest and exact preimage together bind every
-claim field exactly once.
+claim, authorization digest, backend, model, and route. The request envelope
+does not embed a claim-binding digest: the shared durable
+`rsd.delegation-claim-binding.v1` includes the signed request pin, so embedding
+it would create a self-referential hash cycle. The exact preimage and the
+durable binding together bind every claim field exactly once.
 
 `DispatchOutcomeAttestationV1` is a separate, canonical, domain-separated
 Ed25519 receipt for one definitive `completed` or `failed` outcome.
@@ -93,6 +94,8 @@ Malformed, noncanonical, oversized, expired, mismatched, replayed, or
 replay-ambiguous material is rejected. The module has no network client,
 endpoint selection, signer/key loading, dispatch adapter, or lifecycle write;
 its public vector is synthetic offline data only.
+It contains explicitly unsigned synthetic claim facts and is not evidence from
+or a preimage for any signed executable grant.
 
 ## Development
 
