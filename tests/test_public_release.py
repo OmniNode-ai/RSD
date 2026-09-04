@@ -24,6 +24,7 @@ validate_tree = _VALIDATOR.validate_tree
 _ROOT = Path(__file__).parents[1]
 _VERIFIER_ROOT = _ROOT / "public_verifier"
 _VERIFIER_VERSION = "0.1.0"
+_PUBLIC_PYPI_SIMPLE_URL = "https://pypi.org/simple"
 _VERIFIER_RESOURCES = (
     "executable_grant_v2_trust_anchor.json",
     "signed_executable_grant_v2.schema.json",
@@ -275,8 +276,16 @@ def test_paired_public_artifacts_have_isolated_install_ownership(tmp_path: Path)
 
     with zipfile.ZipFile(verifier_wheel) as archive:
         verifier_members = frozenset(archive.namelist())
+        verifier_metadata_name = next(
+            name for name in verifier_members if name.endswith(".dist-info/METADATA")
+        )
+        verifier_metadata = archive.read(verifier_metadata_name).decode("utf-8")
     assert any(member.startswith("omninode_grant_verifier/") for member in verifier_members)
     assert not any(member.startswith("omninode_rsd/") for member in verifier_members)
+    assert "License-Expression: MIT" in verifier_metadata
+    assert "License-File: LICENSE" in verifier_metadata
+    assert "Description-Content-Type: text/markdown" in verifier_metadata
+    assert any(member.endswith(".dist-info/licenses/LICENSE") for member in verifier_members)
 
     root_local_wheel = local_artifacts / root_wheel.name
     verifier_local_wheel = local_artifacts / verifier_wheel.name
@@ -305,13 +314,15 @@ def test_paired_public_artifacts_have_isolated_install_ownership(tmp_path: Path)
 
     _run_command(tmp_path, uv, "venv", "--offline", "--python", "3.12", str(environment))
     interpreter = environment / "bin" / "python"
-    # This is deliberately normal uv index/cache installation: only ordinary third-party
-    # runtime dependencies belong to the lock-derived closure.
+    # Resolve the locked third-party closure from a clean, explicit public index.
     _run_command(
         neutral_cwd,
         uv,
         "pip",
         "install",
+        "--no-cache",
+        "--index-url",
+        _PUBLIC_PYPI_SIMPLE_URL,
         "--require-hashes",
         "--python",
         str(interpreter),
@@ -409,6 +420,7 @@ def test_allows_loopback_documentation_and_public_dependency_values(tmp_path: Pa
             "d = '" + _address("192", ".0.2.7") + "'",
             "e = '" + _address("2001:db8", "::7") + "'",
             "f = 'https://example.com:443/docs'",
+            "g = 'https://pypi.org/simple/'",
         ]
     )
     findings = _write(tmp_path, "README.md", content)

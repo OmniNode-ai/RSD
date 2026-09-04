@@ -50,6 +50,8 @@ ALLOWED_TOP_LEVEL: Final[frozenset[str]] = frozenset(
 )
 PUBLIC_VERIFIER_FILES: Final[frozenset[tuple[str, ...]]] = frozenset(
     {
+        ("public_verifier", "LICENSE"),
+        ("public_verifier", "README.md"),
         ("public_verifier", "pyproject.toml"),
         ("public_verifier", "uv.lock"),
         ("public_verifier", "src", "omninode_grant_verifier", "__init__.py"),
@@ -141,7 +143,7 @@ DOCUMENTATION_NETWORKS: Final[tuple[tuple[IPv4Address | IPv6Address, int], ...]]
 )
 SAFE_HOSTS: Final[frozenset[str]] = frozenset({"localhost", "127.0.0.1", "::1"})
 SAFE_PUBLIC_HOSTS: Final[frozenset[str]] = frozenset(
-    {"api.github.com", "github.com", "img.shields.io"}
+    {"api.github.com", "github.com", "img.shields.io", "pypi.org"}
 )
 SAFE_DOCUMENTATION_SUFFIXES: Final[tuple[str, ...]] = (
     ".example.com",
@@ -256,6 +258,7 @@ def _is_allowed_file(path: Path) -> bool:
         return True
     if parts in {
         VALIDATOR_PATH.parts,
+        ("scripts", "ci", "build_paired_release.py"),
         ("scripts", "ci", "parse_hostile_review.py"),
         ("scripts", "ci", "fetch_hostile_review_input.py"),
     }:

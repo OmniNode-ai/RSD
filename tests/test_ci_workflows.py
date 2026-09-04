@@ -13,6 +13,7 @@ import yaml
 
 _WORKFLOW_DIR = Path(__file__).parents[1] / ".github" / "workflows"
 _HOSTILE_REVIEWER = _WORKFLOW_DIR / "hostile-reviewer.yml"
+_RELEASE_WORKFLOW = _WORKFLOW_DIR / "release.yml"
 _SHA_RE = re.compile(r"^\s*(?:-\s*)?uses:\s*(?P<action>[^@\s]+)@(?P<sha>[0-9a-f]{40})(?:\s+#.*)?$")
 _PARSER_PATH = Path(__file__).parents[1] / "scripts" / "ci" / "parse_hostile_review.py"
 _PARSER_SPEC = importlib.util.spec_from_file_location("parse_hostile_review", _PARSER_PATH)
@@ -38,6 +39,7 @@ def test_all_workflow_actions_are_immutable_and_verified() -> None:
     expected = {
         "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08",
         "astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86",
         "astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78",
     }
@@ -50,6 +52,18 @@ def test_all_workflow_actions_are_immutable_and_verified() -> None:
             assert match is not None, f"mutable or malformed action reference in {workflow}: {line}"
             seen.add(f"{match.group('action')}@{match.group('sha')}")
     assert seen == expected
+
+
+def test_paired_release_workflow_is_build_only() -> None:
+    text = _RELEASE_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "workflow_dispatch:" in text
+    assert "push:" not in text
+    assert "uv publish" not in text
+    assert "PYPI_TOKEN" not in text
+    assert "secrets." not in text
+    assert "contents: read" in text
+    assert "actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08" in text
 
 
 def test_hostile_reviewer_is_fork_safe_and_minimal() -> None:

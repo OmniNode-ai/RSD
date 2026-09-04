@@ -27,6 +27,7 @@ _WHEEL_MEMBERS = frozenset(
         *_RESOURCES,
         "omninode_grant_verifier-0.1.0.dist-info/METADATA",
         "omninode_grant_verifier-0.1.0.dist-info/WHEEL",
+        "omninode_grant_verifier-0.1.0.dist-info/licenses/LICENSE",
         "omninode_grant_verifier-0.1.0.dist-info/RECORD",
     }
 )
@@ -40,6 +41,8 @@ _SDIST_MEMBERS = frozenset(
         *(f"src/{resource}" for resource in _RESOURCES),
         "tests/test_signed_executable_grant_v2.py",
         "tests/test_signed_executable_grant_v2_release.py",
+        "LICENSE",
+        "README.md",
     }
 )
 
