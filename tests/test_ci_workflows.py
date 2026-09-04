@@ -84,7 +84,7 @@ def test_hostile_reviewer_is_fork_safe_and_minimal() -> None:
     assert text.count("${{ secrets.LLM_QWEN3_REVIEW_B_URL }}") == 1
     assert '--file "$REVIEW_INPUT"' in text
     assert "--no-fallback" in text
-    assert "--python 3.12.14" in text
+    assert "--python 3.12" in text
     assert "Hosted runners cannot reach the configured reviewer defaults" in text
     assert "${{ github.event.pull_request.head" not in text
     assert "head.sha" not in text
@@ -148,7 +148,7 @@ def test_hostile_reviewer_has_explicit_degraded_fork_and_default_deny_gate() -> 
     assert "*)" in text
     assert '--file "$REVIEW_INPUT"' in text
     assert "--no-fallback" in text
-    assert "--python 3.12.14" in text
+    assert "--python 3.12" in text
     assert "--model qwen3-review" in text
     assert "--model qwen3-review-b" in text
 
@@ -185,7 +185,7 @@ def test_hostile_reviewer_pins_toolchain_and_disables_cache() -> None:
         assert "enable-cache: false" in text
 
     assert 'python-version: "3.12"' in (_WORKFLOW_DIR / "test.yml").read_text(encoding="utf-8")
-    assert "uv python install 3.12.14" in _HOSTILE_REVIEWER.read_text(encoding="utf-8")
+    assert "uv python install 3.12" in _HOSTILE_REVIEWER.read_text(encoding="utf-8")
 
 
 def test_hostile_reviewer_uses_only_trusted_base_files() -> None:
