@@ -6,6 +6,8 @@
 deterministic lifecycle events. It has no network client, service endpoint, or
 deployment configuration.
 
+Hostile review uses trusted base-controlled tooling and bounded pull-request diff input.
+
 ## Breaking package rename (pre-1.0)
 
 The distribution is now `omninode-rsd` and its Python import root is
