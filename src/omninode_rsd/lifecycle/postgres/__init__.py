@@ -4,6 +4,14 @@ All adapters receive caller-owned connection context managers.  This package
 does not discover endpoints, credentials, pools, or runtime configuration.
 """
 
+from omninode_rsd.lifecycle.postgres.claim_store import (
+    DelegationClaimIdentityV1,
+    DelegationClaimResult,
+    DelegationClaimStoreCorruptionError,
+    DelegationClaimStoreError,
+    DelegationClaimStoreUnavailableError,
+    PostgresDelegationClaimStore,
+)
 from omninode_rsd.lifecycle.postgres.migrations import (
     AppliedLifecycleMigration,
     LifecycleMigration,
@@ -34,6 +42,11 @@ from omninode_rsd.lifecycle.postgres.store import (
 
 __all__ = [
     "AppliedLifecycleMigration",
+    "DelegationClaimIdentityV1",
+    "DelegationClaimResult",
+    "DelegationClaimStoreCorruptionError",
+    "DelegationClaimStoreError",
+    "DelegationClaimStoreUnavailableError",
     "DurableLifecycleEventLog",
     "LifecycleMigration",
     "LifecycleStoreConflictError",
@@ -46,6 +59,7 @@ __all__ = [
     "MigrationLedgerVerificationError",
     "PostgresConnection",
     "PostgresConnectionFactory",
+    "PostgresDelegationClaimStore",
     "PostgresLifecycleEventLog",
     "PostgresLifecycleMigrationRunner",
     "PostgresMigrationConnection",

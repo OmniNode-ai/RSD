@@ -122,6 +122,8 @@ class _Connection(AbstractContextManager["_Connection"]):
         if normalized.startswith("CREATE SCHEMA rsd_canary;"):
             self._database.schema_exists = True
             return _Result([])
+        if normalized.startswith("CREATE TABLE rsd_canary.delegation_claims"):
+            return _Result([])
         if normalized.startswith("INSERT INTO rsd_canary.schema_migrations"):
             version, name, checksum = params
             self._database.ledger.append(_DriverRow(version=version, name=name, checksum=checksum))
@@ -207,6 +209,8 @@ class _ConcurrentBootstrapConnection(AbstractContextManager["_ConcurrentBootstra
             self._database.schema_exists = True
             self._database.migration_executions += 1
             return _Result([])
+        if normalized.startswith("CREATE TABLE rsd_canary.delegation_claims"):
+            return _Result([])
         if normalized.startswith("INSERT INTO rsd_canary.schema_migrations"):
             version, name, checksum = params
             self._database.ledger.append(_DriverRow(version=version, name=name, checksum=checksum))
@@ -252,11 +256,8 @@ def test_runner_locks_validates_and_records_each_pending_resource_in_one_transac
     )
     assert migration_index < ledger_index
     assert database.ledger == [
-        _DriverRow(
-            version=manifest[0].version,
-            name=manifest[0].name,
-            checksum=manifest[0].sha256,
-        )
+        _DriverRow(version=migration.version, name=migration.name, checksum=migration.sha256)
+        for migration in manifest
     ]
 
     assert runner.apply_pending() == ()
@@ -284,7 +285,8 @@ def test_runner_accepts_exact_catalog_probe_rows_and_reads_the_ledger_only_when_
     relation_exists: bool,
 ) -> None:
     database = _Database()
-    migration = discover_lifecycle_migrations()[0]
+    manifest = discover_lifecycle_migrations()
+    migration = manifest[0]
     database.use_catalog_probe_row_override = True
     database.catalog_probe_row_override = catalog_probe_row
     if relation_exists:
@@ -297,7 +299,7 @@ def test_runner_accepts_exact_catalog_probe_rows_and_reads_the_ledger_only_when_
             )
         ]
 
-    assert _runner(database).apply_pending() == (() if relation_exists else (migration,))
+    assert _runner(database).apply_pending() == (manifest[1:] if relation_exists else manifest)
 
     statements = [query for query, _ in database.calls]
     assert statements[:3] == [
@@ -384,11 +386,8 @@ def test_concurrent_fresh_bootstrap_serializes_before_the_catalog_probe() -> Non
     assert database.migration_executions == 1
     assert database.ledger_reads == 1
     assert database.ledger == [
-        _DriverRow(
-            version=manifest[0].version,
-            name=manifest[0].name,
-            checksum=manifest[0].sha256,
-        )
+        _DriverRow(version=migration.version, name=migration.name, checksum=migration.sha256)
+        for migration in manifest
     ]
 
 

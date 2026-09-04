@@ -26,8 +26,11 @@ from omninode_rsd.lifecycle import (
     LifecycleEventType,
 )
 from omninode_rsd.lifecycle.postgres import (
+    DelegationClaimIdentityV1,
+    DelegationClaimResult,
     LifecycleMigration,
     LifecycleStoreCorruptionError,
+    PostgresDelegationClaimStore,
     PostgresLifecycleEventLog,
     PostgresLifecycleMigrationRunner,
     discover_lifecycle_migrations,
@@ -131,6 +134,14 @@ def _builder() -> LifecycleEventIngress:
     return LifecycleEventIngress(
         event_id_factory=lambda: EVENT_IDS[0],
         clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+def _claim_identity() -> DelegationClaimIdentityV1:
+    return DelegationClaimIdentityV1(
+        schema_version="rsd.delegation-claim-identity.v1",
+        authorization_digest="a" * 64,
+        claim_binding_sha256="b" * 64,
     )
 
 
@@ -307,3 +318,25 @@ def test_concurrent_migration_runners_record_one_manifest_prefix(
             "SELECT count(*) AS value FROM rsd_canary.schema_migrations",
         ) == len(manifest)
         connection.commit()
+
+
+def test_delegation_claim_is_atomic_idempotent_and_append_only(
+    request: pytest.FixtureRequest,
+) -> None:
+    factory = _connection_factory(request)
+    _bootstrap_fresh_target(factory)
+    store = PostgresDelegationClaimStore(factory)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(lambda _: store.claim(_claim_identity()), range(2)))
+
+    assert sorted(results) == [
+        DelegationClaimResult.CLAIMED,
+        DelegationClaimResult.NOT_CLAIMED,
+    ]
+    _expect_database_error(
+        factory,
+        "UPDATE rsd_canary.delegation_claims SET claim_binding_sha256 = claim_binding_sha256",
+        (),
+        "append-only",
+    )
