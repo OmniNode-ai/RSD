@@ -33,6 +33,19 @@ def test_workflow_uses_trusted_base_and_immutable_actions() -> None:
     assert "path: base" in text
     assert "persist-credentials: false" in text
     assert "--no-fallback" in text
+    reviewer = text.split("  hostile-review:\n", 1)[1].split("    timeout-minutes:", 1)[0]
+    gate = text.split("  hostile-review-gate:\n", 1)[1]
+    assert "github.event.pull_request.head.repo.full_name != github.repository" in reviewer
+    assert "'ubuntu-latest'" in reviewer
+    assert "fromJSON(vars.OMNI_REVIEW_RUNS_ON_JSON" in reviewer
+    assert '["self-hosted","omnibase-ci"]' in reviewer
+    assert "runs-on: ubuntu-latest" in gate
+    assert "if: always()" in gate
+    assert "github.event.pull_request.head.repo.full_name" in reviewer
+    assert "github.event.pull_request.head.sha" not in text
+    assert "LOCAL_LLM_SHARED_SECRET:" not in reviewer
+    assert "LLM_QWEN3_REVIEW_URL:" not in reviewer
+    assert "LLM_QWEN3_REVIEW_B_URL:" not in reviewer
     assert not re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text)
     for line in text.splitlines():
         if "uses:" in line:
