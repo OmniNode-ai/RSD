@@ -24,6 +24,7 @@ validate_tree = _VALIDATOR.validate_tree
 _ROOT = Path(__file__).parents[1]
 _VERIFIER_ROOT = _ROOT / "public_verifier"
 _VERIFIER_VERSION = "0.1.0"
+_PUBLIC_PYPI_SIMPLE_URL = "https://pypi.org/simple"
 _VERIFIER_RESOURCES = (
     "executable_grant_v2_trust_anchor.json",
     "signed_executable_grant_v2.schema.json",
@@ -313,13 +314,15 @@ def test_paired_public_artifacts_have_isolated_install_ownership(tmp_path: Path)
 
     _run_command(tmp_path, uv, "venv", "--offline", "--python", "3.12", str(environment))
     interpreter = environment / "bin" / "python"
-    # This is deliberately normal uv index/cache installation: only ordinary third-party
-    # runtime dependencies belong to the lock-derived closure.
+    # Resolve the locked third-party closure from a clean, explicit public index.
     _run_command(
         neutral_cwd,
         uv,
         "pip",
         "install",
+        "--no-cache",
+        "--index-url",
+        _PUBLIC_PYPI_SIMPLE_URL,
         "--require-hashes",
         "--python",
         str(interpreter),

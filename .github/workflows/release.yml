@@ -1,8 +1,6 @@
 name: paired-release
 
 on:
-  push:
-    tags: ["v*.*.*"]
   workflow_dispatch:
     inputs:
       version:
@@ -68,6 +66,8 @@ jobs:
         working-directory: public_verifier
         run: uv run --locked pytest -q tests
       - name: Build paired artifacts
+        env:
+          EXPECTED_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           rm -rf dist
@@ -79,25 +79,11 @@ jobs:
           find dist/root-wheel dist/verifier-wheel -maxdepth 1 -type f -exec cp {} dist/ \;
           find dist/root-sdist dist/verifier-sdist -maxdepth 1 -type f -exec cp {} dist/ \;
           rm -rf dist/root-sdist dist/root-wheel dist/verifier-sdist dist/verifier-wheel
-          uv run python scripts/ci/build_paired_release.py --expected-version "${{ steps.version.outputs.version }}"
+          uv run python scripts/ci/build_paired_release.py --expected-version "$EXPECTED_VERSION"
       - name: Upload paired artifacts and provenance
+        # This workflow is build-only. Publication is an external governed operation.
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
         with:
           name: omninode-rsd-paired-release-${{ steps.version.outputs.version }}
           path: dist/
           if-no-files-found: error
-      - name: Publish verifier then root (tag releases only)
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
-        run: |
-          set -euo pipefail
-          test -n "$UV_PUBLISH_TOKEN"
-          # PyPI has no atomic multi-distribution transaction: publish the
-          # verifier first, then the dependent root package. --check-url makes
-          # reruns idempotent after a partial upload; a root failure leaves a
-          # recoverable verifier-only release rather than a false success.
-          uv publish --check-url https://pypi.org/simple/ \
-            dist/omninode_grant_verifier-*.whl dist/omninode_grant_verifier-*.tar.gz
-          uv publish --check-url https://pypi.org/simple/ \
-            dist/omninode_rsd-*.whl dist/omninode_rsd-*.tar.gz
