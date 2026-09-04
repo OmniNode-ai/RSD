@@ -18,10 +18,14 @@ jobs:
     name: Hostile Reviewer (adversarial gate)
     # This privileged workflow is base-controlled. Fork content is fetched only
     # as bounded API data and is never checked out, fetched, or executed.
-    # Hosted runners cannot reach the configured reviewer defaults; --no-fallback
-    # therefore keeps this required gate fail-closed until safe endpoint secrets
-    # are configured for a hosted reviewer.
-    runs-on: ubuntu-latest
+    # This trusted, base-controlled workflow keeps fork PRs on a public runner.
+    # Only same-repository PRs may use the
+    # trusted reviewer fleet; neither path checks out, fetches, or executes PR
+    # head content.
+    runs-on: >-
+      ${{ github.event.pull_request.head.repo.full_name != github.repository &&
+          'ubuntu-latest' ||
+          fromJSON(vars.OMNI_REVIEW_RUNS_ON_JSON || '["self-hosted","omnibase-ci"]') }}
     timeout-minutes: 60
 
     steps:
@@ -114,9 +118,6 @@ jobs:
         working-directory: ../omniintelligence
         env:
           REVIEW_INPUT: ${{ steps.fetch-diff.outputs.path }}
-          LOCAL_LLM_SHARED_SECRET: ${{ secrets.LOCAL_LLM_SHARED_SECRET }}
-          LLM_QWEN3_REVIEW_URL: ${{ secrets.LLM_QWEN3_REVIEW_URL }}
-          LLM_QWEN3_REVIEW_B_URL: ${{ secrets.LLM_QWEN3_REVIEW_B_URL }}
         run: |
           set -euo pipefail
 

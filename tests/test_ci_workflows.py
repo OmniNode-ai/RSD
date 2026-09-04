@@ -64,10 +64,11 @@ def test_hostile_reviewer_is_fork_safe_and_minimal() -> None:
     assert "contents: read" in text
     assert "pull-requests: read" in text
     assert "pull-requests: write" not in text
-    assert text.count("runs-on: ubuntu-latest") == 2
+    assert text.count("runs-on: ubuntu-latest") == 1
     assert "OMNI_PUBLIC_PR_RUNS_ON_JSON" not in text
     assert "OMNI_TRUSTED_CI_RUNS_ON_JSON" not in text
-    assert "self-hosted" not in text
+    assert "OMNI_REVIEW_RUNS_ON_JSON" in text
+    assert "self-hosted" in text
     assert "occ-preflight" not in text
     assert "CodeRabbit" not in text
     assert "github-script" not in text
@@ -79,14 +80,14 @@ def test_hostile_reviewer_is_fork_safe_and_minimal() -> None:
     assert "--with pyyaml" not in text.lower()
     assert "${{ secrets.GITHUB_TOKEN }}" not in text
     assert text.count("${{ github.token }}") == 1
-    assert text.count("${{ secrets.LOCAL_LLM_SHARED_SECRET }}") == 1
-    assert text.count("${{ secrets.LLM_QWEN3_REVIEW_URL }}") == 1
-    assert text.count("${{ secrets.LLM_QWEN3_REVIEW_B_URL }}") == 1
+    assert "${{ secrets.LOCAL_LLM_SHARED_SECRET }}" not in text
+    assert "${{ secrets.LLM_QWEN3_REVIEW_URL }}" not in text
+    assert "${{ secrets.LLM_QWEN3_REVIEW_B_URL }}" not in text
     assert '--file "$REVIEW_INPUT"' in text
     assert "--no-fallback" in text
     assert "--python 3.12" in text
-    assert "Hosted runners cannot reach the configured reviewer defaults" in text
-    assert "${{ github.event.pull_request.head" not in text
+    assert "trusted, base-controlled" in text
+    assert "github.event.pull_request.head.repo.full_name" in text
     assert "head.sha" not in text
     assert "/merge" not in text
     assert "gh pr checkout" not in text
@@ -96,18 +97,36 @@ def test_hostile_reviewer_is_fork_safe_and_minimal() -> None:
 
 def test_hostile_reviewer_uses_canonical_runner_policy() -> None:
     text = _HOSTILE_REVIEWER.read_text(encoding="utf-8")
+    reviewer = text.split("  hostile-review:\n", 1)[1].split("    timeout-minutes:", 1)[0]
+    gate = text.split("  hostile-review-gate:\n", 1)[1]
 
-    assert text.count("runs-on: ubuntu-latest") == 2
-    assert "runs-on: >-" not in text
-    assert "fromJSON(" not in text
-    assert "github.event.pull_request.head" not in text
-    assert "self-hosted" not in text
+    assert "runs-on: >-" in reviewer
+    assert "github.event.pull_request.head.repo.full_name != github.repository" in reviewer
+    assert "'ubuntu-latest'" in reviewer
+    assert "fromJSON(vars.OMNI_REVIEW_RUNS_ON_JSON" in reviewer
+    assert '["self-hosted","omnibase-ci"]' in reviewer
+    assert "runs-on: ubuntu-latest" in gate
+    assert "github.event.pull_request.head.repo.full_name" in reviewer
+    assert "github.event.pull_request.head.sha" not in text
+    assert "self-hosted" in reviewer
+    assert "LOCAL_LLM_SHARED_SECRET:" not in reviewer
+    assert "LLM_QWEN3_REVIEW_URL:" not in reviewer
+    assert "LLM_QWEN3_REVIEW_B_URL:" not in reviewer
 
 
 def test_pull_request_workflows_never_select_self_hosted_runners() -> None:
     for workflow in _WORKFLOW_DIR.glob("*.yml"):
         text = workflow.read_text(encoding="utf-8")
         if not re.search(r"^\s+pull_request(?:_target)?\s*:", text, re.MULTILINE):
+            continue
+        if workflow == _HOSTILE_REVIEWER:
+            reviewer = text.split("  hostile-review:\n", 1)[1].split("    timeout-minutes:", 1)[0]
+            gate = text.split("  hostile-review-gate:\n", 1)[1]
+            assert "OMNI_REVIEW_RUNS_ON_JSON" in reviewer
+            assert "github.event.pull_request.head.repo.full_name != github.repository" in reviewer
+            assert "'ubuntu-latest'" in reviewer
+            assert "self-hosted" in reviewer
+            assert "runs-on: ubuntu-latest" in gate
             continue
         assert "self-hosted" not in text, workflow
         assert "OMNI_PUBLIC_PR_RUNS_ON_JSON" not in text, workflow
@@ -126,7 +145,8 @@ def test_hostile_reviewer_pins_dependencies_and_verifies_checkout() -> None:
     assert 'git -C "${target_dir}" rev-parse HEAD' in text
     assert 'git -C "${target_dir}" fetch --no-tags --depth=1 origin "${expected_sha}"' in text
     assert 'git -C "${target_dir}" checkout --detach "${expected_sha}"' in text
-    assert "github.event.pull_request.head" not in text
+    assert "github.event.pull_request.head.repo.full_name" in text
+    assert "github.event.pull_request.head.sha" not in text
     assert 'git fetch origin "${{ github' not in text
     for repo, sha in expected_pins.items():
         assert sha in text
@@ -196,7 +216,8 @@ def test_hostile_reviewer_uses_only_trusted_base_files() -> None:
     assert "persist-credentials: false" in text
     assert '"$GITHUB_WORKSPACE/base/scripts/ci/fetch_hostile_review_input.py"' in text
     assert '"$GITHUB_WORKSPACE/base/scripts/ci/parse_hostile_review.py"' in text
-    assert "pull_request.head" not in text
+    assert "github.event.pull_request.head.repo.full_name" in text
+    assert "github.event.pull_request.head.sha" not in text
     assert "git clone" not in text
 
 
