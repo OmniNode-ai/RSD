@@ -442,7 +442,7 @@ def test_result_preimages_reject_noncanonical_or_oversize_bytes() -> None:
 def test_outcome_attestation_rejects_tampered_preimages_before_replay_and_accepts_failure() -> None:
     claim, _ = _claim_and_envelope()
     private_key = Ed25519PrivateKey.generate()
-    raw, anchor, response_preimage, _output_payload = _attestation_bytes(claim, private_key)
+    raw, anchor, response_preimage, output_payload = _attestation_bytes(claim, private_key)
     replay = _ReplayAuthority()
     tampered_payload = canonical_dispatch_output_payload_bytes(
         DispatchCompletedOutputPayloadV1(
@@ -460,6 +460,37 @@ def test_outcome_attestation_rejects_tampered_preimages_before_replay_and_accept
             replay_authority=replay,
             response_preimage=response_preimage,
             output_payload=tampered_payload,
+        )
+    assert replay.calls == 0
+
+    tampered_response = canonical_dispatch_response_preimage_bytes(
+        DispatchResponsePreimageV1(
+            schema_version="rsd.dispatch-response-preimage.v1",
+            outcome_status="completed",
+            output_payload_sha256="0" * 64,
+        )
+    )
+    with pytest.raises(DispatchOutcomeSignatureError, match="preimages do not match"):
+        verify_dispatch_outcome_attestation(
+            raw,
+            claim=claim,
+            trust_anchor=anchor,
+            trusted_clock=lambda: _NOW,
+            replay_authority=replay,
+            response_preimage=tampered_response,
+            output_payload=output_payload,
+        )
+    assert replay.calls == 0
+
+    with pytest.raises(DispatchOutcomeSignatureError, match="allowed bound"):
+        verify_dispatch_outcome_attestation(
+            raw,
+            claim=claim,
+            trust_anchor=anchor,
+            trusted_clock=lambda: _NOW,
+            replay_authority=replay,
+            response_preimage=b"x" * 8_193,
+            output_payload=output_payload,
         )
     assert replay.calls == 0
 
