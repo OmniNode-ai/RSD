@@ -73,6 +73,41 @@ target run. That advisory lock coordinates only trusted adapter writers whose
 strict database ACLs prevent bypass writes; it is not protection against other
 independently privileged database users.
 
+## Delegated dispatch attestation contract
+
+`omninode_rsd.lifecycle.dispatch_attestation` is an offline T1 contract only.
+Its `DispatchRequestEnvelopeV1` fixes a bounded, non-streaming
+OpenAI-compatible chat-completions request shape. The exact canonical ASCII
+JSON envelope is the preimage of the already-verified grant's
+`request_sha256`; validation also binds the complete remaining delegated
+claim, authorization digest, backend, model, and route. The request envelope
+does not embed a claim-binding digest: the shared durable
+`rsd.delegation-claim-binding.v1` includes the signed request pin, so embedding
+it would create a self-referential hash cycle. The exact preimage and the
+durable binding together bind every claim field exactly once.
+
+`DispatchOutcomeAttestationV1` is a separate, canonical, domain-separated
+Ed25519 receipt for one definitive `completed` or `failed` outcome.
+Verification requires a caller-supplied explicit public trust anchor, UTC
+clock, and single-use replay authority; it binds the authorization digest,
+claim binding, backend/model/route, request hash, response and output-payload
+hashes, issuance time, signer identity, and anchor identity/fingerprint.
+Those two hashes have reproducible detached preimages: response metadata is
+`DispatchResponsePreimageV1`, and its payload is either a bounded completed
+text payload or a failed payload containing only one finite redacted failure
+code. Each hash is SHA-256 over its exact canonical ASCII JSON preimage with a
+distinct `omninode-rsd.dispatch-*.sha256.v1` domain prefix. Verification takes
+both bounded raw preimages, reparses and reserializes them, recomputes their
+hashes, and requires their status and payload kind to match the signed receipt.
+Thus a `failed` outcome never carries free-form backend diagnostics, while a
+`completed` outcome carries only bounded output content.
+Malformed, noncanonical, oversized, expired, mismatched, replayed, or
+replay-ambiguous material is rejected. The module has no network client,
+endpoint selection, signer/key loading, dispatch adapter, or lifecycle write;
+its public vector is synthetic offline data only.
+It contains explicitly unsigned synthetic claim facts and is not evidence from
+or a preimage for any signed executable grant.
+
 ## Development
 
 Use Python 3.12 or newer and uv:
