@@ -50,6 +50,19 @@ def test_migration_resource_is_packaged_and_checksum_changes_when_tampered() -> 
     assert tampered.sha256 != migration.sha256
 
 
+def test_delegation_claim_migration_is_append_only_and_topology_neutral() -> None:
+    migration = discover_lifecycle_migrations()[1]
+
+    assert migration.name == "create_delegation_claims"
+    assert "authorization_digest TEXT PRIMARY KEY" in migration.content
+    assert "claim_binding_sha256 TEXT NOT NULL" in migration.content
+    assert "delegation claims are append-only" in migration.content
+    assert "REVOKE ALL ON TABLE rsd_canary.delegation_claims FROM PUBLIC" in migration.content
+    assert "IF NOT EXISTS" not in migration.content
+    assert "BEGIN;" not in migration.content and "COMMIT;" not in migration.content
+    assert "postgresql://" not in migration.content and "os.environ" not in migration.content
+
+
 def test_migration_metadata_rejects_a_digest_that_does_not_match_its_content() -> None:
     with pytest.raises(ValueError, match="does not match content"):
         LifecycleMigration(

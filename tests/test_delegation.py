@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 from datetime import UTC, datetime
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -29,6 +30,12 @@ from omninode_rsd.lifecycle import (
     LifecycleEventIntent,
     LifecycleEventType,
 )
+from omninode_rsd.lifecycle.postgres import (
+    DelegationClaimIdentityV1,
+    DelegationClaimResult,
+    PostgresDelegationClaimStore,
+)
+from omninode_rsd.lifecycle.postgres.delegation_claim_port import PostgresAtomicClaimPort
 
 _NOW = datetime(2030, 1, 1, tzinfo=UTC)
 
@@ -121,6 +128,15 @@ class _Dispatch(DispatchPort):
             self.order.append("dispatch")
         if self.error is not None:
             raise self.error
+
+
+class _PostgresClaimStore:
+    def __init__(self) -> None:
+        self.identities: list[DelegationClaimIdentityV1] = []
+
+    def claim(self, identity: DelegationClaimIdentityV1) -> DelegationClaimResult:
+        self.identities.append(identity)
+        return DelegationClaimResult.CLAIMED
 
 
 class _RecordingLog:
@@ -217,6 +233,50 @@ def test_public_verifier_adapter_projects_full_identity() -> None:
     assert facts.attempt_count == 1
     assert facts.retry_disposition == "forbidden"
     assert not facts.fallback_used and facts.recovery_disposition == "report-only"
+
+
+def test_postgres_claim_adapter_binds_all_semantic_claim_material_not_transport_signature() -> None:
+    facts = _facts()
+    request = _request(facts)
+    claim = DelegatedGrantClaim(
+        request=request,
+        grant=facts,
+        policy=load_canonical_delegation_overlay(),
+    )
+    store = _PostgresClaimStore()
+    adapter = PostgresAtomicClaimPort(cast(PostgresDelegationClaimStore, store))
+
+    assert adapter.claim(claim) is ClaimDisposition.CLAIMED
+    signature_changed = claim.model_copy(
+        update={"grant": facts.model_copy(update={"signature_sha256": "f" * 64})}
+    )
+    assert adapter.claim(signature_changed) is ClaimDisposition.CLAIMED
+    semantic_change = claim.model_copy(
+        update={"request": request.model_copy(update={"tenant_id": "other-tenant"})}
+    )
+    assert adapter.claim(semantic_change) is ClaimDisposition.CLAIMED
+
+    assert store.identities[0].authorization_digest == facts.authorization_digest
+    assert store.identities[0].claim_binding_sha256 == store.identities[1].claim_binding_sha256
+    assert store.identities[0].claim_binding_sha256 != store.identities[2].claim_binding_sha256
+
+
+def test_postgres_claim_adapter_rejects_constructed_scalar_subclass_before_store() -> None:
+    class EvilString(str):
+        pass
+
+    facts = _facts()
+    request = _request(facts).model_copy(update={"tenant_id": EvilString(facts.tenant_id)})
+    claim = DelegatedGrantClaim.model_construct(
+        request=request,
+        grant=facts,
+        policy=load_canonical_delegation_overlay(),
+    )
+    store = _PostgresClaimStore()
+
+    with pytest.raises(ValueError, match="non-exact public values"):
+        PostgresAtomicClaimPort(cast(PostgresDelegationClaimStore, store)).claim(claim)
+    assert store.identities == []
 
 
 @pytest.mark.parametrize(
