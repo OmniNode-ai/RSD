@@ -71,6 +71,29 @@ target run. That advisory lock coordinates only trusted adapter writers whose
 strict database ACLs prevent bypass writes; it is not protection against other
 independently privileged database users.
 
+## Delegated dispatch attestation contract
+
+`omninode_rsd.lifecycle.dispatch_attestation` is an offline T1 contract only.
+Its `DispatchRequestEnvelopeV1` fixes a bounded, non-streaming
+OpenAI-compatible chat-completions request shape. The exact canonical ASCII
+JSON envelope is the preimage of the already-verified grant's
+`request_sha256`; validation also binds the complete remaining delegated
+claim, authorization digest, backend, model, and route. The request pin is
+excluded from the companion claim-binding digest solely to avoid a
+self-referential hash cycle; the digest and exact preimage together bind every
+claim field exactly once.
+
+`DispatchOutcomeAttestationV1` is a separate, canonical, domain-separated
+Ed25519 receipt for one definitive `completed` or `failed` outcome.
+Verification requires a caller-supplied explicit public trust anchor, UTC
+clock, and single-use replay authority; it binds the authorization digest,
+claim binding, backend/model/route, request hash, response and output-payload
+hashes, issuance time, signer identity, and anchor identity/fingerprint.
+Malformed, noncanonical, oversized, expired, mismatched, replayed, or
+replay-ambiguous material is rejected. The module has no network client,
+endpoint selection, signer/key loading, dispatch adapter, or lifecycle write;
+its public vector is synthetic offline data only.
+
 ## Development
 
 Use Python 3.12 or newer and uv:
