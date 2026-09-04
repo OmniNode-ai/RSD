@@ -90,6 +90,15 @@ Verification requires a caller-supplied explicit public trust anchor, UTC
 clock, and single-use replay authority; it binds the authorization digest,
 claim binding, backend/model/route, request hash, response and output-payload
 hashes, issuance time, signer identity, and anchor identity/fingerprint.
+Those two hashes have reproducible detached preimages: response metadata is
+`DispatchResponsePreimageV1`, and its payload is either a bounded completed
+text payload or a failed payload containing only one finite redacted failure
+code. Each hash is SHA-256 over its exact canonical ASCII JSON preimage with a
+distinct `omninode-rsd.dispatch-*.sha256.v1` domain prefix. Verification takes
+both bounded raw preimages, reparses and reserializes them, recomputes their
+hashes, and requires their status and payload kind to match the signed receipt.
+Thus a `failed` outcome never carries free-form backend diagnostics, while a
+`completed` outcome carries only bounded output content.
 Malformed, noncanonical, oversized, expired, mismatched, replayed, or
 replay-ambiguous material is rejected. The module has no network client,
 endpoint selection, signer/key loading, dispatch adapter, or lifecycle write;

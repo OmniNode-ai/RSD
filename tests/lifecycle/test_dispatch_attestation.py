@@ -21,6 +21,8 @@ from omninode_rsd.delegation import (
     delegation_claim_binding_sha256,
 )
 from omninode_rsd.lifecycle.dispatch_attestation import (
+    DispatchCompletedOutputPayloadV1,
+    DispatchFailedOutputPayloadV1,
     DispatchOutcomeAttestationV1,
     DispatchOutcomeReplayAmbiguousError,
     DispatchOutcomeReplayAuthority,
@@ -31,12 +33,19 @@ from omninode_rsd.lifecycle.dispatch_attestation import (
     DispatchOutcomeTrustAnchorV1,
     DispatchRequestEnvelopeError,
     DispatchRequestEnvelopeV1,
+    DispatchResponsePreimageV1,
     OpenAIChatCompletionRequestV1,
     OpenAIChatMessageV1,
+    canonical_dispatch_output_payload_bytes,
     canonical_dispatch_request_envelope_bytes,
+    canonical_dispatch_response_preimage_bytes,
     dispatch_outcome_attestation_message,
+    dispatch_output_payload_sha256,
+    dispatch_response_sha256,
     parse_dispatch_outcome_attestation,
+    parse_dispatch_output_payload,
     parse_dispatch_request_envelope,
+    parse_dispatch_response_preimage,
     validate_dispatch_request_envelope,
     verify_dispatch_outcome_attestation,
 )
@@ -46,7 +55,7 @@ _NOW = datetime(2030, 1, 1, tzinfo=UTC)
 _VECTOR = (
     Path(__file__).parents[2] / "src/omninode_rsd/lifecycle/dispatch_attestation_public_vector.yaml"
 )
-_VECTOR_SHA256 = "00976ab4037742d5e36909ff83d687bab2fdb1cb8b75d0a4e0ae0ece2643e027"
+_VECTOR_SHA256 = "f1f903e219136f61c15529583117f53caa0d026bec4dd24bbad8765360186b35"
 
 
 class _ReplayAuthority(DispatchOutcomeReplayAuthority):
@@ -184,10 +193,26 @@ def _attestation_bytes(
     private_key: Ed25519PrivateKey,
     *,
     attestation_id: UUID | None = None,
-    response_sha256: str = "a" * 64,
     outcome_status: str = "completed",
-) -> tuple[bytes, DispatchOutcomeTrustAnchorV1]:
+) -> tuple[bytes, DispatchOutcomeTrustAnchorV1, bytes, bytes]:
     anchor = _anchor(private_key)
+    if outcome_status == "completed":
+        payload = DispatchCompletedOutputPayloadV1(
+            schema_version="rsd.dispatch-completed-output-payload.v1",
+            content="bounded test response",
+        )
+    else:
+        payload = DispatchFailedOutputPayloadV1(
+            schema_version="rsd.dispatch-failed-output-payload.v1",
+            failure_code="service_failed",
+        )
+    output_payload = canonical_dispatch_output_payload_bytes(payload)
+    response = DispatchResponsePreimageV1(
+        schema_version="rsd.dispatch-response-preimage.v1",
+        outcome_status=outcome_status,  # type: ignore[arg-type]
+        output_payload_sha256=dispatch_output_payload_sha256(payload),
+    )
+    response_preimage = canonical_dispatch_response_preimage_bytes(response)
     unsigned = DispatchOutcomeAttestationV1(
         schema_version="rsd.dispatch-outcome-attestation.v1",
         attestation_id=uuid4() if attestation_id is None else attestation_id,
@@ -197,8 +222,8 @@ def _attestation_bytes(
         model_id=claim.request.model_id,
         route_ref=claim.request.route_ref,
         request_sha256=claim.request.request_sha256,
-        response_sha256=response_sha256,
-        output_payload_sha256="b" * 64,
+        response_sha256=dispatch_response_sha256(response),
+        output_payload_sha256=dispatch_output_payload_sha256(payload),
         outcome_status=outcome_status,  # type: ignore[arg-type]
         issued_at=_NOW,
         signer_key_id=anchor.signer_key_id,
@@ -213,7 +238,12 @@ def _attestation_bytes(
             ).decode("ascii")
         }
     )
-    return canonical_json(signed.model_dump(mode="python")), anchor
+    return (
+        canonical_json(signed.model_dump(mode="python")),
+        anchor,
+        response_preimage,
+        output_payload,
+    )
 
 
 def test_canonical_request_envelope_is_the_exact_signed_request_preimage() -> None:
@@ -236,6 +266,10 @@ def test_public_vector_verifies_the_complete_request_and_outcome_contract() -> N
         "purpose",
         "request_envelope_base64",
         "request_envelope_sha256",
+        "response_preimage_base64",
+        "response_preimage_sha256",
+        "output_payload_base64",
+        "output_payload_sha256",
         "outcome_attestation_base64_segments",
         "outcome_attestation_sha256",
         "trust_anchor",
@@ -244,14 +278,22 @@ def test_public_vector_verifies_the_complete_request_and_outcome_contract() -> N
     assert loaded["purpose"] == "synthetic_unsigned_claim_facts_request_and_authenticated_outcome"
     assert type(loaded["request_envelope_base64"]) is str
     assert type(loaded["request_envelope_sha256"]) is str
+    assert type(loaded["response_preimage_base64"]) is str
+    assert type(loaded["response_preimage_sha256"]) is str
+    assert type(loaded["output_payload_base64"]) is str
+    assert type(loaded["output_payload_sha256"]) is str
     assert type(loaded["outcome_attestation_base64_segments"]) is list
     assert type(loaded["outcome_attestation_sha256"]) is str
     assert type(loaded["trust_anchor"]) is dict
     request_raw = base64.b64decode(loaded["request_envelope_base64"], validate=True)
+    response_preimage = base64.b64decode(loaded["response_preimage_base64"], validate=True)
+    output_payload = base64.b64decode(loaded["output_payload_base64"], validate=True)
     encoded_segments = loaded["outcome_attestation_base64_segments"]
     assert all(type(segment) is str for segment in encoded_segments)
     outcome_raw = base64.b64decode("".join(encoded_segments), validate=True)
     assert sha256(request_raw).hexdigest() == loaded["request_envelope_sha256"]
+    assert sha256(response_preimage).hexdigest() == loaded["response_preimage_sha256"]
+    assert sha256(output_payload).hexdigest() == loaded["output_payload_sha256"]
     assert sha256(outcome_raw).hexdigest() == loaded["outcome_attestation_sha256"]
     claim, expected_request_raw = _claim_and_envelope()
     assert request_raw == expected_request_raw
@@ -264,6 +306,8 @@ def test_public_vector_verifies_the_complete_request_and_outcome_contract() -> N
             trust_anchor=anchor,
             trusted_clock=lambda: _NOW,
             replay_authority=_ReplayAuthority(),
+            response_preimage=response_preimage,
+            output_payload=output_payload,
         ).outcome_status
         == "completed"
     )
@@ -337,10 +381,111 @@ def test_request_envelope_rejects_a_forged_request_pin_that_disagrees_with_grant
         validate_dispatch_request_envelope(raw, forged)
 
 
+def test_result_preimages_are_canonical_domain_separated_and_redact_failure() -> None:
+    completed = DispatchCompletedOutputPayloadV1(
+        schema_version="rsd.dispatch-completed-output-payload.v1",
+        content="bounded completed output",
+    )
+    completed_raw = canonical_dispatch_output_payload_bytes(completed)
+    response = DispatchResponsePreimageV1(
+        schema_version="rsd.dispatch-response-preimage.v1",
+        outcome_status="completed",
+        output_payload_sha256=dispatch_output_payload_sha256(completed),
+    )
+    response_raw = canonical_dispatch_response_preimage_bytes(response)
+
+    assert parse_dispatch_output_payload(completed_raw) == completed
+    assert parse_dispatch_response_preimage(response_raw) == response
+    assert dispatch_output_payload_sha256(completed) != sha256(completed_raw).hexdigest()
+    assert dispatch_response_sha256(response) != sha256(response_raw).hexdigest()
+
+    failed = DispatchFailedOutputPayloadV1(
+        schema_version="rsd.dispatch-failed-output-payload.v1",
+        failure_code="model_unavailable",
+    )
+    assert parse_dispatch_output_payload(canonical_dispatch_output_payload_bytes(failed)) == failed
+    assert failed.model_dump() == {
+        "schema_version": "rsd.dispatch-failed-output-payload.v1",
+        "failure_code": "model_unavailable",
+    }
+
+
+def test_result_preimages_reject_noncanonical_or_oversize_bytes() -> None:
+    payload = DispatchCompletedOutputPayloadV1(
+        schema_version="rsd.dispatch-completed-output-payload.v1",
+        content="bounded output",
+    )
+    raw = canonical_dispatch_output_payload_bytes(payload)
+    response = DispatchResponsePreimageV1(
+        schema_version="rsd.dispatch-response-preimage.v1",
+        outcome_status="completed",
+        output_payload_sha256=dispatch_output_payload_sha256(payload),
+    )
+
+    with pytest.raises(DispatchOutcomeSignatureError, match="not canonically encoded"):
+        parse_dispatch_output_payload(b" " + raw)
+    with pytest.raises(DispatchOutcomeSignatureError, match="allowed bound"):
+        parse_dispatch_output_payload(b"x" * 65_537)
+    with pytest.raises(DispatchOutcomeSignatureError, match="allowed bound"):
+        canonical_dispatch_output_payload_bytes(
+            DispatchCompletedOutputPayloadV1(
+                schema_version="rsd.dispatch-completed-output-payload.v1",
+                content="x" * 65_536,
+            )
+        )
+    with pytest.raises(DispatchOutcomeSignatureError, match="not canonically encoded"):
+        parse_dispatch_response_preimage(
+            b" " + canonical_dispatch_response_preimage_bytes(response)
+        )
+
+
+def test_outcome_attestation_rejects_tampered_preimages_before_replay_and_accepts_failure() -> None:
+    claim, _ = _claim_and_envelope()
+    private_key = Ed25519PrivateKey.generate()
+    raw, anchor, response_preimage, _output_payload = _attestation_bytes(claim, private_key)
+    replay = _ReplayAuthority()
+    tampered_payload = canonical_dispatch_output_payload_bytes(
+        DispatchCompletedOutputPayloadV1(
+            schema_version="rsd.dispatch-completed-output-payload.v1",
+            content="different bounded output",
+        )
+    )
+
+    with pytest.raises(DispatchOutcomeSignatureError, match="preimages do not match"):
+        verify_dispatch_outcome_attestation(
+            raw,
+            claim=claim,
+            trust_anchor=anchor,
+            trusted_clock=lambda: _NOW,
+            replay_authority=replay,
+            response_preimage=response_preimage,
+            output_payload=tampered_payload,
+        )
+    assert replay.calls == 0
+
+    failed_raw, failed_anchor, failed_response, failed_payload = _attestation_bytes(
+        claim,
+        private_key,
+        outcome_status="failed",
+    )
+    assert (
+        verify_dispatch_outcome_attestation(
+            failed_raw,
+            claim=claim,
+            trust_anchor=failed_anchor,
+            trusted_clock=lambda: _NOW,
+            replay_authority=_ReplayAuthority(),
+            response_preimage=failed_response,
+            output_payload=failed_payload,
+        ).outcome_status
+        == "failed"
+    )
+
+
 def test_outcome_attestation_verifies_complete_binding_signature_and_single_use() -> None:
     claim, _ = _claim_and_envelope()
     private_key = Ed25519PrivateKey.generate()
-    raw, anchor = _attestation_bytes(claim, private_key)
+    raw, anchor, response_preimage, output_payload = _attestation_bytes(claim, private_key)
     replay = _ReplayAuthority()
 
     verified = verify_dispatch_outcome_attestation(
@@ -349,6 +494,8 @@ def test_outcome_attestation_verifies_complete_binding_signature_and_single_use(
         trust_anchor=anchor,
         trusted_clock=lambda: _NOW,
         replay_authority=replay,
+        response_preimage=response_preimage,
+        output_payload=output_payload,
     )
 
     assert verified.outcome_status == "completed"
@@ -360,6 +507,8 @@ def test_outcome_attestation_verifies_complete_binding_signature_and_single_use(
             trust_anchor=anchor,
             trusted_clock=lambda: _NOW,
             replay_authority=replay,
+            response_preimage=response_preimage,
+            output_payload=output_payload,
         )
     assert replay.calls == 2
 
@@ -367,7 +516,7 @@ def test_outcome_attestation_verifies_complete_binding_signature_and_single_use(
 def test_outcome_attestation_rejects_signature_mismatch_before_replay_claim() -> None:
     claim, _ = _claim_and_envelope()
     private_key = Ed25519PrivateKey.generate()
-    raw, anchor = _attestation_bytes(claim, private_key)
+    raw, anchor, response_preimage, output_payload = _attestation_bytes(claim, private_key)
     decoded = json.loads(raw)
     decoded["model_id"] = "model-other-v2"
     tampered = json.dumps(decoded, separators=(",", ":"), sort_keys=True).encode("ascii")
@@ -380,6 +529,8 @@ def test_outcome_attestation_rejects_signature_mismatch_before_replay_claim() ->
             trust_anchor=anchor,
             trusted_clock=lambda: _NOW,
             replay_authority=replay,
+            response_preimage=response_preimage,
+            output_payload=output_payload,
         )
     assert replay.calls == 0
 
@@ -390,7 +541,7 @@ def test_outcome_attestation_rejects_noncanonical_bytes_and_forged_anchor_scalar
 
     claim, _ = _claim_and_envelope()
     private_key = Ed25519PrivateKey.generate()
-    raw, anchor = _attestation_bytes(claim, private_key)
+    raw, anchor, response_preimage, output_payload = _attestation_bytes(claim, private_key)
     forged_anchor = anchor.model_copy(update={"signer_key_id": EvilString(anchor.signer_key_id)})
 
     with pytest.raises(DispatchOutcomeSignatureError, match="not canonically encoded"):
@@ -402,6 +553,8 @@ def test_outcome_attestation_rejects_noncanonical_bytes_and_forged_anchor_scalar
             trust_anchor=forged_anchor,
             trusted_clock=lambda: _NOW,
             replay_authority=_ReplayAuthority(),
+            response_preimage=response_preimage,
+            output_payload=output_payload,
         )
 
 
@@ -409,12 +562,13 @@ def test_outcome_attestation_rejects_conflicting_replay_identity_and_authority_a
     claim, _ = _claim_and_envelope()
     private_key = Ed25519PrivateKey.generate()
     attestation_id = uuid4()
-    first, anchor = _attestation_bytes(claim, private_key, attestation_id=attestation_id)
-    second, _ = _attestation_bytes(
+    first, anchor, first_response, first_payload = _attestation_bytes(
+        claim, private_key, attestation_id=attestation_id
+    )
+    second, _, second_response, second_payload = _attestation_bytes(
         claim,
         private_key,
         attestation_id=attestation_id,
-        response_sha256="c" * 64,
         outcome_status="failed",
     )
     replay = _ReplayAuthority()
@@ -425,6 +579,8 @@ def test_outcome_attestation_rejects_conflicting_replay_identity_and_authority_a
         trust_anchor=anchor,
         trusted_clock=lambda: _NOW,
         replay_authority=replay,
+        response_preimage=first_response,
+        output_payload=first_payload,
     )
     with pytest.raises(DispatchOutcomeReplayAmbiguousError):
         verify_dispatch_outcome_attestation(
@@ -433,6 +589,8 @@ def test_outcome_attestation_rejects_conflicting_replay_identity_and_authority_a
             trust_anchor=anchor,
             trusted_clock=lambda: _NOW,
             replay_authority=replay,
+            response_preimage=second_response,
+            output_payload=second_payload,
         )
     with pytest.raises(DispatchOutcomeReplayAmbiguousError):
         verify_dispatch_outcome_attestation(
@@ -441,13 +599,15 @@ def test_outcome_attestation_rejects_conflicting_replay_identity_and_authority_a
             trust_anchor=anchor,
             trusted_clock=lambda: _NOW,
             replay_authority=_AmbiguousReplayAuthority(),
+            response_preimage=first_response,
+            output_payload=first_payload,
         )
 
 
 def test_outcome_attestation_rejects_a_claim_forged_after_verification() -> None:
     claim, _ = _claim_and_envelope()
     private_key = Ed25519PrivateKey.generate()
-    raw, anchor = _attestation_bytes(claim, private_key)
+    raw, anchor, response_preimage, output_payload = _attestation_bytes(claim, private_key)
     forged = DelegatedGrantClaim.model_construct(
         request=claim.request.model_copy(update={"tenant_id": "other-tenant"}),
         grant=claim.grant,
@@ -461,4 +621,6 @@ def test_outcome_attestation_rejects_a_claim_forged_after_verification() -> None
             trust_anchor=anchor,
             trusted_clock=lambda: _NOW,
             replay_authority=_ReplayAuthority(),
+            response_preimage=response_preimage,
+            output_payload=output_payload,
         )

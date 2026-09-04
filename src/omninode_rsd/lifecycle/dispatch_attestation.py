@@ -37,8 +37,12 @@ _IDENTIFIER = r"^[a-z][a-z0-9-]{1,63}$"
 _MODEL_IDENTIFIER = r"^[a-z][a-z0-9._/-]{2,127}$"
 _ROUTE_REF = r"^logical://[a-z0-9./-]+$"
 _OUTCOME_DOMAIN: Final[bytes] = b"omninode-rsd.dispatch-outcome-attestation.ed25519.v1\x00"
+_RESPONSE_HASH_DOMAIN: Final[bytes] = b"omninode-rsd.dispatch-response-preimage.sha256.v1\x00"
+_OUTPUT_HASH_DOMAIN: Final[bytes] = b"omninode-rsd.dispatch-output-payload.sha256.v1\x00"
 _MAX_REQUEST_ENVELOPE_BYTES: Final[int] = 131_072
 _MAX_OUTCOME_ATTESTATION_BYTES: Final[int] = 32_768
+_MAX_RESPONSE_PREIMAGE_BYTES: Final[int] = 8_192
+_MAX_OUTPUT_PAYLOAD_BYTES: Final[int] = 65_536
 _MAX_MESSAGE_BYTES: Final[int] = 16_384
 _MAX_MESSAGES: Final[int] = 32
 
@@ -107,6 +111,36 @@ class DispatchOutcomeTrustAnchorV1(_DispatchModel):
     signer_key_fingerprint_sha256: str = Field(pattern=_SHA256)
 
 
+class DispatchResponsePreimageV1(_DispatchModel):
+    """Canonical, topology-free response metadata for one terminal outcome."""
+
+    schema_version: Literal["rsd.dispatch-response-preimage.v1"]
+    outcome_status: Literal["completed", "failed"]
+    output_payload_sha256: str = Field(pattern=_SHA256)
+
+
+class DispatchCompletedOutputPayloadV1(_DispatchModel):
+    """The complete bounded text payload for a definitive completed result."""
+
+    schema_version: Literal["rsd.dispatch-completed-output-payload.v1"]
+    content: str = Field(min_length=0, max_length=65_536)
+
+
+class DispatchFailedOutputPayloadV1(_DispatchModel):
+    """A finite, redacted classification for a definitive failed result."""
+
+    schema_version: Literal["rsd.dispatch-failed-output-payload.v1"]
+    failure_code: Literal[
+        "backend_rejected",
+        "invalid_response",
+        "model_unavailable",
+        "service_failed",
+    ]
+
+
+type DispatchOutputPayloadV1 = DispatchCompletedOutputPayloadV1 | DispatchFailedOutputPayloadV1
+
+
 class DispatchOutcomeAttestationV1(_DispatchModel):
     """Detached-signature evidence for one definitive dispatch outcome."""
 
@@ -157,6 +191,9 @@ _MESSAGE_FIELDS = frozenset(OpenAIChatMessageV1.model_fields)
 _REQUEST_FIELDS = frozenset(OpenAIChatCompletionRequestV1.model_fields)
 _ENVELOPE_FIELDS = frozenset(DispatchRequestEnvelopeV1.model_fields)
 _ANCHOR_FIELDS = frozenset(DispatchOutcomeTrustAnchorV1.model_fields)
+_RESPONSE_PREIMAGE_FIELDS = frozenset(DispatchResponsePreimageV1.model_fields)
+_COMPLETED_OUTPUT_FIELDS = frozenset(DispatchCompletedOutputPayloadV1.model_fields)
+_FAILED_OUTPUT_FIELDS = frozenset(DispatchFailedOutputPayloadV1.model_fields)
 _ATTESTATION_FIELDS = frozenset(DispatchOutcomeAttestationV1.model_fields)
 _CLAIM_FIELDS = frozenset(DispatchOutcomeReplayClaimV1.model_fields)
 _DELEGATED_REQUEST_FIELDS = frozenset(DelegatedRequest.model_fields)
@@ -230,6 +267,27 @@ def _strict_anchor(value: object) -> DispatchOutcomeTrustAnchorV1:
     if any(type(item) is not str for item in values.values()):
         raise DispatchOutcomeSignatureError("dispatch outcome trust anchor uses a non-exact scalar")
     return _strict_model(value, DispatchOutcomeTrustAnchorV1, _ANCHOR_FIELDS)
+
+
+def _strict_response_preimage(value: object) -> DispatchResponsePreimageV1:
+    values = _strict_model_values(value, DispatchResponsePreimageV1, _RESPONSE_PREIMAGE_FIELDS)
+    if any(type(item) is not str for item in values.values()):
+        raise DispatchOutcomeSignatureError("dispatch response preimage uses a non-exact scalar")
+    return _strict_model(value, DispatchResponsePreimageV1, _RESPONSE_PREIMAGE_FIELDS)
+
+
+def _strict_completed_output(value: object) -> DispatchCompletedOutputPayloadV1:
+    values = _strict_model_values(value, DispatchCompletedOutputPayloadV1, _COMPLETED_OUTPUT_FIELDS)
+    if any(type(item) is not str for item in values.values()):
+        raise DispatchOutcomeSignatureError("completed output payload uses a non-exact scalar")
+    return _strict_model(value, DispatchCompletedOutputPayloadV1, _COMPLETED_OUTPUT_FIELDS)
+
+
+def _strict_failed_output(value: object) -> DispatchFailedOutputPayloadV1:
+    values = _strict_model_values(value, DispatchFailedOutputPayloadV1, _FAILED_OUTPUT_FIELDS)
+    if any(type(item) is not str for item in values.values()):
+        raise DispatchOutcomeSignatureError("failed output payload uses a non-exact scalar")
+    return _strict_model(value, DispatchFailedOutputPayloadV1, _FAILED_OUTPUT_FIELDS)
 
 
 def _strict_attestation(value: object) -> DispatchOutcomeAttestationV1:
@@ -321,7 +379,7 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
 
 def _parse_canonical_json(
     raw: bytes, *, maximum: int, error_type: type[DispatchAttestationError]
-) -> None:
+) -> dict[str, object]:
     if type(raw) is not bytes or not raw or len(raw) > maximum:
         raise error_type("dispatch contract bytes exceed the allowed bound")
     try:
@@ -331,19 +389,39 @@ def _parse_canonical_json(
         raise error_type("dispatch contract bytes are not canonical JSON") from None
     if type(value) is not dict:
         raise error_type("dispatch contract bytes are not a JSON object")
+    return value
 
 
 def _canonical_bytes(model: BaseModel) -> bytes:
     return canonical_json(model.model_dump(mode="python"))
 
 
+def _bounded_canonical_bytes(
+    model: BaseModel,
+    *,
+    maximum: int,
+    error_type: type[DispatchAttestationError],
+    label: str,
+) -> bytes:
+    raw = _canonical_bytes(model)
+    if len(raw) > maximum:
+        raise error_type(f"{label} exceeds the allowed bound")
+    return raw
+
+
+def _domain_hash(domain: bytes, raw: bytes) -> str:
+    return sha256(domain + raw).hexdigest()
+
+
 def canonical_dispatch_request_envelope_bytes(envelope: DispatchRequestEnvelopeV1) -> bytes:
     """Return the only accepted preimage for the signed request hash."""
 
-    raw = _canonical_bytes(_strict_envelope(envelope))
-    if len(raw) > _MAX_REQUEST_ENVELOPE_BYTES:
-        raise DispatchRequestEnvelopeError("dispatch request envelope exceeds the allowed bound")
-    return raw
+    return _bounded_canonical_bytes(
+        _strict_envelope(envelope),
+        maximum=_MAX_REQUEST_ENVELOPE_BYTES,
+        error_type=DispatchRequestEnvelopeError,
+        label="dispatch request envelope",
+    )
 
 
 def parse_dispatch_request_envelope(raw: bytes) -> DispatchRequestEnvelopeV1:
@@ -389,6 +467,119 @@ def validate_dispatch_request_envelope(
             "dispatch request envelope does not match its authorization"
         )
     return envelope
+
+
+def canonical_dispatch_response_preimage_bytes(response: DispatchResponsePreimageV1) -> bytes:
+    """Return the one bounded canonical metadata preimage for ``response_sha256``."""
+
+    return _bounded_canonical_bytes(
+        _strict_response_preimage(response),
+        maximum=_MAX_RESPONSE_PREIMAGE_BYTES,
+        error_type=DispatchOutcomeSignatureError,
+        label="dispatch response preimage",
+    )
+
+
+def dispatch_response_sha256(response: DispatchResponsePreimageV1) -> str:
+    """Domain-separate and hash the canonical response metadata preimage."""
+
+    return _domain_hash(_RESPONSE_HASH_DOMAIN, canonical_dispatch_response_preimage_bytes(response))
+
+
+def parse_dispatch_response_preimage(raw: bytes) -> DispatchResponsePreimageV1:
+    """Parse one exact bounded response metadata preimage."""
+
+    _parse_canonical_json(
+        raw, maximum=_MAX_RESPONSE_PREIMAGE_BYTES, error_type=DispatchOutcomeSignatureError
+    )
+    try:
+        response = DispatchResponsePreimageV1.model_validate_json(raw)
+    except ValidationError as error:
+        raise DispatchOutcomeSignatureError("dispatch response preimage is invalid") from error
+    response = _strict_response_preimage(response)
+    if canonical_dispatch_response_preimage_bytes(response) != raw:
+        raise DispatchOutcomeSignatureError("dispatch response preimage is not canonically encoded")
+    return response
+
+
+def canonical_dispatch_output_payload_bytes(payload: DispatchOutputPayloadV1) -> bytes:
+    """Return the one bounded canonical terminal payload preimage.
+
+    A completed payload has only bounded output content. A failed payload has
+    only a finite redacted failure code, so it cannot carry endpoint details,
+    credentials, provider errors, or a free-form diagnostic.
+    """
+
+    if type(payload) is DispatchCompletedOutputPayloadV1:
+        checked: DispatchOutputPayloadV1 = _strict_completed_output(payload)
+    elif type(payload) is DispatchFailedOutputPayloadV1:
+        checked = _strict_failed_output(payload)
+    else:
+        raise DispatchOutcomeSignatureError("dispatch output payload has an invalid type")
+    return _bounded_canonical_bytes(
+        checked,
+        maximum=_MAX_OUTPUT_PAYLOAD_BYTES,
+        error_type=DispatchOutcomeSignatureError,
+        label="dispatch output payload",
+    )
+
+
+def dispatch_output_payload_sha256(payload: DispatchOutputPayloadV1) -> str:
+    """Domain-separate and hash the canonical terminal payload preimage."""
+
+    return _domain_hash(_OUTPUT_HASH_DOMAIN, canonical_dispatch_output_payload_bytes(payload))
+
+
+def parse_dispatch_output_payload(raw: bytes) -> DispatchOutputPayloadV1:
+    """Parse one exact bounded completed or redacted-failure payload."""
+
+    value = _parse_canonical_json(
+        raw, maximum=_MAX_OUTPUT_PAYLOAD_BYTES, error_type=DispatchOutcomeSignatureError
+    )
+    schema_version = value.get("schema_version")
+    if schema_version == "rsd.dispatch-completed-output-payload.v1":
+        try:
+            completed_payload = DispatchCompletedOutputPayloadV1.model_validate_json(raw)
+        except ValidationError as error:
+            raise DispatchOutcomeSignatureError("dispatch output payload is invalid") from error
+        completed = _strict_completed_output(completed_payload)
+        if canonical_dispatch_output_payload_bytes(completed) != raw:
+            raise DispatchOutcomeSignatureError(
+                "dispatch output payload is not canonically encoded"
+            )
+        return completed
+    elif schema_version == "rsd.dispatch-failed-output-payload.v1":
+        try:
+            failed_payload = DispatchFailedOutputPayloadV1.model_validate_json(raw)
+        except ValidationError as error:
+            raise DispatchOutcomeSignatureError("dispatch output payload is invalid") from error
+        failed = _strict_failed_output(failed_payload)
+        if canonical_dispatch_output_payload_bytes(failed) != raw:
+            raise DispatchOutcomeSignatureError(
+                "dispatch output payload is not canonically encoded"
+            )
+        return failed
+    else:
+        raise DispatchOutcomeSignatureError("dispatch output payload schema is invalid")
+
+
+def _verify_outcome_preimages(
+    attestation: DispatchOutcomeAttestationV1,
+    *,
+    response_preimage: bytes,
+    output_payload: bytes,
+) -> None:
+    response = parse_dispatch_response_preimage(response_preimage)
+    payload = parse_dispatch_output_payload(output_payload)
+    completed = type(payload) is DispatchCompletedOutputPayloadV1
+    if (
+        response.outcome_status != attestation.outcome_status
+        or (attestation.outcome_status == "completed") != completed
+        or response.output_payload_sha256 != dispatch_output_payload_sha256(payload)
+        or attestation.output_payload_sha256 != dispatch_output_payload_sha256(payload)
+        or attestation.response_sha256 != dispatch_response_sha256(response)
+    ):
+        raise DispatchOutcomeSignatureError("dispatch outcome preimages do not match the receipt")
 
 
 def _canonical_base64(value: str, *, expected_bytes: int) -> bytes:
@@ -444,8 +635,10 @@ def verify_dispatch_outcome_attestation(
     trust_anchor: DispatchOutcomeTrustAnchorV1,
     trusted_clock: TrustedClock,
     replay_authority: DispatchOutcomeReplayAuthority,
+    response_preimage: bytes,
+    output_payload: bytes,
 ) -> DispatchOutcomeAttestationV1:
-    """Authenticate one complete, unexpired, single-use definitive outcome."""
+    """Authenticate one complete, reproducible, single-use definitive outcome."""
 
     attestation = parse_dispatch_outcome_attestation(raw)
     request, grant, policy = _strict_claim(claim)
@@ -482,6 +675,11 @@ def verify_dispatch_outcome_attestation(
         )
     except (InvalidSignature, ValueError, TypeError):
         raise DispatchOutcomeSignatureError("dispatch outcome signature is invalid") from None
+    _verify_outcome_preimages(
+        attestation,
+        response_preimage=response_preimage,
+        output_payload=output_payload,
+    )
     replay_claim = _strict_replay_claim(
         DispatchOutcomeReplayClaimV1(
             schema_version="rsd.dispatch-outcome-replay-claim.v1",
