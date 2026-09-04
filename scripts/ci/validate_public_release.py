@@ -289,6 +289,7 @@ def _is_allowed_file(path: Path) -> bool:
     return parts in {
         ("tests", "test_public_release.py"),
         ("tests", "test_ci_workflows.py"),
+        ("tests", "test_hostile_review_bootstrap.py"),
     }
 
 
