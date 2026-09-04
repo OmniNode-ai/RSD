@@ -5,6 +5,9 @@ build-backend = "hatchling.build"
 [project]
 name = "omninode-grant-verifier"
 version = "0.1.0"
+description = "Public verifier for signed executable grants."
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = ["cryptography>=50,<51", "pydantic>=2.10,<3"]
 
