@@ -33,9 +33,16 @@ from omninode_rsd.delegation import (
     load_canonical_delegation_overlay,
 )
 from omninode_rsd.lifecycle.dispatch_attestation import (
+    DispatchCompletedOutputPayloadV1,
     DispatchOutcomeTrustAnchorV1,
     canonical_dispatch_outcome_trust_anchor_bytes,
+    dispatch_outcome_attestation_v2_message,
     dispatch_outcome_trust_anchor_sha256,
+    dispatch_output_payload_sha256,
+    dispatch_response_sha256,
+    parse_dispatch_outcome_attestation_v2,
+    parse_dispatch_output_payload,
+    parse_dispatch_response_preimage,
 )
 from omninode_rsd.lifecycle.hashing import canonical_json
 from omninode_rsd.lifecycle.models import strict_model_values
@@ -336,6 +343,36 @@ class DelegationExecutionAuthorityProjectionV2(_Model):
         if self.issued_at.tzinfo is not UTC or self.expires_at.tzinfo is not UTC:
             raise ValueError("authority projection timestamps must be exact UTC")
         return self
+
+
+class VerifiedDispatchOutcomeV2(_Model):
+    """Redacted facts derived only by V2 raw-chain and receipt verification.
+
+    This value is terminal-storage evidence, never a dispatch or verification
+    capability.  Future durable code must call the raw verifier below rather
+    than accepting this constructible DTO from a caller.
+    """
+
+    schema_version: Literal["rsd.verified-dispatch-outcome.v2"]
+    attestation_id: UUID
+    attestation_sha256: str = Field(pattern=_SHA256)
+    authorization_digest: str = Field(pattern=_SHA256)
+    claim_binding_sha256: str = Field(pattern=_SHA256)
+    request_envelope_sha256: str = Field(pattern=_SHA256)
+    backend_id: str = Field(pattern=_IDENTIFIER)
+    model_id: str = Field(pattern=_MODEL_IDENTIFIER)
+    route_ref: str = Field(pattern=_ROUTE_REFERENCE)
+    activation_id: UUID
+    activation_sha256: str = Field(pattern=_SHA256)
+    route_authority_sha256: str = Field(pattern=_SHA256)
+    target_configuration_sha256: str = Field(pattern=_SHA256)
+    outcome_trust_anchor_sha256: str = Field(pattern=_SHA256)
+    outcome_trust_anchor_key_id: str = Field(pattern=_IDENTIFIER)
+    outcome_trust_anchor_key_fingerprint_sha256: str = Field(pattern=_SHA256)
+    response_sha256: str = Field(pattern=_SHA256)
+    output_payload_sha256: str = Field(pattern=_SHA256)
+    outcome_status: Literal["completed", "failed"]
+    issued_at: datetime
 
 
 def delegation_logical_reference_sha256(
@@ -1300,6 +1337,132 @@ def verify_raw_delegation_execution_authority_v2(
     )
 
 
+def verify_raw_dispatch_outcome_attestation_v2(
+    raw_attestation: bytes,
+    *,
+    raw_signed_grant: bytes,
+    raw_activation: bytes,
+    activation_trust_anchor: DelegationExecutionTrustAnchorV1,
+    raw_route_authority: bytes,
+    route_authority_trust_anchor: DelegationRouteAuthorityTrustAnchorV1,
+    trusted_clock: TrustedClock,
+    response_preimage: bytes,
+    output_payload: bytes,
+) -> VerifiedDispatchOutcomeV2:
+    """Verify one V2 terminal receipt from the complete raw authority chain.
+
+    No projection, claim, anchor digest, or caller-selected key can authorize
+    this boundary.  The exact full outcome anchor is re-derived from the raw,
+    signed route authority before signature verification.
+    """
+
+    try:
+        now = _require_utc(trusted_clock())
+    except DelegationExecutionError:
+        raise
+    except Exception as error:
+        raise DelegationExecutionError("trusted activation clock failed") from error
+
+    def frozen_clock() -> datetime:
+        return now
+
+    projection = verify_raw_delegation_execution_authority_v2(
+        raw_signed_grant,
+        raw_activation,
+        activation_trust_anchor=activation_trust_anchor,
+        raw_route_authority=raw_route_authority,
+        route_authority_trust_anchor=route_authority_trust_anchor,
+        trusted_clock=frozen_clock,
+    )
+    authority = verify_delegation_route_authority_v2(
+        raw_route_authority,
+        trust_anchor=route_authority_trust_anchor,
+    )
+    anchor = authority.outcome_trust_anchor
+    attestation = parse_dispatch_outcome_attestation_v2(raw_attestation)
+    if (
+        attestation.authorization_digest != projection.authorization_digest
+        or attestation.claim_binding_sha256 != projection.claim_binding_sha256
+        or attestation.request_sha256 != projection.request_envelope_sha256
+        or attestation.backend_id != projection.backend_id
+        or attestation.model_id != projection.model_id
+        or attestation.route_ref != projection.route_ref
+        or attestation.activation_id != projection.activation_id
+        or attestation.activation_sha256 != projection.activation_sha256
+        or attestation.route_authority_sha256 != projection.route_authority_sha256
+        or attestation.target_configuration_sha256 != projection.target_configuration_sha256
+        or attestation.outcome_trust_anchor_sha256 != projection.outcome_trust_anchor_sha256
+        or attestation.signer_key_id != projection.outcome_trust_anchor_key_id
+        or attestation.trust_anchor_key_id != projection.outcome_trust_anchor_key_id
+        or attestation.trust_anchor_key_fingerprint_sha256
+        != projection.outcome_trust_anchor_key_fingerprint_sha256
+        or projection.outcome_trust_anchor_sha256 != dispatch_outcome_trust_anchor_sha256(anchor)
+        or projection.outcome_trust_anchor_key_id != anchor.signer_key_id
+        or projection.outcome_trust_anchor_key_fingerprint_sha256
+        != anchor.signer_key_fingerprint_sha256
+        or attestation.issued_at < projection.issued_at
+        or attestation.issued_at > projection.expires_at
+        or attestation.issued_at > now
+    ):
+        raise DelegationExecutionSignatureError("V2 outcome attestation does not match authority")
+    try:
+        outcome_key = base64.b64decode(anchor.signer_public_key_base64, validate=True)
+        if (
+            len(outcome_key) != 32
+            or base64.b64encode(outcome_key).decode("ascii") != anchor.signer_public_key_base64
+            or sha256(outcome_key).hexdigest() != anchor.signer_key_fingerprint_sha256
+        ):
+            raise ValueError
+        signature = base64.b64decode(attestation.signature_base64, validate=True)
+        if (
+            len(signature) != 64
+            or base64.b64encode(signature).decode("ascii") != attestation.signature_base64
+        ):
+            raise ValueError
+        Ed25519PublicKey.from_public_bytes(outcome_key).verify(
+            signature, dispatch_outcome_attestation_v2_message(attestation)
+        )
+    except (binascii.Error, InvalidSignature, ValueError, TypeError):
+        raise DelegationExecutionSignatureError(
+            "V2 outcome attestation signature is invalid"
+        ) from None
+    response = parse_dispatch_response_preimage(response_preimage)
+    payload = parse_dispatch_output_payload(output_payload)
+    if (
+        response.outcome_status != attestation.outcome_status
+        or (attestation.outcome_status == "completed")
+        != (type(payload) is DispatchCompletedOutputPayloadV1)
+        or response.output_payload_sha256 != dispatch_output_payload_sha256(payload)
+        or attestation.output_payload_sha256 != dispatch_output_payload_sha256(payload)
+        or attestation.response_sha256 != dispatch_response_sha256(response)
+    ):
+        raise DelegationExecutionSignatureError("V2 outcome attestation preimages do not match")
+    return VerifiedDispatchOutcomeV2(
+        schema_version="rsd.verified-dispatch-outcome.v2",
+        attestation_id=attestation.attestation_id,
+        attestation_sha256=sha256(raw_attestation).hexdigest(),
+        authorization_digest=projection.authorization_digest,
+        claim_binding_sha256=projection.claim_binding_sha256,
+        request_envelope_sha256=projection.request_envelope_sha256,
+        backend_id=projection.backend_id,
+        model_id=projection.model_id,
+        route_ref=projection.route_ref,
+        activation_id=projection.activation_id,
+        activation_sha256=projection.activation_sha256,
+        route_authority_sha256=projection.route_authority_sha256,
+        target_configuration_sha256=projection.target_configuration_sha256,
+        outcome_trust_anchor_sha256=projection.outcome_trust_anchor_sha256,
+        outcome_trust_anchor_key_id=projection.outcome_trust_anchor_key_id,
+        outcome_trust_anchor_key_fingerprint_sha256=(
+            projection.outcome_trust_anchor_key_fingerprint_sha256
+        ),
+        response_sha256=attestation.response_sha256,
+        output_payload_sha256=attestation.output_payload_sha256,
+        outcome_status=attestation.outcome_status,
+        issued_at=attestation.issued_at,
+    )
+
+
 __all__ = [
     "DelegationExecutionAuthorityProjectionV1",
     "DelegationExecutionAuthorityProjectionV2",
@@ -1313,6 +1476,7 @@ __all__ = [
     "DelegationRouteAuthorityTrustAnchorV1",
     "DelegationRouteAuthorityV1",
     "DelegationRouteAuthorityV2",
+    "VerifiedDispatchOutcomeV2",
     "canonical_delegation_execution_authority_projection_json_bytes",
     "canonical_delegation_execution_authority_projection_v2_json_bytes",
     "canonical_delegation_execution_overlay_json_bytes",
@@ -1337,4 +1501,5 @@ __all__ = [
     "verify_delegation_route_authority",
     "verify_delegation_route_authority_v2",
     "verify_raw_delegation_execution_authority_v2",
+    "verify_raw_dispatch_outcome_attestation_v2",
 ]

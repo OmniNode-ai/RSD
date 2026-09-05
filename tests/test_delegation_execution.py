@@ -61,13 +61,18 @@ from omninode_rsd.delegation_execution import (
     verify_delegation_route_authority,
     verify_delegation_route_authority_v2,
     verify_raw_delegation_execution_authority_v2,
+    verify_raw_dispatch_outcome_attestation_v2,
 )
 from omninode_rsd.lifecycle import InMemoryEventLog, LifecycleEventIngress
 from omninode_rsd.lifecycle.dispatch_attestation import (
+    DispatchCompletedOutputPayloadV1,
     DispatchOutcomeAttestationV2,
     DispatchOutcomeTrustAnchorV1,
+    DispatchResponsePreimageV1,
     dispatch_outcome_attestation_v2_message,
     dispatch_outcome_trust_anchor_sha256,
+    dispatch_output_payload_sha256,
+    dispatch_response_sha256,
     parse_dispatch_outcome_attestation_v2,
 )
 from omninode_rsd.lifecycle.hashing import canonical_json
@@ -1223,3 +1228,110 @@ def test_v2_outcome_attestation_preimage_binds_v2_authority_facts() -> None:
         signed
     )
     assert b"target_configuration_sha256" in dispatch_outcome_attestation_v2_message(signed)
+
+
+def test_raw_v2_outcome_verifier_derives_anchor_and_rejects_bound_fact_divergence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claim = _claim()
+    facts = claim.grant
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    activation, authority = _signed_pair_v2(claim, activation_key, route_key)
+
+    class _FixedVerifier:
+        def __init__(self, *, trusted_clock: object) -> None:
+            assert callable(trusted_clock)
+
+        def __call__(self, raw_signed_grant: bytes) -> VerifiedGrantFacts:
+            assert raw_signed_grant == b"raw-signed-grant"
+            return facts
+
+    monkeypatch.setattr(delegation_execution, "PublicGrantVerifierAdapter", _FixedVerifier)
+    raw_activation = canonical_delegation_execution_overlay_json_bytes(activation)
+    activation_anchor = _anchor(activation_key)
+    raw_route_authority = canonical_delegation_route_authority_v2_json_bytes(authority)
+    route_anchor = _route_anchor(route_key)
+    projection = verify_raw_delegation_execution_authority_v2(
+        b"raw-signed-grant",
+        raw_activation,
+        activation_trust_anchor=activation_anchor,
+        raw_route_authority=raw_route_authority,
+        route_authority_trust_anchor=route_anchor,
+        trusted_clock=lambda: _NOW,
+    )
+    payload = DispatchCompletedOutputPayloadV1(
+        schema_version="rsd.dispatch-completed-output-payload.v1", content="bounded output"
+    )
+    response = DispatchResponsePreimageV1(
+        schema_version="rsd.dispatch-response-preimage.v1",
+        outcome_status="completed",
+        output_payload_sha256=dispatch_output_payload_sha256(payload),
+    )
+    unsigned = DispatchOutcomeAttestationV2(
+        schema_version="rsd.dispatch-outcome-attestation.v2",
+        attestation_id=UUID("40000000-0000-4000-8000-000000000005"),
+        authorization_digest=projection.authorization_digest,
+        claim_binding_sha256=projection.claim_binding_sha256,
+        backend_id=projection.backend_id,
+        model_id=projection.model_id,
+        route_ref=projection.route_ref,
+        request_sha256=projection.request_envelope_sha256,
+        response_sha256=dispatch_response_sha256(response),
+        output_payload_sha256=dispatch_output_payload_sha256(payload),
+        outcome_status="completed",
+        issued_at=_NOW,
+        activation_id=projection.activation_id,
+        activation_sha256=projection.activation_sha256,
+        route_authority_sha256=projection.route_authority_sha256,
+        target_configuration_sha256=projection.target_configuration_sha256,
+        outcome_trust_anchor_sha256=projection.outcome_trust_anchor_sha256,
+        signer_key_id=projection.outcome_trust_anchor_key_id,
+        trust_anchor_key_id=projection.outcome_trust_anchor_key_id,
+        trust_anchor_key_fingerprint_sha256=(
+            projection.outcome_trust_anchor_key_fingerprint_sha256
+        ),
+        signature_base64=base64.b64encode(b"\0" * 64).decode("ascii"),
+    )
+    signed = unsigned.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                _OUTCOME_PRIVATE_KEY.sign(dispatch_outcome_attestation_v2_message(unsigned))
+            ).decode("ascii")
+        }
+    )
+    raw = canonical_json(signed.model_dump(mode="python"))
+    verified = verify_raw_dispatch_outcome_attestation_v2(
+        raw,
+        raw_signed_grant=b"raw-signed-grant",
+        raw_activation=raw_activation,
+        activation_trust_anchor=activation_anchor,
+        raw_route_authority=raw_route_authority,
+        route_authority_trust_anchor=route_anchor,
+        trusted_clock=lambda: _NOW,
+        response_preimage=canonical_json(response.model_dump(mode="python")),
+        output_payload=canonical_json(payload.model_dump(mode="python")),
+    )
+    assert verified.attestation_sha256 == sha256(raw).hexdigest()
+    assert verified.outcome_trust_anchor_sha256 == projection.outcome_trust_anchor_sha256
+
+    mismatched = signed.model_copy(update={"target_configuration_sha256": "f" * 64})
+    mismatched = mismatched.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                _OUTCOME_PRIVATE_KEY.sign(dispatch_outcome_attestation_v2_message(mismatched))
+            ).decode("ascii")
+        }
+    )
+    with pytest.raises(DelegationExecutionSignatureError, match="does not match authority"):
+        verify_raw_dispatch_outcome_attestation_v2(
+            canonical_json(mismatched.model_dump(mode="python")),
+            raw_signed_grant=b"raw-signed-grant",
+            raw_activation=raw_activation,
+            activation_trust_anchor=activation_anchor,
+            raw_route_authority=raw_route_authority,
+            route_authority_trust_anchor=route_anchor,
+            trusted_clock=lambda: _NOW,
+            response_preimage=canonical_json(response.model_dump(mode="python")),
+            output_payload=canonical_json(payload.model_dump(mode="python")),
+        )
