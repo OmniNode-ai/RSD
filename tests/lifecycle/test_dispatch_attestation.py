@@ -31,6 +31,7 @@ from omninode_rsd.lifecycle.dispatch_attestation import (
     DispatchOutcomeReplayError,
     DispatchOutcomeSignatureError,
     DispatchOutcomeTrustAnchorV1,
+    DispatchOutputPayloadV1,
     DispatchRequestEnvelopeError,
     DispatchRequestEnvelopeV1,
     DispatchResponsePreimageV1,
@@ -196,6 +197,7 @@ def _attestation_bytes(
     outcome_status: str = "completed",
 ) -> tuple[bytes, DispatchOutcomeTrustAnchorV1, bytes, bytes]:
     anchor = _anchor(private_key)
+    payload: DispatchOutputPayloadV1
     if outcome_status == "completed":
         payload = DispatchCompletedOutputPayloadV1(
             schema_version="rsd.dispatch-completed-output-payload.v1",

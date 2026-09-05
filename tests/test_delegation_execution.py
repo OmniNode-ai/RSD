@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from omninode_grant_verifier import signed_executable_grant_v2_vectors
 from pydantic import ValidationError
 
+import omninode_rsd.delegation_execution as delegation_execution
 from omninode_rsd.delegation import (
     AtomicClaimPort,
     ClaimDisposition,
@@ -26,6 +27,7 @@ from omninode_rsd.delegation import (
 )
 from omninode_rsd.delegation_execution import (
     DelegationExecutionAuthorityProjectionV1,
+    DelegationExecutionAuthorityProjectionV2,
     DelegationExecutionError,
     DelegationExecutionOverlayV1,
     DelegationExecutionParseError,
@@ -35,23 +37,40 @@ from omninode_rsd.delegation_execution import (
     DelegationRouteAuthoritySignatureError,
     DelegationRouteAuthorityTrustAnchorV1,
     DelegationRouteAuthorityV1,
+    DelegationRouteAuthorityV2,
     canonical_delegation_execution_authority_projection_json_bytes,
+    canonical_delegation_execution_authority_projection_v2_json_bytes,
     canonical_delegation_execution_overlay_json_bytes,
     canonical_delegation_execution_overlay_yaml_bytes,
     canonical_delegation_route_authority_json_bytes,
+    canonical_delegation_route_authority_v2_json_bytes,
+    canonical_delegation_route_authority_v2_yaml_bytes,
     canonical_disabled_delegation_overlay_sha256,
     delegation_execution_activation_sha256,
     delegation_execution_overlay_message,
     delegation_logical_reference_sha256,
     delegation_route_authority_message,
     delegation_route_authority_sha256,
+    delegation_route_authority_v2_message,
+    delegation_route_authority_v2_sha256,
     parse_delegation_execution_overlay,
     parse_delegation_route_authority,
+    parse_delegation_route_authority_v2,
     verify_delegation_execution_authority,
     verify_delegation_execution_overlay,
     verify_delegation_route_authority,
+    verify_delegation_route_authority_v2,
+    verify_raw_delegation_execution_authority_v2,
 )
 from omninode_rsd.lifecycle import InMemoryEventLog, LifecycleEventIngress
+from omninode_rsd.lifecycle.dispatch_attestation import (
+    DispatchOutcomeAttestationV2,
+    DispatchOutcomeTrustAnchorV1,
+    dispatch_outcome_attestation_v2_message,
+    dispatch_outcome_trust_anchor_sha256,
+    parse_dispatch_outcome_attestation_v2,
+)
+from omninode_rsd.lifecycle.hashing import canonical_json
 
 _NOW = datetime(2030, 1, 1, tzinfo=UTC)
 _ACTIVATION_SCHEMA: Literal["rsd.delegation-execution-activation.v2"] = (
@@ -61,6 +80,7 @@ _ROUTE_AUTHORITY_SCHEMA: Literal["rsd.delegation-route-authority.v1"] = (
     "rsd.delegation-route-authority.v1"
 )
 _ROUTE_PRIVATE_KEY = Ed25519PrivateKey.generate()
+_OUTCOME_PRIVATE_KEY = Ed25519PrivateKey.generate()
 
 
 class _UnusedClaim(AtomicClaimPort):
@@ -115,6 +135,17 @@ def _route_anchor(private_key: Ed25519PrivateKey) -> DelegationRouteAuthorityTru
     return DelegationRouteAuthorityTrustAnchorV1(
         schema_version="rsd.delegation-route-authority-trust-anchor.v1",
         signer_key_id="route-authority",
+        signer_public_key_base64=base64.b64encode(public_key).decode("ascii"),
+        signer_key_fingerprint_sha256=sha256(public_key).hexdigest(),
+    )
+
+
+def _outcome_anchor(private_key: Ed25519PrivateKey) -> DispatchOutcomeTrustAnchorV1:
+    public_key = private_key.public_key().public_bytes_raw()
+    return DispatchOutcomeTrustAnchorV1(
+        schema_version="rsd.dispatch-outcome-trust-anchor.v1",
+        trust_domain="omninode-rsd.dispatch-outcome-attestation.v1",
+        signer_key_id="outcome-attester",
         signer_public_key_base64=base64.b64encode(public_key).decode("ascii"),
         signer_key_fingerprint_sha256=sha256(public_key).hexdigest(),
     )
@@ -186,6 +217,74 @@ def _signed_route_authority(
     )
 
 
+def _unsigned_route_authority_v2(
+    claim: DelegatedGrantClaim,
+    *,
+    route_ref: str | None = None,
+    backend_id: str | None = None,
+    model_id: str | None = None,
+    endpoint_ref: str = "logical://endpoint/provider-alpha",
+    credential_ref: str = "logical://credential/provider-alpha-v1",
+    route_policy_digest: str = "5" * 64,
+    target_configuration_sha256: str = "7" * 64,
+    credential_provider_id: str = "provider-alpha",
+    credential_provider_fingerprint_sha256: str = "6" * 64,
+    activation_sha256: str | None = None,
+    outcome_trust_anchor: DispatchOutcomeTrustAnchorV1 | None = None,
+) -> DelegationRouteAuthorityV2:
+    if activation_sha256 is None:
+        activation_sha256 = delegation_execution_activation_sha256(
+            activation_id=claim.grant.activation_id,
+            activation_schema_version=_ACTIVATION_SCHEMA,
+            activation_version=1,
+        )
+    return DelegationRouteAuthorityV2(
+        schema_version="rsd.delegation-route-authority.v2",
+        authorization_digest=claim.grant.authorization_digest,
+        request_envelope_sha256=claim.request.request_sha256,
+        activation_id=claim.grant.activation_id,
+        activation_sha256=activation_sha256,
+        route_ref=route_ref or claim.request.route_ref,
+        backend_id=backend_id or claim.request.backend_id,
+        model_id=model_id or claim.request.model_id,
+        endpoint_ref=endpoint_ref,
+        credential_ref=credential_ref,
+        route_policy_digest=route_policy_digest,
+        target_configuration_sha256=target_configuration_sha256,
+        credential_provider_id=credential_provider_id,
+        credential_provider_fingerprint_sha256=credential_provider_fingerprint_sha256,
+        outcome_trust_anchor=outcome_trust_anchor or _outcome_anchor(_OUTCOME_PRIVATE_KEY),
+        signer_key_id="route-authority",
+        signer_key_fingerprint_sha256="0" * 64,
+        signature_base64=base64.b64encode(b"\0" * 64).decode("ascii"),
+    )
+
+
+def _signed_route_authority_v2(
+    claim: DelegatedGrantClaim,
+    activation: DelegationExecutionOverlayV1,
+    private_key: Ed25519PrivateKey,
+    **updates: object,
+) -> DelegationRouteAuthorityV2:
+    unsigned = _unsigned_route_authority_v2(
+        claim,
+        route_ref=activation.route_ref,
+        backend_id=activation.backend_id,
+        model_id=activation.model_id,
+        endpoint_ref=activation.endpoint_ref,
+        credential_ref=activation.credential_ref,
+        activation_sha256=activation.activation_sha256,
+    ).model_copy(update=updates)
+    anchor = _route_anchor(private_key)
+    unsigned = unsigned.model_copy(
+        update={"signer_key_fingerprint_sha256": anchor.signer_key_fingerprint_sha256}
+    )
+    signature = private_key.sign(delegation_route_authority_v2_message(unsigned))
+    return unsigned.model_copy(
+        update={"signature_base64": base64.b64encode(signature).decode("ascii")}
+    )
+
+
 def _signed_pair(
     claim: DelegatedGrantClaim,
     activation_private_key: Ed25519PrivateKey,
@@ -241,6 +340,53 @@ def _signed_pair(
         update={"signature_base64": base64.b64encode(activation_signature).decode("ascii")}
     )
     authority = _signed_route_authority(claim, activation, route_private_key, **target)
+    return activation, authority
+
+
+def _signed_pair_v2(
+    claim: DelegatedGrantClaim,
+    activation_private_key: Ed25519PrivateKey,
+    route_private_key: Ed25519PrivateKey,
+    **target: object,
+) -> tuple[DelegationExecutionOverlayV1, DelegationRouteAuthorityV2]:
+    route_anchor = _route_anchor(route_private_key)
+    route_ref = str(target.get("route_ref", claim.request.route_ref))
+    backend_id = str(target.get("backend_id", claim.request.backend_id))
+    model_id = str(target.get("model_id", claim.request.model_id))
+    endpoint_ref = str(target.get("endpoint_ref", "logical://endpoint/provider-alpha"))
+    credential_ref = str(target.get("credential_ref", "logical://credential/provider-alpha-v1"))
+    authority = _unsigned_route_authority_v2(
+        claim,
+        route_ref=route_ref,
+        backend_id=backend_id,
+        model_id=model_id,
+        endpoint_ref=endpoint_ref,
+        credential_ref=credential_ref,
+    ).model_copy(
+        update={"signer_key_fingerprint_sha256": route_anchor.signer_key_fingerprint_sha256}
+    )
+    activation = _unsigned_activation(claim).model_copy(
+        update={
+            "route_ref": route_ref,
+            "backend_id": backend_id,
+            "model_id": model_id,
+            "endpoint_ref": endpoint_ref,
+            "credential_ref": credential_ref,
+            "route_authority_sha256": delegation_route_authority_v2_sha256(authority),
+        }
+    )
+    activation_anchor = _anchor(activation_private_key)
+    activation = activation.model_copy(
+        update={"signer_key_fingerprint_sha256": activation_anchor.signer_key_fingerprint_sha256}
+    )
+    activation = activation.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                activation_private_key.sign(delegation_execution_overlay_message(activation))
+            ).decode("ascii")
+        }
+    )
+    authority = _signed_route_authority_v2(claim, activation, route_private_key, **target)
     return activation, authority
 
 
@@ -886,3 +1032,194 @@ def test_activation_hash_is_deterministic_and_domain_separated() -> None:
             activation_schema_version="rsd.other.v1",
             activation_version=1,
         )
+
+
+def test_v2_route_authority_signs_the_complete_outcome_anchor() -> None:
+    claim = _claim()
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    _activation, authority = _signed_pair_v2(claim, activation_key, route_key)
+    raw = canonical_delegation_route_authority_v2_json_bytes(authority)
+
+    verified = verify_delegation_route_authority_v2(
+        raw,
+        trust_anchor=_route_anchor(route_key),
+    )
+
+    assert verified == authority
+    assert (
+        delegation_route_authority_v2_sha256(verified)
+        == sha256(delegation_route_authority_v2_message(verified)).hexdigest()
+    )
+    assert dispatch_outcome_trust_anchor_sha256(verified.outcome_trust_anchor) != "0" * 64
+    with pytest.raises(DelegationRouteAuthorityParseError):
+        parse_delegation_route_authority(raw)
+
+
+def test_v2_anchor_divergence_and_noncanonical_shapes_fail_before_verification() -> None:
+    claim = _claim()
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    _activation, authority = _signed_pair_v2(claim, activation_key, route_key)
+    raw = canonical_delegation_route_authority_v2_json_bytes(authority)
+    value = json.loads(raw)
+    anchor = value["outcome_trust_anchor"]
+    assert type(anchor) is dict
+    anchor["signer_key_id"] = "substituted-attester"
+    tampered = json.dumps(value, separators=(",", ":")).encode("ascii")
+
+    with pytest.raises(DelegationRouteAuthoritySignatureError):
+        verify_delegation_route_authority_v2(
+            tampered,
+            trust_anchor=_route_anchor(route_key),
+        )
+    with pytest.raises(DelegationRouteAuthorityParseError):
+        parse_delegation_route_authority_v2(raw + b" ")
+    with pytest.raises(DelegationRouteAuthorityParseError):
+        parse_delegation_route_authority_v2(
+            raw.replace(b'"schema_version":', b'"schema_version":"other","schema_version":', 1)
+        )
+    with pytest.raises(DelegationRouteAuthorityParseError):
+        parse_delegation_route_authority_v2(b"anchor: &same {x: value}\ncopy: *same\n")
+    with pytest.raises(DelegationRouteAuthorityParseError):
+        parse_delegation_route_authority_v2(
+            b"x:\n  y:\n    z:\n      a:\n        b:\n          c:\n            d:\n"
+            b"              e:\n                f: 1\n"
+        )
+    with pytest.raises(ValidationError):
+        _unsigned_route_authority_v2(
+            claim,
+            outcome_trust_anchor=_outcome_anchor(_OUTCOME_PRIVATE_KEY).model_copy(
+                update={"signer_key_fingerprint_sha256": "0" * 64}
+            ),
+        )
+
+
+def test_v2_yaml_is_canonical_and_embeds_the_strict_anchor() -> None:
+    claim = _claim()
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    _activation, authority = _signed_pair_v2(claim, activation_key, route_key)
+    raw = canonical_delegation_route_authority_v2_yaml_bytes(authority)
+
+    assert parse_delegation_route_authority_v2(raw) == authority
+    assert b"outcome_trust_anchor:" in raw
+    assert b"outcome_trust_anchor_sha256" not in raw
+
+
+def test_raw_v2_chain_derives_projection_without_claim_or_projection_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = load_canonical_delegation_overlay()
+    facts = _facts().model_copy(update={"model_id": policy.model_ref})
+    claim = DelegatedGrantClaim(
+        request=DelegatedRequest(
+            run_id=facts.correlation_id,
+            request_sha256=facts.request_sha256,
+            artifact_sha256=facts.artifact_sha256,
+            rendered_contract_sha256=facts.rendered_contract_sha256,
+            tenant_id=facts.tenant_id,
+            backend_id=facts.backend_id,
+            model_id=policy.model_ref,
+            route_ref=policy.route_ref,
+            expected_output_topic=facts.expected_output_topic,
+            expected_output_event_class=facts.expected_output_event_class,
+            expected_output_event_index=facts.expected_output_event_index,
+        ),
+        grant=facts,
+        policy=policy,
+    )
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    activation, authority = _signed_pair_v2(claim, activation_key, route_key)
+
+    class _FixedVerifier:
+        def __init__(self, *, trusted_clock: object) -> None:
+            assert callable(trusted_clock)
+
+        def __call__(self, raw_signed_grant: bytes) -> VerifiedGrantFacts:
+            assert raw_signed_grant == b"raw-signed-grant"
+            return facts
+
+    monkeypatch.setattr(delegation_execution, "PublicGrantVerifierAdapter", _FixedVerifier)
+    projection = verify_raw_delegation_execution_authority_v2(
+        b"raw-signed-grant",
+        canonical_delegation_execution_overlay_json_bytes(activation),
+        activation_trust_anchor=_anchor(activation_key),
+        raw_route_authority=canonical_delegation_route_authority_v2_json_bytes(authority),
+        route_authority_trust_anchor=_route_anchor(route_key),
+        trusted_clock=lambda: _NOW,
+    )
+
+    assert type(projection) is DelegationExecutionAuthorityProjectionV2
+    assert projection.schema_version == "rsd.delegation-execution-authority-projection.v2"
+    assert projection.outcome_trust_anchor_sha256 == dispatch_outcome_trust_anchor_sha256(
+        authority.outcome_trust_anchor
+    )
+    assert projection.outcome_trust_anchor_key_id == authority.outcome_trust_anchor.signer_key_id
+    assert (
+        projection.outcome_trust_anchor_key_fingerprint_sha256
+        == authority.outcome_trust_anchor.signer_key_fingerprint_sha256
+    )
+    projection_bytes = canonical_delegation_execution_authority_projection_v2_json_bytes(projection)
+    assert b"logical://endpoint/" not in projection_bytes
+
+
+def test_raw_v2_chain_refuses_fixed_public_grant_that_conflicts_with_packaged_policy() -> None:
+    vector = signed_executable_grant_v2_vectors()["base_wire"]
+    assert type(vector) is dict
+    raw_grant = json.dumps(vector, separators=(",", ":")).encode("utf-8")
+    claim = _claim()
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    activation, authority = _signed_pair_v2(claim, activation_key, route_key)
+
+    with pytest.raises(DelegationExecutionError):
+        verify_raw_delegation_execution_authority_v2(
+            raw_grant,
+            canonical_delegation_execution_overlay_json_bytes(activation),
+            activation_trust_anchor=_anchor(activation_key),
+            raw_route_authority=canonical_delegation_route_authority_v2_json_bytes(authority),
+            route_authority_trust_anchor=_route_anchor(route_key),
+            trusted_clock=lambda: _NOW,
+        )
+
+
+def test_v2_outcome_attestation_preimage_binds_v2_authority_facts() -> None:
+    attestation = DispatchOutcomeAttestationV2(
+        schema_version="rsd.dispatch-outcome-attestation.v2",
+        attestation_id=UUID("40000000-0000-4000-8000-000000000004"),
+        authorization_digest="1" * 64,
+        claim_binding_sha256="2" * 64,
+        backend_id="backend-alpha",
+        model_id="qwen/qwen3.8-27b",
+        route_ref="logical://delegation/qwen3.8-27b",
+        request_sha256="3" * 64,
+        response_sha256="4" * 64,
+        output_payload_sha256="5" * 64,
+        outcome_status="completed",
+        issued_at=_NOW,
+        activation_id=UUID("40000000-0000-4000-8000-000000000003"),
+        activation_sha256="6" * 64,
+        route_authority_sha256="7" * 64,
+        target_configuration_sha256="8" * 64,
+        outcome_trust_anchor_sha256="9" * 64,
+        signer_key_id="outcome-attester",
+        trust_anchor_key_id="outcome-attester",
+        trust_anchor_key_fingerprint_sha256="a" * 64,
+        signature_base64=base64.b64encode(b"\0" * 64).decode("ascii"),
+    )
+    signed = attestation.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                _OUTCOME_PRIVATE_KEY.sign(dispatch_outcome_attestation_v2_message(attestation))
+            ).decode("ascii")
+        }
+    )
+    raw = canonical_json(signed.model_dump(mode="python"))
+
+    assert parse_dispatch_outcome_attestation_v2(raw) == signed
+    assert b"dispatch-outcome-attestation.ed25519.v2" in dispatch_outcome_attestation_v2_message(
+        signed
+    )
+    assert b"target_configuration_sha256" in dispatch_outcome_attestation_v2_message(signed)
