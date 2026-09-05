@@ -43,9 +43,12 @@ def test_workflow_uses_trusted_base_and_immutable_actions() -> None:
     assert "if: always()" in gate
     assert "github.event.pull_request.head.repo.full_name" in reviewer
     assert "github.event.pull_request.head.sha" not in text
-    assert "LOCAL_LLM_SHARED_SECRET:" not in reviewer
-    assert "LLM_QWEN3_REVIEW_URL:" not in reviewer
-    assert "LLM_QWEN3_REVIEW_B_URL:" not in reviewer
+    assert "LOCAL_LLM_SHARED_SECRET:" in text
+    assert "LLM_QWEN3_REVIEW_URL:" in text
+    assert "LLM_QWEN3_REVIEW_B_URL:" in text
+    assert text.count("github.event.pull_request.head.repo.full_name == github.repository") == 3
+    assert "capture_bounded_stderr" in text
+    assert "classify_diagnostic" in text
     assert not re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text)
     for line in text.splitlines():
         if "uses:" in line:
