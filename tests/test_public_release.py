@@ -147,7 +147,14 @@ facts = PublicGrantVerifierAdapter(
 )(json.dumps(base_wire, separators=(",", ":")).encode())
 assert facts.tenant_id == "public-demo"
 assert not load_canonical_delegation_overlay().execute_enabled
-assert discover_lifecycle_migrations()[0].version == 1
+migrations = discover_lifecycle_migrations()
+assert [migration.version for migration in migrations] == [1, 2, 3]
+for resource_name in (
+    "001_create_lifecycle_store.sql",
+    "002_create_delegation_claims.sql",
+    "003_create_delegated_canary_ledger.sql",
+):
+    assert files("omninode_rsd.lifecycle.postgres.migrations").joinpath(resource_name).read_bytes()
 """
     _run_command(cwd, str(interpreter), "-I", "-c", code)
 

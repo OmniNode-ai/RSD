@@ -63,6 +63,45 @@ def test_delegation_claim_migration_is_append_only_and_topology_neutral() -> Non
     assert "postgresql://" not in migration.content and "os.environ" not in migration.content
 
 
+def test_delegated_canary_ledger_migration_is_redacted_append_only_and_ordered() -> None:
+    migration = discover_lifecycle_migrations()[2]
+
+    assert migration.version == 3
+    assert migration.name == "create_delegated_canary_ledger"
+    assert "delegated_canary_attempts" in migration.content
+    assert "delegated_canary_dispatches" in migration.content
+    assert "delegated_canary_terminal_receipts" in migration.content
+    assert "authorization_digest VARCHAR(64) NOT NULL UNIQUE" in migration.content
+    assert "UNIQUE (authorization_digest, attestation_id)" in migration.content
+    assert migration.content.count("FOREIGN KEY (authorization_digest, attestation_id)") == 2
+    assert "attestation_sha256 VARCHAR(64) NOT NULL UNIQUE" in migration.content
+    for redacted_field in (
+        "activation_sha256",
+        "request_envelope_sha256",
+        "disabled_overlay_sha256",
+        "route_authority_sha256",
+        "target_configuration_sha256",
+        "endpoint_ref_sha256",
+        "credential_ref_sha256",
+        "activation_trust_anchor_fingerprint_sha256",
+        "route_authority_trust_anchor_fingerprint_sha256",
+        "credential_provider_fingerprint_sha256",
+    ):
+        assert redacted_field in migration.content
+    assert "route_ref TEXT" not in migration.content
+    for table in (
+        "delegated_canary_attempts",
+        "delegated_canary_dispatches",
+        "delegated_canary_terminal_receipts",
+    ):
+        assert f"BEFORE TRUNCATE ON rsd_canary.{table}" in migration.content
+        assert f"REVOKE ALL ON TABLE rsd_canary.{table} FROM PUBLIC" in migration.content
+    assert "delegated canary ledger is append-only" in migration.content
+    assert "IF NOT EXISTS" not in migration.content
+    assert "BEGIN;" not in migration.content and "COMMIT;" not in migration.content
+    assert "postgresql://" not in migration.content and "os.environ" not in migration.content
+
+
 def test_migration_metadata_rejects_a_digest_that_does_not_match_its_content() -> None:
     with pytest.raises(ValueError, match="does not match content"):
         LifecycleMigration(
