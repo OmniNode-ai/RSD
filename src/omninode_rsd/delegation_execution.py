@@ -235,7 +235,7 @@ def parse_delegation_execution_overlay(raw: bytes) -> DelegationExecutionOverlay
         return activation
     try:
         value = yaml.load(raw.decode("utf-8"), Loader=_UniqueLoader)
-    except (UnicodeDecodeError, yaml.YAMLError):
+    except (UnicodeDecodeError, TypeError, yaml.YAMLError):
         raise DelegationExecutionParseError("activation is not canonical YAML") from None
     if type(value) is not dict:
         raise DelegationExecutionParseError("activation YAML is not an object")
@@ -349,12 +349,18 @@ def verify_delegation_execution_overlay(
     activation = parse_delegation_execution_overlay(raw)
     anchor = _strict_anchor(trust_anchor)
     request, grant, _policy = _validate_claim(claim)
+    _require_utc(activation.issued_at)
+    _require_utc(activation.expires_at)
     try:
         now = _require_utc(trusted_clock())
     except DelegationExecutionError:
         raise
     except Exception as error:
         raise DelegationExecutionError("trusted activation clock failed") from error
+    try:
+        disabled_overlay_sha256 = canonical_disabled_delegation_overlay_sha256()
+    except Exception as error:
+        raise DelegationExecutionError("packaged delegation overlay is unavailable") from error
     if (
         activation.authorization_digest != grant.authorization_digest
         or activation.request_envelope_sha256 != request.request_sha256
@@ -363,7 +369,7 @@ def verify_delegation_execution_overlay(
         or activation.model_id != request.model_id
         or activation.model_id != grant.model_id
         or activation.route_ref != request.route_ref
-        or activation.disabled_overlay_sha256 != canonical_disabled_delegation_overlay_sha256()
+        or activation.disabled_overlay_sha256 != disabled_overlay_sha256
         or activation.activation_id != grant.activation_id
         or activation.issued_at < grant.not_before
         or activation.expires_at > grant.expires_at

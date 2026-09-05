@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from hashlib import sha256
 from typing import Literal
 from uuid import UUID, uuid4
@@ -381,6 +381,23 @@ def test_oversized_and_non_utc_clock_material_fails_closed() -> None:
             trust_anchor=anchor,
             trusted_clock=lambda: datetime(2030, 1, 1),
         )
+
+
+def test_activation_timestamps_must_be_utc() -> None:
+    claim = _claim()
+    private_key = Ed25519PrivateKey.generate()
+    anchor = _anchor(private_key)
+    non_utc = _NOW.astimezone(timezone(timedelta(hours=-5)))
+    activation = _signed_activation(
+        claim,
+        private_key,
+        issued_at=non_utc,
+        expires_at=non_utc + timedelta(seconds=30),
+        signer_key_fingerprint_sha256=anchor.signer_key_fingerprint_sha256,
+    )
+
+    with pytest.raises(DelegationExecutionError):
+        _verified(canonical_delegation_execution_overlay_json_bytes(activation), claim, anchor)
 
 
 def test_activation_hash_is_deterministic_and_domain_separated() -> None:
