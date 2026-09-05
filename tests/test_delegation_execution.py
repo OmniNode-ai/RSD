@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from omninode_grant_verifier import signed_executable_grant_v2_vectors
+from pydantic import ValidationError
 
 from omninode_rsd.delegation import (
     AtomicClaimPort,
@@ -28,20 +29,32 @@ from omninode_rsd.delegation_execution import (
     DelegationExecutionParseError,
     DelegationExecutionSignatureError,
     DelegationExecutionTrustAnchorV1,
+    DelegationRouteAuthorityParseError,
+    DelegationRouteAuthoritySignatureError,
+    DelegationRouteAuthorityTrustAnchorV1,
+    DelegationRouteAuthorityV1,
     canonical_delegation_execution_overlay_json_bytes,
     canonical_delegation_execution_overlay_yaml_bytes,
+    canonical_delegation_route_authority_json_bytes,
     canonical_disabled_delegation_overlay_sha256,
     delegation_execution_activation_sha256,
     delegation_execution_overlay_message,
+    delegation_route_authority_message,
+    delegation_route_authority_sha256,
     parse_delegation_execution_overlay,
+    parse_delegation_route_authority,
     verify_delegation_execution_overlay,
 )
 from omninode_rsd.lifecycle import InMemoryEventLog, LifecycleEventIngress
 
 _NOW = datetime(2030, 1, 1, tzinfo=UTC)
-_ACTIVATION_SCHEMA: Literal["rsd.delegation-execution-activation.v1"] = (
-    "rsd.delegation-execution-activation.v1"
+_ACTIVATION_SCHEMA: Literal["rsd.delegation-execution-activation.v2"] = (
+    "rsd.delegation-execution-activation.v2"
 )
+_ROUTE_AUTHORITY_SCHEMA: Literal["rsd.delegation-route-authority.v1"] = (
+    "rsd.delegation-route-authority.v1"
+)
+_ROUTE_PRIVATE_KEY = Ed25519PrivateKey.generate()
 
 
 class _UnusedClaim(AtomicClaimPort):
@@ -91,6 +104,136 @@ def _anchor(private_key: Ed25519PrivateKey) -> DelegationExecutionTrustAnchorV1:
     )
 
 
+def _route_anchor(private_key: Ed25519PrivateKey) -> DelegationRouteAuthorityTrustAnchorV1:
+    public_key = private_key.public_key().public_bytes_raw()
+    return DelegationRouteAuthorityTrustAnchorV1(
+        schema_version="rsd.delegation-route-authority-trust-anchor.v1",
+        signer_key_id="route-authority",
+        signer_public_key_base64=base64.b64encode(public_key).decode("ascii"),
+        signer_key_fingerprint_sha256=sha256(public_key).hexdigest(),
+    )
+
+
+def _unsigned_route_authority(
+    claim: DelegatedGrantClaim,
+    *,
+    route_ref: str | None = None,
+    backend_id: str | None = None,
+    model_id: str | None = None,
+    endpoint_ref: str = "logical://endpoint/provider-alpha",
+    credential_ref: str = "logical://credential/provider-alpha-v1",
+    route_policy_digest: str = "5" * 64,
+    credential_provider_id: str = "provider-alpha",
+    credential_provider_fingerprint_sha256: str = "6" * 64,
+    activation_sha256: str | None = None,
+) -> DelegationRouteAuthorityV1:
+    if activation_sha256 is None:
+        activation_sha256 = delegation_execution_activation_sha256(
+            activation_id=claim.grant.activation_id,
+            activation_schema_version=_ACTIVATION_SCHEMA,
+            activation_version=1,
+        )
+    return DelegationRouteAuthorityV1(
+        schema_version=_ROUTE_AUTHORITY_SCHEMA,
+        authorization_digest=claim.grant.authorization_digest,
+        request_envelope_sha256=claim.request.request_sha256,
+        activation_id=claim.grant.activation_id,
+        activation_sha256=activation_sha256,
+        route_ref=route_ref or claim.request.route_ref,
+        backend_id=backend_id or claim.request.backend_id,
+        model_id=model_id or claim.request.model_id,
+        endpoint_ref=endpoint_ref,
+        credential_ref=credential_ref,
+        route_policy_digest=route_policy_digest,
+        credential_provider_id=credential_provider_id,
+        credential_provider_fingerprint_sha256=credential_provider_fingerprint_sha256,
+        signer_key_id="route-authority",
+        signer_key_fingerprint_sha256="0" * 64,
+        signature_base64=base64.b64encode(b"\0" * 64).decode("ascii"),
+    )
+
+
+def _signed_route_authority(
+    claim: DelegatedGrantClaim,
+    activation: DelegationExecutionOverlayV1,
+    private_key: Ed25519PrivateKey,
+    **updates: object,
+) -> DelegationRouteAuthorityV1:
+    unsigned = _unsigned_route_authority(
+        claim,
+        route_ref=activation.route_ref,
+        backend_id=activation.backend_id,
+        model_id=activation.model_id,
+        endpoint_ref=activation.endpoint_ref,
+        credential_ref=activation.credential_ref,
+        activation_sha256=activation.activation_sha256,
+    ).model_copy(update=updates)
+    anchor = _route_anchor(private_key)
+    unsigned = unsigned.model_copy(
+        update={"signer_key_fingerprint_sha256": anchor.signer_key_fingerprint_sha256}
+    )
+    signature = private_key.sign(delegation_route_authority_message(unsigned))
+    return unsigned.model_copy(
+        update={"signature_base64": base64.b64encode(signature).decode("ascii")}
+    )
+
+
+def _signed_pair(
+    claim: DelegatedGrantClaim,
+    activation_private_key: Ed25519PrivateKey,
+    route_private_key: Ed25519PrivateKey,
+    **target: object,
+) -> tuple[DelegationExecutionOverlayV1, DelegationRouteAuthorityV1]:
+    route_anchor = _route_anchor(route_private_key)
+    route_ref = str(target.get("route_ref", claim.request.route_ref))
+    backend_id = str(target.get("backend_id", claim.request.backend_id))
+    model_id = str(target.get("model_id", claim.request.model_id))
+    endpoint_ref = str(target.get("endpoint_ref", "logical://endpoint/provider-alpha"))
+    credential_ref = str(target.get("credential_ref", "logical://credential/provider-alpha-v1"))
+    route_policy_digest = str(target.get("route_policy_digest", "5" * 64))
+    credential_provider_id = str(target.get("credential_provider_id", "provider-alpha"))
+    credential_provider_fingerprint_sha256 = str(
+        target.get("credential_provider_fingerprint_sha256", "6" * 64)
+    )
+    authority = _unsigned_route_authority(
+        claim,
+        route_ref=route_ref,
+        backend_id=backend_id,
+        model_id=model_id,
+        endpoint_ref=endpoint_ref,
+        credential_ref=credential_ref,
+        route_policy_digest=route_policy_digest,
+        credential_provider_id=credential_provider_id,
+        credential_provider_fingerprint_sha256=credential_provider_fingerprint_sha256,
+    ).model_copy(
+        update={"signer_key_fingerprint_sha256": route_anchor.signer_key_fingerprint_sha256}
+    )
+    activation = _unsigned_activation(
+        claim,
+    ).model_copy(
+        update={
+            "route_ref": route_ref,
+            "backend_id": backend_id,
+            "model_id": model_id,
+            "endpoint_ref": endpoint_ref,
+            "credential_ref": credential_ref,
+            "route_authority_sha256": delegation_route_authority_sha256(authority),
+        }
+    )
+    activation_anchor = _anchor(activation_private_key)
+    activation = activation.model_copy(
+        update={"signer_key_fingerprint_sha256": activation_anchor.signer_key_fingerprint_sha256}
+    )
+    activation_signature = activation_private_key.sign(
+        delegation_execution_overlay_message(activation)
+    )
+    activation = activation.model_copy(
+        update={"signature_base64": base64.b64encode(activation_signature).decode("ascii")}
+    )
+    authority = _signed_route_authority(claim, activation, route_private_key, **target)
+    return activation, authority
+
+
 def _unsigned_activation(
     claim: DelegatedGrantClaim,
     *,
@@ -98,8 +241,12 @@ def _unsigned_activation(
     expires_at: datetime = _NOW + timedelta(seconds=30),
 ) -> DelegationExecutionOverlayV1:
     activation_id = claim.grant.activation_id
+    route_anchor = _route_anchor(_ROUTE_PRIVATE_KEY)
+    authority = _unsigned_route_authority(claim).model_copy(
+        update={"signer_key_fingerprint_sha256": route_anchor.signer_key_fingerprint_sha256}
+    )
     return DelegationExecutionOverlayV1(
-        schema_version="rsd.delegation-execution-overlay.v1",
+        schema_version="rsd.delegation-execution-overlay.v2",
         execute_enabled=True,
         authorization_digest=claim.grant.authorization_digest,
         request_envelope_sha256=claim.request.request_sha256,
@@ -107,6 +254,7 @@ def _unsigned_activation(
         model_id=claim.request.model_id,
         route_ref=claim.request.route_ref,
         disabled_overlay_sha256=canonical_disabled_delegation_overlay_sha256(),
+        route_authority_sha256=delegation_route_authority_sha256(authority),
         activation_id=activation_id,
         activation_schema_version=_ACTIVATION_SCHEMA,
         activation_version=1,
@@ -141,12 +289,22 @@ def _verified(
     raw: bytes,
     claim: DelegatedGrantClaim,
     anchor: DelegationExecutionTrustAnchorV1,
+    *,
+    route_authority: DelegationRouteAuthorityV1 | None = None,
+    route_anchor: DelegationRouteAuthorityTrustAnchorV1 | None = None,
+    trusted_clock: datetime = _NOW,
 ) -> DelegationExecutionOverlayV1:
+    activation = parse_delegation_execution_overlay(raw)
+    route_private_key = _ROUTE_PRIVATE_KEY
+    authority = route_authority or _signed_route_authority(claim, activation, route_private_key)
+    authority_anchor = route_anchor or _route_anchor(route_private_key)
     return verify_delegation_execution_overlay(
         raw,
         claim=claim,
         trust_anchor=anchor,
-        trusted_clock=lambda: _NOW,
+        route_authority=canonical_delegation_route_authority_json_bytes(authority),
+        route_authority_trust_anchor=authority_anchor,
+        trusted_clock=lambda: trusted_clock,
     )
 
 
@@ -154,13 +312,18 @@ def test_valid_json_activation_binds_every_execution_fact() -> None:
     claim = _claim()
     private_key = Ed25519PrivateKey.generate()
     anchor = _anchor(private_key)
-    activation = _signed_activation(
+    activation, authority = _signed_pair(
         claim,
         private_key,
-        signer_key_fingerprint_sha256=anchor.signer_key_fingerprint_sha256,
+        _ROUTE_PRIVATE_KEY,
     )
 
-    result = _verified(canonical_delegation_execution_overlay_json_bytes(activation), claim, anchor)
+    result = _verified(
+        canonical_delegation_execution_overlay_json_bytes(activation),
+        claim,
+        anchor,
+        route_authority=authority,
+    )
 
     assert result == activation
     assert result.execute_enabled is True
@@ -171,20 +334,138 @@ def test_valid_json_activation_binds_every_execution_fact() -> None:
     assert result.credential_ref.startswith("logical://")
 
 
+def test_independent_route_authority_allows_only_its_resigned_target() -> None:
+    claim = _claim()
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    activation, authority = _signed_pair(
+        claim,
+        activation_key,
+        route_key,
+        endpoint_ref="logical://endpoint/provider-beta",
+        credential_ref="logical://credential/provider-beta-v2",
+        route_policy_digest="7" * 64,
+        credential_provider_id="provider-beta",
+        credential_provider_fingerprint_sha256="8" * 64,
+    )
+    result = _verified(
+        canonical_delegation_execution_overlay_json_bytes(activation),
+        claim,
+        _anchor(activation_key),
+        route_authority=authority,
+        route_anchor=_route_anchor(route_key),
+    )
+
+    assert result.endpoint_ref == "logical://endpoint/provider-beta"
+    assert result.credential_ref == "logical://credential/provider-beta-v2"
+    assert authority.route_policy_digest == "7" * 64
+    assert authority.credential_provider_id == "provider-beta"
+
+
+def test_validly_resigned_route_authority_cannot_redirect_activation() -> None:
+    claim = _claim()
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    activation, _authority = _signed_pair(claim, activation_key, route_key)
+    redirected_authority = _signed_route_authority(
+        claim,
+        activation,
+        route_key,
+        endpoint_ref="logical://endpoint/provider-beta",
+        credential_ref="logical://credential/provider-beta-v2",
+        route_policy_digest="7" * 64,
+        credential_provider_id="provider-beta",
+        credential_provider_fingerprint_sha256="8" * 64,
+    )
+
+    with pytest.raises(DelegationExecutionError):
+        _verified(
+            canonical_delegation_execution_overlay_json_bytes(activation),
+            claim,
+            _anchor(activation_key),
+            route_authority=redirected_authority,
+            route_anchor=_route_anchor(route_key),
+        )
+
+
+def test_route_authority_wrong_trust_root_fails_closed() -> None:
+    claim = _claim()
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    wrong_route_key = Ed25519PrivateKey.generate()
+    activation, _authority = _signed_pair(claim, activation_key, route_key)
+    wrong_authority = _signed_route_authority(claim, activation, wrong_route_key)
+
+    with pytest.raises(DelegationRouteAuthoritySignatureError):
+        _verified(
+            canonical_delegation_execution_overlay_json_bytes(activation),
+            claim,
+            _anchor(activation_key),
+            route_authority=wrong_authority,
+            route_anchor=_route_anchor(route_key),
+        )
+
+
+def test_alternate_disabled_policy_is_rejected_even_when_resigned() -> None:
+    claim = _claim()
+    alternate_route = "logical://delegation/alternate"
+    alternate_policy = claim.policy.model_copy(update={"route_ref": alternate_route})
+    alternate_request = claim.request.model_copy(update={"route_ref": alternate_route})
+    alternate_claim = DelegatedGrantClaim(
+        request=alternate_request,
+        grant=claim.grant,
+        policy=alternate_policy,
+    )
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    activation, authority = _signed_pair(
+        alternate_claim,
+        activation_key,
+        route_key,
+        route_ref=alternate_route,
+    )
+
+    with pytest.raises(DelegationExecutionError):
+        _verified(
+            canonical_delegation_execution_overlay_json_bytes(activation),
+            alternate_claim,
+            _anchor(activation_key),
+            route_authority=authority,
+            route_anchor=_route_anchor(route_key),
+        )
+
+
+@pytest.mark.parametrize(
+    "endpoint_ref",
+    [
+        "logical://credential/provider-alpha",
+        "logical://endpoint//provider-alpha",
+        "logical://endpoint/../provider-alpha",
+        "logical://endpoint/./provider-alpha",
+        "logical://endpoint/provider.alpha",
+    ],
+)
+def test_route_authority_references_reject_aliases_and_namespace_confusion(
+    endpoint_ref: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        _unsigned_route_authority(_claim(), endpoint_ref=endpoint_ref)
+
+
 def test_canonical_yaml_round_trip_is_deterministic() -> None:
     claim = _claim()
     private_key = Ed25519PrivateKey.generate()
     anchor = _anchor(private_key)
-    activation = _signed_activation(
+    activation, authority = _signed_pair(
         claim,
         private_key,
-        signer_key_fingerprint_sha256=anchor.signer_key_fingerprint_sha256,
+        _ROUTE_PRIVATE_KEY,
     )
     raw = canonical_delegation_execution_overlay_yaml_bytes(activation)
 
     assert raw == canonical_delegation_execution_overlay_yaml_bytes(activation)
     assert parse_delegation_execution_overlay(raw) == activation
-    assert _verified(raw, claim, anchor) == activation
+    assert _verified(raw, claim, anchor, route_authority=authority) == activation
 
 
 def test_packaged_disabled_overlay_and_old_ingress_remain_non_bypassable() -> None:
@@ -311,7 +592,7 @@ def test_endpoint_and_credential_references_are_signature_bound() -> None:
         b"logical://credential/provider-alpha-v1", b"logical://credential/provider-beta-v1"
     )
 
-    with pytest.raises(DelegationExecutionSignatureError):
+    with pytest.raises(DelegationExecutionError):
         _verified(tampered, claim, anchor)
 
 
@@ -361,6 +642,24 @@ def test_unknown_duplicate_and_noncanonical_input_is_rejected() -> None:
         parse_delegation_execution_overlay(yaml_raw + b"unknown: reject\n")
 
 
+def test_route_authority_unknown_duplicate_and_noncanonical_input_is_rejected() -> None:
+    claim = _claim()
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    _activation, authority = _signed_pair(claim, activation_key, route_key)
+    raw = canonical_delegation_route_authority_json_bytes(authority)
+    value = json.loads(raw)
+
+    unknown = json.dumps({**value, "unknown": "reject"}, separators=(",", ":")).encode("ascii")
+    with pytest.raises(DelegationRouteAuthorityParseError):
+        parse_delegation_route_authority(unknown)
+    duplicate = raw.replace(b'"schema_version":', b'"schema_version":"other", "schema_version":', 1)
+    with pytest.raises(DelegationRouteAuthorityParseError):
+        parse_delegation_route_authority(duplicate)
+    with pytest.raises(DelegationRouteAuthorityParseError):
+        parse_delegation_route_authority(raw + b" ")
+
+
 def test_oversized_and_non_utc_clock_material_fails_closed() -> None:
     claim = _claim()
     private_key = Ed25519PrivateKey.generate()
@@ -375,10 +674,13 @@ def test_oversized_and_non_utc_clock_material_fails_closed() -> None:
     with pytest.raises(DelegationExecutionParseError):
         parse_delegation_execution_overlay(raw + b"\n" + b" " * 131_072)
     with pytest.raises(DelegationExecutionError):
+        authority = _signed_route_authority(claim, activation, _ROUTE_PRIVATE_KEY)
         verify_delegation_execution_overlay(
             raw,
             claim=claim,
             trust_anchor=anchor,
+            route_authority=canonical_delegation_route_authority_json_bytes(authority),
+            route_authority_trust_anchor=_route_anchor(_ROUTE_PRIVATE_KEY),
             trusted_clock=lambda: datetime(2030, 1, 1),
         )
 
@@ -388,16 +690,32 @@ def test_activation_timestamps_must_be_utc() -> None:
     private_key = Ed25519PrivateKey.generate()
     anchor = _anchor(private_key)
     non_utc = _NOW.astimezone(timezone(timedelta(hours=-5)))
-    activation = _signed_activation(
-        claim,
-        private_key,
-        issued_at=non_utc,
-        expires_at=non_utc + timedelta(seconds=30),
-        signer_key_fingerprint_sha256=anchor.signer_key_fingerprint_sha256,
-    )
+    with pytest.raises(DelegationExecutionError):
+        activation = _signed_activation(
+            claim,
+            private_key,
+            issued_at=non_utc,
+            expires_at=non_utc + timedelta(seconds=30),
+            signer_key_fingerprint_sha256=anchor.signer_key_fingerprint_sha256,
+        )
+        _verified(canonical_delegation_execution_overlay_json_bytes(activation), claim, anchor)
+
+
+def test_custom_zero_offset_timezone_is_not_utc() -> None:
+    claim = _claim()
+    private_key = Ed25519PrivateKey.generate()
+    anchor = _anchor(private_key)
+    custom_utc = timezone(timedelta(0), name="custom-utc")
 
     with pytest.raises(DelegationExecutionError):
-        _verified(canonical_delegation_execution_overlay_json_bytes(activation), claim, anchor)
+        activation = _signed_activation(
+            claim,
+            private_key,
+            issued_at=datetime(2030, 1, 1, tzinfo=custom_utc),
+            expires_at=datetime(2030, 1, 1, 0, 0, 30, tzinfo=custom_utc),
+            signer_key_fingerprint_sha256=anchor.signer_key_fingerprint_sha256,
+        )
+        canonical_delegation_execution_overlay_json_bytes(activation)
 
 
 def test_activation_hash_is_deterministic_and_domain_separated() -> None:

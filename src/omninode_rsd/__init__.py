@@ -4,6 +4,8 @@ from omninode_rsd.delegation import DelegatedRequest, DelegatedRequestIngress, V
 from omninode_rsd.delegation_execution import (
     DelegationExecutionOverlayV1,
     DelegationExecutionTrustAnchorV1,
+    DelegationRouteAuthorityTrustAnchorV1,
+    DelegationRouteAuthorityV1,
     verify_delegation_execution_overlay,
 )
 from omninode_rsd.lifecycle import LifecycleEvent, LifecycleEventType, LifecycleState
@@ -13,6 +15,8 @@ __all__ = [
     "DelegatedRequestIngress",
     "DelegationExecutionOverlayV1",
     "DelegationExecutionTrustAnchorV1",
+    "DelegationRouteAuthorityTrustAnchorV1",
+    "DelegationRouteAuthorityV1",
     "LifecycleEvent",
     "LifecycleEventType",
     "LifecycleState",
