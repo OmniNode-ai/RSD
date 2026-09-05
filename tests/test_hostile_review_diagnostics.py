@@ -21,8 +21,8 @@ _DIAGNOSTICS_SPEC.loader.exec_module(_DIAGNOSTICS)
 def _configured_environment() -> dict[str, str]:
     return {
         "LOCAL_LLM_SHARED_SECRET": "configured",
-        "LLM_QWEN3_REVIEW_URL": "configured",
-        "LLM_QWEN3_REVIEW_B_URL": "configured",
+        "LLM_QWEN3_REVIEW_URL": "https://review.example.test/primary",
+        "LLM_QWEN3_REVIEW_B_URL": "http://review.example.test/secondary",
     }
 
 
@@ -35,7 +35,33 @@ def test_preflight_reports_missing_slots_without_retaining_values() -> None:
         _DIAGNOSTICS.ConfigurationField.PRIMARY_ENDPOINT,
         _DIAGNOSTICS.ConfigurationField.SECONDARY_ENDPOINT,
     )
+    assert preflight.malformed_fields == ()
     assert _DIAGNOSTICS.preflight_reviewer_configuration(_configured_environment()).ready
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    (
+        "ftp://review.example.test",
+        "https://",
+        "https://user@review.example.test",
+        "https://review.example.test/#fragment",
+        "https://review.example.test/\x1fcontrol",
+    ),
+)
+def test_preflight_rejects_malformed_endpoint_shape_without_retaining_it(
+    endpoint: str,
+) -> None:
+    environment = _configured_environment()
+    environment["LLM_QWEN3_REVIEW_URL"] = endpoint
+
+    preflight = _DIAGNOSTICS.preflight_reviewer_configuration(environment)
+
+    assert not preflight.ready
+    assert preflight.missing_fields == ()
+    assert preflight.malformed_fields == (_DIAGNOSTICS.ConfigurationField.PRIMARY_ENDPOINT,)
+    assert endpoint not in repr(preflight)
+    assert not hasattr(preflight, "values")
 
 
 @pytest.mark.parametrize(
@@ -43,7 +69,9 @@ def test_preflight_reports_missing_slots_without_retaining_values() -> None:
     [
         ("request timed out after 30 seconds", "TIMEOUT"),
         ("Connection refused while contacting review service", "CONNECTION"),
-        ("JSONDecodeError while parsing response", "PARSER"),
+        ("server unavailable after connection reset", "CONNECTION"),
+        ("failed JSON response", "PARSER"),
+        ("HTTP 404 endpoint not found", "CONNECTION"),
         ("model qwen-review not found", "MODEL"),
         ("progress completed=4 timeout=30", "ERROR"),
     ],

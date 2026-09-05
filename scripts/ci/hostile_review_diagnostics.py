@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Final
+from urllib.parse import urlsplit
 
 MAX_DIAGNOSTIC_BYTES: Final[int] = 16 * 1024
 
@@ -47,11 +48,12 @@ class ConfigurationPreflight:
     """Presence-only configuration result that cannot disclose values."""
 
     missing_fields: tuple[ConfigurationField, ...]
+    malformed_fields: tuple[ConfigurationField, ...]
 
     @property
     def ready(self) -> bool:
         """Whether all required configuration slots have safe nonempty values."""
-        return not self.missing_fields
+        return not self.missing_fields and not self.malformed_fields
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,20 +86,53 @@ _MODEL: Final[re.Pattern[str]] = re.compile(
     r"\b(?:unknown|unsupported)\s+model\b)",
     re.IGNORECASE,
 )
+_ENDPOINT_NOT_FOUND: Final[re.Pattern[str]] = re.compile(
+    r"(?:\b(?:http\s+)?404\b|\bendpoint\b.*\b(?:not found|unavailable)\b|"
+    r"\b(?:not found|unavailable)\b.*\bendpoint\b)",
+    re.IGNORECASE,
+)
 _RATE_LIMIT: Final[re.Pattern[str]] = re.compile(
     r"(?:\b429\b|\brate limit\b|\btoo many requests\b)", re.IGNORECASE
 )
 _CONNECTION: Final[re.Pattern[str]] = re.compile(
     r"(?:\bconnection refused\b|\bfailed to connect\b|\bcould not connect\b|"
     r"\bnetwork is unreachable\b|\bname or service not known\b|\beconnrefused\b|"
-    r"\benetunreach\b)",
+    r"\benetunreach\b|\bconnecterror\b|\bconnection (?:reset|aborted|closed|failed)\b|"
+    r"\bserver unavailable\b|\bserver disconnected\b|\bno route to host\b|"
+    r"\btemporary failure in name resolution\b)",
     re.IGNORECASE,
 )
 _PARSER: Final[re.Pattern[str]] = re.compile(
     r"(?:\bjsondecodeerror\b|\bjson\s+(?:parse|decode|decoding)\s+(?:error|failed)\b|"
-    r"\bparse error\b|\bmalformed\s+(?:json|response)\b|\bdecode error\b)",
+    r"\bfailed\s+(?:to\s+parse\s+)?json(?:\s+response)?\b|\bparse error\b|"
+    r"\bmalformed\s+(?:json|response)\b|\binvalid\s+json(?:\s+response)?\b|"
+    r"\bdecode error\b)",
     re.IGNORECASE,
 )
+
+
+def is_valid_review_endpoint_shape(value: object) -> bool:
+    """Accept only a syntactically strict HTTP(S) endpoint without resolving it."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    if any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value
+    ):
+        return False
+    if "#" in value:
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return False
+    if "@" in parsed.netloc or parsed.username is not None or parsed.password is not None:
+        return False
+    if parsed.hostname is None:
+        return False
+    return parsed.hostname.isascii() and (port is None or port >= 1)
 
 
 def preflight_reviewer_configuration(
@@ -105,11 +140,16 @@ def preflight_reviewer_configuration(
 ) -> ConfigurationPreflight:
     """Inspect only required-slot presence without retaining their values."""
     missing: list[ConfigurationField] = []
+    malformed: list[ConfigurationField] = []
     for field, environment_key in _CONFIGURATION_ENVIRONMENT_KEYS:
         value = environment.get(environment_key)
         if not isinstance(value, str) or not value.strip() or "\r" in value or "\n" in value:
             missing.append(field)
-    return ConfigurationPreflight(tuple(missing))
+        elif field is not ConfigurationField.AUTHENTICATION and not is_valid_review_endpoint_shape(
+            value
+        ):
+            malformed.append(field)
+    return ConfigurationPreflight(tuple(missing), tuple(malformed))
 
 
 def classify_reviewer_diagnostics(raw: bytes | str) -> DiagnosticReport:
@@ -138,6 +178,7 @@ def classify_reviewer_diagnostics(raw: bytes | str) -> DiagnosticReport:
         (_AUTHENTICATION, DiagnosticCategory.AUTHENTICATION),
         (_MODEL, DiagnosticCategory.MODEL),
         (_RATE_LIMIT, DiagnosticCategory.RATE_LIMIT),
+        (_ENDPOINT_NOT_FOUND, DiagnosticCategory.CONNECTION),
         (_CONNECTION, DiagnosticCategory.CONNECTION),
         (_PARSER, DiagnosticCategory.PARSER),
     ):
