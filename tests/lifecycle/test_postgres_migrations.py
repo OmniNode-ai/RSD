@@ -134,10 +134,12 @@ def test_delegated_canary_ledger_v2_migration_is_additive_and_fail_closed() -> N
     assert "delegated_canary_terminal_receipts_v2_outcome_attestation_unique" in migration.content
     assert "grant_expires_at > grant_not_before" in migration.content
     assert "outcome_issued_at_v2 >= grant_not_before" in migration.content
-    assert "outcome_issued_at_v2 <= grant_expires_at" in migration.content
+    assert "outcome_issued_at_v2 < grant_expires_at" in migration.content
+    assert "delegated_canary_attempts_v2_identity_unique" in migration.content
+    assert migration.content.count("FOREIGN KEY (attempt_id_v2)") == 2
     assert (
-        "FOREIGN KEY (attempt_id_v2, authorization_digest, attestation_id, grant_not_before, "
-        "grant_expires_at)" in migration.content
+        migration.content.count("REFERENCES rsd_canary.delegated_canary_attempts (attempt_id_v2)")
+        == 2
     )
     assert "PUBLIC KEY" not in migration.content
     assert "signed_bytes" not in migration.content
@@ -163,6 +165,25 @@ def test_migration_three_remains_byte_identical_after_v2_addition() -> None:
         "f5f8cd74b4c65cfb2b0e5f6efa85956d1f95a9ac998a3eca64b1f8ca891f16fa"
     )
     assert migrations[2].content == resource.read_text(encoding="utf-8")
+
+
+def test_v2_attempt_identity_is_global_and_rejects_cross_authorization_reuse() -> None:
+    migration = discover_lifecycle_migrations()[3].content
+
+    # PostgreSQL UNIQUE(attempt_id_v2) rejects the same V2 attempt identity
+    # even when an attacker changes the authorization carrier.  NULL legacy
+    # rows remain valid because PostgreSQL's unique constraint permits NULL.
+    assert "UNIQUE (attempt_id_v2)" in migration
+    assert "attempt_id_v2 IS NULL" in migration
+    assert "attempt_id_v2 IS NOT NULL" in migration
+
+
+def test_v2_outcome_boundary_accepts_not_before_and_rejects_exact_expiry() -> None:
+    migration = discover_lifecycle_migrations()[3].content
+
+    assert "outcome_issued_at_v2 >= grant_not_before" in migration
+    assert "outcome_issued_at_v2 < grant_expires_at" in migration
+    assert "outcome_issued_at_v2 <= grant_expires_at" not in migration
 
 
 def test_migration_metadata_rejects_a_digest_that_does_not_match_its_content() -> None:
