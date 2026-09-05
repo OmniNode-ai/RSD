@@ -6,10 +6,14 @@ import base64
 import hashlib
 import multiprocessing
 import os
+import queue
 import shutil
 import sqlite3
+import stat
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 from threading import Event, Lock, get_ident
 from typing import Protocol
@@ -46,6 +50,24 @@ class _ResultQueue(Protocol):
 
 
 _MAX_DIAGNOSTIC_EVENTS = 32
+_DIAGNOSTIC_TIMEOUT_SECONDS = 10.0
+_DIAGNOSTIC_COMPANION_KINDS = {
+    "missing",
+    "regular",
+    "lstat_error",
+    "symlink",
+    "nonregular",
+    "uid_mismatch",
+    "mode_mismatch",
+    "nlink_mismatch",
+}
+_DIAGNOSTIC_IDENTITY_RESULTS = {
+    "database_stat",
+    "anchor",
+    "metadata",
+    "schema",
+    "durability_mismatch",
+}
 _DiagnosticEvent = tuple[
     int,
     int,
@@ -269,11 +291,14 @@ def _diagnostic_claim_worker(
     result_queue: _ResultQueue,
     event_queue: _DiagnosticEventQueue,
     process_ordinal: int,
+    fail_before_receipt: bool = False,
 ) -> None:
     observer = _RecordingJournalObserver(
         process_ordinal=process_ordinal, journal_ordinal=process_ordinal
     )
     start.wait()
+    if fail_before_receipt:
+        raise RuntimeError("diagnostic worker failure")
     try:
         SQLiteAuthorizationJournal(Path(path), diagnostic_observer=observer)._claim_verified(
             _verified(nonce, operation_id)
@@ -284,6 +309,68 @@ def _diagnostic_claim_worker(
         result_queue.put("claimed")
     finally:
         event_queue.put(observer.receipt())
+
+
+def _cleanup_diagnostic_workers(workers: list[multiprocessing.Process]) -> None:
+    """Terminate, reap, and finally kill only workers started by this case."""
+
+    deadline = time.monotonic() + _DIAGNOSTIC_TIMEOUT_SECONDS
+    for worker in workers:
+        if worker.is_alive():
+            worker.terminate()
+    for worker in workers:
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+    for worker in workers:
+        if worker.is_alive():
+            worker.kill()
+    for worker in workers:
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        assert not worker.is_alive(), worker.pid
+
+
+def _close_diagnostic_queues(*queues: object) -> None:
+    for event_queue in queues:
+        close = getattr(event_queue, "close", None)
+        cancel_join_thread = getattr(event_queue, "cancel_join_thread", None)
+        if callable(close):
+            with suppress(OSError, ValueError):
+                close()
+        if callable(cancel_join_thread):
+            with suppress(OSError, ValueError):
+                cancel_join_thread()
+
+
+def _run_process_claim_control(root: Path, *, operation_id: str) -> None:
+    """Run the identical process race with the observer disabled."""
+
+    journal = _journal_at(root)
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    result_queue = context.Queue()
+    workers = [
+        context.Process(
+            target=_claim_worker,
+            args=(str(journal._path), f"{index + 3}" * 32, operation_id, start, result_queue),
+        )
+        for index in range(2)
+    ]
+    started_workers: list[multiprocessing.Process] = []
+    try:
+        for worker in workers:
+            worker.start()
+            started_workers.append(worker)
+        start.set()
+        deadline = time.monotonic() + _DIAGNOSTIC_TIMEOUT_SECONDS
+        observed = [
+            result_queue.get(timeout=max(0.001, deadline - time.monotonic())) for _ in workers
+        ]
+        for worker in started_workers:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            assert worker.exitcode == 0
+        assert sorted(observed) == ["claimed", "operation_replayed"]
+    finally:
+        _cleanup_diagnostic_workers(started_workers)
+        _close_diagnostic_queues(result_queue)
 
 
 def _crash_worker(path: str, nonce: str, operation_id: str) -> None:
@@ -347,25 +434,7 @@ def test_claim_is_atomic_for_threads_and_processes(tmp_path: Path) -> None:
             results.append("claimed")
     assert sorted(results) == ["claimed", "nonce_replayed"]
 
-    context = multiprocessing.get_context("spawn")
-    start = context.Event()
-    queue = context.Queue()
-    operation_id = "shared-operation"
-    workers = [
-        context.Process(
-            target=_claim_worker,
-            args=(str(journal._path), f"{index + 3}" * 32, operation_id, start, queue),
-        )
-        for index in range(2)
-    ]
-    for worker in workers:
-        worker.start()
-    start.set()
-    observed = [queue.get(timeout=10) for _ in workers]
-    for worker in workers:
-        worker.join(timeout=10)
-        assert worker.exitcode == 0
-    assert sorted(observed) == ["claimed", "operation_replayed"]
+    _run_process_claim_control(tmp_path / "process-control", operation_id="shared-operation")
 
 
 def _assert_redacted_diagnostic_events(
@@ -385,9 +454,25 @@ def _assert_redacted_diagnostic_events(
     assert "diagnostic-process-operation" not in serialized
     assert "cccc" not in serialized
     for event in events:
+        if event[7] is not None:
+            assert event[7] in _DIAGNOSTIC_IDENTITY_RESULTS | {
+                "claimed",
+                "operation_replayed",
+                "nonce_replayed",
+                "committed",
+                "authorization",
+                "journal_transaction",
+                "missing",
+                "lstat_error",
+                "symlink",
+                "nonregular",
+                "uid_mismatch",
+                "mode_mismatch",
+                "nlink_mismatch",
+            }
         for suffix, kind in event[8]:
             assert suffix in {"-journal", "-wal", "-shm"}
-            assert kind in {"absent", "regular", "other"}
+            assert kind in _DIAGNOSTIC_COMPANION_KINDS
 
 
 def _assert_claim_phase_coverage(events: tuple[_DiagnosticEvent, ...]) -> None:
@@ -456,14 +541,43 @@ def _run_thread_claim_diagnostic(root: Path) -> None:
         assert sequences == list(range(1, len(sequences) + 1)), observer_events
 
 
+def _run_thread_claim_control(root: Path) -> None:
+    """Run the identical thread race with the observer disabled."""
+
+    journal = _journal_at(root)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                journal._claim_verified,
+                _verified("c" * 32, f"control-thread-{index}"),
+            )
+            for index in range(2)
+        ]
+    observed: list[str] = []
+    for future in futures:
+        try:
+            future.result()
+        except AuthorizationError as error:
+            observed.append(error.phase)
+        else:
+            observed.append("claimed")
+    assert sorted(observed) == ["claimed", "nonce_replayed"]
+
+
 def test_claim_diagnostic_observer_for_threads_is_redacted_and_ordered(
     tmp_path: Path, request: pytest.FixtureRequest
 ) -> None:
     for run_ordinal in range(_journal_diagnostic_runs(request)):
         _run_thread_claim_diagnostic(tmp_path / f"thread-{run_ordinal}")
+        _run_thread_claim_control(tmp_path / f"thread-control-{run_ordinal}")
 
 
-def _run_process_claim_diagnostic(root: Path) -> None:
+def _run_process_claim_diagnostic(
+    root: Path,
+    *,
+    fail_worker: int | None = None,
+    timeout_seconds: float = _DIAGNOSTIC_TIMEOUT_SECONDS,
+) -> None:
     """Process event receipts retain only opaque local ordinals and phase labels."""
 
     journal = _journal_at(root)
@@ -483,27 +597,39 @@ def _run_process_claim_diagnostic(root: Path) -> None:
                 result_queue,
                 event_queue,
                 index + 2,
+                fail_worker == index,
             ),
         )
         for index in range(2)
     ]
-    for worker in workers:
-        worker.start()
-    start.set()
-    process_results = [result_queue.get(timeout=10) for _ in workers]
-    process_receipts = [event_queue.get(timeout=10) for _ in workers]
-    for worker in workers:
-        worker.join(timeout=10)
-        assert worker.exitcode == 0
-    events = tuple(event for receipt, _ in process_receipts for event in receipt)
-    _require_claim_results(process_results, ["claimed", "operation_replayed"], events)
-    _assert_claim_phase_coverage(events)
-    for receipt in process_receipts:
-        _assert_redacted_diagnostic_events(receipt, journal=journal)
-    for worker_events, overflowed in process_receipts:
-        assert not overflowed, worker_events
-        sequences = [event[0] for event in worker_events]
-        assert sequences == list(range(1, len(sequences) + 1)), worker_events
+    started_workers: list[multiprocessing.Process] = []
+    try:
+        for worker in workers:
+            worker.start()
+            started_workers.append(worker)
+        start.set()
+        deadline = time.monotonic() + timeout_seconds
+        process_results = [
+            result_queue.get(timeout=max(0.001, deadline - time.monotonic())) for _ in workers
+        ]
+        process_receipts = [
+            event_queue.get(timeout=max(0.001, deadline - time.monotonic())) for _ in workers
+        ]
+        for worker in started_workers:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            assert worker.exitcode == 0
+        events = tuple(event for receipt, _ in process_receipts for event in receipt)
+        _require_claim_results(process_results, ["claimed", "operation_replayed"], events)
+        _assert_claim_phase_coverage(events)
+        for receipt in process_receipts:
+            _assert_redacted_diagnostic_events(receipt, journal=journal)
+        for worker_events, overflowed in process_receipts:
+            assert not overflowed, worker_events
+            sequences = [event[0] for event in worker_events]
+            assert sequences == list(range(1, len(sequences) + 1)), worker_events
+    finally:
+        _cleanup_diagnostic_workers(started_workers)
+        _close_diagnostic_queues(result_queue, event_queue)
 
 
 def test_claim_diagnostic_observer_for_processes_is_redacted_and_ordered(
@@ -511,6 +637,21 @@ def test_claim_diagnostic_observer_for_processes_is_redacted_and_ordered(
 ) -> None:
     for run_ordinal in range(_journal_diagnostic_runs(request)):
         _run_process_claim_diagnostic(tmp_path / f"process-{run_ordinal}")
+        _run_process_claim_control(
+            tmp_path / f"process-control-{run_ordinal}", operation_id="control-process-operation"
+        )
+
+
+def test_claim_diagnostic_worker_failure_reaps_started_peers(tmp_path: Path) -> None:
+    before = {worker.pid for worker in multiprocessing.active_children()}
+    with pytest.raises(queue.Empty):
+        _run_process_claim_diagnostic(
+            tmp_path / "process-failure",
+            fail_worker=0,
+            timeout_seconds=0.5,
+        )
+    after = {worker.pid for worker in multiprocessing.active_children()}
+    assert after <= before
 
 
 def test_claim_diagnostic_observer_failure_is_not_silenced(tmp_path: Path) -> None:
@@ -520,6 +661,132 @@ def test_claim_diagnostic_observer_failure_is_not_silenced(tmp_path: Path) -> No
         SQLiteAuthorizationJournal(
             journal._path, diagnostic_observer=_FailingJournalObserver()
         )._claim_verified(_verified("d" * 32, "diagnostic-observer-failure"))
+
+
+def _companion_stat_result(*, mode: int, uid: int, nlink: int) -> os.stat_result:
+    return os.stat_result((mode, 0, 0, nlink, uid, 0, 0, 0, 0, 0))
+
+
+@pytest.mark.parametrize(
+    ("mode", "uid", "nlink", "expected"),
+    [
+        (stat.S_IFLNK | 0o777, os.getuid(), 1, "symlink"),
+        (stat.S_IFDIR | 0o700, os.getuid(), 1, "nonregular"),
+        (stat.S_IFREG | 0o600, os.getuid() + 1, 1, "uid_mismatch"),
+        (stat.S_IFREG | 0o644, os.getuid(), 1, "mode_mismatch"),
+        (stat.S_IFREG | 0o600, os.getuid(), 2, "nlink_mismatch"),
+    ],
+)
+def test_diagnostic_companion_snapshot_precedence_is_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int, uid: int, nlink: int, expected: str
+) -> None:
+    journal = _journal(tmp_path)
+    observer = _RecordingJournalObserver(process_ordinal=1, journal_ordinal=1)
+    diagnostic = SQLiteAuthorizationJournal(journal._path, diagnostic_observer=observer)
+    candidate = journal._path.with_name(f"{journal._path.name}-wal")
+    real_lstat = os.lstat
+    calls = 0
+
+    def snapshot_lstat(path: str | os.PathLike[str]) -> os.stat_result:
+        nonlocal calls
+        if Path(path) == candidate:
+            calls += 1
+            return _companion_stat_result(mode=mode, uid=uid, nlink=nlink)
+        return real_lstat(path)
+
+    monkeypatch.setattr(os, "lstat", snapshot_lstat)
+    with pytest.raises(AuthorizationError, match="journal_path"):
+        diagnostic._validate_companions()
+    events, overflowed = observer.receipt()
+    assert not overflowed
+    assert calls == 2
+    assert any(
+        event[6] == "companions_failed"
+        and event[7] == expected
+        and event[8] == (("-wal", expected),)
+        for event in events
+    ), events
+
+
+@pytest.mark.parametrize("failure", ["missing", "lstat_error"])
+def test_diagnostic_companion_snapshot_acquisition_is_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    journal = _journal(tmp_path)
+    observer = _RecordingJournalObserver(process_ordinal=1, journal_ordinal=1)
+    diagnostic = SQLiteAuthorizationJournal(journal._path, diagnostic_observer=observer)
+    candidate = journal._path.with_name(f"{journal._path.name}-wal")
+    candidate.touch(mode=0o600)
+    real_lstat = os.lstat
+    calls = 0
+
+    def fail_second_lstat(path: str | os.PathLike[str]) -> os.stat_result:
+        nonlocal calls
+        if Path(path) == candidate:
+            calls += 1
+            if calls == 2:
+                if failure == "missing":
+                    raise FileNotFoundError
+                raise OSError("redacted test fault")
+        return real_lstat(path)
+
+    monkeypatch.setattr(os, "lstat", fail_second_lstat)
+    with pytest.raises(AuthorizationError, match="journal_path"):
+        diagnostic._validate_companions()
+    events, overflowed = observer.receipt()
+    assert not overflowed
+    assert calls == 2
+    assert any(
+        event[6] == "companions_failed" and event[7] == failure and event[8] == (("-wal", failure),)
+        for event in events
+    ), events
+
+
+def test_diagnostic_companion_regular_snapshot_is_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = _journal(tmp_path)
+    observer = _RecordingJournalObserver(process_ordinal=1, journal_ordinal=1)
+    diagnostic = SQLiteAuthorizationJournal(journal._path, diagnostic_observer=observer)
+    candidate = journal._path.with_name(f"{journal._path.name}-wal")
+    real_lstat = os.lstat
+    calls = 0
+
+    def regular_lstat(path: str | os.PathLike[str]) -> os.stat_result:
+        nonlocal calls
+        if Path(path) == candidate:
+            calls += 1
+            return _companion_stat_result(mode=stat.S_IFREG | 0o600, uid=os.getuid(), nlink=1)
+        return real_lstat(path)
+
+    monkeypatch.setattr(os, "lstat", regular_lstat)
+    diagnostic._validate_companions()
+    events, overflowed = observer.receipt()
+    assert not overflowed
+    assert calls == 2
+    assert any(
+        event[8] == (("-journal", "missing"), ("-wal", "regular"), ("-shm", "missing"))
+        for event in events
+    ), events
+
+
+def test_diagnostic_identity_failures_are_redacted_and_classified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = _journal(tmp_path)
+    observer = _RecordingJournalObserver(process_ordinal=1, journal_ordinal=1)
+    diagnostic = SQLiteAuthorizationJournal(journal._path, diagnostic_observer=observer)
+
+    def fail_anchor() -> object:
+        raise AuthorizationError("journal_anchor")
+
+    monkeypatch.setattr(diagnostic, "_read_anchor", fail_anchor)
+    with pytest.raises(AuthorizationError, match="journal_anchor"):
+        diagnostic.assert_identity()
+    events, overflowed = observer.receipt()
+    assert not overflowed
+    assert any(event[6] == "identity_failed" and event[7] == "anchor" for event in events), events
+    assert str(journal._path) not in repr(events)
 
 
 def test_crash_restart_leaves_in_progress_and_requires_explicit_recovery(tmp_path: Path) -> None:

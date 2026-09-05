@@ -5326,6 +5326,36 @@ class SQLiteAuthorizationJournal:
             raise AuthorizationError(phase) from None
         return cls._validate_owner_file_details(details, phase)
 
+    @staticmethod
+    def _diagnostic_companion_snapshot_category(
+        details: os.stat_result,
+    ) -> Literal[
+        "symlink",
+        "nonregular",
+        "uid_mismatch",
+        "mode_mismatch",
+        "nlink_mismatch",
+        "regular",
+    ]:
+        """Return the one-snapshot, redacted diagnostic category for a companion.
+
+        This is observer-only instrumentation.  The caller retains the existing
+        two-observation companion boundary and never performs another lstat while
+        selecting a category.
+        """
+
+        if stat.S_ISLNK(details.st_mode):
+            return "symlink"
+        if not stat.S_ISREG(details.st_mode):
+            return "nonregular"
+        if details.st_uid != os.getuid():
+            return "uid_mismatch"
+        if stat.S_IMODE(details.st_mode) != 0o600:
+            return "mode_mismatch"
+        if details.st_nlink != 1:
+            return "nlink_mismatch"
+        return "regular"
+
     def _create_database_file(self) -> tuple[int, int, int]:
         flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -5353,22 +5383,50 @@ class SQLiteAuthorizationJournal:
         for suffix in ("-journal", "-wal", "-shm"):
             candidate = self._path.with_name(f"{self._path.name}{suffix}")
             try:
-                details = os.lstat(candidate)
+                os.lstat(candidate)
             except FileNotFoundError:
                 if companions is not None:
-                    companions.append((suffix, "absent"))
+                    companions.append((suffix, "missing"))
                 continue
             except OSError:
-                self._diagnostic_event("companions_failed", result="journal_path")
+                self._diagnostic_event(
+                    "companions_failed",
+                    result="lstat_error",
+                    companions=((suffix, "lstat_error"),),
+                )
                 raise AuthorizationError("journal_path") from None
-            try:
+
+            if observer is None:
                 self._owner_file_details(candidate, "journal_path")
-            except AuthorizationError:
-                self._diagnostic_event("companions_failed", result="journal_path")
-                raise
-            if companions is not None:
-                kind = "regular" if stat.S_ISREG(details.st_mode) else "other"
-                companions.append((suffix, kind))
+                continue
+            assert companions is not None
+
+            try:
+                details = os.lstat(candidate)
+            except FileNotFoundError:
+                self._diagnostic_event(
+                    "companions_failed",
+                    result="missing",
+                    companions=((suffix, "missing"),),
+                )
+                raise AuthorizationError("journal_path") from None
+            except OSError:
+                self._diagnostic_event(
+                    "companions_failed",
+                    result="lstat_error",
+                    companions=((suffix, "lstat_error"),),
+                )
+                raise AuthorizationError("journal_path") from None
+
+            category = self._diagnostic_companion_snapshot_category(details)
+            if category != "regular":
+                self._diagnostic_event(
+                    "companions_failed",
+                    result=category,
+                    companions=((suffix, category),),
+                )
+                raise AuthorizationError("journal_path")
+            companions.append((suffix, category))
         if companions is not None:
             self._diagnostic_event("companions_checked", companions=tuple(companions))
 
@@ -5979,8 +6037,43 @@ class SQLiteAuthorizationJournal:
         finally:
             connection.close()
 
+    @staticmethod
+    def _diagnostic_identity_result(
+        phase: str,
+    ) -> Literal["database_stat", "anchor", "metadata", "schema", "durability_mismatch"]:
+        if phase in {
+            "journal_anchor",
+            "journal_anchor_missing",
+            "journal_genesis_marker",
+            "journal_genesis_missing",
+            "provisioning_incomplete",
+        }:
+            return "anchor"
+        if phase in {"journal_schema", "journal_legacy_detected"}:
+            return "schema"
+        if phase == "journal_durability":
+            return "durability_mismatch"
+        if phase in {
+            "journal_absent",
+            "journal_directory",
+            "journal_identity_mismatch",
+            "journal_missing",
+            "journal_path",
+        }:
+            return "database_stat"
+        return "metadata"
+
     def _established_identity(self) -> _JournalIdentity:
         self._diagnostic_event("identity_started")
+        try:
+            return self._established_identity_checked()
+        except AuthorizationError as error:
+            self._diagnostic_event(
+                "identity_failed", result=self._diagnostic_identity_result(error.phase)
+            )
+            raise
+
+    def _established_identity_checked(self) -> _JournalIdentity:
         self._validate_path()
         with self._identity_lease() as lease:
             lease.assert_stable()
