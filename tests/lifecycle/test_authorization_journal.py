@@ -11,7 +11,7 @@ import sqlite3
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock, get_ident
 from typing import Protocol
 
 import pytest
@@ -43,6 +43,87 @@ class _StartGate(Protocol):
 
 class _ResultQueue(Protocol):
     def put(self, value: str) -> None: ...
+
+
+_MAX_DIAGNOSTIC_EVENTS = 32
+_DiagnosticEvent = tuple[
+    int,
+    int,
+    int,
+    int,
+    int | None,
+    int | None,
+    str,
+    str | None,
+    tuple[tuple[str, str], ...],
+]
+
+
+class _DiagnosticEventQueue(Protocol):
+    def put(self, value: tuple[tuple[_DiagnosticEvent, ...], bool]) -> None: ...
+
+
+class _RecordingJournalObserver:
+    """Test-only ordered event sink with opaque stable local identities."""
+
+    def __init__(self, *, process_ordinal: int, journal_ordinal: int) -> None:
+        self._process_ordinal = process_ordinal
+        self._journal_ordinal = journal_ordinal
+        self._lock = Lock()
+        self._next_sequence = 0
+        self._thread_ordinals: dict[int, int] = {}
+        self._events: list[_DiagnosticEvent] = []
+        self._overflowed = False
+
+    def record(
+        self,
+        *,
+        phase: str,
+        connection_ordinal: int | None,
+        transaction_ordinal: int | None,
+        result: str | None,
+        companions: tuple[tuple[str, str], ...],
+    ) -> None:
+        with self._lock:
+            if len(self._events) == _MAX_DIAGNOSTIC_EVENTS:
+                self._overflowed = True
+                return
+            thread_id = get_ident()
+            thread_ordinal = self._thread_ordinals.setdefault(
+                thread_id, len(self._thread_ordinals) + 1
+            )
+            self._next_sequence += 1
+            self._events.append(
+                (
+                    self._next_sequence,
+                    self._process_ordinal,
+                    self._journal_ordinal,
+                    thread_ordinal,
+                    connection_ordinal,
+                    transaction_ordinal,
+                    phase,
+                    result,
+                    companions,
+                )
+            )
+
+    def receipt(self) -> tuple[tuple[_DiagnosticEvent, ...], bool]:
+        with self._lock:
+            return tuple(self._events), self._overflowed
+
+
+class _FailingJournalObserver:
+    def record(
+        self,
+        *,
+        phase: str,
+        connection_ordinal: int | None,
+        transaction_ordinal: int | None,
+        result: str | None,
+        companions: tuple[tuple[str, str], ...],
+    ) -> None:
+        del phase, connection_ordinal, transaction_ordinal, result, companions
+        raise RuntimeError("diagnostic observer failure")
 
 
 def _verified(nonce: str, operation_id: str = "operation-one") -> _VerifiedExecution:
@@ -180,6 +261,31 @@ def _claim_worker(
         queue.put("claimed")
 
 
+def _diagnostic_claim_worker(
+    path: str,
+    nonce: str,
+    operation_id: str,
+    start: _StartGate,
+    result_queue: _ResultQueue,
+    event_queue: _DiagnosticEventQueue,
+    process_ordinal: int,
+) -> None:
+    observer = _RecordingJournalObserver(
+        process_ordinal=process_ordinal, journal_ordinal=process_ordinal
+    )
+    start.wait()
+    try:
+        SQLiteAuthorizationJournal(Path(path), diagnostic_observer=observer)._claim_verified(
+            _verified(nonce, operation_id)
+        )
+    except AuthorizationError as error:
+        result_queue.put(error.phase)
+    else:
+        result_queue.put("claimed")
+    finally:
+        event_queue.put(observer.receipt())
+
+
 def _crash_worker(path: str, nonce: str, operation_id: str) -> None:
     journal = SQLiteAuthorizationJournal(Path(path))
     verified = _verified(nonce, operation_id)
@@ -260,6 +366,160 @@ def test_claim_is_atomic_for_threads_and_processes(tmp_path: Path) -> None:
         worker.join(timeout=10)
         assert worker.exitcode == 0
     assert sorted(observed) == ["claimed", "operation_replayed"]
+
+
+def _assert_redacted_diagnostic_events(
+    receipt: tuple[tuple[_DiagnosticEvent, ...], bool], *, journal: SQLiteAuthorizationJournal
+) -> None:
+    """Reject regressions that leak journal inputs into a test failure receipt."""
+
+    events, overflowed = receipt
+    assert not overflowed, events
+    assert events
+    assert all(event[1] >= 1 and event[2] >= 1 and event[3] >= 1 for event in events), events
+    assert any(event[4] == 1 for event in events), events
+    assert any(event[5] == 1 for event in events), events
+    serialized = repr(events)
+    assert str(journal._path) not in serialized
+    assert "diagnostic-thread-" not in serialized
+    assert "diagnostic-process-operation" not in serialized
+    assert "cccc" not in serialized
+    for event in events:
+        for suffix, kind in event[8]:
+            assert suffix in {"-journal", "-wal", "-shm"}
+            assert kind in {"absent", "regular", "other"}
+
+
+def _assert_claim_phase_coverage(events: tuple[_DiagnosticEvent, ...]) -> None:
+    assert {event[6] for event in events} >= {
+        "claim_started",
+        "claim_operation_read",
+        "claim_nonce_read",
+        "claim_insert_enter",
+        "transaction_begin_enter",
+        "transaction_begin_return",
+    }, events
+
+
+def _require_claim_results(
+    observed: list[str], expected: list[str], events: tuple[_DiagnosticEvent, ...]
+) -> None:
+    if sorted(observed) != expected:
+        pytest.fail(f"redacted journal diagnostic receipt: {events!r}")
+
+
+def _journal_diagnostic_runs(request: pytest.FixtureRequest) -> int:
+    runs = request.config.getoption("--journal-diagnostic-runs")
+    if type(runs) is not int or not 1 <= runs <= 100:
+        raise pytest.UsageError("--journal-diagnostic-runs must be in [1, 100]")
+    return runs
+
+
+def _run_thread_claim_diagnostic(root: Path) -> None:
+    """The opt-in observer exposes causal phases, never journal input values."""
+
+    journal = _journal_at(root)
+    thread_observers = [
+        _RecordingJournalObserver(process_ordinal=1, journal_ordinal=index + 1)
+        for index in range(2)
+    ]
+    thread_journals = [
+        SQLiteAuthorizationJournal(journal._path, diagnostic_observer=observer)
+        for observer in thread_observers
+    ]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                thread_journals[index]._claim_verified,
+                _verified("c" * 32, f"diagnostic-thread-{index}"),
+            )
+            for index in range(2)
+        ]
+    thread_results = []
+    for future in futures:
+        try:
+            future.result()
+        except AuthorizationError as error:
+            thread_results.append(error.phase)
+        else:
+            thread_results.append("claimed")
+    receipts = [observer.receipt() for observer in thread_observers]
+    events = tuple(event for receipt, _ in receipts for event in receipt)
+    _require_claim_results(thread_results, ["claimed", "nonce_replayed"], events)
+    _assert_claim_phase_coverage(events)
+    for receipt in receipts:
+        _assert_redacted_diagnostic_events(receipt, journal=journal)
+    for observer in thread_observers:
+        observer_events, overflowed = observer.receipt()
+        assert not overflowed, observer_events
+        sequences = [event[0] for event in observer_events]
+        assert sequences == list(range(1, len(sequences) + 1)), observer_events
+
+
+def test_claim_diagnostic_observer_for_threads_is_redacted_and_ordered(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    for run_ordinal in range(_journal_diagnostic_runs(request)):
+        _run_thread_claim_diagnostic(tmp_path / f"thread-{run_ordinal}")
+
+
+def _run_process_claim_diagnostic(root: Path) -> None:
+    """Process event receipts retain only opaque local ordinals and phase labels."""
+
+    journal = _journal_at(root)
+
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    result_queue = context.Queue()
+    event_queue = context.Queue()
+    workers = [
+        context.Process(
+            target=_diagnostic_claim_worker,
+            args=(
+                str(journal._path),
+                f"{index + 5}" * 32,
+                "diagnostic-process-operation",
+                start,
+                result_queue,
+                event_queue,
+                index + 2,
+            ),
+        )
+        for index in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    start.set()
+    process_results = [result_queue.get(timeout=10) for _ in workers]
+    process_receipts = [event_queue.get(timeout=10) for _ in workers]
+    for worker in workers:
+        worker.join(timeout=10)
+        assert worker.exitcode == 0
+    events = tuple(event for receipt, _ in process_receipts for event in receipt)
+    _require_claim_results(process_results, ["claimed", "operation_replayed"], events)
+    _assert_claim_phase_coverage(events)
+    for receipt in process_receipts:
+        _assert_redacted_diagnostic_events(receipt, journal=journal)
+    for worker_events, overflowed in process_receipts:
+        assert not overflowed, worker_events
+        sequences = [event[0] for event in worker_events]
+        assert sequences == list(range(1, len(sequences) + 1)), worker_events
+
+
+def test_claim_diagnostic_observer_for_processes_is_redacted_and_ordered(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    for run_ordinal in range(_journal_diagnostic_runs(request)):
+        _run_process_claim_diagnostic(tmp_path / f"process-{run_ordinal}")
+
+
+def test_claim_diagnostic_observer_failure_is_not_silenced(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+
+    with pytest.raises(RuntimeError, match="diagnostic observer failure"):
+        SQLiteAuthorizationJournal(
+            journal._path, diagnostic_observer=_FailingJournalObserver()
+        )._claim_verified(_verified("d" * 32, "diagnostic-observer-failure"))
 
 
 def test_crash_restart_leaves_in_progress_and_requires_explicit_recovery(tmp_path: Path) -> None:

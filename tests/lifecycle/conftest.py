@@ -14,3 +14,10 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="run integration tests with an externally injected isolated PostgreSQL factory",
     )
+    parser.addoption(
+        "--journal-diagnostic-runs",
+        action="store",
+        type=int,
+        default=1,
+        help="run a bounded SQLite authorization-journal diagnostic stress case",
+    )
