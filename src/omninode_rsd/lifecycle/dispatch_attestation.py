@@ -37,6 +37,10 @@ _IDENTIFIER = r"^[a-z][a-z0-9-]{1,63}$"
 _MODEL_IDENTIFIER = r"^[a-z][a-z0-9._/-]{2,127}$"
 _ROUTE_REF = r"^logical://[a-z0-9./-]+$"
 _OUTCOME_DOMAIN: Final[bytes] = b"omninode-rsd.dispatch-outcome-attestation.ed25519.v1\x00"
+_OUTCOME_V2_DOMAIN: Final[bytes] = b"omninode-rsd.dispatch-outcome-attestation.ed25519.v2\x00"
+_OUTCOME_TRUST_ANCHOR_DOMAIN: Final[bytes] = (
+    b"omninode-rsd.dispatch-outcome-trust-anchor.sha256.v1\x00"
+)
 _RESPONSE_HASH_DOMAIN: Final[bytes] = b"omninode-rsd.dispatch-response-preimage.sha256.v1\x00"
 _OUTPUT_HASH_DOMAIN: Final[bytes] = b"omninode-rsd.dispatch-output-payload.sha256.v1\x00"
 _MAX_REQUEST_ENVELOPE_BYTES: Final[int] = 131_072
@@ -162,6 +166,33 @@ class DispatchOutcomeAttestationV1(_DispatchModel):
     signature_base64: str = Field(min_length=88, max_length=88)
 
 
+class DispatchOutcomeAttestationV2(_DispatchModel):
+    """Detached evidence bound to one V2 execution authority and target."""
+
+    schema_version: Literal["rsd.dispatch-outcome-attestation.v2"]
+    attestation_id: UUID
+    attempt_id: UUID
+    authorization_digest: str = Field(pattern=_SHA256)
+    claim_binding_sha256: str = Field(pattern=_SHA256)
+    backend_id: str = Field(pattern=_IDENTIFIER)
+    model_id: str = Field(pattern=_MODEL_IDENTIFIER)
+    route_ref: str = Field(pattern=_ROUTE_REF)
+    request_sha256: str = Field(pattern=_SHA256)
+    response_sha256: str = Field(pattern=_SHA256)
+    output_payload_sha256: str = Field(pattern=_SHA256)
+    outcome_status: Literal["completed", "failed"]
+    issued_at: datetime
+    activation_id: UUID
+    activation_sha256: str = Field(pattern=_SHA256)
+    route_authority_sha256: str = Field(pattern=_SHA256)
+    target_configuration_sha256: str = Field(pattern=_SHA256)
+    outcome_trust_anchor_sha256: str = Field(pattern=_SHA256)
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    trust_anchor_key_id: str = Field(pattern=_IDENTIFIER)
+    trust_anchor_key_fingerprint_sha256: str = Field(pattern=_SHA256)
+    signature_base64: str = Field(min_length=88, max_length=88)
+
+
 class DispatchOutcomeReplayClaimV1(_DispatchModel):
     """The complete identity a durable authority needs to consume one receipt."""
 
@@ -195,6 +226,7 @@ _RESPONSE_PREIMAGE_FIELDS = frozenset(DispatchResponsePreimageV1.model_fields)
 _COMPLETED_OUTPUT_FIELDS = frozenset(DispatchCompletedOutputPayloadV1.model_fields)
 _FAILED_OUTPUT_FIELDS = frozenset(DispatchFailedOutputPayloadV1.model_fields)
 _ATTESTATION_FIELDS = frozenset(DispatchOutcomeAttestationV1.model_fields)
+_ATTESTATION_V2_FIELDS = frozenset(DispatchOutcomeAttestationV2.model_fields)
 _CLAIM_FIELDS = frozenset(DispatchOutcomeReplayClaimV1.model_fields)
 _DELEGATED_REQUEST_FIELDS = frozenset(DelegatedRequest.model_fields)
 _GRANT_FIELDS = frozenset(VerifiedGrantFacts.model_fields)
@@ -299,6 +331,17 @@ def _strict_attestation(value: object) -> DispatchOutcomeAttestationV1:
             )
     _require_utc(values["issued_at"], error_type=DispatchOutcomeSignatureError)
     return _strict_model(value, DispatchOutcomeAttestationV1, _ATTESTATION_FIELDS)
+
+
+def _strict_attestation_v2(value: object) -> DispatchOutcomeAttestationV2:
+    values = _strict_model_values(value, DispatchOutcomeAttestationV2, _ATTESTATION_V2_FIELDS)
+    for value_item in values.values():
+        if type(value_item) not in {str, UUID, datetime}:
+            raise DispatchOutcomeSignatureError(
+                "dispatch outcome attestation uses a non-exact scalar"
+            )
+    _require_utc(values["issued_at"], error_type=DispatchOutcomeSignatureError)
+    return _strict_model(value, DispatchOutcomeAttestationV2, _ATTESTATION_V2_FIELDS)
 
 
 def _strict_replay_claim(value: object) -> DispatchOutcomeReplayClaimV1:
@@ -411,6 +454,28 @@ def _bounded_canonical_bytes(
 
 def _domain_hash(domain: bytes, raw: bytes) -> str:
     return sha256(domain + raw).hexdigest()
+
+
+def canonical_dispatch_outcome_trust_anchor_bytes(anchor: DispatchOutcomeTrustAnchorV1) -> bytes:
+    """Return the strict, public canonical preimage for an outcome anchor."""
+
+    checked = _strict_anchor(anchor)
+    _anchor_public_key(checked)
+    return _bounded_canonical_bytes(
+        checked,
+        maximum=_MAX_OUTCOME_ATTESTATION_BYTES,
+        error_type=DispatchOutcomeSignatureError,
+        label="dispatch outcome trust anchor",
+    )
+
+
+def dispatch_outcome_trust_anchor_sha256(anchor: DispatchOutcomeTrustAnchorV1) -> str:
+    """Commit the full public outcome anchor under its own hash domain."""
+
+    return _domain_hash(
+        _OUTCOME_TRUST_ANCHOR_DOMAIN,
+        canonical_dispatch_outcome_trust_anchor_bytes(anchor),
+    )
 
 
 def canonical_dispatch_request_envelope_bytes(envelope: DispatchRequestEnvelopeV1) -> bytes:
@@ -610,6 +675,19 @@ def dispatch_outcome_attestation_message(attestation: DispatchOutcomeAttestation
     )
 
 
+def dispatch_outcome_attestation_v2_message(attestation: DispatchOutcomeAttestationV2) -> bytes:
+    """Return the V2 domain-separated signature payload.
+
+    V2 is deliberately a distinct contract: a V1 receipt cannot become evidence
+    for a V2 durable attempt merely by sharing otherwise similar fields.
+    """
+
+    checked = _strict_attestation_v2(attestation)
+    return _OUTCOME_V2_DOMAIN + canonical_json(
+        checked.model_dump(mode="python", exclude={"signature_base64"})
+    )
+
+
 def parse_dispatch_outcome_attestation(raw: bytes) -> DispatchOutcomeAttestationV1:
     """Parse one bounded canonical detached-signature outcome receipt."""
 
@@ -621,6 +699,24 @@ def parse_dispatch_outcome_attestation(raw: bytes) -> DispatchOutcomeAttestation
     except ValidationError as error:
         raise DispatchOutcomeSignatureError("dispatch outcome attestation is invalid") from error
     attestation = _strict_attestation(attestation)
+    if _canonical_bytes(attestation) != raw:
+        raise DispatchOutcomeSignatureError(
+            "dispatch outcome attestation is not canonically encoded"
+        )
+    return attestation
+
+
+def parse_dispatch_outcome_attestation_v2(raw: bytes) -> DispatchOutcomeAttestationV2:
+    """Parse one bounded canonical V2 detached-signature outcome receipt."""
+
+    _parse_canonical_json(
+        raw, maximum=_MAX_OUTCOME_ATTESTATION_BYTES, error_type=DispatchOutcomeSignatureError
+    )
+    try:
+        attestation = DispatchOutcomeAttestationV2.model_validate_json(raw)
+    except ValidationError as error:
+        raise DispatchOutcomeSignatureError("dispatch outcome attestation is invalid") from error
+    attestation = _strict_attestation_v2(attestation)
     if _canonical_bytes(attestation) != raw:
         raise DispatchOutcomeSignatureError(
             "dispatch outcome attestation is not canonically encoded"
