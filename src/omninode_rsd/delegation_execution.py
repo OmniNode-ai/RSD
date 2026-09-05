@@ -1,0 +1,401 @@
+"""Offline verification of a narrowly scoped delegated execution activation.
+
+The packaged delegation overlay remains the immutable disabled policy.  This
+module verifies a separately signed, short-lived activation artifact; it does
+not enable the existing ingress or resolve an endpoint, credential, or key.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import hmac
+import json
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
+from typing import Final, Literal
+from uuid import UUID
+
+import yaml
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+from omninode_rsd.delegation import (
+    DelegatedGrantClaim,
+    DelegatedRequest,
+    DelegationOverlay,
+    VerifiedGrantFacts,
+    load_canonical_delegation_overlay,
+)
+from omninode_rsd.lifecycle.hashing import canonical_json
+from omninode_rsd.lifecycle.models import strict_model_values
+
+_SHA256: Final = r"^[0-9a-f]{64}$"
+_IDENTIFIER: Final = r"^[a-z][a-z0-9-]{1,63}$"
+_MODEL_IDENTIFIER: Final = r"^[a-z][a-z0-9._/-]{2,127}$"
+_LOGICAL_REFERENCE: Final = r"^logical://[a-z0-9][a-z0-9./-]{0,126}$"
+_MAX_INPUT_BYTES: Final = 131_072
+_MAX_ACTIVATION_LIFETIME: Final = timedelta(minutes=5)
+_ACTIVATION_ID_DOMAIN: Final = b"omninode-rsd.delegation-execution-activation-id.v1\x00"
+_SIGNATURE_DOMAIN: Final = b"omninode-rsd.delegation-execution-overlay.ed25519.v1\x00"
+
+
+class DelegationExecutionError(ValueError):
+    """Base error for invalid or unauthoritative activation material."""
+
+
+class DelegationExecutionParseError(DelegationExecutionError):
+    """Raised when activation input is not bounded, canonical, or typed."""
+
+
+class DelegationExecutionSignatureError(DelegationExecutionError):
+    """Raised when activation trust-anchor or detached signature checks fail."""
+
+
+class _Model(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
+
+
+class DelegationExecutionTrustAnchorV1(_Model):
+    """Explicit caller-supplied Ed25519 public trust anchor."""
+
+    schema_version: Literal["rsd.delegation-execution-trust-anchor.v1"]
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signer_public_key_base64: str = Field(min_length=44, max_length=44)
+    signer_key_fingerprint_sha256: str = Field(pattern=_SHA256)
+
+
+def delegation_execution_activation_sha256(
+    *, activation_id: UUID, activation_schema_version: str, activation_version: int
+) -> str:
+    """Hash the immutable activation identity without its self-referential hash."""
+
+    if (
+        type(activation_id) is not UUID
+        or type(activation_schema_version) is not str
+        or activation_schema_version != "rsd.delegation-execution-activation.v1"
+        or type(activation_version) is not int
+        or activation_version != 1
+    ):
+        raise DelegationExecutionError("activation identity is invalid")
+    return sha256(
+        _ACTIVATION_ID_DOMAIN
+        + canonical_json(
+            {
+                "activation_id": activation_id,
+                "activation_schema_version": activation_schema_version,
+                "activation_version": activation_version,
+            }
+        )
+    ).hexdigest()
+
+
+class DelegationExecutionOverlayV1(_Model):
+    """A signed, short-lived authorization to activate one exact delegation."""
+
+    schema_version: Literal["rsd.delegation-execution-overlay.v1"]
+    execute_enabled: Literal[True]
+    authorization_digest: str = Field(pattern=_SHA256)
+    request_envelope_sha256: str = Field(pattern=_SHA256)
+    backend_id: str = Field(pattern=_IDENTIFIER)
+    model_id: str = Field(pattern=_MODEL_IDENTIFIER)
+    route_ref: str = Field(pattern=_LOGICAL_REFERENCE)
+    disabled_overlay_sha256: str = Field(pattern=_SHA256)
+    activation_id: UUID
+    activation_schema_version: Literal["rsd.delegation-execution-activation.v1"]
+    activation_version: Literal[1]
+    activation_sha256: str = Field(pattern=_SHA256)
+    issued_at: datetime
+    expires_at: datetime
+    endpoint_ref: str = Field(pattern=_LOGICAL_REFERENCE)
+    credential_ref: str = Field(pattern=_LOGICAL_REFERENCE)
+    signer_key_id: str = Field(pattern=_IDENTIFIER)
+    signer_key_fingerprint_sha256: str = Field(pattern=_SHA256)
+    signature_base64: str = Field(min_length=88, max_length=88)
+
+    @model_validator(mode="after")
+    def binds_activation_identity(self) -> DelegationExecutionOverlayV1:
+        expected = delegation_execution_activation_sha256(
+            activation_id=self.activation_id,
+            activation_schema_version=self.activation_schema_version,
+            activation_version=self.activation_version,
+        )
+        if not hmac.compare_digest(expected, self.activation_sha256):
+            raise ValueError("activation identity hash is invalid")
+        return self
+
+
+_ACTIVATION_FIELDS = frozenset(DelegationExecutionOverlayV1.model_fields)
+_ANCHOR_FIELDS = frozenset(DelegationExecutionTrustAnchorV1.model_fields)
+_REQUEST_FIELDS = frozenset(DelegatedRequest.model_fields)
+_GRANT_FIELDS = frozenset(VerifiedGrantFacts.model_fields)
+_POLICY_FIELDS = frozenset(DelegationOverlay.model_fields)
+
+
+class _UniqueLoader(yaml.SafeLoader):
+    """Safe YAML loader rejecting duplicate mapping keys."""
+
+
+def _mapping(
+    loader: _UniqueLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[object, object]:
+    result: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in result:
+            raise yaml.YAMLError("duplicate mapping key")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+_UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _mapping)
+
+
+def _strict_model[T: BaseModel](
+    value: object, expected_type: type[T], field_names: frozenset[str]
+) -> T:
+    if type(value) is not expected_type:
+        raise DelegationExecutionParseError("activation model has an invalid type")
+    values = strict_model_values(value, expected_type=expected_type, field_names=field_names)
+    if values is None:
+        raise DelegationExecutionParseError("activation model has an invalid shape")
+    try:
+        return expected_type.model_validate(values)
+    except ValidationError as error:
+        raise DelegationExecutionParseError("activation model is invalid") from error
+
+
+def _strict_activation(value: object) -> DelegationExecutionOverlayV1:
+    return _strict_model(value, DelegationExecutionOverlayV1, _ACTIVATION_FIELDS)
+
+
+def _strict_anchor(value: object) -> DelegationExecutionTrustAnchorV1:
+    return _strict_model(value, DelegationExecutionTrustAnchorV1, _ANCHOR_FIELDS)
+
+
+def _canonical_json_bytes(model: BaseModel) -> bytes:
+    return canonical_json(model.model_dump(mode="python"))
+
+
+def canonical_delegation_execution_overlay_json_bytes(
+    overlay: DelegationExecutionOverlayV1,
+) -> bytes:
+    """Serialize an activation as canonical JSON for signing or transport."""
+
+    checked = _strict_activation(overlay)
+    raw = _canonical_json_bytes(checked)
+    if len(raw) > _MAX_INPUT_BYTES:
+        raise DelegationExecutionParseError("activation exceeds the input bound")
+    return raw
+
+
+def canonical_delegation_execution_overlay_yaml_bytes(
+    overlay: DelegationExecutionOverlayV1,
+) -> bytes:
+    """Serialize an activation as canonical block YAML for signing or transport."""
+
+    checked = _strict_activation(overlay)
+    try:
+        raw = yaml.safe_dump(
+            checked.model_dump(mode="json"),
+            sort_keys=True,
+            default_flow_style=False,
+            allow_unicode=False,
+            width=_MAX_INPUT_BYTES,
+        ).encode("utf-8")
+    except (TypeError, UnicodeError, yaml.YAMLError) as error:
+        raise DelegationExecutionParseError("activation cannot be serialized") from error
+    if len(raw) > _MAX_INPUT_BYTES:
+        raise DelegationExecutionParseError("activation exceeds the input bound")
+    return raw
+
+
+def parse_delegation_execution_overlay(raw: bytes) -> DelegationExecutionOverlayV1:
+    """Parse one exact bounded canonical JSON or block-YAML activation."""
+
+    if type(raw) is not bytes or not raw or len(raw) > _MAX_INPUT_BYTES:
+        raise DelegationExecutionParseError("activation bytes exceed the allowed bound")
+    if raw.lstrip().startswith(b"{"):
+        try:
+            decoded = raw.decode("ascii")
+            value = json.loads(decoded, object_pairs_hook=_reject_duplicate_keys)
+        except (UnicodeDecodeError, json.JSONDecodeError, DelegationExecutionParseError):
+            raise DelegationExecutionParseError("activation is not canonical JSON") from None
+        if type(value) is not dict:
+            raise DelegationExecutionParseError("activation JSON is not an object")
+        try:
+            activation = DelegationExecutionOverlayV1.model_validate_json(raw)
+        except ValidationError as error:
+            raise DelegationExecutionParseError("activation JSON is invalid") from error
+        activation = _strict_activation(activation)
+        if canonical_delegation_execution_overlay_json_bytes(activation) != raw:
+            raise DelegationExecutionParseError("activation JSON is not canonical")
+        return activation
+    try:
+        value = yaml.load(raw.decode("utf-8"), Loader=_UniqueLoader)
+    except (UnicodeDecodeError, yaml.YAMLError):
+        raise DelegationExecutionParseError("activation is not canonical YAML") from None
+    if type(value) is not dict:
+        raise DelegationExecutionParseError("activation YAML is not an object")
+    try:
+        activation = DelegationExecutionOverlayV1.model_validate_json(canonical_json(value))
+    except ValidationError as error:
+        raise DelegationExecutionParseError("activation YAML is invalid") from error
+    activation = _strict_activation(activation)
+    if canonical_delegation_execution_overlay_yaml_bytes(activation) != raw:
+        raise DelegationExecutionParseError("activation YAML is not canonical")
+    return activation
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DelegationExecutionParseError("activation JSON contains duplicate keys")
+        result[key] = value
+    return result
+
+
+def delegation_execution_overlay_message(overlay: DelegationExecutionOverlayV1) -> bytes:
+    """Return the domain-separated canonical message covered by its signature."""
+
+    checked = _strict_activation(overlay)
+    return _SIGNATURE_DOMAIN + canonical_json(
+        checked.model_dump(mode="python", exclude={"signature_base64"})
+    )
+
+
+def canonical_disabled_delegation_overlay_sha256() -> str:
+    """Commit the packaged disabled policy as typed canonical model material."""
+
+    overlay = load_canonical_delegation_overlay()
+    if type(overlay) is not DelegationOverlay or overlay.execute_enabled is not False:
+        raise DelegationExecutionError("packaged delegation overlay is not disabled")
+    return sha256(canonical_json(overlay.model_dump(mode="python"))).hexdigest()
+
+
+def _canonical_base64(value: str, *, expected_bytes: int) -> bytes:
+    if type(value) is not str:
+        raise DelegationExecutionSignatureError("activation key encoding is invalid")
+    try:
+        decoded = base64.b64decode(value.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, binascii.Error):
+        raise DelegationExecutionSignatureError("activation key encoding is invalid") from None
+    if len(decoded) != expected_bytes or base64.b64encode(decoded).decode("ascii") != value:
+        raise DelegationExecutionSignatureError("activation key encoding is invalid")
+    return decoded
+
+
+def _trusted_public_key(anchor: DelegationExecutionTrustAnchorV1) -> bytes:
+    key = _canonical_base64(anchor.signer_public_key_base64, expected_bytes=32)
+    if not hmac.compare_digest(sha256(key).hexdigest(), anchor.signer_key_fingerprint_sha256):
+        raise DelegationExecutionSignatureError("activation trust-anchor fingerprint is invalid")
+    return key
+
+
+def _require_utc(value: object) -> datetime:
+    if (
+        type(value) is not datetime
+        or value.tzinfo is None
+        or value.utcoffset() != UTC.utcoffset(value)
+    ):
+        raise DelegationExecutionError("activation timestamp must be exact UTC")
+    return value
+
+
+def _validate_claim(
+    claim: DelegatedGrantClaim,
+) -> tuple[DelegatedRequest, VerifiedGrantFacts, DelegationOverlay]:
+    if type(claim) is not DelegatedGrantClaim:
+        raise DelegationExecutionError("delegation claim has an invalid type")
+    request = _strict_model(claim.request, DelegatedRequest, _REQUEST_FIELDS)
+    grant = _strict_model(claim.grant, VerifiedGrantFacts, _GRANT_FIELDS)
+    policy = _strict_model(claim.policy, DelegationOverlay, _POLICY_FIELDS)
+    if (
+        request.run_id != grant.correlation_id
+        or request.request_sha256 != grant.request_sha256
+        or request.artifact_sha256 != grant.artifact_sha256
+        or request.rendered_contract_sha256 != grant.rendered_contract_sha256
+        or request.tenant_id != grant.tenant_id
+        or request.backend_id != grant.backend_id
+        or request.model_id != grant.model_id
+        or request.expected_output_topic != grant.expected_output_topic
+        or request.expected_output_event_class != grant.expected_output_event_class
+        or request.expected_output_event_index != grant.expected_output_event_index
+        or policy.execute_enabled is not False
+        or policy.route_ref != request.route_ref
+        or policy.model_ref != request.model_id
+    ):
+        raise DelegationExecutionError("delegation claim is not coherent")
+    _require_utc(grant.not_before)
+    _require_utc(grant.expires_at)
+    return request, grant, policy
+
+
+type TrustedClock = Callable[[], datetime]
+
+
+def verify_delegation_execution_overlay(
+    raw: bytes,
+    *,
+    claim: DelegatedGrantClaim,
+    trust_anchor: DelegationExecutionTrustAnchorV1,
+    trusted_clock: TrustedClock,
+) -> DelegationExecutionOverlayV1:
+    """Verify one signed activation against an exact disabled-policy claim."""
+
+    activation = parse_delegation_execution_overlay(raw)
+    anchor = _strict_anchor(trust_anchor)
+    request, grant, _policy = _validate_claim(claim)
+    try:
+        now = _require_utc(trusted_clock())
+    except DelegationExecutionError:
+        raise
+    except Exception as error:
+        raise DelegationExecutionError("trusted activation clock failed") from error
+    if (
+        activation.authorization_digest != grant.authorization_digest
+        or activation.request_envelope_sha256 != request.request_sha256
+        or activation.backend_id != request.backend_id
+        or activation.backend_id != grant.backend_id
+        or activation.model_id != request.model_id
+        or activation.model_id != grant.model_id
+        or activation.route_ref != request.route_ref
+        or activation.disabled_overlay_sha256 != canonical_disabled_delegation_overlay_sha256()
+        or activation.activation_id != grant.activation_id
+        or activation.issued_at < grant.not_before
+        or activation.expires_at > grant.expires_at
+        or activation.issued_at > now
+        or activation.expires_at <= now
+        or activation.expires_at <= activation.issued_at
+        or activation.expires_at - activation.issued_at > _MAX_ACTIVATION_LIFETIME
+        or activation.signer_key_id != anchor.signer_key_id
+        or activation.signer_key_fingerprint_sha256 != anchor.signer_key_fingerprint_sha256
+    ):
+        raise DelegationExecutionError("activation does not match its authority")
+    try:
+        signature = _canonical_base64(activation.signature_base64, expected_bytes=64)
+        Ed25519PublicKey.from_public_bytes(_trusted_public_key(anchor)).verify(
+            signature, delegation_execution_overlay_message(activation)
+        )
+    except (InvalidSignature, ValueError, TypeError, DelegationExecutionError):
+        raise DelegationExecutionSignatureError("activation signature is invalid") from None
+    return activation
+
+
+__all__ = [
+    "DelegationExecutionError",
+    "DelegationExecutionOverlayV1",
+    "DelegationExecutionParseError",
+    "DelegationExecutionSignatureError",
+    "DelegationExecutionTrustAnchorV1",
+    "canonical_delegation_execution_overlay_json_bytes",
+    "canonical_delegation_execution_overlay_yaml_bytes",
+    "canonical_disabled_delegation_overlay_sha256",
+    "delegation_execution_activation_sha256",
+    "delegation_execution_overlay_message",
+    "parse_delegation_execution_overlay",
+    "verify_delegation_execution_overlay",
+]

@@ -91,8 +91,10 @@ PUBLIC_GRANT_RESOURCES: Final[frozenset[str]] = frozenset(
 DELEGATED_REQUEST_SAFE_SLICE_FILES: Final[frozenset[tuple[str, ...]]] = frozenset(
     {
         ("src", "omninode_rsd", "delegation.py"),
+        ("src", "omninode_rsd", "delegation_execution.py"),
         ("src", "omninode_rsd", "delegation-overlay.yaml"),
         ("tests", "test_delegation.py"),
+        ("tests", "test_delegation_execution.py"),
     }
 )
 VALIDATOR_PATH: Final[Path] = Path("scripts/ci/validate_public_release.py")
