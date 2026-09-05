@@ -2,10 +2,12 @@
 
 from omninode_rsd.delegation import DelegatedRequest, DelegatedRequestIngress, VerifiedGrantFacts
 from omninode_rsd.delegation_execution import (
+    DelegationExecutionAuthorityProjectionV1,
     DelegationExecutionOverlayV1,
     DelegationExecutionTrustAnchorV1,
     DelegationRouteAuthorityTrustAnchorV1,
     DelegationRouteAuthorityV1,
+    verify_delegation_execution_authority,
     verify_delegation_execution_overlay,
 )
 from omninode_rsd.lifecycle import LifecycleEvent, LifecycleEventType, LifecycleState
@@ -13,6 +15,7 @@ from omninode_rsd.lifecycle import LifecycleEvent, LifecycleEventType, Lifecycle
 __all__ = [
     "DelegatedRequest",
     "DelegatedRequestIngress",
+    "DelegationExecutionAuthorityProjectionV1",
     "DelegationExecutionOverlayV1",
     "DelegationExecutionTrustAnchorV1",
     "DelegationRouteAuthorityTrustAnchorV1",
@@ -21,5 +24,6 @@ __all__ = [
     "LifecycleEventType",
     "LifecycleState",
     "VerifiedGrantFacts",
+    "verify_delegation_execution_authority",
     "verify_delegation_execution_overlay",
 ]

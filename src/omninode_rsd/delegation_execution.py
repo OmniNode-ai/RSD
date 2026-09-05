@@ -28,6 +28,7 @@ from omninode_rsd.delegation import (
     DelegatedRequest,
     DelegationOverlay,
     VerifiedGrantFacts,
+    delegation_claim_binding_sha256,
     load_canonical_delegation_overlay,
 )
 from omninode_rsd.lifecycle.hashing import canonical_json
@@ -48,6 +49,7 @@ _MAX_ACTIVATION_LIFETIME: Final = timedelta(minutes=5)
 _ACTIVATION_ID_DOMAIN: Final = b"omninode-rsd.delegation-execution-activation-id.v2\x00"
 _SIGNATURE_DOMAIN: Final = b"omninode-rsd.delegation-execution-overlay.ed25519.v2\x00"
 _ROUTE_AUTHORITY_SIGNATURE_DOMAIN: Final = b"omninode-rsd.delegation-route-authority.ed25519.v1\x00"
+_REFERENCE_DIGEST_DOMAIN: Final = b"omninode-rsd.logical-reference.sha256.v1\x00"
 
 
 def _require_reference(value: object, *, namespace: str) -> None:
@@ -186,6 +188,7 @@ class DelegationRouteAuthorityV1(_Model):
     endpoint_ref: str = Field(pattern=_ENDPOINT_REFERENCE)
     credential_ref: str = Field(pattern=_CREDENTIAL_REFERENCE)
     route_policy_digest: str = Field(pattern=_SHA256)
+    target_configuration_sha256: str = Field(pattern=_SHA256)
     credential_provider_id: str = Field(pattern=_IDENTIFIER)
     credential_provider_fingerprint_sha256: str = Field(pattern=_SHA256)
     signer_key_id: str = Field(pattern=_IDENTIFIER)
@@ -200,9 +203,64 @@ class DelegationRouteAuthorityV1(_Model):
         return self
 
 
+class DelegationExecutionAuthorityProjectionV1(_Model):
+    """Redacted facts projected by raw verification for durable downstream use.
+
+    This immutable value is evidence, not an execution capability.  It carries
+    no endpoint, credential, signature, public-key, or transport material; an
+    adapter or orchestrator must still verify the original signed bytes before
+    performing any side effect.
+    """
+
+    schema_version: Literal["rsd.delegation-execution-authority-projection.v1"]
+    execute_enabled: Literal[True]
+    activation_id: UUID
+    activation_schema_version: Literal["rsd.delegation-execution-activation.v2"]
+    activation_version: Literal[1]
+    activation_sha256: str = Field(pattern=_SHA256)
+    issued_at: datetime
+    expires_at: datetime
+    authorization_digest: str = Field(pattern=_SHA256)
+    claim_binding_sha256: str = Field(pattern=_SHA256)
+    request_envelope_sha256: str = Field(pattern=_SHA256)
+    disabled_overlay_sha256: str = Field(pattern=_SHA256)
+    backend_id: str = Field(pattern=_IDENTIFIER)
+    model_id: str = Field(pattern=_MODEL_IDENTIFIER)
+    route_ref: str = Field(pattern=_ROUTE_REFERENCE)
+    route_authority_sha256: str = Field(pattern=_SHA256)
+    route_policy_digest: str = Field(pattern=_SHA256)
+    target_configuration_sha256: str = Field(pattern=_SHA256)
+    endpoint_ref_sha256: str = Field(pattern=_SHA256)
+    credential_ref_sha256: str = Field(pattern=_SHA256)
+    activation_trust_anchor_fingerprint_sha256: str = Field(pattern=_SHA256)
+    route_authority_trust_anchor_fingerprint_sha256: str = Field(pattern=_SHA256)
+    credential_provider_id: str = Field(pattern=_IDENTIFIER)
+    credential_provider_fingerprint_sha256: str = Field(pattern=_SHA256)
+
+    @model_validator(mode="after")
+    def timestamps_are_exact_utc(
+        self,
+    ) -> DelegationExecutionAuthorityProjectionV1:
+        if self.issued_at.tzinfo is not UTC or self.expires_at.tzinfo is not UTC:
+            raise ValueError("authority projection timestamps must be exact UTC")
+        return self
+
+
+def delegation_logical_reference_sha256(
+    value: str, *, namespace: Literal["endpoint", "credential"]
+) -> str:
+    """Hash one canonical logical reference without exposing its spelling downstream."""
+
+    _require_reference(value, namespace=namespace)
+    return sha256(
+        _REFERENCE_DIGEST_DOMAIN + canonical_json({"namespace": namespace, "reference": value})
+    ).hexdigest()
+
+
 _ACTIVATION_FIELDS = frozenset(DelegationExecutionOverlayV1.model_fields)
 _ANCHOR_FIELDS = frozenset(DelegationExecutionTrustAnchorV1.model_fields)
 _ROUTE_AUTHORITY_FIELDS = frozenset(DelegationRouteAuthorityV1.model_fields)
+_PROJECTION_FIELDS = frozenset(DelegationExecutionAuthorityProjectionV1.model_fields)
 _ROUTE_ANCHOR_FIELDS = frozenset(DelegationRouteAuthorityTrustAnchorV1.model_fields)
 _REQUEST_FIELDS = frozenset(DelegatedRequest.model_fields)
 _GRANT_FIELDS = frozenset(VerifiedGrantFacts.model_fields)
@@ -255,6 +313,22 @@ def _strict_anchor(value: object) -> DelegationExecutionTrustAnchorV1:
 
 def _strict_route_authority(value: object) -> DelegationRouteAuthorityV1:
     return _strict_model(value, DelegationRouteAuthorityV1, _ROUTE_AUTHORITY_FIELDS)
+
+
+def _strict_projection(value: object) -> DelegationExecutionAuthorityProjectionV1:
+    if type(value) is not DelegationExecutionAuthorityProjectionV1:
+        raise DelegationExecutionParseError("authority projection has an invalid type")
+    values = strict_model_values(
+        value,
+        expected_type=DelegationExecutionAuthorityProjectionV1,
+        field_names=_PROJECTION_FIELDS,
+    )
+    if values is None:
+        raise DelegationExecutionParseError("authority projection has an invalid shape")
+    try:
+        return DelegationExecutionAuthorityProjectionV1.model_validate(values)
+    except ValidationError as error:
+        raise DelegationExecutionParseError("authority projection is invalid") from error
 
 
 def _strict_route_anchor(value: object) -> DelegationRouteAuthorityTrustAnchorV1:
@@ -389,6 +463,18 @@ def canonical_delegation_route_authority_yaml_bytes(
         raise DelegationRouteAuthorityParseError("route authority cannot be serialized") from error
     if len(raw) > _MAX_INPUT_BYTES:
         raise DelegationRouteAuthorityParseError("route authority exceeds the input bound")
+    return raw
+
+
+def canonical_delegation_execution_authority_projection_json_bytes(
+    projection: DelegationExecutionAuthorityProjectionV1,
+) -> bytes:
+    """Serialize redacted verified authority facts deterministically."""
+
+    checked = _strict_projection(projection)
+    raw = _canonical_json_bytes(checked)
+    if len(raw) > _MAX_INPUT_BYTES:
+        raise DelegationExecutionParseError("authority projection exceeds the input bound")
     return raw
 
 
@@ -652,7 +738,77 @@ def verify_delegation_execution_overlay(
     return activation
 
 
+def verify_delegation_execution_authority(
+    raw: bytes,
+    *,
+    claim: DelegatedGrantClaim,
+    trust_anchor: DelegationExecutionTrustAnchorV1,
+    route_authority: bytes,
+    route_authority_trust_anchor: DelegationRouteAuthorityTrustAnchorV1,
+    trusted_clock: TrustedClock,
+) -> DelegationExecutionAuthorityProjectionV1:
+    """Verify raw authorities, then return only redacted durable identity facts.
+
+    The projection is deliberately derived after the complete raw verification
+    path.  It is a value object for ledgers and orchestration, never a bearer
+    capability; callers must not substitute it for raw verification.
+    """
+
+    activation = verify_delegation_execution_overlay(
+        raw,
+        claim=claim,
+        trust_anchor=trust_anchor,
+        route_authority=route_authority,
+        route_authority_trust_anchor=route_authority_trust_anchor,
+        trusted_clock=trusted_clock,
+    )
+    authority = verify_delegation_route_authority(
+        route_authority,
+        trust_anchor=route_authority_trust_anchor,
+    )
+    request, grant, policy = _validate_claim(claim)
+    activation_anchor = _strict_anchor(trust_anchor)
+    route_anchor = _strict_route_anchor(route_authority_trust_anchor)
+    return DelegationExecutionAuthorityProjectionV1(
+        schema_version="rsd.delegation-execution-authority-projection.v1",
+        execute_enabled=True,
+        activation_id=activation.activation_id,
+        activation_schema_version=activation.activation_schema_version,
+        activation_version=activation.activation_version,
+        activation_sha256=activation.activation_sha256,
+        issued_at=activation.issued_at,
+        expires_at=activation.expires_at,
+        authorization_digest=grant.authorization_digest,
+        claim_binding_sha256=delegation_claim_binding_sha256(
+            request=request,
+            grant=grant,
+            policy=policy,
+        ),
+        request_envelope_sha256=activation.request_envelope_sha256,
+        disabled_overlay_sha256=activation.disabled_overlay_sha256,
+        backend_id=activation.backend_id,
+        model_id=activation.model_id,
+        route_ref=activation.route_ref,
+        route_authority_sha256=activation.route_authority_sha256,
+        route_policy_digest=authority.route_policy_digest,
+        target_configuration_sha256=authority.target_configuration_sha256,
+        endpoint_ref_sha256=delegation_logical_reference_sha256(
+            authority.endpoint_ref,
+            namespace="endpoint",
+        ),
+        credential_ref_sha256=delegation_logical_reference_sha256(
+            authority.credential_ref,
+            namespace="credential",
+        ),
+        activation_trust_anchor_fingerprint_sha256=activation_anchor.signer_key_fingerprint_sha256,
+        route_authority_trust_anchor_fingerprint_sha256=route_anchor.signer_key_fingerprint_sha256,
+        credential_provider_id=authority.credential_provider_id,
+        credential_provider_fingerprint_sha256=authority.credential_provider_fingerprint_sha256,
+    )
+
+
 __all__ = [
+    "DelegationExecutionAuthorityProjectionV1",
     "DelegationExecutionError",
     "DelegationExecutionOverlayV1",
     "DelegationExecutionParseError",
@@ -662,6 +818,7 @@ __all__ = [
     "DelegationRouteAuthoritySignatureError",
     "DelegationRouteAuthorityTrustAnchorV1",
     "DelegationRouteAuthorityV1",
+    "canonical_delegation_execution_authority_projection_json_bytes",
     "canonical_delegation_execution_overlay_json_bytes",
     "canonical_delegation_execution_overlay_yaml_bytes",
     "canonical_delegation_route_authority_json_bytes",
@@ -669,10 +826,12 @@ __all__ = [
     "canonical_disabled_delegation_overlay_sha256",
     "delegation_execution_activation_sha256",
     "delegation_execution_overlay_message",
+    "delegation_logical_reference_sha256",
     "delegation_route_authority_message",
     "delegation_route_authority_sha256",
     "parse_delegation_execution_overlay",
     "parse_delegation_route_authority",
+    "verify_delegation_execution_authority",
     "verify_delegation_execution_overlay",
     "verify_delegation_route_authority",
 ]

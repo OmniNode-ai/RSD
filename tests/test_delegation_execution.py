@@ -21,9 +21,11 @@ from omninode_rsd.delegation import (
     DelegationSubmissionState,
     PublicGrantVerifierAdapter,
     VerifiedGrantFacts,
+    delegation_claim_binding_sha256,
     load_canonical_delegation_overlay,
 )
 from omninode_rsd.delegation_execution import (
+    DelegationExecutionAuthorityProjectionV1,
     DelegationExecutionError,
     DelegationExecutionOverlayV1,
     DelegationExecutionParseError,
@@ -33,16 +35,19 @@ from omninode_rsd.delegation_execution import (
     DelegationRouteAuthoritySignatureError,
     DelegationRouteAuthorityTrustAnchorV1,
     DelegationRouteAuthorityV1,
+    canonical_delegation_execution_authority_projection_json_bytes,
     canonical_delegation_execution_overlay_json_bytes,
     canonical_delegation_execution_overlay_yaml_bytes,
     canonical_delegation_route_authority_json_bytes,
     canonical_disabled_delegation_overlay_sha256,
     delegation_execution_activation_sha256,
     delegation_execution_overlay_message,
+    delegation_logical_reference_sha256,
     delegation_route_authority_message,
     delegation_route_authority_sha256,
     parse_delegation_execution_overlay,
     parse_delegation_route_authority,
+    verify_delegation_execution_authority,
     verify_delegation_execution_overlay,
     verify_delegation_route_authority,
 )
@@ -124,6 +129,7 @@ def _unsigned_route_authority(
     endpoint_ref: str = "logical://endpoint/provider-alpha",
     credential_ref: str = "logical://credential/provider-alpha-v1",
     route_policy_digest: str = "5" * 64,
+    target_configuration_sha256: str = "7" * 64,
     credential_provider_id: str = "provider-alpha",
     credential_provider_fingerprint_sha256: str = "6" * 64,
     activation_sha256: str | None = None,
@@ -146,6 +152,7 @@ def _unsigned_route_authority(
         endpoint_ref=endpoint_ref,
         credential_ref=credential_ref,
         route_policy_digest=route_policy_digest,
+        target_configuration_sha256=target_configuration_sha256,
         credential_provider_id=credential_provider_id,
         credential_provider_fingerprint_sha256=credential_provider_fingerprint_sha256,
         signer_key_id="route-authority",
@@ -192,6 +199,7 @@ def _signed_pair(
     endpoint_ref = str(target.get("endpoint_ref", "logical://endpoint/provider-alpha"))
     credential_ref = str(target.get("credential_ref", "logical://credential/provider-alpha-v1"))
     route_policy_digest = str(target.get("route_policy_digest", "5" * 64))
+    target_configuration_sha256 = str(target.get("target_configuration_sha256", "7" * 64))
     credential_provider_id = str(target.get("credential_provider_id", "provider-alpha"))
     credential_provider_fingerprint_sha256 = str(
         target.get("credential_provider_fingerprint_sha256", "6" * 64)
@@ -204,6 +212,7 @@ def _signed_pair(
         endpoint_ref=endpoint_ref,
         credential_ref=credential_ref,
         route_policy_digest=route_policy_digest,
+        target_configuration_sha256=target_configuration_sha256,
         credential_provider_id=credential_provider_id,
         credential_provider_fingerprint_sha256=credential_provider_fingerprint_sha256,
     ).model_copy(
@@ -365,6 +374,112 @@ def test_independent_route_authority_allows_only_its_resigned_target() -> None:
     assert result.credential_ref == "logical://credential/provider-beta-v2"
     assert authority.route_policy_digest == "7" * 64
     assert authority.credential_provider_id == "provider-beta"
+
+
+def test_resigned_route_authority_target_configuration_cannot_redirect_activation() -> None:
+    claim = _claim()
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    activation, _authority = _signed_pair(claim, activation_key, route_key)
+    redirected_authority = _signed_route_authority(
+        claim,
+        activation,
+        route_key,
+        target_configuration_sha256="8" * 64,
+    )
+
+    assert (
+        verify_delegation_route_authority(
+            canonical_delegation_route_authority_json_bytes(redirected_authority),
+            trust_anchor=_route_anchor(route_key),
+        )
+        == redirected_authority
+    )
+    with pytest.raises(DelegationExecutionError):
+        _verified(
+            canonical_delegation_execution_overlay_json_bytes(activation),
+            claim,
+            _anchor(activation_key),
+            route_authority=redirected_authority,
+            route_anchor=_route_anchor(route_key),
+        )
+
+
+def test_verified_authority_projection_is_redacted_exact_and_deterministic() -> None:
+    claim = _claim()
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    activation, authority = _signed_pair(claim, activation_key, route_key)
+    raw_activation = canonical_delegation_execution_overlay_json_bytes(activation)
+    raw_authority = canonical_delegation_route_authority_json_bytes(authority)
+    projection = verify_delegation_execution_authority(
+        raw_activation,
+        claim=claim,
+        trust_anchor=_anchor(activation_key),
+        route_authority=raw_authority,
+        route_authority_trust_anchor=_route_anchor(route_key),
+        trusted_clock=lambda: _NOW,
+    )
+
+    assert type(projection) is DelegationExecutionAuthorityProjectionV1
+    assert projection.activation_id == activation.activation_id
+    assert projection.activation_sha256 == activation.activation_sha256
+    assert projection.claim_binding_sha256 == delegation_claim_binding_sha256(
+        request=claim.request,
+        grant=claim.grant,
+        policy=claim.policy,
+    )
+    assert projection.route_authority_sha256 == delegation_route_authority_sha256(authority)
+    assert projection.target_configuration_sha256 == authority.target_configuration_sha256
+    assert projection.endpoint_ref_sha256 == delegation_logical_reference_sha256(
+        authority.endpoint_ref,
+        namespace="endpoint",
+    )
+    assert projection.credential_ref_sha256 == delegation_logical_reference_sha256(
+        authority.credential_ref,
+        namespace="credential",
+    )
+    assert (
+        projection.activation_trust_anchor_fingerprint_sha256
+        == _anchor(activation_key).signer_key_fingerprint_sha256
+    )
+    assert (
+        projection.route_authority_trust_anchor_fingerprint_sha256
+        == _route_anchor(route_key).signer_key_fingerprint_sha256
+    )
+    assert (
+        b"logical://endpoint/"
+        not in canonical_delegation_execution_authority_projection_json_bytes(projection)
+    )
+    assert set(DelegationExecutionAuthorityProjectionV1.model_fields) == {
+        "schema_version",
+        "execute_enabled",
+        "activation_id",
+        "activation_schema_version",
+        "activation_version",
+        "activation_sha256",
+        "issued_at",
+        "expires_at",
+        "authorization_digest",
+        "claim_binding_sha256",
+        "request_envelope_sha256",
+        "disabled_overlay_sha256",
+        "backend_id",
+        "model_id",
+        "route_ref",
+        "route_authority_sha256",
+        "route_policy_digest",
+        "target_configuration_sha256",
+        "endpoint_ref_sha256",
+        "credential_ref_sha256",
+        "activation_trust_anchor_fingerprint_sha256",
+        "route_authority_trust_anchor_fingerprint_sha256",
+        "credential_provider_id",
+        "credential_provider_fingerprint_sha256",
+    }
+    assert canonical_delegation_execution_authority_projection_json_bytes(
+        projection
+    ) == canonical_delegation_execution_authority_projection_json_bytes(projection)
 
 
 def test_same_trust_key_is_rejected_after_valid_independent_signatures() -> None:
