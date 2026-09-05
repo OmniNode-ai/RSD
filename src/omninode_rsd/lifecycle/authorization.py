@@ -5045,12 +5045,76 @@ class _JournalGenesisMarker:
     created_at: str
 
 
+class _AuthorizationJournalDiagnosticObserver(Protocol):
+    """Test-only observer for redacted SQLite journal ordering evidence.
+
+    The journal never supplies a path, SQLite exception text, operation input,
+    or durable-record content.  Callers that opt in are responsible for
+    assigning opaque process and journal labels in their test harness.
+    """
+
+    def record(
+        self,
+        *,
+        phase: str,
+        connection_ordinal: int | None,
+        transaction_ordinal: int | None,
+        result: str | None,
+        companions: tuple[tuple[str, str], ...],
+    ) -> None: ...
+
+
 class SQLiteAuthorizationJournal:
     """Owner-only SQLite store for one-shot operation state transitions."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        diagnostic_observer: _AuthorizationJournalDiagnosticObserver | None = None,
+    ) -> None:
         self._requested_path = path
         self._path = Path(os.path.realpath(path))
+        self._diagnostic_observer = diagnostic_observer
+        self._diagnostic_lock = Lock()
+        self._next_connection_ordinal = 0
+        self._next_transaction_ordinal = 0
+
+    def _diagnostic_event(
+        self,
+        phase: str,
+        *,
+        connection_ordinal: int | None = None,
+        transaction_ordinal: int | None = None,
+        result: str | None = None,
+        companions: tuple[tuple[str, str], ...] = (),
+    ) -> None:
+        """Emit a deliberately redacted, observer-only diagnostic event."""
+
+        observer = self._diagnostic_observer
+        if observer is None:
+            return
+        observer.record(
+            phase=phase,
+            connection_ordinal=connection_ordinal,
+            transaction_ordinal=transaction_ordinal,
+            result=result,
+            companions=companions,
+        )
+
+    def _next_diagnostic_connection_ordinal(self) -> int | None:
+        if self._diagnostic_observer is None:
+            return None
+        with self._diagnostic_lock:
+            self._next_connection_ordinal += 1
+            return self._next_connection_ordinal
+
+    def _next_diagnostic_transaction_ordinal(self) -> int | None:
+        if self._diagnostic_observer is None:
+            return None
+        with self._diagnostic_lock:
+            self._next_transaction_ordinal += 1
+            return self._next_transaction_ordinal
 
     def _validate_path(self) -> None:
         requested = self._requested_path
@@ -5262,6 +5326,36 @@ class SQLiteAuthorizationJournal:
             raise AuthorizationError(phase) from None
         return cls._validate_owner_file_details(details, phase)
 
+    @staticmethod
+    def _diagnostic_companion_snapshot_category(
+        details: os.stat_result,
+    ) -> Literal[
+        "symlink",
+        "nonregular",
+        "uid_mismatch",
+        "mode_mismatch",
+        "nlink_mismatch",
+        "regular",
+    ]:
+        """Return the one-snapshot, redacted diagnostic category for a companion.
+
+        This is observer-only instrumentation.  The caller retains the existing
+        two-observation companion boundary and never performs another lstat while
+        selecting a category.
+        """
+
+        if stat.S_ISLNK(details.st_mode):
+            return "symlink"
+        if not stat.S_ISREG(details.st_mode):
+            return "nonregular"
+        if details.st_uid != os.getuid():
+            return "uid_mismatch"
+        if stat.S_IMODE(details.st_mode) != 0o600:
+            return "mode_mismatch"
+        if details.st_nlink != 1:
+            return "nlink_mismatch"
+        return "regular"
+
     def _create_database_file(self) -> tuple[int, int, int]:
         flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -5284,15 +5378,57 @@ class SQLiteAuthorizationJournal:
                 os.close(descriptor)
 
     def _validate_companions(self) -> None:
+        observer = self._diagnostic_observer
+        companions: list[tuple[str, str]] | None = [] if observer is not None else None
         for suffix in ("-journal", "-wal", "-shm"):
             candidate = self._path.with_name(f"{self._path.name}{suffix}")
             try:
                 os.lstat(candidate)
             except FileNotFoundError:
+                if companions is not None:
+                    companions.append((suffix, "missing"))
                 continue
             except OSError:
+                self._diagnostic_event(
+                    "companions_failed",
+                    result="lstat_error",
+                    companions=((suffix, "lstat_error"),),
+                )
                 raise AuthorizationError("journal_path") from None
-            self._owner_file_details(candidate, "journal_path")
+
+            if observer is None:
+                self._owner_file_details(candidate, "journal_path")
+                continue
+            assert companions is not None
+
+            try:
+                details = os.lstat(candidate)
+            except FileNotFoundError:
+                self._diagnostic_event(
+                    "companions_failed",
+                    result="missing",
+                    companions=((suffix, "missing"),),
+                )
+                raise AuthorizationError("journal_path") from None
+            except OSError:
+                self._diagnostic_event(
+                    "companions_failed",
+                    result="lstat_error",
+                    companions=((suffix, "lstat_error"),),
+                )
+                raise AuthorizationError("journal_path") from None
+
+            category = self._diagnostic_companion_snapshot_category(details)
+            if category != "regular":
+                self._diagnostic_event(
+                    "companions_failed",
+                    result=category,
+                    companions=((suffix, category),),
+                )
+                raise AuthorizationError("journal_path")
+            companions.append((suffix, category))
+        if companions is not None:
+            self._diagnostic_event("companions_checked", companions=tuple(companions))
 
     @staticmethod
     def _marker_bytes(marker: _JournalGenesisMarker) -> bytes:
@@ -5901,7 +6037,43 @@ class SQLiteAuthorizationJournal:
         finally:
             connection.close()
 
+    @staticmethod
+    def _diagnostic_identity_result(
+        phase: str,
+    ) -> Literal["database_stat", "anchor", "metadata", "schema", "durability_mismatch"]:
+        if phase in {
+            "journal_anchor",
+            "journal_anchor_missing",
+            "journal_genesis_marker",
+            "journal_genesis_missing",
+            "provisioning_incomplete",
+        }:
+            return "anchor"
+        if phase in {"journal_schema", "journal_legacy_detected"}:
+            return "schema"
+        if phase == "journal_durability":
+            return "durability_mismatch"
+        if phase in {
+            "journal_absent",
+            "journal_directory",
+            "journal_identity_mismatch",
+            "journal_missing",
+            "journal_path",
+        }:
+            return "database_stat"
+        return "metadata"
+
     def _established_identity(self) -> _JournalIdentity:
+        self._diagnostic_event("identity_started")
+        try:
+            return self._established_identity_checked()
+        except AuthorizationError as error:
+            self._diagnostic_event(
+                "identity_failed", result=self._diagnostic_identity_result(error.phase)
+            )
+            raise
+
+    def _established_identity_checked(self) -> _JournalIdentity:
         self._validate_path()
         with self._identity_lease() as lease:
             lease.assert_stable()
@@ -5933,6 +6105,7 @@ class SQLiteAuthorizationJournal:
                 identity = self._read_anchor()
                 self._validate_identity(connection, identity)
                 lease.assert_stable()
+                self._diagnostic_event("identity_validated")
                 return identity
             finally:
                 connection.close()
@@ -6068,6 +6241,8 @@ class SQLiteAuthorizationJournal:
             return JournalMigrationStatus.CURRENT
 
     def _connect(self) -> tuple[sqlite3.Connection, _JournalIdentity]:
+        connection_ordinal = self._next_diagnostic_connection_ordinal()
+        self._diagnostic_event("connection_started", connection_ordinal=connection_ordinal)
         identity = self._established_identity()
         self._validate_companions()
         try:
@@ -6075,6 +6250,9 @@ class SQLiteAuthorizationJournal:
                 f"{self._path.as_uri()}?mode=rw", uri=True, isolation_level=None, timeout=5.0
             )
         except sqlite3.Error:
+            self._diagnostic_event(
+                "connection_failed", connection_ordinal=connection_ordinal, result="journal_open"
+            )
             raise AuthorizationError("journal_open") from None
         try:
             connection.execute("PRAGMA trusted_schema = OFF")
@@ -6084,12 +6262,19 @@ class SQLiteAuthorizationJournal:
                 raise AuthorizationError("journal_durability")
             connection.execute("PRAGMA synchronous = FULL")
             self._validate_identity(connection, identity)
+            self._diagnostic_event("connection_ready", connection_ordinal=connection_ordinal)
             return connection, identity
         except AuthorizationError:
             connection.close()
+            self._diagnostic_event(
+                "connection_failed", connection_ordinal=connection_ordinal, result="authorization"
+            )
             raise
         except sqlite3.Error:
             connection.close()
+            self._diagnostic_event(
+                "connection_failed", connection_ordinal=connection_ordinal, result="journal_open"
+            )
             raise AuthorizationError("journal_open") from None
 
     @staticmethod
@@ -6170,23 +6355,50 @@ class SQLiteAuthorizationJournal:
 
     def _transaction(self, action: Callable[[sqlite3.Connection], str | None]) -> str | None:
         connection, identity = self._connect()
+        transaction_ordinal = self._next_diagnostic_transaction_ordinal()
         try:
+            self._diagnostic_event(
+                "transaction_begin_enter", transaction_ordinal=transaction_ordinal
+            )
             connection.execute("BEGIN IMMEDIATE")
+            self._diagnostic_event(
+                "transaction_begin_return", transaction_ordinal=transaction_ordinal
+            )
             self._validate_identity(connection, identity)
+            self._diagnostic_event(
+                "transaction_action_enter", transaction_ordinal=transaction_ordinal
+            )
             result = action(connection)
+            self._diagnostic_event(
+                "transaction_action_return", transaction_ordinal=transaction_ordinal
+            )
             connection.execute("COMMIT")
+            self._diagnostic_event(
+                "transaction_commit", transaction_ordinal=transaction_ordinal, result="committed"
+            )
             self._validate_identity(connection, identity)
             return result
         except AuthorizationError:
             with suppress(sqlite3.Error):
                 connection.execute("ROLLBACK")
+            self._diagnostic_event(
+                "transaction_rollback",
+                transaction_ordinal=transaction_ordinal,
+                result="authorization",
+            )
             raise
         except sqlite3.Error:
             with suppress(sqlite3.Error):
                 connection.execute("ROLLBACK")
+            self._diagnostic_event(
+                "transaction_rollback",
+                transaction_ordinal=transaction_ordinal,
+                result="journal_transaction",
+            )
             raise AuthorizationError("journal_transaction") from None
         finally:
             connection.close()
+            self._diagnostic_event("connection_closed")
 
     @staticmethod
     def _require_verified(verified: _VerifiedExecution) -> None:
@@ -6212,23 +6424,29 @@ class SQLiteAuthorizationJournal:
         return _OperationLease(self, operation_id, nonblocking=nonblocking)
 
     def _claim_verified(self, verified: _VerifiedExecution) -> None:
+        self._diagnostic_event("claim_started")
         self._require_verified(verified)
         proposal_sha256, contract_sha256, provider_sha256, idempotency_key = self._bindings(
             verified
         )
 
         def claim(connection: sqlite3.Connection) -> None:
+            self._diagnostic_event("claim_operation_read")
             existing = connection.execute(
                 f"SELECT state FROM {_OPERATION_TABLE} WHERE operation_id = ?",
                 (verified.context.operation_id,),
             ).fetchone()
             if existing is not None:
+                self._diagnostic_event("claim_rejected", result="operation_replayed")
                 raise AuthorizationError("operation_replayed")
+            self._diagnostic_event("claim_nonce_read")
             nonce = connection.execute(
                 f"SELECT operation_id FROM {_OPERATION_TABLE} WHERE nonce = ?", (verified.nonce,)
             ).fetchone()
             if nonce is not None:
+                self._diagnostic_event("claim_rejected", result="nonce_replayed")
                 raise AuthorizationError("nonce_replayed")
+            self._diagnostic_event("claim_insert_enter")
             connection.execute(
                 f"""
                 INSERT INTO {_OPERATION_TABLE} (
@@ -6250,9 +6468,11 @@ class SQLiteAuthorizationJournal:
                     verified.authorized_at,
                 ),
             )
+            self._diagnostic_event("claim_insert_return")
             return None
 
         self._transaction(claim)
+        self._diagnostic_event("claim_completed", result="claimed")
 
     def _begin_effect(self, verified: _VerifiedExecution) -> None:
         self._require_verified(verified)
