@@ -39,6 +39,7 @@ from omninode_rsd.delegation_execution import (
     DelegationRouteAuthorityTrustAnchorV1,
     DelegationRouteAuthorityV1,
     DelegationRouteAuthorityV2,
+    VerifiedDispatchOutcomeV2,
     canonical_delegation_execution_authority_projection_json_bytes,
     canonical_delegation_execution_authority_projection_v2_json_bytes,
     canonical_delegation_execution_overlay_json_bytes,
@@ -1162,6 +1163,9 @@ def test_raw_v2_chain_derives_projection_without_claim_or_projection_inputs(
 
     assert type(projection) is DelegationExecutionAuthorityProjectionV2
     assert projection.schema_version == "rsd.delegation-execution-authority-projection.v2"
+    assert projection.grant_correlation_id == facts.correlation_id == claim.request.run_id
+    assert projection.grant_not_before == facts.not_before
+    assert projection.grant_expires_at == facts.expires_at
     assert projection.outcome_trust_anchor_sha256 == dispatch_outcome_trust_anchor_sha256(
         authority.outcome_trust_anchor
     )
@@ -1171,7 +1175,61 @@ def test_raw_v2_chain_derives_projection_without_claim_or_projection_inputs(
         == authority.outcome_trust_anchor.signer_key_fingerprint_sha256
     )
     projection_bytes = canonical_delegation_execution_authority_projection_v2_json_bytes(projection)
+    assert json.loads(projection_bytes)["grant_correlation_id"] == str(facts.correlation_id)
     assert b"logical://endpoint/" not in projection_bytes
+
+    invalid_lifetime = projection.model_dump(mode="python")
+    invalid_lifetime["grant_not_before"] = projection.issued_at + timedelta(microseconds=1)
+    with pytest.raises(ValidationError, match="lifetime is not within"):
+        DelegationExecutionAuthorityProjectionV2.model_validate(invalid_lifetime)
+
+    non_singleton_utc = timezone(timedelta(0), "UTC")
+    invalid_timezone = projection.model_dump(mode="python")
+    invalid_timezone["grant_not_before"] = projection.grant_not_before.replace(
+        tzinfo=non_singleton_utc
+    )
+    with pytest.raises(ValidationError, match="exact UTC"):
+        DelegationExecutionAuthorityProjectionV2.model_validate(invalid_timezone)
+
+
+def test_raw_v2_chain_rejects_grant_lifetime_divergence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claim = _claim()
+    facts = claim.grant
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    activation, authority = _signed_pair_v2(claim, activation_key, route_key)
+    raw_activation = canonical_delegation_execution_overlay_json_bytes(activation)
+    raw_route_authority = canonical_delegation_route_authority_v2_json_bytes(authority)
+
+    for divergent in (
+        facts.model_copy(update={"not_before": activation.issued_at + timedelta(microseconds=1)}),
+        facts.model_copy(update={"expires_at": activation.expires_at - timedelta(microseconds=1)}),
+    ):
+
+        class _FixedVerifier:
+            def __init__(self, *, trusted_clock: object) -> None:
+                assert callable(trusted_clock)
+
+            def __call__(
+                self,
+                raw_signed_grant: bytes,
+                _facts: VerifiedGrantFacts = divergent,
+            ) -> VerifiedGrantFacts:
+                assert raw_signed_grant == b"raw-signed-grant"
+                return _facts
+
+        monkeypatch.setattr(delegation_execution, "PublicGrantVerifierAdapter", _FixedVerifier)
+        with pytest.raises(DelegationExecutionError):
+            verify_raw_delegation_execution_authority_v2(
+                b"raw-signed-grant",
+                raw_activation,
+                activation_trust_anchor=_anchor(activation_key),
+                raw_route_authority=raw_route_authority,
+                route_authority_trust_anchor=_route_anchor(route_key),
+                trusted_clock=lambda: _NOW,
+            )
 
 
 def test_raw_v2_chain_refuses_fixed_public_grant_that_conflicts_with_packaged_policy() -> None:
@@ -1186,6 +1244,41 @@ def test_raw_v2_chain_refuses_fixed_public_grant_that_conflicts_with_packaged_po
     with pytest.raises(DelegationExecutionError):
         verify_raw_delegation_execution_authority_v2(
             raw_grant,
+            canonical_delegation_execution_overlay_json_bytes(activation),
+            activation_trust_anchor=_anchor(activation_key),
+            raw_route_authority=canonical_delegation_route_authority_v2_json_bytes(authority),
+            route_authority_trust_anchor=_route_anchor(route_key),
+            trusted_clock=lambda: _NOW,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("correlation_id", "40000000-0000-4000-8000-000000000099"),
+        ("not_before", "2030-01-01T00:00:01Z"),
+        ("expires_at", "2030-01-01T00:00:00Z"),
+    ),
+)
+def test_raw_v2_chain_refuses_tampered_signed_grant_identity_or_lifetime(
+    field: str,
+    value: str,
+) -> None:
+    vector = signed_executable_grant_v2_vectors()["base_wire"]
+    assert type(vector) is dict
+    material = vector["authorization_material"]
+    assert type(material) is dict
+    grant = material["grant"]
+    assert type(grant) is dict
+    grant[field] = value
+    claim = _claim()
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    activation, authority = _signed_pair_v2(claim, activation_key, route_key)
+
+    with pytest.raises(DelegationExecutionError):
+        verify_raw_delegation_execution_authority_v2(
+            json.dumps(vector, separators=(",", ":")).encode("utf-8"),
             canonical_delegation_execution_overlay_json_bytes(activation),
             activation_trust_anchor=_anchor(activation_key),
             raw_route_authority=canonical_delegation_route_authority_v2_json_bytes(authority),
@@ -1321,10 +1414,18 @@ def test_raw_v2_outcome_verifier_derives_anchor_and_rejects_bound_fact_divergenc
     )
     assert verified.attestation_sha256 == sha256(raw).hexdigest()
     assert verified.attempt_id == signed.attempt_id
+    assert verified.grant_correlation_id == projection.grant_correlation_id == facts.correlation_id
+    assert verified.grant_not_before == projection.grant_not_before == facts.not_before
+    assert verified.grant_expires_at == projection.grant_expires_at == facts.expires_at
     assert verified.outcome_trust_anchor_sha256 == projection.outcome_trust_anchor_sha256
     assert {"projection", "claim", "outcome_trust_anchor", "execute_enabled"}.isdisjoint(
         inspect.signature(verify_raw_dispatch_outcome_attestation_v2).parameters
     )
+
+    at_grant_expiry = verified.model_dump(mode="python")
+    at_grant_expiry["issued_at"] = verified.grant_expires_at
+    with pytest.raises(ValidationError, match="outside the verified grant"):
+        VerifiedDispatchOutcomeV2.model_validate(at_grant_expiry)
 
     mismatched = signed.model_copy(update={"target_configuration_sha256": "f" * 64})
     mismatched = mismatched.model_copy(
@@ -1449,6 +1550,7 @@ def test_raw_v2_outcome_verifier_derives_anchor_and_rejects_bound_fact_divergenc
 
     for issued_at, trusted_clock in (
         (projection.issued_at - timedelta(microseconds=1), lambda: _NOW),
+        (projection.expires_at, lambda: _NOW),
         (projection.expires_at + timedelta(microseconds=1), lambda: _NOW),
         (_NOW + timedelta(microseconds=1), lambda: _NOW),
     ):

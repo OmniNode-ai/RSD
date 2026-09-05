@@ -34,6 +34,7 @@ from omninode_rsd.delegation import (
 )
 from omninode_rsd.lifecycle.dispatch_attestation import (
     DispatchCompletedOutputPayloadV1,
+    DispatchOutcomeAttestationV2,
     DispatchOutcomeTrustAnchorV1,
     canonical_dispatch_outcome_trust_anchor_bytes,
     dispatch_outcome_attestation_v2_message,
@@ -316,6 +317,12 @@ class DelegationExecutionAuthorityProjectionV2(_Model):
     activation_sha256: str = Field(pattern=_SHA256)
     issued_at: datetime
     expires_at: datetime
+    # This exact signed-grant field is emitted only after raw-chain verification.
+    # It is the durable run identity: the raw verifier derives request.run_id
+    # from it and _validate_claim requires the two to be equal.
+    grant_correlation_id: UUID
+    grant_not_before: datetime
+    grant_expires_at: datetime
     authorization_digest: str = Field(pattern=_SHA256)
     claim_binding_sha256: str = Field(pattern=_SHA256)
     request_envelope_sha256: str = Field(pattern=_SHA256)
@@ -340,8 +347,15 @@ class DelegationExecutionAuthorityProjectionV2(_Model):
     def timestamps_are_exact_utc(
         self,
     ) -> DelegationExecutionAuthorityProjectionV2:
-        if self.issued_at.tzinfo is not UTC or self.expires_at.tzinfo is not UTC:
+        if (
+            self.issued_at.tzinfo is not UTC
+            or self.expires_at.tzinfo is not UTC
+            or self.grant_not_before.tzinfo is not UTC
+            or self.grant_expires_at.tzinfo is not UTC
+        ):
             raise ValueError("authority projection timestamps must be exact UTC")
+        if not (self.grant_not_before <= self.issued_at < self.expires_at <= self.grant_expires_at):
+            raise ValueError("authority projection lifetime is not within the verified grant")
         return self
 
 
@@ -357,6 +371,9 @@ class VerifiedDispatchOutcomeV2(_Model):
     attestation_id: UUID
     attempt_id: UUID
     attestation_sha256: str = Field(pattern=_SHA256)
+    grant_correlation_id: UUID
+    grant_not_before: datetime
+    grant_expires_at: datetime
     authorization_digest: str = Field(pattern=_SHA256)
     claim_binding_sha256: str = Field(pattern=_SHA256)
     request_envelope_sha256: str = Field(pattern=_SHA256)
@@ -374,6 +391,20 @@ class VerifiedDispatchOutcomeV2(_Model):
     output_payload_sha256: str = Field(pattern=_SHA256)
     outcome_status: Literal["completed", "failed"]
     issued_at: datetime
+
+    @model_validator(mode="after")
+    def timestamps_are_exact_utc(
+        self,
+    ) -> VerifiedDispatchOutcomeV2:
+        if (
+            self.issued_at.tzinfo is not UTC
+            or self.grant_not_before.tzinfo is not UTC
+            or self.grant_expires_at.tzinfo is not UTC
+        ):
+            raise ValueError("verified outcome timestamps must be exact UTC")
+        if not self.grant_not_before <= self.issued_at < self.grant_expires_at:
+            raise ValueError("verified outcome timestamp is outside the verified grant")
+        return self
 
 
 def delegation_logical_reference_sha256(
@@ -504,6 +535,19 @@ def _normalize_parsed_activation_utc(
         if value.tzinfo is not UTC and value.utcoffset() == timedelta(0):
             updates[field_name] = value.replace(tzinfo=UTC)
     return activation.model_copy(update=updates) if updates else activation
+
+
+def _normalize_parsed_dispatch_outcome_utc(
+    attestation: DispatchOutcomeAttestationV2,
+) -> DispatchOutcomeAttestationV2:
+    """Normalize the canonical raw parser's zero-offset UTC wrapper once."""
+
+    issued_at = attestation.issued_at
+    if issued_at.tzinfo is UTC:
+        return attestation
+    if issued_at.utcoffset() == timedelta(0) and issued_at.tzname() == "UTC":
+        return attestation.model_copy(update={"issued_at": issued_at.replace(tzinfo=UTC)})
+    raise DelegationExecutionSignatureError("V2 outcome attestation timestamp is invalid")
 
 
 def canonical_delegation_execution_overlay_json_bytes(
@@ -1306,6 +1350,9 @@ def verify_raw_delegation_execution_authority_v2(
         activation_sha256=activation.activation_sha256,
         issued_at=activation.issued_at,
         expires_at=activation.expires_at,
+        grant_correlation_id=grant.correlation_id,
+        grant_not_before=grant.not_before,
+        grant_expires_at=grant.expires_at,
         authorization_digest=grant.authorization_digest,
         claim_binding_sha256=delegation_claim_binding_sha256(
             request=request,
@@ -1385,7 +1432,9 @@ def verify_raw_dispatch_outcome_attestation_v2(
         trust_anchor=route_authority_trust_anchor,
     )
     anchor = authority.outcome_trust_anchor
-    attestation = parse_dispatch_outcome_attestation_v2(raw_attestation)
+    attestation = _normalize_parsed_dispatch_outcome_utc(
+        parse_dispatch_outcome_attestation_v2(raw_attestation)
+    )
     if (
         attestation.attempt_id != expected_attempt_id
         or attestation.authorization_digest != projection.authorization_digest
@@ -1408,7 +1457,7 @@ def verify_raw_dispatch_outcome_attestation_v2(
         or projection.outcome_trust_anchor_key_fingerprint_sha256
         != anchor.signer_key_fingerprint_sha256
         or attestation.issued_at < projection.issued_at
-        or attestation.issued_at > projection.expires_at
+        or attestation.issued_at >= projection.expires_at
         or attestation.issued_at > now
     ):
         raise DelegationExecutionSignatureError("V2 outcome attestation does not match authority")
@@ -1449,6 +1498,9 @@ def verify_raw_dispatch_outcome_attestation_v2(
         attestation_id=attestation.attestation_id,
         attempt_id=attestation.attempt_id,
         attestation_sha256=sha256(raw_attestation).hexdigest(),
+        grant_correlation_id=projection.grant_correlation_id,
+        grant_not_before=projection.grant_not_before,
+        grant_expires_at=projection.grant_expires_at,
         authorization_digest=projection.authorization_digest,
         claim_binding_sha256=projection.claim_binding_sha256,
         request_envelope_sha256=projection.request_envelope_sha256,
