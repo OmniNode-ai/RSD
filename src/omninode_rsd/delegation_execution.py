@@ -468,13 +468,7 @@ def verify_delegation_route_authority(
         raise DelegationRouteAuthoritySignatureError("route authority signer is invalid")
     try:
         signature = _canonical_base64(authority.signature_base64, expected_bytes=64)
-        public_key = _canonical_base64(anchor.signer_public_key_base64, expected_bytes=32)
-        if not hmac.compare_digest(
-            sha256(public_key).hexdigest(), anchor.signer_key_fingerprint_sha256
-        ):
-            raise DelegationRouteAuthoritySignatureError(
-                "route-authority trust-anchor fingerprint is invalid"
-            )
+        public_key = _trusted_route_public_key(anchor)
         Ed25519PublicKey.from_public_bytes(public_key).verify(
             signature, delegation_route_authority_message(authority)
         )
@@ -519,6 +513,22 @@ def _trusted_public_key(anchor: DelegationExecutionTrustAnchorV1) -> bytes:
     key = _canonical_base64(anchor.signer_public_key_base64, expected_bytes=32)
     if not hmac.compare_digest(sha256(key).hexdigest(), anchor.signer_key_fingerprint_sha256):
         raise DelegationExecutionSignatureError("activation trust-anchor fingerprint is invalid")
+    return key
+
+
+def _trusted_route_public_key(
+    anchor: DelegationRouteAuthorityTrustAnchorV1,
+) -> bytes:
+    try:
+        key = _canonical_base64(anchor.signer_public_key_base64, expected_bytes=32)
+    except DelegationExecutionError:
+        raise DelegationRouteAuthoritySignatureError(
+            "route-authority trust-anchor is invalid"
+        ) from None
+    if not hmac.compare_digest(sha256(key).hexdigest(), anchor.signer_key_fingerprint_sha256):
+        raise DelegationRouteAuthoritySignatureError(
+            "route-authority trust-anchor fingerprint is invalid"
+        )
     return key
 
 
@@ -576,9 +586,19 @@ def verify_delegation_execution_overlay(
     activation = parse_delegation_execution_overlay(raw)
     anchor = _strict_anchor(trust_anchor)
     request, grant, _policy = _validate_claim(claim)
+    activation_public_key = _trusted_public_key(anchor)
+    route_anchor = _strict_route_anchor(route_authority_trust_anchor)
+    route_public_key = _trusted_route_public_key(route_anchor)
+    if hmac.compare_digest(activation_public_key, route_public_key) or hmac.compare_digest(
+        anchor.signer_key_fingerprint_sha256,
+        route_anchor.signer_key_fingerprint_sha256,
+    ):
+        raise DelegationExecutionSignatureError(
+            "activation and route authority trust anchors must be distinct"
+        )
     authority = verify_delegation_route_authority(
         route_authority,
-        trust_anchor=route_authority_trust_anchor,
+        trust_anchor=route_anchor,
     )
     _require_utc(activation.issued_at)
     _require_utc(activation.expires_at)
@@ -624,7 +644,7 @@ def verify_delegation_execution_overlay(
         raise DelegationExecutionError("activation does not match its authority")
     try:
         signature = _canonical_base64(activation.signature_base64, expected_bytes=64)
-        Ed25519PublicKey.from_public_bytes(_trusted_public_key(anchor)).verify(
+        Ed25519PublicKey.from_public_bytes(activation_public_key).verify(
             signature, delegation_execution_overlay_message(activation)
         )
     except (InvalidSignature, ValueError, TypeError, DelegationExecutionError):

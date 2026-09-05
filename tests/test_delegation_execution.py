@@ -44,6 +44,7 @@ from omninode_rsd.delegation_execution import (
     parse_delegation_execution_overlay,
     parse_delegation_route_authority,
     verify_delegation_execution_overlay,
+    verify_delegation_route_authority,
 )
 from omninode_rsd.lifecycle import InMemoryEventLog, LifecycleEventIngress
 
@@ -348,6 +349,10 @@ def test_independent_route_authority_allows_only_its_resigned_target() -> None:
         credential_provider_id="provider-beta",
         credential_provider_fingerprint_sha256="8" * 64,
     )
+    assert (
+        _anchor(activation_key).signer_key_fingerprint_sha256
+        != _route_anchor(route_key).signer_key_fingerprint_sha256
+    )
     result = _verified(
         canonical_delegation_execution_overlay_json_bytes(activation),
         claim,
@@ -360,6 +365,33 @@ def test_independent_route_authority_allows_only_its_resigned_target() -> None:
     assert result.credential_ref == "logical://credential/provider-beta-v2"
     assert authority.route_policy_digest == "7" * 64
     assert authority.credential_provider_id == "provider-beta"
+
+
+def test_same_trust_key_is_rejected_after_valid_independent_signatures() -> None:
+    claim = _claim()
+    shared_key = Ed25519PrivateKey.generate()
+    activation, authority = _signed_pair(claim, shared_key, shared_key)
+    route_anchor = _route_anchor(shared_key)
+
+    assert (
+        verify_delegation_route_authority(
+            canonical_delegation_route_authority_json_bytes(authority),
+            trust_anchor=route_anchor,
+        )
+        == authority
+    )
+    with pytest.raises(
+        DelegationExecutionSignatureError,
+        match="trust anchors must be distinct",
+    ) as error:
+        _verified(
+            canonical_delegation_execution_overlay_json_bytes(activation),
+            claim,
+            _anchor(shared_key),
+            route_authority=authority,
+            route_anchor=route_anchor,
+        )
+    assert str(error.value) == "activation and route authority trust anchors must be distinct"
 
 
 def test_validly_resigned_route_authority_cannot_redirect_activation() -> None:
