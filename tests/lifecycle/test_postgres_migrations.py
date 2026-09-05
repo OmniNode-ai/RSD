@@ -136,9 +136,20 @@ def test_delegated_canary_ledger_v2_migration_is_additive_and_fail_closed() -> N
     assert "outcome_issued_at_v2 >= grant_not_before" in migration.content
     assert "outcome_issued_at_v2 < grant_expires_at" in migration.content
     assert "delegated_canary_attempts_v2_identity_unique" in migration.content
-    assert migration.content.count("FOREIGN KEY (attempt_id_v2)") == 2
+    binding_columns = """(
+        attempt_id_v2,
+        authorization_digest,
+        attestation_id,
+        grant_not_before,
+        grant_expires_at
+    )"""
+    assert "delegated_canary_attempts_v2_binding_unique" in migration.content
+    assert migration.content.count(f"UNIQUE {binding_columns}") == 1
+    assert migration.content.count(f"FOREIGN KEY {binding_columns}") == 2
     assert (
-        migration.content.count("REFERENCES rsd_canary.delegated_canary_attempts (attempt_id_v2)")
+        migration.content.count(
+            "REFERENCES rsd_canary.delegated_canary_attempts " + binding_columns
+        )
         == 2
     )
     assert "PUBLIC KEY" not in migration.content
@@ -174,8 +185,39 @@ def test_v2_attempt_identity_is_global_and_rejects_cross_authorization_reuse() -
     # even when an attacker changes the authorization carrier.  NULL legacy
     # rows remain valid because PostgreSQL's unique constraint permits NULL.
     assert "UNIQUE (attempt_id_v2)" in migration
+    assert migration.count("UNIQUE (attempt_id_v2)") == 1
     assert "attempt_id_v2 IS NULL" in migration
     assert "attempt_id_v2 IS NOT NULL" in migration
+
+
+def test_v2_composite_binding_rejects_cross_pair_and_bound_mismatch() -> None:
+    migration = discover_lifecycle_migrations()[3].content
+    binding_columns = (
+        "attempt_id_v2, authorization_digest, attestation_id, grant_not_before, grant_expires_at"
+    )
+
+    # Static SQL checks establish that the fake below models the actual child
+    # foreign-key shape, rather than the old attempt-id-only relationship.
+    assert migration.count("FOREIGN KEY (\n        attempt_id_v2,") == 2
+    assert binding_columns.replace(", ", ",\n        ") in migration
+
+    def accepts(
+        parent_bindings: set[tuple[str, str, str, str, str]],
+        child_binding: tuple[str, str, str, str, str],
+    ) -> bool:
+        """Model PostgreSQL's composite-FK exact tuple match without a DB."""
+
+        return child_binding in parent_bindings
+
+    parent_a = ("attempt-a", "auth-a", "att-a", "nb-a", "exp-a")
+    parent_b = ("attempt-b", "auth-b", "att-b", "nb-b", "exp-b")
+    parents = {parent_a, parent_b}
+
+    assert accepts(parents, parent_a)
+    # Neither an authorization/attempt cross-pair nor a grant-bound swap may
+    # select a different parent row through the V2 relationship.
+    assert not accepts(parents, ("attempt-b", "auth-a", "att-a", "nb-b", "exp-b"))
+    assert not accepts(parents, ("attempt-a", "auth-a", "att-a", "nb-b", "exp-b"))
 
 
 def test_v2_outcome_boundary_accepts_not_before_and_rejects_exact_expiry() -> None:

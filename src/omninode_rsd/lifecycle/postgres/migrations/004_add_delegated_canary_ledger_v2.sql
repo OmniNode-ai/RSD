@@ -23,7 +23,15 @@ ALTER TABLE rsd_canary.delegated_canary_attempts
          AND activation_expires_at <= grant_expires_at)
     ),
     ADD CONSTRAINT delegated_canary_attempts_v2_identity_unique
-    UNIQUE (attempt_id_v2);
+    UNIQUE (attempt_id_v2),
+    ADD CONSTRAINT delegated_canary_attempts_v2_binding_unique
+    UNIQUE (
+        attempt_id_v2,
+        authorization_digest,
+        attestation_id,
+        grant_not_before,
+        grant_expires_at
+    );
 
 ALTER TABLE rsd_canary.delegated_canary_dispatches
     ADD COLUMN attempt_id_v2 UUID,
@@ -39,8 +47,20 @@ ALTER TABLE rsd_canary.delegated_canary_dispatches
          AND grant_expires_at > grant_not_before)
     ),
     ADD CONSTRAINT delegated_canary_dispatches_v2_carrier_fk
-    FOREIGN KEY (attempt_id_v2)
-    REFERENCES rsd_canary.delegated_canary_attempts (attempt_id_v2);
+    FOREIGN KEY (
+        attempt_id_v2,
+        authorization_digest,
+        attestation_id,
+        grant_not_before,
+        grant_expires_at
+    )
+    REFERENCES rsd_canary.delegated_canary_attempts (
+        attempt_id_v2,
+        authorization_digest,
+        attestation_id,
+        grant_not_before,
+        grant_expires_at
+    );
 
 ALTER TABLE rsd_canary.delegated_canary_terminal_receipts
     ADD COLUMN attempt_id_v2 UUID,
@@ -87,7 +107,19 @@ ALTER TABLE rsd_canary.delegated_canary_terminal_receipts
         )
     ),
     ADD CONSTRAINT delegated_canary_terminal_receipts_v2_carrier_fk
-    FOREIGN KEY (attempt_id_v2)
-    REFERENCES rsd_canary.delegated_canary_attempts (attempt_id_v2),
+    FOREIGN KEY (
+        attempt_id_v2,
+        authorization_digest,
+        attestation_id,
+        grant_not_before,
+        grant_expires_at
+    )
+    REFERENCES rsd_canary.delegated_canary_attempts (
+        attempt_id_v2,
+        authorization_digest,
+        attestation_id,
+        grant_not_before,
+        grant_expires_at
+    ),
     ADD CONSTRAINT delegated_canary_terminal_receipts_v2_outcome_attestation_unique
     UNIQUE (outcome_attestation_id_v2);
