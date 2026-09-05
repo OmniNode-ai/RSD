@@ -355,6 +355,7 @@ class VerifiedDispatchOutcomeV2(_Model):
 
     schema_version: Literal["rsd.verified-dispatch-outcome.v2"]
     attestation_id: UUID
+    attempt_id: UUID
     attestation_sha256: str = Field(pattern=_SHA256)
     authorization_digest: str = Field(pattern=_SHA256)
     claim_binding_sha256: str = Field(pattern=_SHA256)
@@ -1345,6 +1346,7 @@ def verify_raw_dispatch_outcome_attestation_v2(
     activation_trust_anchor: DelegationExecutionTrustAnchorV1,
     raw_route_authority: bytes,
     route_authority_trust_anchor: DelegationRouteAuthorityTrustAnchorV1,
+    expected_attempt_id: UUID,
     trusted_clock: TrustedClock,
     response_preimage: bytes,
     output_payload: bytes,
@@ -1352,8 +1354,10 @@ def verify_raw_dispatch_outcome_attestation_v2(
     """Verify one V2 terminal receipt from the complete raw authority chain.
 
     No projection, claim, anchor digest, or caller-selected key can authorize
-    this boundary.  The exact full outcome anchor is re-derived from the raw,
-    signed route authority before signature verification.
+    this boundary. The caller's exact attempt identity is non-authorizing
+    durable context: it must exactly match the signed receipt. The exact full
+    outcome anchor is re-derived from the raw, signed route authority before
+    signature verification.
     """
 
     try:
@@ -1362,6 +1366,8 @@ def verify_raw_dispatch_outcome_attestation_v2(
         raise
     except Exception as error:
         raise DelegationExecutionError("trusted activation clock failed") from error
+    if type(expected_attempt_id) is not UUID:
+        raise DelegationExecutionError("expected dispatch attempt is invalid")
 
     def frozen_clock() -> datetime:
         return now
@@ -1381,7 +1387,8 @@ def verify_raw_dispatch_outcome_attestation_v2(
     anchor = authority.outcome_trust_anchor
     attestation = parse_dispatch_outcome_attestation_v2(raw_attestation)
     if (
-        attestation.authorization_digest != projection.authorization_digest
+        attestation.attempt_id != expected_attempt_id
+        or attestation.authorization_digest != projection.authorization_digest
         or attestation.claim_binding_sha256 != projection.claim_binding_sha256
         or attestation.request_sha256 != projection.request_envelope_sha256
         or attestation.backend_id != projection.backend_id
@@ -1440,6 +1447,7 @@ def verify_raw_dispatch_outcome_attestation_v2(
     return VerifiedDispatchOutcomeV2(
         schema_version="rsd.verified-dispatch-outcome.v2",
         attestation_id=attestation.attestation_id,
+        attempt_id=attestation.attempt_id,
         attestation_sha256=sha256(raw_attestation).hexdigest(),
         authorization_digest=projection.authorization_digest,
         claim_binding_sha256=projection.claim_binding_sha256,

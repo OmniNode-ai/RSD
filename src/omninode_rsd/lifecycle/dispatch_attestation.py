@@ -171,6 +171,7 @@ class DispatchOutcomeAttestationV2(_DispatchModel):
 
     schema_version: Literal["rsd.dispatch-outcome-attestation.v2"]
     attestation_id: UUID
+    attempt_id: UUID
     authorization_digest: str = Field(pattern=_SHA256)
     claim_binding_sha256: str = Field(pattern=_SHA256)
     backend_id: str = Field(pattern=_IDENTIFIER)

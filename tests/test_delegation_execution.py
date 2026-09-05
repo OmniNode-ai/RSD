@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 from datetime import UTC, datetime, timedelta, timezone
 from hashlib import sha256
@@ -66,9 +67,12 @@ from omninode_rsd.delegation_execution import (
 from omninode_rsd.lifecycle import InMemoryEventLog, LifecycleEventIngress
 from omninode_rsd.lifecycle.dispatch_attestation import (
     DispatchCompletedOutputPayloadV1,
+    DispatchOutcomeAttestationV1,
     DispatchOutcomeAttestationV2,
+    DispatchOutcomeSignatureError,
     DispatchOutcomeTrustAnchorV1,
     DispatchResponsePreimageV1,
+    dispatch_outcome_attestation_message,
     dispatch_outcome_attestation_v2_message,
     dispatch_outcome_trust_anchor_sha256,
     dispatch_output_payload_sha256,
@@ -863,7 +867,7 @@ def test_signature_and_trust_anchor_mismatch_fail_closed() -> None:
         signer_key_fingerprint_sha256=anchor.signer_key_fingerprint_sha256,
     )
 
-    with pytest.raises(DelegationExecutionSignatureError):
+    with pytest.raises(DelegationExecutionSignatureError, match="activation signature is invalid"):
         _verified(canonical_delegation_execution_overlay_json_bytes(activation), claim, anchor)
 
     wrong_anchor = anchor.model_copy(update={"signer_key_fingerprint_sha256": "0" * 64})
@@ -1194,6 +1198,7 @@ def test_v2_outcome_attestation_preimage_binds_v2_authority_facts() -> None:
     attestation = DispatchOutcomeAttestationV2(
         schema_version="rsd.dispatch-outcome-attestation.v2",
         attestation_id=UUID("40000000-0000-4000-8000-000000000004"),
+        attempt_id=UUID("40000000-0000-4000-8000-000000000005"),
         authorization_digest="1" * 64,
         claim_binding_sha256="2" * 64,
         backend_id="backend-alpha",
@@ -1271,6 +1276,7 @@ def test_raw_v2_outcome_verifier_derives_anchor_and_rejects_bound_fact_divergenc
     unsigned = DispatchOutcomeAttestationV2(
         schema_version="rsd.dispatch-outcome-attestation.v2",
         attestation_id=UUID("40000000-0000-4000-8000-000000000005"),
+        attempt_id=UUID("40000000-0000-4000-8000-000000000006"),
         authorization_digest=projection.authorization_digest,
         claim_binding_sha256=projection.claim_binding_sha256,
         backend_id=projection.backend_id,
@@ -1308,12 +1314,17 @@ def test_raw_v2_outcome_verifier_derives_anchor_and_rejects_bound_fact_divergenc
         activation_trust_anchor=activation_anchor,
         raw_route_authority=raw_route_authority,
         route_authority_trust_anchor=route_anchor,
+        expected_attempt_id=signed.attempt_id,
         trusted_clock=lambda: _NOW,
         response_preimage=canonical_json(response.model_dump(mode="python")),
         output_payload=canonical_json(payload.model_dump(mode="python")),
     )
     assert verified.attestation_sha256 == sha256(raw).hexdigest()
+    assert verified.attempt_id == signed.attempt_id
     assert verified.outcome_trust_anchor_sha256 == projection.outcome_trust_anchor_sha256
+    assert {"projection", "claim", "outcome_trust_anchor", "execute_enabled"}.isdisjoint(
+        inspect.signature(verify_raw_dispatch_outcome_attestation_v2).parameters
+    )
 
     mismatched = signed.model_copy(update={"target_configuration_sha256": "f" * 64})
     mismatched = mismatched.model_copy(
@@ -1331,7 +1342,263 @@ def test_raw_v2_outcome_verifier_derives_anchor_and_rejects_bound_fact_divergenc
             activation_trust_anchor=activation_anchor,
             raw_route_authority=raw_route_authority,
             route_authority_trust_anchor=route_anchor,
+            expected_attempt_id=signed.attempt_id,
             trusted_clock=lambda: _NOW,
             response_preimage=canonical_json(response.model_dump(mode="python")),
+            output_payload=canonical_json(payload.model_dump(mode="python")),
+        )
+
+    for field, value in (
+        ("attempt_id", UUID("40000000-0000-4000-8000-000000000007")),
+        ("authorization_digest", "0" * 64),
+        ("claim_binding_sha256", "0" * 64),
+        ("request_sha256", "0" * 64),
+        ("backend_id", "backend-beta"),
+        ("model_id", "qwen/qwen3.8-27b-alt"),
+        ("route_ref", "logical://delegation/qwen3.8-27b-alt"),
+        ("activation_id", UUID("40000000-0000-4000-8000-000000000006")),
+        ("activation_sha256", "0" * 64),
+        ("route_authority_sha256", "0" * 64),
+        ("outcome_trust_anchor_sha256", "0" * 64),
+        ("signer_key_id", "other-attester"),
+        ("trust_anchor_key_id", "other-attester"),
+        ("trust_anchor_key_fingerprint_sha256", "0" * 64),
+    ):
+        divergent = signed.model_copy(update={field: value})
+        divergent = divergent.model_copy(
+            update={
+                "signature_base64": base64.b64encode(
+                    _OUTCOME_PRIVATE_KEY.sign(dispatch_outcome_attestation_v2_message(divergent))
+                ).decode("ascii")
+            }
+        )
+        with pytest.raises(DelegationExecutionSignatureError, match="does not match authority"):
+            verify_raw_dispatch_outcome_attestation_v2(
+                canonical_json(divergent.model_dump(mode="python")),
+                raw_signed_grant=b"raw-signed-grant",
+                raw_activation=raw_activation,
+                activation_trust_anchor=activation_anchor,
+                raw_route_authority=raw_route_authority,
+                route_authority_trust_anchor=route_anchor,
+                expected_attempt_id=signed.attempt_id,
+                trusted_clock=lambda: _NOW,
+                response_preimage=canonical_json(response.model_dump(mode="python")),
+                output_payload=canonical_json(payload.model_dump(mode="python")),
+            )
+
+    invalid_signature = signed.model_copy(
+        update={"signature_base64": base64.b64encode(b"\0" * 64).decode("ascii")}
+    )
+    with pytest.raises(DelegationExecutionSignatureError, match="signature is invalid"):
+        verify_raw_dispatch_outcome_attestation_v2(
+            canonical_json(invalid_signature.model_dump(mode="python")),
+            raw_signed_grant=b"raw-signed-grant",
+            raw_activation=raw_activation,
+            activation_trust_anchor=activation_anchor,
+            raw_route_authority=raw_route_authority,
+            route_authority_trust_anchor=route_anchor,
+            expected_attempt_id=signed.attempt_id,
+            trusted_clock=lambda: _NOW,
+            response_preimage=canonical_json(response.model_dump(mode="python")),
+            output_payload=canonical_json(payload.model_dump(mode="python")),
+        )
+
+    v1 = DispatchOutcomeAttestationV1(
+        schema_version="rsd.dispatch-outcome-attestation.v1",
+        attestation_id=signed.attestation_id,
+        authorization_digest=signed.authorization_digest,
+        claim_binding_sha256=signed.claim_binding_sha256,
+        backend_id=signed.backend_id,
+        model_id=signed.model_id,
+        route_ref=signed.route_ref,
+        request_sha256=signed.request_sha256,
+        response_sha256=signed.response_sha256,
+        output_payload_sha256=signed.output_payload_sha256,
+        outcome_status=signed.outcome_status,
+        issued_at=signed.issued_at,
+        signer_key_id=signed.signer_key_id,
+        trust_anchor_key_id=signed.trust_anchor_key_id,
+        trust_anchor_key_fingerprint_sha256=signed.trust_anchor_key_fingerprint_sha256,
+        signature_base64=base64.b64encode(b"\0" * 64).decode("ascii"),
+    )
+    v1 = v1.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                _OUTCOME_PRIVATE_KEY.sign(dispatch_outcome_attestation_message(v1))
+            ).decode("ascii")
+        }
+    )
+    for raw_invalid in (
+        canonical_json(v1.model_dump(mode="python")),
+        b'{"schema_version":"rsd.dispatch-outcome-attestation.v2","schema_version":"x"}',
+        b"{" + (b" " * 32_768) + b"}",
+    ):
+        with pytest.raises(DispatchOutcomeSignatureError):
+            verify_raw_dispatch_outcome_attestation_v2(
+                raw_invalid,
+                raw_signed_grant=b"raw-signed-grant",
+                raw_activation=raw_activation,
+                activation_trust_anchor=activation_anchor,
+                raw_route_authority=raw_route_authority,
+                route_authority_trust_anchor=route_anchor,
+                expected_attempt_id=signed.attempt_id,
+                trusted_clock=lambda: _NOW,
+                response_preimage=canonical_json(response.model_dump(mode="python")),
+                output_payload=canonical_json(payload.model_dump(mode="python")),
+            )
+
+    for issued_at, trusted_clock in (
+        (projection.issued_at - timedelta(microseconds=1), lambda: _NOW),
+        (projection.expires_at + timedelta(microseconds=1), lambda: _NOW),
+        (_NOW + timedelta(microseconds=1), lambda: _NOW),
+    ):
+        outside_window = unsigned.model_copy(update={"issued_at": issued_at})
+        outside_window = outside_window.model_copy(
+            update={
+                "signature_base64": base64.b64encode(
+                    _OUTCOME_PRIVATE_KEY.sign(
+                        dispatch_outcome_attestation_v2_message(outside_window)
+                    )
+                ).decode("ascii")
+            }
+        )
+        with pytest.raises(DelegationExecutionSignatureError, match="does not match authority"):
+            verify_raw_dispatch_outcome_attestation_v2(
+                canonical_json(outside_window.model_dump(mode="python")),
+                raw_signed_grant=b"raw-signed-grant",
+                raw_activation=raw_activation,
+                activation_trust_anchor=activation_anchor,
+                raw_route_authority=raw_route_authority,
+                route_authority_trust_anchor=route_anchor,
+                expected_attempt_id=signed.attempt_id,
+                trusted_clock=trusted_clock,
+                response_preimage=canonical_json(response.model_dump(mode="python")),
+                output_payload=canonical_json(payload.model_dump(mode="python")),
+            )
+
+    at_expiry = unsigned.model_copy(update={"issued_at": projection.expires_at})
+    at_expiry = at_expiry.model_copy(
+        update={
+            "signature_base64": base64.b64encode(
+                _OUTCOME_PRIVATE_KEY.sign(dispatch_outcome_attestation_v2_message(at_expiry))
+            ).decode("ascii")
+        }
+    )
+    with pytest.raises(DelegationExecutionError, match="activation does not match its authority"):
+        verify_raw_dispatch_outcome_attestation_v2(
+            canonical_json(at_expiry.model_dump(mode="python")),
+            raw_signed_grant=b"raw-signed-grant",
+            raw_activation=raw_activation,
+            activation_trust_anchor=activation_anchor,
+            raw_route_authority=raw_route_authority,
+            route_authority_trust_anchor=route_anchor,
+            expected_attempt_id=signed.attempt_id,
+            trusted_clock=lambda: projection.expires_at,
+            response_preimage=canonical_json(response.model_dump(mode="python")),
+            output_payload=canonical_json(payload.model_dump(mode="python")),
+        )
+
+    for alternate_outcome_anchor in (
+        _outcome_anchor(Ed25519PrivateKey.generate()).model_copy(
+            update={"signer_key_id": "unrelated-attester"}
+        ),
+        _outcome_anchor(Ed25519PrivateKey.generate()),
+    ):
+        alternate_authority = _signed_route_authority_v2(
+            claim,
+            activation,
+            route_key,
+            outcome_trust_anchor=alternate_outcome_anchor,
+        )
+        alternate_raw_authority = canonical_delegation_route_authority_v2_json_bytes(
+            alternate_authority
+        )
+        alternate_activation = activation.model_copy(
+            update={
+                "route_authority_sha256": delegation_route_authority_v2_sha256(alternate_authority),
+                "signature_base64": base64.b64encode(b"\0" * 64).decode("ascii"),
+            }
+        )
+        alternate_activation = alternate_activation.model_copy(
+            update={
+                "signature_base64": base64.b64encode(
+                    activation_key.sign(delegation_execution_overlay_message(alternate_activation))
+                ).decode("ascii")
+            }
+        )
+        alternate_raw_activation = canonical_delegation_execution_overlay_json_bytes(
+            alternate_activation
+        )
+        alternate_projection = verify_raw_delegation_execution_authority_v2(
+            b"raw-signed-grant",
+            alternate_raw_activation,
+            activation_trust_anchor=activation_anchor,
+            raw_route_authority=alternate_raw_authority,
+            route_authority_trust_anchor=route_anchor,
+            trusted_clock=lambda: _NOW,
+        )
+        alternate_unsigned = unsigned.model_copy(
+            update={
+                "route_authority_sha256": alternate_projection.route_authority_sha256,
+                "outcome_trust_anchor_sha256": alternate_projection.outcome_trust_anchor_sha256,
+                "signer_key_id": alternate_projection.outcome_trust_anchor_key_id,
+                "trust_anchor_key_id": alternate_projection.outcome_trust_anchor_key_id,
+                "trust_anchor_key_fingerprint_sha256": (
+                    alternate_projection.outcome_trust_anchor_key_fingerprint_sha256
+                ),
+            }
+        )
+        alternate_signed = alternate_unsigned.model_copy(
+            update={
+                "signature_base64": base64.b64encode(
+                    _OUTCOME_PRIVATE_KEY.sign(
+                        dispatch_outcome_attestation_v2_message(alternate_unsigned)
+                    )
+                ).decode("ascii")
+            }
+        )
+        with pytest.raises(DelegationExecutionSignatureError, match="signature is invalid"):
+            verify_raw_dispatch_outcome_attestation_v2(
+                canonical_json(alternate_signed.model_dump(mode="python")),
+                raw_signed_grant=b"raw-signed-grant",
+                raw_activation=alternate_raw_activation,
+                activation_trust_anchor=activation_anchor,
+                raw_route_authority=alternate_raw_authority,
+                route_authority_trust_anchor=route_anchor,
+                expected_attempt_id=alternate_signed.attempt_id,
+                trusted_clock=lambda: _NOW,
+                response_preimage=canonical_json(response.model_dump(mode="python")),
+                output_payload=canonical_json(payload.model_dump(mode="python")),
+            )
+    with pytest.raises(DelegationExecutionSignatureError, match="preimages do not match"):
+        verify_raw_dispatch_outcome_attestation_v2(
+            raw,
+            raw_signed_grant=b"raw-signed-grant",
+            raw_activation=raw_activation,
+            activation_trust_anchor=activation_anchor,
+            raw_route_authority=raw_route_authority,
+            route_authority_trust_anchor=route_anchor,
+            expected_attempt_id=signed.attempt_id,
+            trusted_clock=lambda: _NOW,
+            response_preimage=canonical_json(response.model_dump(mode="python")),
+            output_payload=canonical_json(
+                payload.model_copy(update={"content": "different"}).model_dump(mode="python")
+            ),
+        )
+    with pytest.raises(DelegationExecutionSignatureError, match="preimages do not match"):
+        verify_raw_dispatch_outcome_attestation_v2(
+            raw,
+            raw_signed_grant=b"raw-signed-grant",
+            raw_activation=raw_activation,
+            activation_trust_anchor=activation_anchor,
+            raw_route_authority=raw_route_authority,
+            route_authority_trust_anchor=route_anchor,
+            expected_attempt_id=signed.attempt_id,
+            trusted_clock=lambda: _NOW,
+            response_preimage=canonical_json(
+                response.model_copy(update={"output_payload_sha256": "0" * 64}).model_dump(
+                    mode="python"
+                )
+            ),
             output_payload=canonical_json(payload.model_dump(mode="python")),
         )
