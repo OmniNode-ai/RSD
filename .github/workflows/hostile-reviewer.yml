@@ -63,7 +63,7 @@ jobs:
             return 1
           }
 
-          clone_with_retry omniintelligence ../omniintelligence dec976b1177cd1338d0d79335d30bebff687d997
+          clone_with_retry omniintelligence ../omniintelligence 12aaf67a782befad3e500b6b7d0fc3bc8826a0d9
           clone_with_retry omnibase_core ../omnibase_core 872beef0397e81064e1212ad5d9d73f173ea3f84
           clone_with_retry omnibase_compat ../omnibase_compat 039df62a695f0498821dfd76d44363872c8f6b22
 
@@ -118,6 +118,9 @@ jobs:
         working-directory: ../omniintelligence
         env:
           REVIEW_INPUT: ${{ steps.fetch-diff.outputs.path }}
+          LOCAL_LLM_SHARED_SECRET: ${{ github.event.pull_request.head.repo.full_name == github.repository && secrets['LOCAL_LLM_SHARED_SECRET'] || '' }}
+          LLM_QWEN3_REVIEW_URL: ${{ github.event.pull_request.head.repo.full_name == github.repository && secrets['LLM_QWEN3_REVIEW_URL'] || '' }}
+          LLM_QWEN3_REVIEW_B_URL: ${{ github.event.pull_request.head.repo.full_name == github.repository && secrets['LLM_QWEN3_REVIEW_B_URL'] || '' }}
         run: |
           set -euo pipefail
 
@@ -126,18 +129,66 @@ jobs:
             exit 1
           fi
 
-          if REVIEW_JSON="$(uv run --python 3.12 python -m omniintelligence.review_pairing.cli_review \
+          REVIEW_TMPDIR="$(mktemp -d)"
+          REVIEW_STDOUT="${REVIEW_TMPDIR}/stdout"
+          REVIEW_STDERR="${REVIEW_TMPDIR}/stderr"
+          REVIEW_FIFO="${REVIEW_TMPDIR}/stderr.pipe"
+          trap 'rm -rf "$REVIEW_TMPDIR"' EXIT
+          mkfifo "$REVIEW_FIFO"
+
+          capture_bounded_stderr() {
+            head -c 16384
+            cat >/dev/null
+          }
+
+          classify_diagnostic() {
+            local diagnostics="$1"
+            if grep -Eiq 'timed out|timeout|deadline' "$diagnostics"; then
+              printf '%s\n' "reviewer-timeout"
+            elif grep -Eiq '401|403|unauthori[sz]ed|forbidden|shared secret' "$diagnostics"; then
+              printf '%s\n' "reviewer-authentication"
+            elif grep -Eiq '404|model.*(not found|does not exist)' "$diagnostics"; then
+              printf '%s\n' "reviewer-model-unavailable"
+            elif grep -Eiq '429|rate limit|too many requests' "$diagnostics"; then
+              printf '%s\n' "reviewer-rate-limited"
+            elif grep -Eiq 'connection refused|unreachable|failed to connect|name or service not known' "$diagnostics"; then
+              printf '%s\n' "reviewer-endpoint-unavailable"
+            elif grep -Eiq 'json|parse|malformed|decode' "$diagnostics"; then
+              printf '%s\n' "reviewer-malformed-response"
+            else
+              printf '%s\n' "reviewer-error"
+            fi
+          }
+
+          capture_bounded_stderr <"$REVIEW_FIFO" >"$REVIEW_STDERR" &
+          STDERR_CAPTURE_PID=$!
+          uv run --python 3.12 python -m omniintelligence.review_pairing.cli_review \
             --file "$REVIEW_INPUT" \
             --model qwen3-review \
             --model qwen3-review-b \
             --no-fallback \
-            2>/dev/null)"; then
-            :
+            >"$REVIEW_STDOUT" 2>"$REVIEW_FIFO" &
+          REVIEW_PID=$!
+          if wait "$REVIEW_PID"; then
+            REVIEW_STATUS=0
           else
-            status=$?
-            echo "::error::adversarial reviewer failed or was unavailable (exit ${status})"
-            exit "$status"
+            REVIEW_STATUS=$?
           fi
+          if ! wait "$STDERR_CAPTURE_PID"; then
+            echo "::error::adversarial reviewer diagnostics capture failed"
+            exit 1
+          fi
+          if [ "$REVIEW_STATUS" -ne 0 ]; then
+            DIAGNOSTIC_CATEGORY="$(classify_diagnostic "$REVIEW_STDERR")"
+            echo "::error::adversarial reviewer failed or was unavailable (category ${DIAGNOSTIC_CATEGORY}, exit ${REVIEW_STATUS})"
+            exit "$REVIEW_STATUS"
+          fi
+
+          if [ ! -s "$REVIEW_STDOUT" ] || [ "$(wc -c < "$REVIEW_STDOUT")" -gt 1200000 ]; then
+            echo "::error::bounded adversarial reviewer output is missing or invalid"
+            exit 1
+          fi
+          REVIEW_JSON="$(cat "$REVIEW_STDOUT")"
 
           if VERDICT_DATA="$(printf '%s' "$REVIEW_JSON" | uv run --python 3.12 python \
             "$GITHUB_WORKSPACE/base/scripts/ci/parse_hostile_review.py")"; then

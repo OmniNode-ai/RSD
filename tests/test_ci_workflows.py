@@ -94,9 +94,9 @@ def test_hostile_reviewer_is_fork_safe_and_minimal() -> None:
     assert "--with pyyaml" not in text.lower()
     assert "${{ secrets.GITHUB_TOKEN }}" not in text
     assert text.count("${{ github.token }}") == 1
-    assert "${{ secrets.LOCAL_LLM_SHARED_SECRET }}" not in text
-    assert "${{ secrets.LLM_QWEN3_REVIEW_URL }}" not in text
-    assert "${{ secrets.LLM_QWEN3_REVIEW_B_URL }}" not in text
+    assert "secrets['LOCAL_LLM_SHARED_SECRET']" in text
+    assert "secrets['LLM_QWEN3_REVIEW_URL']" in text
+    assert "secrets['LLM_QWEN3_REVIEW_B_URL']" in text
     assert '--file "$REVIEW_INPUT"' in text
     assert "--no-fallback" in text
     assert "--python 3.12" in text
@@ -123,9 +123,13 @@ def test_hostile_reviewer_uses_canonical_runner_policy() -> None:
     assert "github.event.pull_request.head.repo.full_name" in reviewer
     assert "github.event.pull_request.head.sha" not in text
     assert "self-hosted" in reviewer
-    assert "LOCAL_LLM_SHARED_SECRET:" not in reviewer
-    assert "LLM_QWEN3_REVIEW_URL:" not in reviewer
-    assert "LLM_QWEN3_REVIEW_B_URL:" not in reviewer
+    assert "LOCAL_LLM_SHARED_SECRET:" in text
+    assert "LLM_QWEN3_REVIEW_URL:" in text
+    assert "LLM_QWEN3_REVIEW_B_URL:" in text
+    assert text.count("github.event.pull_request.head.repo.full_name == github.repository") == 3
+    assert "secrets['LOCAL_LLM_SHARED_SECRET'] || ''" in text
+    assert "secrets['LLM_QWEN3_REVIEW_URL'] || ''" in text
+    assert "secrets['LLM_QWEN3_REVIEW_B_URL'] || ''" in text
 
 
 def test_pull_request_workflows_never_select_self_hosted_runners() -> None:
@@ -150,7 +154,7 @@ def test_pull_request_workflows_never_select_self_hosted_runners() -> None:
 def test_hostile_reviewer_pins_dependencies_and_verifies_checkout() -> None:
     text = _HOSTILE_REVIEWER.read_text(encoding="utf-8")
     expected_pins = {
-        "omniintelligence": "dec976b1177cd1338d0d79335d30bebff687d997",
+        "omniintelligence": "12aaf67a782befad3e500b6b7d0fc3bc8826a0d9",
         "omnibase_core": "872beef0397e81064e1212ad5d9d73f173ea3f84",
         "omnibase_compat": "039df62a695f0498821dfd76d44363872c8f6b22",
     }
@@ -185,6 +189,36 @@ def test_hostile_reviewer_has_explicit_degraded_fork_and_default_deny_gate() -> 
     assert "--python 3.12" in text
     assert "--model qwen3-review" in text
     assert "--model qwen3-review-b" in text
+
+
+def test_hostile_reviewer_bounds_and_normalizes_diagnostics() -> None:
+    text = _HOSTILE_REVIEWER.read_text(encoding="utf-8")
+    reviewer = text.split("  hostile-review:\n", 1)[1]
+
+    assert 'REVIEW_TMPDIR="$(mktemp -d)"' in reviewer
+    assert "trap 'rm -rf \"$REVIEW_TMPDIR\"' EXIT" in reviewer
+    assert 'mkfifo "$REVIEW_FIFO"' in reviewer
+    assert "capture_bounded_stderr" in reviewer
+    assert "head -c 16384" in reviewer
+    assert "cat >/dev/null" in reviewer
+    assert '2>"$REVIEW_FIFO"' in reviewer
+    assert "2>/dev/null" not in reviewer
+    assert '"$REVIEW_STDERR"' in reviewer
+    assert "classify_diagnostic" in reviewer
+    for category in (
+        "reviewer-timeout",
+        "reviewer-authentication",
+        "reviewer-model-unavailable",
+        "reviewer-rate-limited",
+        "reviewer-endpoint-unavailable",
+        "reviewer-malformed-response",
+        "reviewer-error",
+    ):
+        assert category in reviewer
+    assert 'echo "$REVIEW_STDERR"' not in reviewer
+    assert 'cat "$REVIEW_STDERR"' not in reviewer
+    assert "--no-fallback" in reviewer
+    assert 'REVIEW_JSON="$(cat "$REVIEW_STDOUT")"' in reviewer
 
 
 def _run_scripts(value: object) -> list[str]:
