@@ -126,6 +126,12 @@ class _Connection(AbstractContextManager["_Connection"]):
             return _Result([])
         if normalized.startswith("CREATE TABLE rsd_canary.delegated_canary_attempts"):
             return _Result([])
+        if "ALTER TABLE rsd_canary.delegated_canary_attempts" in normalized:
+            return _Result([])
+        if "ALTER TABLE rsd_canary.delegated_canary_dispatches" in normalized:
+            return _Result([])
+        if "ALTER TABLE rsd_canary.delegated_canary_terminal_receipts" in normalized:
+            return _Result([])
         if normalized.startswith("INSERT INTO rsd_canary.schema_migrations"):
             version, name, checksum = params
             self._database.ledger.append(_DriverRow(version=version, name=name, checksum=checksum))
@@ -214,6 +220,12 @@ class _ConcurrentBootstrapConnection(AbstractContextManager["_ConcurrentBootstra
         if normalized.startswith("CREATE TABLE rsd_canary.delegation_claims"):
             return _Result([])
         if normalized.startswith("CREATE TABLE rsd_canary.delegated_canary_attempts"):
+            return _Result([])
+        if "ALTER TABLE rsd_canary.delegated_canary_attempts" in normalized:
+            return _Result([])
+        if "ALTER TABLE rsd_canary.delegated_canary_dispatches" in normalized:
+            return _Result([])
+        if "ALTER TABLE rsd_canary.delegated_canary_terminal_receipts" in normalized:
             return _Result([])
         if normalized.startswith("INSERT INTO rsd_canary.schema_migrations"):
             version, name, checksum = params
