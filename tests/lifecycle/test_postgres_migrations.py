@@ -63,6 +63,171 @@ def test_delegation_claim_migration_is_append_only_and_topology_neutral() -> Non
     assert "postgresql://" not in migration.content and "os.environ" not in migration.content
 
 
+def test_delegated_canary_ledger_migration_is_redacted_append_only_and_ordered() -> None:
+    migration = discover_lifecycle_migrations()[2]
+
+    assert migration.version == 3
+    assert migration.name == "create_delegated_canary_ledger"
+    assert "delegated_canary_attempts" in migration.content
+    assert "delegated_canary_dispatches" in migration.content
+    assert "delegated_canary_terminal_receipts" in migration.content
+    assert "authorization_digest VARCHAR(64) NOT NULL UNIQUE" in migration.content
+    assert "UNIQUE (authorization_digest, attestation_id)" in migration.content
+    assert migration.content.count("FOREIGN KEY (authorization_digest, attestation_id)") == 2
+    assert "attestation_sha256 VARCHAR(64) NOT NULL UNIQUE" in migration.content
+    for redacted_field in (
+        "activation_sha256",
+        "request_envelope_sha256",
+        "disabled_overlay_sha256",
+        "route_authority_sha256",
+        "target_configuration_sha256",
+        "endpoint_ref_sha256",
+        "credential_ref_sha256",
+        "activation_trust_anchor_fingerprint_sha256",
+        "route_authority_trust_anchor_fingerprint_sha256",
+        "credential_provider_fingerprint_sha256",
+    ):
+        assert redacted_field in migration.content
+    assert "route_ref TEXT" not in migration.content
+    for table in (
+        "delegated_canary_attempts",
+        "delegated_canary_dispatches",
+        "delegated_canary_terminal_receipts",
+    ):
+        assert f"BEFORE TRUNCATE ON rsd_canary.{table}" in migration.content
+        assert f"REVOKE ALL ON TABLE rsd_canary.{table} FROM PUBLIC" in migration.content
+    assert "delegated canary ledger is append-only" in migration.content
+    assert "IF NOT EXISTS" not in migration.content
+    assert "BEGIN;" not in migration.content and "COMMIT;" not in migration.content
+    assert "postgresql://" not in migration.content and "os.environ" not in migration.content
+
+
+def test_delegated_canary_ledger_v2_migration_is_additive_and_fail_closed() -> None:
+    migration = discover_lifecycle_migrations()[3]
+
+    assert migration.version == 4
+    assert migration.name == "add_delegated_canary_ledger_v2"
+    assert migration.content.count("ALTER TABLE rsd_canary.") == 6
+    assert "ADD COLUMN attempt_schema_version VARCHAR(64)" in migration.content
+    assert "ADD COLUMN attempt_id_v2 UUID" in migration.content
+    assert "ADD COLUMN grant_not_before TIMESTAMPTZ" in migration.content
+    assert "ADD COLUMN grant_expires_at TIMESTAMPTZ" in migration.content
+    assert "rsd.delegated-canary-attempt.v2" in migration.content
+    assert "rsd.dispatch-outcome-attestation.v2" in migration.content
+    assert "outcome_attestation_id_v2 UUID" in migration.content
+    assert "outcome_attestation_schema_version VARCHAR(64)" in migration.content
+    assert "outcome_attestation_sha256 VARCHAR(64)" in migration.content
+    for derived_field in (
+        "outcome_trust_anchor_sha256",
+        "outcome_trust_anchor_key_id",
+        "outcome_trust_anchor_key_fingerprint_sha256",
+    ):
+        assert f"ADD COLUMN {derived_field}" in migration.content
+    for table in (
+        "attempts",
+        "dispatches",
+        "terminal_receipts",
+    ):
+        assert f"{table}_v2_carrier_complete" in migration.content
+    assert "delegated_canary_dispatches_v2_carrier_fk" in migration.content
+    assert "delegated_canary_terminal_receipts_v2_carrier_fk" in migration.content
+    assert "delegated_canary_terminal_receipts_v2_outcome_attestation_unique" in migration.content
+    assert "grant_expires_at > grant_not_before" in migration.content
+    assert "outcome_issued_at_v2 >= grant_not_before" in migration.content
+    assert "outcome_issued_at_v2 < grant_expires_at" in migration.content
+    assert "delegated_canary_attempts_v2_identity_unique" in migration.content
+    binding_columns = """(
+        attempt_id_v2,
+        authorization_digest,
+        attestation_id,
+        grant_not_before,
+        grant_expires_at
+    )"""
+    assert "delegated_canary_attempts_v2_binding_unique" in migration.content
+    assert migration.content.count(f"UNIQUE {binding_columns}") == 1
+    assert migration.content.count(f"FOREIGN KEY {binding_columns}") == 2
+    assert (
+        migration.content.count(
+            "REFERENCES rsd_canary.delegated_canary_attempts " + binding_columns
+        )
+        == 2
+    )
+    assert "PUBLIC KEY" not in migration.content
+    assert "signed_bytes" not in migration.content
+    assert "outcome_trust_anchor " not in migration.content
+    assert "DEFAULT" not in migration.content
+    assert "UPDATE rsd_canary" not in migration.content
+    assert "DELETE FROM rsd_canary" not in migration.content
+    assert "TRUNCATE" not in migration.content
+    assert "CREATE TRIGGER" not in migration.content
+    assert "REVOKE" not in migration.content
+    assert "IF NOT EXISTS" not in migration.content
+    assert "BEGIN;" not in migration.content and "COMMIT;" not in migration.content
+    assert "postgresql://" not in migration.content and "os.environ" not in migration.content
+
+
+def test_migration_three_remains_byte_identical_after_v2_addition() -> None:
+    migrations = discover_lifecycle_migrations()
+    resource = resources.files("omninode_rsd.lifecycle.postgres.migrations").joinpath(
+        "003_create_delegated_canary_ledger.sql"
+    )
+
+    assert migrations[2].sha256 == (
+        "f5f8cd74b4c65cfb2b0e5f6efa85956d1f95a9ac998a3eca64b1f8ca891f16fa"
+    )
+    assert migrations[2].content == resource.read_text(encoding="utf-8")
+
+
+def test_v2_attempt_identity_is_global_and_rejects_cross_authorization_reuse() -> None:
+    migration = discover_lifecycle_migrations()[3].content
+
+    # PostgreSQL UNIQUE(attempt_id_v2) rejects the same V2 attempt identity
+    # even when an attacker changes the authorization carrier.  NULL legacy
+    # rows remain valid because PostgreSQL's unique constraint permits NULL.
+    assert "UNIQUE (attempt_id_v2)" in migration
+    assert migration.count("UNIQUE (attempt_id_v2)") == 1
+    assert "attempt_id_v2 IS NULL" in migration
+    assert "attempt_id_v2 IS NOT NULL" in migration
+
+
+def test_v2_composite_binding_rejects_cross_pair_and_bound_mismatch() -> None:
+    migration = discover_lifecycle_migrations()[3].content
+    binding_columns = (
+        "attempt_id_v2, authorization_digest, attestation_id, grant_not_before, grant_expires_at"
+    )
+
+    # Static SQL checks establish that the fake below models the actual child
+    # foreign-key shape, rather than the old attempt-id-only relationship.
+    assert migration.count("FOREIGN KEY (\n        attempt_id_v2,") == 2
+    assert binding_columns.replace(", ", ",\n        ") in migration
+
+    def accepts(
+        parent_bindings: set[tuple[str, str, str, str, str]],
+        child_binding: tuple[str, str, str, str, str],
+    ) -> bool:
+        """Model PostgreSQL's composite-FK exact tuple match without a DB."""
+
+        return child_binding in parent_bindings
+
+    parent_a = ("attempt-a", "auth-a", "att-a", "nb-a", "exp-a")
+    parent_b = ("attempt-b", "auth-b", "att-b", "nb-b", "exp-b")
+    parents = {parent_a, parent_b}
+
+    assert accepts(parents, parent_a)
+    # Neither an authorization/attempt cross-pair nor a grant-bound swap may
+    # select a different parent row through the V2 relationship.
+    assert not accepts(parents, ("attempt-b", "auth-a", "att-a", "nb-b", "exp-b"))
+    assert not accepts(parents, ("attempt-a", "auth-a", "att-a", "nb-b", "exp-b"))
+
+
+def test_v2_outcome_boundary_accepts_not_before_and_rejects_exact_expiry() -> None:
+    migration = discover_lifecycle_migrations()[3].content
+
+    assert "outcome_issued_at_v2 >= grant_not_before" in migration
+    assert "outcome_issued_at_v2 < grant_expires_at" in migration
+    assert "outcome_issued_at_v2 <= grant_expires_at" not in migration
+
+
 def test_migration_metadata_rejects_a_digest_that_does_not_match_its_content() -> None:
     with pytest.raises(ValueError, match="does not match content"):
         LifecycleMigration(

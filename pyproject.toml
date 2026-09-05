@@ -42,12 +42,18 @@ packages = ["src/omninode_rsd"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql" = "omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql"
+"src/omninode_rsd/lifecycle/postgres/migrations/002_create_delegation_claims.sql" = "omninode_rsd/lifecycle/postgres/migrations/002_create_delegation_claims.sql"
+"src/omninode_rsd/lifecycle/postgres/migrations/003_create_delegated_canary_ledger.sql" = "omninode_rsd/lifecycle/postgres/migrations/003_create_delegated_canary_ledger.sql"
+"src/omninode_rsd/lifecycle/postgres/migrations/004_add_delegated_canary_ledger_v2.sql" = "omninode_rsd/lifecycle/postgres/migrations/004_add_delegated_canary_ledger_v2.sql"
 
 [tool.hatch.build.targets.sdist]
 exclude = ["public_verifier"]
 
 [tool.hatch.build.targets.sdist.force-include]
 "src/omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql" = "src/omninode_rsd/lifecycle/postgres/migrations/001_create_lifecycle_store.sql"
+"src/omninode_rsd/lifecycle/postgres/migrations/002_create_delegation_claims.sql" = "src/omninode_rsd/lifecycle/postgres/migrations/002_create_delegation_claims.sql"
+"src/omninode_rsd/lifecycle/postgres/migrations/003_create_delegated_canary_ledger.sql" = "src/omninode_rsd/lifecycle/postgres/migrations/003_create_delegated_canary_ledger.sql"
+"src/omninode_rsd/lifecycle/postgres/migrations/004_add_delegated_canary_ledger_v2.sql" = "src/omninode_rsd/lifecycle/postgres/migrations/004_add_delegated_canary_ledger_v2.sql"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
