@@ -480,6 +480,21 @@ def test_allows_only_the_delegated_request_safe_slice_files(tmp_path: Path, rela
 @pytest.mark.parametrize(
     "relative",
     (
+        "scripts/ci/hostile_review_diagnostics.py",
+        "tests/test_hostile_review_diagnostics.py",
+    ),
+)
+def test_allows_only_the_hostile_review_diagnostics_safe_slice_files(
+    tmp_path: Path, relative: str
+) -> None:
+    findings = _write(tmp_path, relative, "safe artifact\n")
+
+    assert findings == []
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
         "src/omninode_rsd/delegation_extra.py",
         "tests/test_delegation_extra.py",
     ),

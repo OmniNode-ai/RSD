@@ -141,24 +141,13 @@ jobs:
             cat >/dev/null
           }
 
-          classify_diagnostic() {
-            local diagnostics="$1"
-            if grep -Eiq 'timed out|timeout|deadline' "$diagnostics"; then
-              printf '%s\n' "reviewer-timeout"
-            elif grep -Eiq '401|403|unauthori[sz]ed|forbidden|shared secret' "$diagnostics"; then
-              printf '%s\n' "reviewer-authentication"
-            elif grep -Eiq '404|model.*(not found|does not exist)' "$diagnostics"; then
-              printf '%s\n' "reviewer-model-unavailable"
-            elif grep -Eiq '429|rate limit|too many requests' "$diagnostics"; then
-              printf '%s\n' "reviewer-rate-limited"
-            elif grep -Eiq 'connection refused|unreachable|failed to connect|name or service not known' "$diagnostics"; then
-              printf '%s\n' "reviewer-endpoint-unavailable"
-            elif grep -Eiq 'json|parse|malformed|decode' "$diagnostics"; then
-              printf '%s\n' "reviewer-malformed-response"
-            else
-              printf '%s\n' "reviewer-error"
-            fi
-          }
+          if REVIEWER_PREFLIGHT="$(uv run --no-project --python 3.12 python \
+            "$GITHUB_WORKSPACE/base/scripts/ci/hostile_review_diagnostics.py" preflight)"; then
+            :
+          else
+            echo "::error::adversarial reviewer configuration unavailable (category ${REVIEWER_PREFLIGHT})"
+            exit 1
+          fi
 
           capture_bounded_stderr <"$REVIEW_FIFO" >"$REVIEW_STDERR" &
           STDERR_CAPTURE_PID=$!
@@ -179,7 +168,14 @@ jobs:
             exit 1
           fi
           if [ "$REVIEW_STATUS" -ne 0 ]; then
-            DIAGNOSTIC_CATEGORY="$(classify_diagnostic "$REVIEW_STDERR")"
+            if DIAGNOSTIC_CATEGORY="$(uv run --no-project --python 3.12 python \
+              "$GITHUB_WORKSPACE/base/scripts/ci/hostile_review_diagnostics.py" \
+              classify --diagnostics "$REVIEW_STDERR")"; then
+              :
+            else
+              echo "::error::adversarial reviewer diagnostic classification failed"
+              exit 1
+            fi
             echo "::error::adversarial reviewer failed or was unavailable (category ${DIAGNOSTIC_CATEGORY}, exit ${REVIEW_STATUS})"
             exit "$REVIEW_STATUS"
           fi
