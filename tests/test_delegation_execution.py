@@ -32,7 +32,6 @@ from omninode_rsd.delegation_execution import (
     DelegationExecutionError,
     DelegationExecutionOverlayV1,
     DelegationExecutionParseError,
-    DelegationExecutionReconciliationEvidenceV2,
     DelegationExecutionSignatureError,
     DelegationExecutionTrustAnchorV1,
     DelegationRouteAuthorityParseError,
@@ -40,6 +39,7 @@ from omninode_rsd.delegation_execution import (
     DelegationRouteAuthorityTrustAnchorV1,
     DelegationRouteAuthorityV1,
     DelegationRouteAuthorityV2,
+    HistoricalDelegationExecutionEvidenceV2,
     VerifiedDispatchOutcomeV2,
     canonical_delegation_execution_authority_projection_json_bytes,
     canonical_delegation_execution_authority_projection_v2_json_bytes,
@@ -64,7 +64,7 @@ from omninode_rsd.delegation_execution import (
     verify_delegation_route_authority,
     verify_delegation_route_authority_v2,
     verify_raw_delegation_execution_authority_v2,
-    verify_raw_delegation_execution_authority_v2_for_reconciliation,
+    verify_raw_delegation_execution_chain_v2_for_historical_reconciliation,
     verify_raw_dispatch_outcome_attestation_v2,
 )
 from omninode_rsd.lifecycle import InMemoryEventLog, LifecycleEventIngress
@@ -1194,7 +1194,7 @@ def test_raw_v2_chain_derives_projection_without_claim_or_projection_inputs(
         DelegationExecutionAuthorityProjectionV2.model_validate(invalid_timezone)
 
 
-def test_raw_v2_reconciliation_derives_historical_non_authorizing_evidence_after_expiry(
+def test_raw_v2_historical_reconciliation_authenticates_chain_without_live_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     claim = _claim()
@@ -1218,7 +1218,7 @@ def test_raw_v2_reconciliation_derives_historical_non_authorizing_evidence_after
             route_authority_trust_anchor=_route_anchor(route_key),
             trusted_clock=lambda: _NOW + timedelta(minutes=10),
         )
-    evidence = verify_raw_delegation_execution_authority_v2_for_reconciliation(
+    evidence = verify_raw_delegation_execution_chain_v2_for_historical_reconciliation(
         raw_grant,
         canonical_delegation_execution_overlay_json_bytes(activation),
         activation_trust_anchor=_anchor(activation_key),
@@ -1226,15 +1226,16 @@ def test_raw_v2_reconciliation_derives_historical_non_authorizing_evidence_after
         route_authority_trust_anchor=_route_anchor(route_key),
     )
 
-    assert type(evidence) is DelegationExecutionReconciliationEvidenceV2
+    assert type(evidence) is HistoricalDelegationExecutionEvidenceV2
     assert not hasattr(evidence, "execute_enabled")
+    assert not hasattr(evidence, "revocation")
     assert evidence.authorization_digest == claim.grant.authorization_digest
     assert evidence.grant_expires_at > evidence.grant_not_before
 
     tampered_activation = bytearray(canonical_delegation_execution_overlay_json_bytes(activation))
     tampered_activation[-2] ^= 1
     with pytest.raises(DelegationExecutionError):
-        verify_raw_delegation_execution_authority_v2_for_reconciliation(
+        verify_raw_delegation_execution_chain_v2_for_historical_reconciliation(
             raw_grant,
             bytes(tampered_activation),
             activation_trust_anchor=_anchor(activation_key),

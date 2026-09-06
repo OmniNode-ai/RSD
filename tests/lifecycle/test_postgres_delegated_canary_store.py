@@ -14,9 +14,9 @@ import pytest
 import omninode_rsd.lifecycle.postgres.delegated_canary_store as store_module
 from omninode_rsd.delegation_execution import (
     DelegationExecutionAuthorityProjectionV2,
-    DelegationExecutionReconciliationEvidenceV2,
     DelegationExecutionTrustAnchorV1,
     DelegationRouteAuthorityTrustAnchorV1,
+    HistoricalDelegationExecutionEvidenceV2,
     VerifiedDispatchOutcomeV2,
 )
 from omninode_rsd.lifecycle.postgres.delegated_canary_store import (
@@ -37,6 +37,16 @@ RUN_ID = UUID("10000000-0000-4000-8000-000000000001")
 ATTEMPT_ID = UUID("20000000-0000-4000-8000-000000000002")
 ATTESTATION_ID = UUID("30000000-0000-4000-8000-000000000003")
 RECONCILIATION_ID = UUID("40000000-0000-4000-8000-000000000004")
+
+
+class _AdvancingClock:
+    def __init__(self, start: datetime) -> None:
+        self._next = start
+
+    def __call__(self) -> datetime:
+        now = self._next
+        self._next += timedelta(seconds=1)
+        return now
 
 
 class _Result:
@@ -297,9 +307,9 @@ def _patch_verifiers(
     )
     monkeypatch.setattr(
         store_module,
-        "verify_raw_delegation_execution_authority_v2_for_reconciliation",
+        "verify_raw_delegation_execution_chain_v2_for_historical_reconciliation",
         lambda raw_signed_grant, raw_activation, **kwargs: (
-            DelegationExecutionReconciliationEvidenceV2.model_construct(
+            HistoricalDelegationExecutionEvidenceV2.model_construct(
                 schema_version="rsd.delegation-execution-reconciliation-evidence.v2",
                 grant_correlation_id=(projection or _projection()).grant_correlation_id,
                 grant_not_before=(projection or _projection()).grant_not_before,
@@ -389,13 +399,14 @@ def test_terminal_out_of_order_and_expired_authority_fail_before_writes(
     assert database.attempts == {}
 
 
-def test_commit_ambiguity_requires_append_only_reconciliation(
+def test_commit_ambiguity_reconciliation_is_idempotent_after_advancing_clock_restart(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database = _Database()
     database.commit_error_once = True
     _patch_verifiers(monkeypatch)
-    store = _store(database)
+    first_clock = _AdvancingClock(NOW)
+    store = _store(database, trusted_clock=first_clock)
 
     with pytest.raises(DelegatedCanaryStoreAmbiguousCommitError, match="reconcile"):
         asyncio.run(store.prepare(_authority(), _identity()))
@@ -413,8 +424,9 @@ def test_commit_ambiguity_requires_append_only_reconciliation(
     )
     assert result is DelegatedCanaryReconciliationDisposition.PREPARED
     assert database.reconciliations[RECONCILIATION_ID]["reconciliation_state"] == "prepared"
+    first_observed_at = database.reconciliations[RECONCILIATION_ID]["observed_at"]
 
-    restarted = _store(database)
+    restarted = _store(database, trusted_clock=_AdvancingClock(NOW + timedelta(days=1)))
     assert (
         asyncio.run(
             restarted.reconcile_ambiguous_commit(
@@ -428,6 +440,73 @@ def test_commit_ambiguity_requires_append_only_reconciliation(
         )
         is DelegatedCanaryReconciliationDisposition.PREPARED
     )
+    assert database.reconciliations[RECONCILIATION_ID]["observed_at"] == first_observed_at
+
+
+def test_reconciliation_concurrent_retries_reuse_one_immutable_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _Database()
+    _patch_verifiers(monkeypatch)
+    identity = _identity()
+    reconciliation = DelegatedCanaryReconciliationIdentityV1(
+        schema_version="rsd.delegated-canary-reconciliation-identity.v1",
+        reconciliation_id=RECONCILIATION_ID,
+    )
+    asyncio.run(_store(database).reconcile_ambiguous_commit(_authority(), identity, reconciliation))
+    observed_at = database.reconciliations[RECONCILIATION_ID]["observed_at"]
+
+    async def retry_concurrently() -> tuple[object, object]:
+        results = await asyncio.gather(
+            _store(
+                database, trusted_clock=_AdvancingClock(NOW + timedelta(minutes=1))
+            ).reconcile_ambiguous_commit(_authority(), identity, reconciliation),
+            _store(
+                database, trusted_clock=_AdvancingClock(NOW + timedelta(minutes=2))
+            ).reconcile_ambiguous_commit(_authority(), identity, reconciliation),
+        )
+        return results[0], results[1]
+
+    assert asyncio.run(retry_concurrently()) == (
+        DelegatedCanaryReconciliationDisposition.UNKNOWN_COMMIT,
+        DelegatedCanaryReconciliationDisposition.UNKNOWN_COMMIT,
+    )
+    assert len(database.reconciliations) == 1
+    assert database.reconciliations[RECONCILIATION_ID]["observed_at"] == observed_at
+
+
+def test_reconciliation_same_id_fails_closed_on_identity_or_state_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _Database()
+    _patch_verifiers(monkeypatch)
+    store = _store(database)
+    identity = _identity()
+    reconciliation = DelegatedCanaryReconciliationIdentityV1(
+        schema_version="rsd.delegated-canary-reconciliation-identity.v1",
+        reconciliation_id=RECONCILIATION_ID,
+    )
+    assert (
+        asyncio.run(store.reconcile_ambiguous_commit(_authority(), identity, reconciliation))
+        is DelegatedCanaryReconciliationDisposition.UNKNOWN_COMMIT
+    )
+
+    different_identity = DelegatedCanaryAttemptIdentityV2(
+        schema_version="rsd.delegated-canary-attempt-identity.v2",
+        attempt_id=ATTEMPT_ID,
+        outcome_attestation_id=UUID("30000000-0000-4000-8000-000000000099"),
+    )
+    with pytest.raises(DelegatedCanaryStoreConflictError, match="different binding"):
+        asyncio.run(
+            store.reconcile_ambiguous_commit(_authority(), different_identity, reconciliation)
+        )
+
+    assert (
+        asyncio.run(store.prepare(_authority(), identity))
+        is DelegatedCanaryPrepareDisposition.PREPARED
+    )
+    with pytest.raises(DelegatedCanaryStoreConflictError, match="different state"):
+        asyncio.run(store.reconcile_ambiguous_commit(_authority(), identity, reconciliation))
 
 
 def test_reconciliation_uses_historical_evidence_after_live_expiry(

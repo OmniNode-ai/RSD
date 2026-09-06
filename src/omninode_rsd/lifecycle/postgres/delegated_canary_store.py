@@ -21,13 +21,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from omninode_rsd.delegation_execution import (
     DelegationExecutionAuthorityProjectionV2,
-    DelegationExecutionReconciliationEvidenceV2,
     DelegationExecutionTrustAnchorV1,
     DelegationRouteAuthorityTrustAnchorV1,
+    HistoricalDelegationExecutionEvidenceV2,
     VerifiedDispatchOutcomeV2,
     delegation_logical_reference_sha256,
     verify_raw_delegation_execution_authority_v2,
-    verify_raw_delegation_execution_authority_v2_for_reconciliation,
+    verify_raw_delegation_execution_chain_v2_for_historical_reconciliation,
     verify_raw_dispatch_outcome_attestation_v2,
 )
 from omninode_rsd.lifecycle.hashing import canonical_hash
@@ -134,7 +134,7 @@ type AsyncPostgresConnectionFactory = Callable[
 type TrustedClock = Callable[[], datetime]
 _Result = TypeVar("_Result")
 _VerifiedAuthority = (
-    DelegationExecutionAuthorityProjectionV2 | DelegationExecutionReconciliationEvidenceV2
+    DelegationExecutionAuthorityProjectionV2 | HistoricalDelegationExecutionEvidenceV2
 )
 
 
@@ -238,6 +238,18 @@ class _TerminalRow:
     outcome_attestation_sha256: str
     grant_not_before: datetime
     grant_expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _ReconciliationRow:
+    attempt_id: UUID
+    authorization_digest: str
+    attestation_id: UUID
+    grant_not_before: datetime
+    grant_expires_at: datetime
+    state: DelegatedCanaryReconciliationDisposition
+    observation_sha256: str
+    observed_at: datetime
 
 
 class AsyncPostgresDelegatedCanaryStore:
@@ -376,10 +388,9 @@ class AsyncPostgresDelegatedCanaryStore:
         identity: DelegatedCanaryAttemptIdentityV2,
         reconciliation: DelegatedCanaryReconciliationIdentityV1,
     ) -> DelegatedCanaryReconciliationDisposition:
-        """Append a durable observation; this never changes attempt history."""
+        """Append or reuse one durable observation; this never changes history."""
 
-        evidence = self._verified_reconciliation_evidence(authority)
-        now = self._now()
+        evidence = self._verified_historical_evidence(authority)
         self._validate_attempt_identity(identity)
         if (
             type(reconciliation) is not DelegatedCanaryReconciliationIdentityV1
@@ -390,7 +401,14 @@ class AsyncPostgresDelegatedCanaryStore:
         async def operation(
             connection: AsyncPostgresConnection,
         ) -> DelegatedCanaryReconciliationDisposition:
+            existing = await self._reconciliation(connection, reconciliation.reconciliation_id)
+            if existing is not None:
+                self._require_reconciliation_identity_matches(existing, evidence, identity)
             state = await self._observed_state(connection, evidence, identity)
+            if existing is not None:
+                self._require_reconciliation_state_matches(existing, state)
+                return state
+            now = self._now()
             observation_sha256 = canonical_hash(
                 {
                     "schema_version": "rsd.delegated-canary-reconciliation-observation.v1",
@@ -403,17 +421,6 @@ class AsyncPostgresDelegatedCanaryStore:
                     "observed_at": now,
                 }
             )
-            existing = await self._reconciliation(connection, reconciliation.reconciliation_id)
-            if existing is not None:
-                self._require_reconciliation_matches(
-                    existing,
-                    evidence,
-                    identity,
-                    state,
-                    observation_sha256,
-                    now,
-                )
-                return state
             inserted = await connection.execute(
                 _INSERT_RECONCILIATION_SQL,
                 (
@@ -434,23 +441,17 @@ class AsyncPostgresDelegatedCanaryStore:
                     raise DelegatedCanaryStoreCorruptionError(
                         "reconciliation conflict row is absent"
                     )
-                self._require_reconciliation_matches(
-                    existing,
-                    evidence,
-                    identity,
-                    state,
-                    observation_sha256,
-                    now,
-                )
+                self._require_reconciliation_identity_matches(existing, evidence, identity)
+                self._require_reconciliation_state_matches(existing, state)
             return state
 
         return await self._write(identity.attempt_id, operation)
 
-    def _verified_reconciliation_evidence(
+    def _verified_historical_evidence(
         self, authority: RawDelegationExecutionAuthorityV2
-    ) -> DelegationExecutionReconciliationEvidenceV2:
+    ) -> HistoricalDelegationExecutionEvidenceV2:
         self._validate_raw_authority(authority)
-        evidence = verify_raw_delegation_execution_authority_v2_for_reconciliation(
+        evidence = verify_raw_delegation_execution_chain_v2_for_historical_reconciliation(
             authority.raw_signed_grant,
             authority.raw_activation,
             activation_trust_anchor=authority.activation_trust_anchor,
@@ -458,10 +459,10 @@ class AsyncPostgresDelegatedCanaryStore:
             route_authority_trust_anchor=authority.route_authority_trust_anchor,
         )
         if (
-            type(evidence) is not DelegationExecutionReconciliationEvidenceV2
+            type(evidence) is not HistoricalDelegationExecutionEvidenceV2
             or evidence.schema_version != "rsd.delegation-execution-reconciliation-evidence.v2"
         ):
-            raise ValueError("raw verifier returned invalid reconciliation evidence")
+            raise ValueError("raw verifier returned invalid historical evidence")
         return evidence
 
     def _verified_authority(
@@ -568,7 +569,7 @@ class AsyncPostgresDelegatedCanaryStore:
 
     async def _reconciliation(
         self, connection: AsyncPostgresConnection, reconciliation_id: UUID
-    ) -> tuple[object, ...] | None:
+    ) -> _ReconciliationRow | None:
         row = await (
             await connection.execute(_SELECT_RECONCILIATION_SQL, (reconciliation_id,))
         ).fetchone()
@@ -587,7 +588,25 @@ class AsyncPostgresDelegatedCanaryStore:
                 "observed_at",
             ),
         )
-        return tuple(values[name] for name in values)
+        state_value = values["reconciliation_state"]
+        if type(state_value) is not str:
+            raise DelegatedCanaryStoreCorruptionError("stored reconciliation state is invalid")
+        try:
+            state = DelegatedCanaryReconciliationDisposition(state_value)
+        except ValueError:
+            raise DelegatedCanaryStoreCorruptionError(
+                "stored reconciliation state is invalid"
+            ) from None
+        return _ReconciliationRow(
+            attempt_id=_uuid(values["attempt_id_v2"]),
+            authorization_digest=_digest(values["authorization_digest"]),
+            attestation_id=_uuid(values["attestation_id"]),
+            grant_not_before=_utc(values["grant_not_before"]),
+            grant_expires_at=_utc(values["grant_expires_at"]),
+            state=state,
+            observation_sha256=_digest(values["observation_sha256"]),
+            observed_at=_utc(values["observed_at"]),
+        )
 
     async def _observed_state(
         self,
@@ -817,26 +836,27 @@ class AsyncPostgresDelegatedCanaryStore:
             )
 
     @staticmethod
-    def _require_reconciliation_matches(
-        row: tuple[object, ...],
+    def _require_reconciliation_identity_matches(
+        row: _ReconciliationRow,
         evidence: _VerifiedAuthority,
         identity: DelegatedCanaryAttemptIdentityV2,
-        state: DelegatedCanaryReconciliationDisposition,
-        observation_sha256: str,
-        observed_at: datetime,
     ) -> None:
-        expected = (
-            identity.attempt_id,
-            evidence.authorization_digest,
-            identity.outcome_attestation_id,
-            evidence.grant_not_before,
-            evidence.grant_expires_at,
-            state.value,
-            observation_sha256,
-            observed_at,
-        )
-        if row != expected:
+        if (
+            row.attempt_id != identity.attempt_id
+            or row.authorization_digest != evidence.authorization_digest
+            or row.attestation_id != identity.outcome_attestation_id
+            or row.grant_not_before != evidence.grant_not_before
+            or row.grant_expires_at != evidence.grant_expires_at
+        ):
             raise DelegatedCanaryStoreConflictError("reconciliation has a different binding")
+
+    @staticmethod
+    def _require_reconciliation_state_matches(
+        row: _ReconciliationRow,
+        state: DelegatedCanaryReconciliationDisposition,
+    ) -> None:
+        if row.state is not state:
+            raise DelegatedCanaryStoreConflictError("reconciliation has a different state")
 
 
 def _row_values(

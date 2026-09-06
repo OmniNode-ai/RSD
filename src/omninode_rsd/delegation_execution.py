@@ -360,13 +360,15 @@ class DelegationExecutionAuthorityProjectionV2(_Model):
         return self
 
 
-class DelegationExecutionReconciliationEvidenceV2(_Model):
-    """Historical, non-authorizing facts used only to reconcile a durable write.
+class HistoricalDelegationExecutionEvidenceV2(_Model):
+    """Historical, non-authorizing evidence for durable-write recovery only.
 
-    This deliberately contains no execution flag or target material.  It is
-    derived from the raw signed chain at a timestamp inside the signed
-    artifacts' historical validity window so that recovery remains possible
-    after the live authority has expired.
+    This authenticates the exact original signed V2 grant, activation, and
+    route chain plus their bindings at a historical validity instant.  It is
+    deliberately revocation-neutral: the public signed-grant contract has no
+    signed revocation artifact, so this type neither represents nor checks a
+    current revocation disposition.  It contains no execution flag, target,
+    or authority state and must never be used to dispatch or authorize work.
     """
 
     schema_version: Literal["rsd.delegation-execution-reconciliation-evidence.v2"]
@@ -379,7 +381,7 @@ class DelegationExecutionReconciliationEvidenceV2(_Model):
     @model_validator(mode="after")
     def timestamps_are_exact_utc(
         self,
-    ) -> DelegationExecutionReconciliationEvidenceV2:
+    ) -> HistoricalDelegationExecutionEvidenceV2:
         if self.grant_not_before.tzinfo is not UTC or self.grant_expires_at.tzinfo is not UTC:
             raise ValueError("reconciliation evidence timestamps must be exact UTC")
         if self.grant_expires_at <= self.grant_not_before:
@@ -1413,22 +1415,23 @@ def verify_raw_delegation_execution_authority_v2(
     )
 
 
-def verify_raw_delegation_execution_authority_v2_for_reconciliation(
+def verify_raw_delegation_execution_chain_v2_for_historical_reconciliation(
     raw_signed_grant: bytes,
     raw_activation: bytes,
     *,
     activation_trust_anchor: DelegationExecutionTrustAnchorV1,
     raw_route_authority: bytes,
     route_authority_trust_anchor: DelegationRouteAuthorityTrustAnchorV1,
-) -> DelegationExecutionReconciliationEvidenceV2:
-    """Derive historical evidence for recovery without granting live authority.
+) -> HistoricalDelegationExecutionEvidenceV2:
+    """Authenticate historical chain evidence without granting live authority.
 
-    The signed grant and activation timestamps choose the historical instant
-    at which the existing complete raw-chain verifier runs.  This preserves
-    all signature, digest, binding, schema, and fixed-root checks while
-    deliberately avoiding a current-liveness check.  The return type contains
-    only the durable identity needed for reconciliation and cannot authorize
-    execution.
+    The signed grant and activation timestamps select one instant inside the
+    original signed validity window.  At that instant the complete V2 raw
+    chain verifies signatures, digests, schemas, fixed roots, and bindings.
+    This is intentionally revocation-neutral because no signed revocation
+    contract is an input to this public protocol.  The result only recovers
+    durable evidence: it must never dispatch, authorize current execution, or
+    mutate authority state.
     """
 
     if type(raw_signed_grant) is not bytes or type(raw_activation) is not bytes:
@@ -1454,7 +1457,7 @@ def verify_raw_delegation_execution_authority_v2_for_reconciliation(
         route_authority_trust_anchor=route_authority_trust_anchor,
         trusted_clock=lambda: historical_now,
     )
-    return DelegationExecutionReconciliationEvidenceV2(
+    return HistoricalDelegationExecutionEvidenceV2(
         schema_version="rsd.delegation-execution-reconciliation-evidence.v2",
         grant_correlation_id=projection.grant_correlation_id,
         grant_not_before=projection.grant_not_before,
@@ -1608,7 +1611,6 @@ __all__ = [
     "DelegationExecutionError",
     "DelegationExecutionOverlayV1",
     "DelegationExecutionParseError",
-    "DelegationExecutionReconciliationEvidenceV2",
     "DelegationExecutionSignatureError",
     "DelegationExecutionTrustAnchorV1",
     "DelegationRouteAuthorityParseError",
@@ -1616,6 +1618,7 @@ __all__ = [
     "DelegationRouteAuthorityTrustAnchorV1",
     "DelegationRouteAuthorityV1",
     "DelegationRouteAuthorityV2",
+    "HistoricalDelegationExecutionEvidenceV2",
     "VerifiedDispatchOutcomeV2",
     "canonical_delegation_execution_authority_projection_json_bytes",
     "canonical_delegation_execution_authority_projection_v2_json_bytes",
@@ -1641,6 +1644,6 @@ __all__ = [
     "verify_delegation_route_authority",
     "verify_delegation_route_authority_v2",
     "verify_raw_delegation_execution_authority_v2",
-    "verify_raw_delegation_execution_authority_v2_for_reconciliation",
+    "verify_raw_delegation_execution_chain_v2_for_historical_reconciliation",
     "verify_raw_dispatch_outcome_attestation_v2",
 ]
