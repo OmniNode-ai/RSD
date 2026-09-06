@@ -408,7 +408,7 @@ class VerifiedDispatchOutcomeV2(_Model):
 
 
 def delegation_logical_reference_sha256(
-    value: str, *, namespace: Literal["endpoint", "credential"]
+    value: str, *, namespace: Literal["delegation", "endpoint", "credential"]
 ) -> str:
     """Hash one canonical logical reference without exposing its spelling downstream."""
 

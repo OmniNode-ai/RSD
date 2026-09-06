@@ -178,6 +178,27 @@ def test_migration_three_remains_byte_identical_after_v2_addition() -> None:
     assert migrations[2].content == resource.read_text(encoding="utf-8")
 
 
+def test_reconciliation_migration_is_additive_redacted_and_append_only() -> None:
+    migration = discover_lifecycle_migrations()[4]
+
+    assert migration.version == 5
+    assert migration.name == "create_delegated_canary_reconciliations"
+    assert (
+        "reconciliation_state IN ('unknown_commit', 'prepared', 'dispatch_started', 'terminal')"
+        in (migration.content)
+    )
+    assert "observation_sha256 VARCHAR(64) NOT NULL" in migration.content
+    assert "delegated_canary_reconciliations_append_only" in migration.content
+    assert "delegated_canary_reconciliations_no_truncate" in migration.content
+    assert "REVOKE ALL ON TABLE rsd_canary.delegated_canary_reconciliations FROM PUBLIC" in (
+        migration.content
+    )
+    assert "FOREIGN KEY" not in migration.content
+    assert "UPDATE rsd_canary" not in migration.content
+    assert "DELETE FROM rsd_canary" not in migration.content
+    assert "postgresql://" not in migration.content and "os.environ" not in migration.content
+
+
 def test_v2_attempt_identity_is_global_and_rejects_cross_authorization_reuse() -> None:
     migration = discover_lifecycle_migrations()[3].content
 
