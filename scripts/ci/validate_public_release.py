@@ -97,6 +97,12 @@ DELEGATED_REQUEST_SAFE_SLICE_FILES: Final[frozenset[tuple[str, ...]]] = frozense
         ("tests", "test_delegation_execution.py"),
     }
 )
+HOSTILE_REVIEW_SAFE_SLICE_FILES: Final[frozenset[tuple[str, ...]]] = frozenset(
+    {
+        ("scripts", "ci", "hostile_review_diagnostics.py"),
+        ("tests", "test_hostile_review_diagnostics.py"),
+    }
+)
 VALIDATOR_PATH: Final[Path] = Path("scripts/ci/validate_public_release.py")
 
 MARKER_RE = re.compile(
@@ -253,6 +259,8 @@ def _is_allowed_file(path: Path) -> bool:
     if parts and parts[0] == "public_verifier":
         return parts in PUBLIC_VERIFIER_FILES
     if parts in DELEGATED_REQUEST_SAFE_SLICE_FILES:
+        return True
+    if parts in HOSTILE_REVIEW_SAFE_SLICE_FILES:
         return True
     if len(parts) == 1:
         return parts[0] in ALLOWED_TOP_LEVEL - {".github", "scripts", "src", "tests"}

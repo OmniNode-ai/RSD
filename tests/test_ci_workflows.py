@@ -194,6 +194,9 @@ def test_hostile_reviewer_has_explicit_degraded_fork_and_default_deny_gate() -> 
 def test_hostile_reviewer_bounds_and_normalizes_diagnostics() -> None:
     text = _HOSTILE_REVIEWER.read_text(encoding="utf-8")
     reviewer = text.split("  hostile-review:\n", 1)[1]
+    diagnostics = (
+        Path(__file__).parents[1] / "scripts" / "ci" / "hostile_review_diagnostics.py"
+    ).read_text(encoding="utf-8")
 
     assert 'REVIEW_TMPDIR="$(mktemp -d)"' in reviewer
     assert "trap 'rm -rf \"$REVIEW_TMPDIR\"' EXIT" in reviewer
@@ -204,7 +207,8 @@ def test_hostile_reviewer_bounds_and_normalizes_diagnostics() -> None:
     assert '2>"$REVIEW_FIFO"' in reviewer
     assert "2>/dev/null" not in reviewer
     assert '"$REVIEW_STDERR"' in reviewer
-    assert "classify_diagnostic" in reviewer
+    assert "hostile_review_diagnostics.py" in reviewer
+    assert "classify_diagnostic" not in reviewer
     for category in (
         "reviewer-timeout",
         "reviewer-authentication",
@@ -214,7 +218,7 @@ def test_hostile_reviewer_bounds_and_normalizes_diagnostics() -> None:
         "reviewer-malformed-response",
         "reviewer-error",
     ):
-        assert category in reviewer
+        assert category in diagnostics
     assert 'echo "$REVIEW_STDERR"' not in reviewer
     assert 'cat "$REVIEW_STDERR"' not in reviewer
     assert "--no-fallback" in reviewer
