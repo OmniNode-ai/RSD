@@ -32,6 +32,7 @@ from omninode_rsd.delegation_execution import (
     DelegationExecutionError,
     DelegationExecutionOverlayV1,
     DelegationExecutionParseError,
+    DelegationExecutionReconciliationEvidenceV2,
     DelegationExecutionSignatureError,
     DelegationExecutionTrustAnchorV1,
     DelegationRouteAuthorityParseError,
@@ -63,6 +64,7 @@ from omninode_rsd.delegation_execution import (
     verify_delegation_route_authority,
     verify_delegation_route_authority_v2,
     verify_raw_delegation_execution_authority_v2,
+    verify_raw_delegation_execution_authority_v2_for_reconciliation,
     verify_raw_dispatch_outcome_attestation_v2,
 )
 from omninode_rsd.lifecycle import InMemoryEventLog, LifecycleEventIngress
@@ -1190,6 +1192,55 @@ def test_raw_v2_chain_derives_projection_without_claim_or_projection_inputs(
     )
     with pytest.raises(ValidationError, match="exact UTC"):
         DelegationExecutionAuthorityProjectionV2.model_validate(invalid_timezone)
+
+
+def test_raw_v2_reconciliation_derives_historical_non_authorizing_evidence_after_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claim = _claim()
+    monkeypatch.setattr(
+        delegation_execution,
+        "_claim_from_raw_signed_grant",
+        lambda raw_signed_grant, *, trusted_clock: claim,
+    )
+    activation_key = Ed25519PrivateKey.generate()
+    route_key = Ed25519PrivateKey.generate()
+    activation, authority = _signed_pair_v2(claim, activation_key, route_key)
+    raw_grant = json.dumps(
+        signed_executable_grant_v2_vectors()["base_wire"], separators=(",", ":")
+    ).encode("utf-8")
+    with pytest.raises(DelegationExecutionError):
+        verify_raw_delegation_execution_authority_v2(
+            raw_grant,
+            canonical_delegation_execution_overlay_json_bytes(activation),
+            activation_trust_anchor=_anchor(activation_key),
+            raw_route_authority=canonical_delegation_route_authority_v2_json_bytes(authority),
+            route_authority_trust_anchor=_route_anchor(route_key),
+            trusted_clock=lambda: _NOW + timedelta(minutes=10),
+        )
+    evidence = verify_raw_delegation_execution_authority_v2_for_reconciliation(
+        raw_grant,
+        canonical_delegation_execution_overlay_json_bytes(activation),
+        activation_trust_anchor=_anchor(activation_key),
+        raw_route_authority=canonical_delegation_route_authority_v2_json_bytes(authority),
+        route_authority_trust_anchor=_route_anchor(route_key),
+    )
+
+    assert type(evidence) is DelegationExecutionReconciliationEvidenceV2
+    assert not hasattr(evidence, "execute_enabled")
+    assert evidence.authorization_digest == claim.grant.authorization_digest
+    assert evidence.grant_expires_at > evidence.grant_not_before
+
+    tampered_activation = bytearray(canonical_delegation_execution_overlay_json_bytes(activation))
+    tampered_activation[-2] ^= 1
+    with pytest.raises(DelegationExecutionError):
+        verify_raw_delegation_execution_authority_v2_for_reconciliation(
+            raw_grant,
+            bytes(tampered_activation),
+            activation_trust_anchor=_anchor(activation_key),
+            raw_route_authority=canonical_delegation_route_authority_v2_json_bytes(authority),
+            route_authority_trust_anchor=_route_anchor(route_key),
+        )
 
 
 def test_raw_v2_chain_rejects_grant_lifetime_divergence(

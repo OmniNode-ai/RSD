@@ -21,6 +21,7 @@ from uuid import UUID
 import yaml
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from omninode_grant_verifier import parse_signed_executable_grant_v2
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from omninode_rsd.delegation import (
@@ -356,6 +357,33 @@ class DelegationExecutionAuthorityProjectionV2(_Model):
             raise ValueError("authority projection timestamps must be exact UTC")
         if not (self.grant_not_before <= self.issued_at < self.expires_at <= self.grant_expires_at):
             raise ValueError("authority projection lifetime is not within the verified grant")
+        return self
+
+
+class DelegationExecutionReconciliationEvidenceV2(_Model):
+    """Historical, non-authorizing facts used only to reconcile a durable write.
+
+    This deliberately contains no execution flag or target material.  It is
+    derived from the raw signed chain at a timestamp inside the signed
+    artifacts' historical validity window so that recovery remains possible
+    after the live authority has expired.
+    """
+
+    schema_version: Literal["rsd.delegation-execution-reconciliation-evidence.v2"]
+    grant_correlation_id: UUID
+    grant_not_before: datetime
+    grant_expires_at: datetime
+    authorization_digest: str = Field(pattern=_SHA256)
+    claim_binding_sha256: str = Field(pattern=_SHA256)
+
+    @model_validator(mode="after")
+    def timestamps_are_exact_utc(
+        self,
+    ) -> DelegationExecutionReconciliationEvidenceV2:
+        if self.grant_not_before.tzinfo is not UTC or self.grant_expires_at.tzinfo is not UTC:
+            raise ValueError("reconciliation evidence timestamps must be exact UTC")
+        if self.grant_expires_at <= self.grant_not_before:
+            raise ValueError("reconciliation evidence grant lifetime is invalid")
         return self
 
 
@@ -1385,6 +1413,57 @@ def verify_raw_delegation_execution_authority_v2(
     )
 
 
+def verify_raw_delegation_execution_authority_v2_for_reconciliation(
+    raw_signed_grant: bytes,
+    raw_activation: bytes,
+    *,
+    activation_trust_anchor: DelegationExecutionTrustAnchorV1,
+    raw_route_authority: bytes,
+    route_authority_trust_anchor: DelegationRouteAuthorityTrustAnchorV1,
+) -> DelegationExecutionReconciliationEvidenceV2:
+    """Derive historical evidence for recovery without granting live authority.
+
+    The signed grant and activation timestamps choose the historical instant
+    at which the existing complete raw-chain verifier runs.  This preserves
+    all signature, digest, binding, schema, and fixed-root checks while
+    deliberately avoiding a current-liveness check.  The return type contains
+    only the durable identity needed for reconciliation and cannot authorize
+    execution.
+    """
+
+    if type(raw_signed_grant) is not bytes or type(raw_activation) is not bytes:
+        raise DelegationExecutionError("reconciliation authority bytes are invalid")
+    try:
+        parsed_grant = parse_signed_executable_grant_v2(raw_signed_grant)
+        parsed_activation = parse_delegation_execution_overlay(raw_activation)
+        grant_issued_at = parsed_grant.authorization_material.grant.issued_at.astimezone(UTC)
+        activation_issued_at = _require_utc(parsed_activation.issued_at)
+        historical_now = max(grant_issued_at, activation_issued_at)
+    except DelegationExecutionError:
+        raise
+    except Exception as error:
+        raise DelegationExecutionError(
+            "raw reconciliation authority cannot establish a historical instant"
+        ) from error
+
+    projection = verify_raw_delegation_execution_authority_v2(
+        raw_signed_grant,
+        raw_activation,
+        activation_trust_anchor=activation_trust_anchor,
+        raw_route_authority=raw_route_authority,
+        route_authority_trust_anchor=route_authority_trust_anchor,
+        trusted_clock=lambda: historical_now,
+    )
+    return DelegationExecutionReconciliationEvidenceV2(
+        schema_version="rsd.delegation-execution-reconciliation-evidence.v2",
+        grant_correlation_id=projection.grant_correlation_id,
+        grant_not_before=projection.grant_not_before,
+        grant_expires_at=projection.grant_expires_at,
+        authorization_digest=projection.authorization_digest,
+        claim_binding_sha256=projection.claim_binding_sha256,
+    )
+
+
 def verify_raw_dispatch_outcome_attestation_v2(
     raw_attestation: bytes,
     *,
@@ -1529,6 +1608,7 @@ __all__ = [
     "DelegationExecutionError",
     "DelegationExecutionOverlayV1",
     "DelegationExecutionParseError",
+    "DelegationExecutionReconciliationEvidenceV2",
     "DelegationExecutionSignatureError",
     "DelegationExecutionTrustAnchorV1",
     "DelegationRouteAuthorityParseError",
@@ -1561,5 +1641,6 @@ __all__ = [
     "verify_delegation_route_authority",
     "verify_delegation_route_authority_v2",
     "verify_raw_delegation_execution_authority_v2",
+    "verify_raw_delegation_execution_authority_v2_for_reconciliation",
     "verify_raw_dispatch_outcome_attestation_v2",
 ]

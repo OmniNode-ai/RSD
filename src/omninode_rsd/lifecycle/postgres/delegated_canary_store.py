@@ -21,11 +21,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from omninode_rsd.delegation_execution import (
     DelegationExecutionAuthorityProjectionV2,
+    DelegationExecutionReconciliationEvidenceV2,
     DelegationExecutionTrustAnchorV1,
     DelegationRouteAuthorityTrustAnchorV1,
     VerifiedDispatchOutcomeV2,
     delegation_logical_reference_sha256,
     verify_raw_delegation_execution_authority_v2,
+    verify_raw_delegation_execution_authority_v2_for_reconciliation,
     verify_raw_dispatch_outcome_attestation_v2,
 )
 from omninode_rsd.lifecycle.hashing import canonical_hash
@@ -131,6 +133,9 @@ type AsyncPostgresConnectionFactory = Callable[
 ]
 type TrustedClock = Callable[[], datetime]
 _Result = TypeVar("_Result")
+_VerifiedAuthority = (
+    DelegationExecutionAuthorityProjectionV2 | DelegationExecutionReconciliationEvidenceV2
+)
 
 
 class DelegatedCanaryStoreError(RuntimeError):
@@ -373,23 +378,27 @@ class AsyncPostgresDelegatedCanaryStore:
     ) -> DelegatedCanaryReconciliationDisposition:
         """Append a durable observation; this never changes attempt history."""
 
-        projection, now = self._verified_authority(authority)
+        evidence = self._verified_reconciliation_evidence(authority)
+        now = self._now()
         self._validate_attempt_identity(identity)
-        if type(reconciliation) is not DelegatedCanaryReconciliationIdentityV1:
+        if (
+            type(reconciliation) is not DelegatedCanaryReconciliationIdentityV1
+            or reconciliation.schema_version != "rsd.delegated-canary-reconciliation-identity.v1"
+        ):
             raise ValueError("reconciliation identity must use the exact public type")
 
         async def operation(
             connection: AsyncPostgresConnection,
         ) -> DelegatedCanaryReconciliationDisposition:
-            state = await self._observed_state(connection, projection, identity)
+            state = await self._observed_state(connection, evidence, identity)
             observation_sha256 = canonical_hash(
                 {
                     "schema_version": "rsd.delegated-canary-reconciliation-observation.v1",
                     "attempt_id": identity.attempt_id,
                     "outcome_attestation_id": identity.outcome_attestation_id,
-                    "authorization_digest": projection.authorization_digest,
-                    "grant_not_before": projection.grant_not_before,
-                    "grant_expires_at": projection.grant_expires_at,
+                    "authorization_digest": evidence.authorization_digest,
+                    "grant_not_before": evidence.grant_not_before,
+                    "grant_expires_at": evidence.grant_expires_at,
                     "state": state.value,
                     "observed_at": now,
                 }
@@ -398,7 +407,7 @@ class AsyncPostgresDelegatedCanaryStore:
             if existing is not None:
                 self._require_reconciliation_matches(
                     existing,
-                    projection,
+                    evidence,
                     identity,
                     state,
                     observation_sha256,
@@ -410,10 +419,10 @@ class AsyncPostgresDelegatedCanaryStore:
                 (
                     reconciliation.reconciliation_id,
                     identity.attempt_id,
-                    projection.authorization_digest,
+                    evidence.authorization_digest,
                     identity.outcome_attestation_id,
-                    projection.grant_not_before,
-                    projection.grant_expires_at,
+                    evidence.grant_not_before,
+                    evidence.grant_expires_at,
                     state.value,
                     observation_sha256,
                     now,
@@ -427,7 +436,7 @@ class AsyncPostgresDelegatedCanaryStore:
                     )
                 self._require_reconciliation_matches(
                     existing,
-                    projection,
+                    evidence,
                     identity,
                     state,
                     observation_sha256,
@@ -436,6 +445,24 @@ class AsyncPostgresDelegatedCanaryStore:
             return state
 
         return await self._write(identity.attempt_id, operation)
+
+    def _verified_reconciliation_evidence(
+        self, authority: RawDelegationExecutionAuthorityV2
+    ) -> DelegationExecutionReconciliationEvidenceV2:
+        self._validate_raw_authority(authority)
+        evidence = verify_raw_delegation_execution_authority_v2_for_reconciliation(
+            authority.raw_signed_grant,
+            authority.raw_activation,
+            activation_trust_anchor=authority.activation_trust_anchor,
+            raw_route_authority=authority.raw_route_authority,
+            route_authority_trust_anchor=authority.route_authority_trust_anchor,
+        )
+        if (
+            type(evidence) is not DelegationExecutionReconciliationEvidenceV2
+            or evidence.schema_version != "rsd.delegation-execution-reconciliation-evidence.v2"
+        ):
+            raise ValueError("raw verifier returned invalid reconciliation evidence")
+        return evidence
 
     def _verified_authority(
         self, authority: RawDelegationExecutionAuthorityV2
@@ -450,7 +477,10 @@ class AsyncPostgresDelegatedCanaryStore:
             route_authority_trust_anchor=authority.route_authority_trust_anchor,
             trusted_clock=lambda: now,
         )
-        if type(projection) is not DelegationExecutionAuthorityProjectionV2:
+        if (
+            type(projection) is not DelegationExecutionAuthorityProjectionV2
+            or projection.schema_version != "rsd.delegation-execution-authority-projection.v2"
+        ):
             raise ValueError("raw verifier returned an invalid authority projection")
         return projection, now
 
@@ -484,7 +514,10 @@ class AsyncPostgresDelegatedCanaryStore:
             response_preimage=response_preimage,
             output_payload=output_payload,
         )
-        if type(outcome) is not VerifiedDispatchOutcomeV2:
+        if (
+            type(outcome) is not VerifiedDispatchOutcomeV2
+            or outcome.schema_version != "rsd.verified-dispatch-outcome.v2"
+        ):
             raise ValueError("raw verifier returned an invalid terminal receipt")
         return outcome, now
 
@@ -559,20 +592,20 @@ class AsyncPostgresDelegatedCanaryStore:
     async def _observed_state(
         self,
         connection: AsyncPostgresConnection,
-        projection: DelegationExecutionAuthorityProjectionV2,
+        evidence: _VerifiedAuthority,
         identity: DelegatedCanaryAttemptIdentityV2,
     ) -> DelegatedCanaryReconciliationDisposition:
         attempt = await self._attempt(connection, identity.attempt_id)
         if attempt is None:
             return DelegatedCanaryReconciliationDisposition.UNKNOWN_COMMIT
-        self._require_attempt_matches(attempt, projection, identity)
-        terminal = await self._terminal(connection, projection.authorization_digest)
+        self._require_attempt_matches(attempt, evidence, identity)
+        terminal = await self._terminal(connection, evidence.authorization_digest)
         if terminal is not None:
-            self._require_terminal_identity_matches(terminal, projection, identity)
+            self._require_terminal_identity_matches(terminal, evidence, identity)
             return DelegatedCanaryReconciliationDisposition.TERMINAL
-        dispatch = await self._dispatch(connection, projection.authorization_digest)
+        dispatch = await self._dispatch(connection, evidence.authorization_digest)
         if dispatch is not None:
-            self._require_dispatch_matches(dispatch, projection, identity)
+            self._require_dispatch_matches(dispatch, evidence, identity)
             return DelegatedCanaryReconciliationDisposition.DISPATCH_STARTED
         return DelegatedCanaryReconciliationDisposition.PREPARED
 
@@ -642,7 +675,10 @@ class AsyncPostgresDelegatedCanaryStore:
 
     @staticmethod
     def _validate_raw_authority(authority: RawDelegationExecutionAuthorityV2) -> None:
-        if type(authority) is not RawDelegationExecutionAuthorityV2:
+        if (
+            type(authority) is not RawDelegationExecutionAuthorityV2
+            or authority.schema_version != "rsd.raw-delegation-execution-authority.v2"
+        ):
             raise ValueError("raw authority must use the exact public type")
         if (
             type(authority.raw_signed_grant) is not bytes
@@ -658,6 +694,7 @@ class AsyncPostgresDelegatedCanaryStore:
     def _validate_attempt_identity(identity: DelegatedCanaryAttemptIdentityV2) -> None:
         if (
             type(identity) is not DelegatedCanaryAttemptIdentityV2
+            or identity.schema_version != "rsd.delegated-canary-attempt-identity.v2"
             or type(identity.attempt_id) is not UUID
             or type(identity.outcome_attestation_id) is not UUID
             or identity.attempt_id == identity.outcome_attestation_id
@@ -689,31 +726,31 @@ class AsyncPostgresDelegatedCanaryStore:
     @staticmethod
     def _require_attempt_matches(
         row: _AttemptRow,
-        projection: DelegationExecutionAuthorityProjectionV2,
+        evidence: _VerifiedAuthority,
         identity: DelegatedCanaryAttemptIdentityV2,
     ) -> None:
         if (
-            row.run_id != projection.grant_correlation_id
-            or row.authorization_digest != projection.authorization_digest
+            row.run_id != evidence.grant_correlation_id
+            or row.authorization_digest != evidence.authorization_digest
             or row.attestation_id != identity.outcome_attestation_id
-            or row.claim_binding_sha256 != projection.claim_binding_sha256
-            or row.grant_not_before != projection.grant_not_before
-            or row.grant_expires_at != projection.grant_expires_at
+            or row.claim_binding_sha256 != evidence.claim_binding_sha256
+            or row.grant_not_before != evidence.grant_not_before
+            or row.grant_expires_at != evidence.grant_expires_at
         ):
             raise DelegatedCanaryStoreConflictError("prepared attempt has a different binding")
 
     @staticmethod
     def _require_dispatch_matches(
         row: _DispatchRow,
-        projection: DelegationExecutionAuthorityProjectionV2,
+        evidence: _VerifiedAuthority,
         identity: DelegatedCanaryAttemptIdentityV2,
     ) -> None:
         if (
-            row.authorization_digest != projection.authorization_digest
+            row.authorization_digest != evidence.authorization_digest
             or row.attestation_id != identity.outcome_attestation_id
             or row.attempt_id != identity.attempt_id
-            or row.grant_not_before != projection.grant_not_before
-            or row.grant_expires_at != projection.grant_expires_at
+            or row.grant_not_before != evidence.grant_not_before
+            or row.grant_expires_at != evidence.grant_expires_at
         ):
             raise DelegatedCanaryStoreConflictError("dispatch start has a different binding")
 
@@ -764,16 +801,16 @@ class AsyncPostgresDelegatedCanaryStore:
     @staticmethod
     def _require_terminal_identity_matches(
         row: _TerminalRow,
-        projection: DelegationExecutionAuthorityProjectionV2,
+        evidence: _VerifiedAuthority,
         identity: DelegatedCanaryAttemptIdentityV2,
     ) -> None:
         if (
-            row.authorization_digest != projection.authorization_digest
+            row.authorization_digest != evidence.authorization_digest
             or row.attestation_id != identity.outcome_attestation_id
             or row.attempt_id != identity.attempt_id
             or row.outcome_attestation_id != identity.outcome_attestation_id
-            or row.grant_not_before != projection.grant_not_before
-            or row.grant_expires_at != projection.grant_expires_at
+            or row.grant_not_before != evidence.grant_not_before
+            or row.grant_expires_at != evidence.grant_expires_at
         ):
             raise DelegatedCanaryStoreCorruptionError(
                 "stored terminal record has a different binding"
@@ -782,7 +819,7 @@ class AsyncPostgresDelegatedCanaryStore:
     @staticmethod
     def _require_reconciliation_matches(
         row: tuple[object, ...],
-        projection: DelegationExecutionAuthorityProjectionV2,
+        evidence: _VerifiedAuthority,
         identity: DelegatedCanaryAttemptIdentityV2,
         state: DelegatedCanaryReconciliationDisposition,
         observation_sha256: str,
@@ -790,10 +827,10 @@ class AsyncPostgresDelegatedCanaryStore:
     ) -> None:
         expected = (
             identity.attempt_id,
-            projection.authorization_digest,
+            evidence.authorization_digest,
             identity.outcome_attestation_id,
-            projection.grant_not_before,
-            projection.grant_expires_at,
+            evidence.grant_not_before,
+            evidence.grant_expires_at,
             state.value,
             observation_sha256,
             observed_at,

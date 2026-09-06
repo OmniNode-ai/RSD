@@ -40,8 +40,63 @@ from omninode_rsd.lifecycle.postgres.store import (
     PostgresResult,
 )
 
+_DELEGATED_CANARY_EXPORTS = frozenset(
+    {
+        "AsyncPostgresConnection",
+        "AsyncPostgresConnectionFactory",
+        "AsyncPostgresDelegatedCanaryStore",
+        "AsyncPostgresResult",
+        "DelegatedCanaryAttemptIdentityV2",
+        "DelegatedCanaryDispatchDisposition",
+        "DelegatedCanaryPrepareDisposition",
+        "DelegatedCanaryReconciliationDisposition",
+        "DelegatedCanaryReconciliationIdentityV1",
+        "DelegatedCanaryStoreAmbiguousCommitError",
+        "DelegatedCanaryStoreConflictError",
+        "DelegatedCanaryStoreCorruptionError",
+        "DelegatedCanaryStoreError",
+        "DelegatedCanaryStoreUnavailableError",
+        "DelegatedCanaryTerminalDisposition",
+        "RawDelegationExecutionAuthorityV2",
+    }
+)
+
+
+def __getattr__(name: str) -> object:
+    """Load the canary adapter after the lifecycle aggregate is initialized.
+
+    ``delegation`` imports the lifecycle aggregate, while the canary adapter
+    depends on ``delegation_execution``.  Keeping only this new dependency at
+    the package boundary prevents that pre-existing cycle; the resolved
+    symbols are cached in the module and are otherwise ordinary exports.
+    """
+
+    if name not in _DELEGATED_CANARY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from omninode_rsd.lifecycle.postgres import delegated_canary_store
+
+    value = getattr(delegated_canary_store, name)
+    globals()[name] = value
+    return value
+
+
 __all__ = [
     "AppliedLifecycleMigration",
+    "AsyncPostgresConnection",
+    "AsyncPostgresConnectionFactory",
+    "AsyncPostgresDelegatedCanaryStore",
+    "AsyncPostgresResult",
+    "DelegatedCanaryAttemptIdentityV2",
+    "DelegatedCanaryDispatchDisposition",
+    "DelegatedCanaryPrepareDisposition",
+    "DelegatedCanaryReconciliationDisposition",
+    "DelegatedCanaryReconciliationIdentityV1",
+    "DelegatedCanaryStoreAmbiguousCommitError",
+    "DelegatedCanaryStoreConflictError",
+    "DelegatedCanaryStoreCorruptionError",
+    "DelegatedCanaryStoreError",
+    "DelegatedCanaryStoreUnavailableError",
+    "DelegatedCanaryTerminalDisposition",
     "DelegationClaimIdentityV1",
     "DelegationClaimResult",
     "DelegationClaimStoreCorruptionError",
@@ -66,6 +121,7 @@ __all__ = [
     "PostgresMigrationConnectionFactory",
     "PostgresMigrationResult",
     "PostgresResult",
+    "RawDelegationExecutionAuthorityV2",
     "discover_lifecycle_migrations",
     "pending_lifecycle_migrations",
 ]

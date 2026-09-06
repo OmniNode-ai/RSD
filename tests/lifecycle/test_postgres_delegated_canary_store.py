@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,6 +14,7 @@ import pytest
 import omninode_rsd.lifecycle.postgres.delegated_canary_store as store_module
 from omninode_rsd.delegation_execution import (
     DelegationExecutionAuthorityProjectionV2,
+    DelegationExecutionReconciliationEvidenceV2,
     DelegationExecutionTrustAnchorV1,
     DelegationRouteAuthorityTrustAnchorV1,
     VerifiedDispatchOutcomeV2,
@@ -275,8 +276,12 @@ def _outcome() -> VerifiedDispatchOutcomeV2:
     )
 
 
-def _store(database: _Database) -> AsyncPostgresDelegatedCanaryStore:
-    return AsyncPostgresDelegatedCanaryStore(_Factory(database), trusted_clock=lambda: NOW)
+def _store(
+    database: _Database,
+    *,
+    trusted_clock: Callable[[], datetime] = lambda: NOW,
+) -> AsyncPostgresDelegatedCanaryStore:
+    return AsyncPostgresDelegatedCanaryStore(_Factory(database), trusted_clock=trusted_clock)
 
 
 def _patch_verifiers(
@@ -289,6 +294,20 @@ def _patch_verifiers(
         store_module,
         "verify_raw_delegation_execution_authority_v2",
         lambda raw_signed_grant, raw_activation, **kwargs: projection or _projection(),
+    )
+    monkeypatch.setattr(
+        store_module,
+        "verify_raw_delegation_execution_authority_v2_for_reconciliation",
+        lambda raw_signed_grant, raw_activation, **kwargs: (
+            DelegationExecutionReconciliationEvidenceV2.model_construct(
+                schema_version="rsd.delegation-execution-reconciliation-evidence.v2",
+                grant_correlation_id=(projection or _projection()).grant_correlation_id,
+                grant_not_before=(projection or _projection()).grant_not_before,
+                grant_expires_at=(projection or _projection()).grant_expires_at,
+                authorization_digest=(projection or _projection()).authorization_digest,
+                claim_binding_sha256=(projection or _projection()).claim_binding_sha256,
+            )
+        ),
     )
     monkeypatch.setattr(
         store_module,
@@ -395,6 +414,44 @@ def test_commit_ambiguity_requires_append_only_reconciliation(
     assert result is DelegatedCanaryReconciliationDisposition.PREPARED
     assert database.reconciliations[RECONCILIATION_ID]["reconciliation_state"] == "prepared"
 
+    restarted = _store(database)
+    assert (
+        asyncio.run(
+            restarted.reconcile_ambiguous_commit(
+                _authority(),
+                _identity(),
+                DelegatedCanaryReconciliationIdentityV1(
+                    schema_version="rsd.delegated-canary-reconciliation-identity.v1",
+                    reconciliation_id=RECONCILIATION_ID,
+                ),
+            )
+        )
+        is DelegatedCanaryReconciliationDisposition.PREPARED
+    )
+
+
+def test_reconciliation_uses_historical_evidence_after_live_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _Database()
+    _patch_verifiers(monkeypatch)
+    expired_now = NOW + timedelta(minutes=10)
+    store = _store(database, trusted_clock=lambda: expired_now)
+
+    result = asyncio.run(
+        store.reconcile_ambiguous_commit(
+            _authority(),
+            _identity(),
+            DelegatedCanaryReconciliationIdentityV1(
+                schema_version="rsd.delegated-canary-reconciliation-identity.v1",
+                reconciliation_id=RECONCILIATION_ID,
+            ),
+        )
+    )
+
+    assert result is DelegatedCanaryReconciliationDisposition.UNKNOWN_COMMIT
+    assert database.reconciliations[RECONCILIATION_ID]["grant_expires_at"] < expired_now
+
 
 def test_missing_attempt_is_recorded_as_unknown_commit_without_history_mutation(
     monkeypatch: pytest.MonkeyPatch,
@@ -439,3 +496,68 @@ def test_store_has_no_driver_or_runtime_configuration_dependency() -> None:
     assert "psycopg" not in text
     assert "os.environ" not in text
     assert "httpx" not in text
+
+
+def test_store_rejects_model_construct_wrong_schema_versions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority = RawDelegationExecutionAuthorityV2.model_construct(
+        schema_version="wrong",
+        raw_signed_grant=b"grant",
+        raw_activation=b"activation",
+        activation_trust_anchor=DelegationExecutionTrustAnchorV1.model_construct(),
+        raw_route_authority=b"route",
+        route_authority_trust_anchor=DelegationRouteAuthorityTrustAnchorV1.model_construct(),
+    )
+    identity = DelegatedCanaryAttemptIdentityV2.model_construct(
+        schema_version="wrong",
+        attempt_id=ATTEMPT_ID,
+        outcome_attestation_id=ATTESTATION_ID,
+    )
+    reconciliation = DelegatedCanaryReconciliationIdentityV1.model_construct(
+        schema_version="wrong",
+        reconciliation_id=RECONCILIATION_ID,
+    )
+
+    with pytest.raises(ValueError, match="exact public type"):
+        AsyncPostgresDelegatedCanaryStore._validate_raw_authority(authority)
+    with pytest.raises(ValueError, match="invalid"):
+        AsyncPostgresDelegatedCanaryStore._validate_attempt_identity(identity)
+    store = _store(_Database())
+    _patch_verifiers(monkeypatch)
+
+    with pytest.raises(ValueError, match="exact public type"):
+        asyncio.run(store.reconcile_ambiguous_commit(_authority(), _identity(), reconciliation))
+
+    projection_values = _projection().model_dump()
+    projection_values["schema_version"] = "wrong"
+    invalid_projection = DelegationExecutionAuthorityProjectionV2.model_construct(
+        **projection_values
+    )
+    _patch_verifiers(monkeypatch, projection=invalid_projection)
+    with pytest.raises(ValueError, match="invalid authority projection"):
+        asyncio.run(store.prepare(_authority(), _identity()))
+
+
+def test_delegated_canary_symbols_are_exported_from_canonical_postgres_package() -> None:
+    from omninode_rsd.lifecycle.postgres import (
+        AsyncPostgresDelegatedCanaryStore as CanonicalStore,
+    )
+    from omninode_rsd.lifecycle.postgres import (
+        DelegatedCanaryAttemptIdentityV2 as CanonicalAttemptIdentity,
+    )
+    from omninode_rsd.lifecycle.postgres import (
+        DelegatedCanaryPrepareDisposition as CanonicalPrepareDisposition,
+    )
+    from omninode_rsd.lifecycle.postgres import (
+        DelegatedCanaryStoreError as CanonicalStoreError,
+    )
+    from omninode_rsd.lifecycle.postgres import (
+        RawDelegationExecutionAuthorityV2 as CanonicalAuthority,
+    )
+
+    assert CanonicalStore is AsyncPostgresDelegatedCanaryStore
+    assert CanonicalAttemptIdentity is DelegatedCanaryAttemptIdentityV2
+    assert CanonicalPrepareDisposition is DelegatedCanaryPrepareDisposition
+    assert CanonicalStoreError is store_module.DelegatedCanaryStoreError
+    assert CanonicalAuthority is RawDelegationExecutionAuthorityV2
