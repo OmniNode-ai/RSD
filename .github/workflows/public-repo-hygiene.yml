@@ -6,7 +6,7 @@
 # This repository is PUBLIC. The gate refuses internal operating detail landing
 # in it: an undeclared top-level directory, an agent-state or evidence tree, a
 # misplaced dated document, a brand asset, an env file, cloud identity, a
-# private address, an operator machine path, a private repository name, and
+# non-public address, an operator machine path, a non-public repository name, and
 # internal-KB prose in a public README.
 #
 # mode: report. The gate records every finding and exits 0, so it lands without
@@ -18,7 +18,7 @@
 # refuses to run without it rather than treating an absent config as an empty
 # allowlist.
 #
-# `secrets: inherit` IS REQUIRED: the denylist vocabulary lives in a private
+# `secrets: inherit` IS REQUIRED: the denylist vocabulary lives in a restricted
 # repository and the reusable workflow mints an installation token to read it.
 # Without the secrets the gate fails CLOSED, which is the correct behaviour and
 # a loud one.
