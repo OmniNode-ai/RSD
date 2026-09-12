@@ -38,6 +38,7 @@ ALLOWED_TOP_LEVEL: Final[frozenset[str]] = frozenset(
         ".github",
         ".gitignore",
         ".pre-commit-config.yaml",
+        ".public-repo-hygiene.yaml",
         "LICENSE",
         "README.md",
         "pyproject.toml",
