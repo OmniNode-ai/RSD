@@ -14,6 +14,8 @@ import yaml
 _WORKFLOW_DIR = Path(__file__).parents[1] / ".github" / "workflows"
 _HOSTILE_REVIEWER = _WORKFLOW_DIR / "hostile-reviewer.yml"
 _RELEASE_WORKFLOW = _WORKFLOW_DIR / "release.yml"
+_TEST_WORKFLOW = _WORKFLOW_DIR / "test.yml"
+_PRE_COMMIT_CONFIG = Path(__file__).parents[1] / ".pre-commit-config.yaml"
 _SHA_RE = re.compile(r"^\s*(?:-\s*)?uses:\s*(?P<action>[^@\s]+)@(?P<sha>[0-9a-f]{40})(?:\s+#.*)?$")
 _PARSER_PATH = Path(__file__).parents[1] / "scripts" / "ci" / "parse_hostile_review.py"
 _PARSER_SPEC = importlib.util.spec_from_file_location("parse_hostile_review", _PARSER_PATH)
@@ -553,3 +555,32 @@ def test_review_input_fetch_uses_read_only_github_diff_endpoint(
     assert request.get_header("Accept") == "application/vnd.github.diff"
     assert request.get_header("Authorization") == "Bearer token"
     assert captured["timeout"] == 60
+
+
+def test_authored_contract_set_validation_is_wired_as_a_gate() -> None:
+    """The authored contract set is re-validated by CI and by pre-commit.
+
+    The unit tests around the harness prove the harness; only running the
+    console script against the committed YAML proves the committed contract
+    set itself still validates. Wiring it in both places is what stops a
+    change to the YAML from landing on the strength of a green unit suite.
+    """
+    command = "uv run rsd-validate-lab-delegation-contracts"
+
+    workflow = yaml.safe_load(_TEST_WORKFLOW.read_text(encoding="utf-8"))
+    assert isinstance(workflow, dict)
+    steps = workflow["jobs"]["full-suite"]["steps"]
+    assert any(step.get("run") == command for step in steps), (
+        "the authored contract set validation is not a step in the test workflow"
+    )
+
+    pre_commit = yaml.safe_load(_PRE_COMMIT_CONFIG.read_text(encoding="utf-8"))
+    assert isinstance(pre_commit, dict)
+    hooks = [hook for repo in pre_commit["repos"] for hook in repo["hooks"]]
+    hook = next(
+        (item for item in hooks if item["id"] == "validate-lab-delegation-contracts"),
+        None,
+    )
+    assert hook is not None, "the authored contract set validation is not a pre-commit hook"
+    assert hook["entry"] == command
+    assert hook["pass_filenames"] is False

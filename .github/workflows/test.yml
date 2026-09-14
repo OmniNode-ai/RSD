@@ -21,6 +21,7 @@ jobs:
           enable-cache: false
       - run: uv sync --all-groups --locked
       - run: uv run python scripts/ci/validate_public_release.py
+      - run: uv run rsd-validate-lab-delegation-contracts
       - run: uv run ruff format --check src/ tests/
       - run: uv run ruff check src/ tests/
       - run: uv run mypy src/ --strict
