@@ -1,0 +1,169 @@
+# Authored facts for one intended offline-validated delivery topology.
+#
+# This file holds ONLY authored facts. Every canonical commitment (provider
+# reference digests, URI byte-count grammars, material fingerprints, the map
+# signature) is recomputed by scripts/validate_lab_delegation_contracts.py.
+# Nothing here is a secret: each secret is named by a provider reference whose
+# value lives in the external secret store and never in this repository.
+#
+# Address policy: committed addresses use the RFC 5737 / RFC 3849 documentation
+# ranges. Both disposable lanes are `internal` bridge networks that are never
+# routed, so the documentation ranges are a real allocation choice, not a
+# redaction. The one address that must point at an operator-owned host - the
+# PostgreSQL authority - is overlay-supplied at validation time
+# (`--overlay <file>`), because this repository's own public-release validator
+# rejects a non-documentation address in a committed file.
+schema_version: rsd.lab-delegation-contract-set.v1
+purpose: offline_authored_facts_for_one_intended_delivery_topology
+
+# --- Overlay-replaceable addresses -----------------------------------------
+# `postgresql_authority` is the only host-owned address in the set. Supply the
+# operator address with `--overlay`; the committed default is documentation
+# range so the file remains publishable.
+addresses:
+  postgresql_authority: postgresql://203.0.113.40:5432
+
+# --- Provider references ----------------------------------------------------
+# Version-pinned metadata only. `reference_sha256` is derived from
+# (account, provider, service, version) by the validator; no value appears.
+provider_references:
+  commitment_hmac:
+    provider: infisical
+    service: onex-platform.dev
+    account: commitment-hmac
+    version: 1
+  backup_encryption:
+    provider: infisical
+    service: onex-platform.dev
+    account: backup-encryption
+    version: 1
+  encryption_key:
+    provider: infisical
+    service: onex-platform.dev
+    account: delivery-encryption-key
+    version: 1
+  auth_secret:
+    provider: infisical
+    service: onex-platform.dev
+    account: delivery-auth-secret
+    version: 1
+  primary_valkey_password:
+    provider: infisical
+    service: onex-platform.dev
+    account: primary-valkey-requirepass
+    version: 1
+  restore_valkey_password:
+    provider: infisical
+    service: onex-platform.dev
+    account: restore-valkey-requirepass
+    version: 1
+  postgres_application_password:
+    provider: infisical
+    service: onex-platform.dev
+    account: postgres-application-password
+    version: 1
+
+# --- Isolated allocation topology ------------------------------------------
+# Two non-overlapping internal bridge networks; one Infisical and one Valkey
+# container each. The executor stays on the host control plane.
+topology:
+  executor_id: onex-lab-executor
+  primary_network:
+    name: onex-delivery-primary
+    subnet: 203.0.113.0/26
+    gateway: 203.0.113.1
+  restore_network:
+    name: onex-delivery-restore
+    subnet: 198.51.100.0/26
+    gateway: 198.51.100.1
+  placements:
+    primary_infisical:
+      network: onex-delivery-primary
+      alias: onex-primary-infisical
+      static_ipv4: 203.0.113.2
+    primary_valkey:
+      network: onex-delivery-primary
+      alias: onex-primary-valkey
+      static_ipv4: 203.0.113.30
+    restore_infisical:
+      network: onex-delivery-restore
+      alias: onex-restore-infisical
+      static_ipv4: 198.51.100.2
+    restore_valkey:
+      network: onex-delivery-restore
+      alias: onex-restore-valkey
+      static_ipv4: 198.51.100.30
+
+# --- Valkey delivery --------------------------------------------------------
+# NOTE: the Valkey authority is NOT authorable. TargetDeliveryMapV1 forces it
+# to `redis://<placement.static_ipv4>:6379` via valkey_static_authority(), so
+# an external Valkey on a non-default port cannot be named here at all.
+valkey:
+  primary_database_index: 0
+  restore_database_index: 0
+
+# --- PostgreSQL delivery ----------------------------------------------------
+# `*_oid` and `system_identifier` are POST-PROVISIONING OBSERVATIONS. They
+# cannot be known when this contract is authored; the values below are declared
+# intent and the validator reports them as unproven observations.
+postgres:
+  system_identifier: "70000000000000000000"
+  primary:
+    database_name: onex-delivery-primary
+    owner_role: onex-delivery-primary-owner
+    application_role: onex-delivery-primary-app
+    observed:
+      database_oid: 101
+      schema_oid: 102
+      owner_role_oid: 103
+      application_role_oid: 104
+  restore:
+    database_name: onex-delivery-restore
+    owner_role: onex-delivery-restore-owner
+    application_role: onex-delivery-restore-app
+    observed:
+      database_oid: 201
+      schema_oid: 202
+      owner_role_oid: 203
+      application_role_oid: 204
+  scram:
+    iterations: 4096
+    salt_bytes: 16
+
+# --- Upstream commitments ---------------------------------------------------
+# TargetDeliveryMapV1 carries these as opaque SHA-256 commitments to artifacts
+# produced by earlier stages. Offline, none of those artifacts exist, so the
+# validator derives each digest from the domain label below and reports it as
+# an UNBOUND commitment. The map validator checks only that three of them are
+# mutually distinct; it does not bind any of them to a real artifact.
+unbound_commitments:
+  source_commit_label: onex-lab-delegation-source-commit
+  allocation_intent_label: onex-lab-delegation-allocation-intent
+  wrapper_manifest_label: onex-lab-delegation-wrapper-manifest
+  attach_protocol_label: onex-lab-delegation-attach-protocol
+  secret_handling_policy_label: onex-lab-delegation-secret-handling-policy
+  prepared_control_policy_label: onex-lab-delegation-prepared-control-policy
+  derived_image_policy_labels:
+    primary_infisical: onex-lab-delegation-image-policy-primary-infisical
+    primary_valkey: onex-lab-delegation-image-policy-primary-valkey
+    restore_infisical: onex-lab-delegation-image-policy-restore-infisical
+    restore_valkey: onex-lab-delegation-image-policy-restore-valkey
+  wrapper_artifact_binding_labels:
+    primary_infisical: onex-lab-delegation-wrapper-primary-infisical
+    primary_valkey: onex-lab-delegation-wrapper-primary-valkey
+    restore_infisical: onex-lab-delegation-wrapper-restore-infisical
+    restore_valkey: onex-lab-delegation-wrapper-restore-valkey
+  observation_binding_labels:
+    primary_database: onex-lab-delegation-observation-primary
+    restore_database: onex-lab-delegation-observation-restore
+  prepared_operation_ids:
+    primary_database: 4e6f3c1a-0b2d-4e8f-9a1b-2c3d4e5f6a7b
+    restore_database: 5f7a4d2b-1c3e-4f9a-8b2c-3d4e5f6a7b8c
+  material_fingerprint_labels:
+    encryption_key: onex-lab-delegation-material-encryption-key
+    auth_secret: onex-lab-delegation-material-auth-secret
+    primary_valkey_password: onex-lab-delegation-material-primary-valkey
+    restore_valkey_password: onex-lab-delegation-material-restore-valkey
+    postgres_application_password: onex-lab-delegation-material-postgres-application
+
+created_at: "2026-08-30T00:00:00Z"

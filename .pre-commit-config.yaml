@@ -16,3 +16,8 @@ repos:
         entry: uv run python scripts/ci/validate_public_release.py
         language: system
         pass_filenames: false
+      - id: validate-lab-delegation-contracts
+        name: validate lab delegation contract set
+        entry: uv run rsd-validate-lab-delegation-contracts
+        language: system
+        pass_filenames: false
