@@ -301,10 +301,11 @@ delivery topology expressed in this package's own vocabulary. It holds only
 authored facts: provider reference identities, the two isolated lane networks
 and their component placements, the PostgreSQL database and role identifiers,
 and the labels behind each opaque upstream commitment. Every canonical
-commitment - reference digests, rendered URI byte counts, material
-fingerprints, the map signature - is recomputed at validation time, and no
-secret value appears in the file. Each secret is named only by its provider
-reference.
+commitment - reference digests, rendered URI byte counts, and the map
+signature - is recomputed at validation time. Material fingerprints are
+checked against the signed, value-free receipt and its provider-reference
+bindings before entering the map. No secret value appears in the file; each
+secret is named only by its provider reference.
 
 Validate it offline:
 
@@ -328,17 +329,21 @@ transcript of three outcome classes:
 Committed addresses use the documentation ranges, because
 `scripts/ci/validate_public_release.py` rejects any other address in a
 committed file. An operator-owned PostgreSQL authority is therefore supplied at
-validation time through `--overlay`, whose YAML replaces the `addresses` map:
+validation time through `--overlay`. The overlay must declare both the supplied
+connection authority and the PostgreSQL lane authority it must match:
 
 ```yaml
 addresses:
   postgresql_authority: postgresql://<ip-literal>:<port>
+postgres:
+  lane_authority: postgresql://<ip-literal>:<port>
 ```
 
 `tests/lifecycle/test_lab_delegation_contract_set.py` covers the set from both
-sides. Five wrong contracts and one unpinned signature must be rejected; three
-further cases pass deliberately and record exactly which authored values the
-map binds to nothing.
+sides. Six wrong contracts, one unpinned signature, a material fingerprint
+whose receipt binding is changed, and each PostgreSQL identity/OID receipt
+mismatch must be rejected. The receipts are pinned to signed, value-free
+evidence and do not claim live database reachability.
 
 ## Phase-B authorization
 

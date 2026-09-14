@@ -27,7 +27,8 @@ from pathlib import Path
 from typing import Any, Final, cast
 
 import yaml
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 from omninode_rsd.lifecycle import infisical_disposable as core
 from omninode_rsd.lifecycle import target_delivery_field_matrix_v1 as matrix_v1
@@ -39,6 +40,30 @@ _COMPONENTS: Final[tuple[str, ...]] = (
     "primary_valkey",
     "restore_infisical",
     "restore_valkey",
+)
+_MATERIAL_PURPOSES: Final[tuple[str, ...]] = (
+    "encryption_key",
+    "auth_secret",
+    "primary_valkey_password",
+    "restore_valkey_password",
+    "postgres_application_password",
+)
+_MATERIAL_FINGERPRINT_RECEIPT_SCHEMA_VERSION: Final[str] = (
+    "rsd.lab-delegation-material-fingerprint-receipt.v1"
+)
+_MATERIAL_FINGERPRINT_RECEIPT_SIGNER_KEY_ID: Final[str] = "rsd-lab-material-receipt-v1"
+_MATERIAL_FINGERPRINT_RECEIPT_SIGNER_PUBLIC_KEY_BASE64: Final[str] = (
+    "fsNCknz8FE3GagV7dnwgM+s8DqzKGWkGBi/gQPMvVcc="
+)
+_MATERIAL_FINGERPRINT_RECEIPT_DOMAIN: Final[bytes] = (
+    b"omninode-rsd.lab-delegation-material-fingerprint-receipt.v1\x00"
+)
+_POSTGRES_OBSERVATION_RECEIPT_SIGNER_KEY_ID: Final[str] = "rsd-lab-postgres-observation-v1"
+_POSTGRES_OBSERVATION_RECEIPT_SIGNER_PUBLIC_KEY_BASE64: Final[str] = (
+    "JsjgeJAi37MzuwZ9mWkllEB9AYsuo+iFgWcKo8/FlQA="
+)
+_POSTGRES_OBSERVATION_RECEIPT_DOMAIN: Final[bytes] = (
+    b"omninode-rsd.lab-delegation-postgres-observation-receipt.v1\x00"
 )
 
 
@@ -97,9 +122,19 @@ def _apply_overlay(contract_set: dict[str, Any], overlay_path: Path | None) -> s
     if overlay_path is None:
         return "committed documentation-range default"
     overlay = yaml.safe_load(overlay_path.read_text(encoding="utf-8"))
-    if not isinstance(overlay, dict) or "addresses" not in overlay:
-        raise SystemExit(f"{overlay_path}: overlay must define `addresses`")
+    if (
+        not isinstance(overlay, dict)
+        or not isinstance(overlay.get("addresses"), dict)
+        or not isinstance(overlay.get("postgres"), dict)
+        or "postgresql_authority" not in overlay["addresses"]
+        or "lane_authority" not in overlay["postgres"]
+    ):
+        raise SystemExit(
+            f"{overlay_path}: overlay must define `addresses.postgresql_authority` "
+            "and `postgres.lane_authority`"
+        )
     contract_set["addresses"].update(overlay["addresses"])
+    contract_set["postgres"].update(overlay["postgres"])
     return f"overlay {overlay_path.name}"
 
 
@@ -130,6 +165,101 @@ def _provider_references(
         "existence: any well-formed identifier tuple validates"
     )
     return references, {name: value.reference_sha256 for name, value in built.items()}
+
+
+def _material_fingerprint_receipt_message(
+    *,
+    schema_version: str,
+    references: dict[str, Any],
+    fingerprints: dict[str, Any],
+    signer_key_id: str,
+) -> bytes:
+    """Return the exact domain-separated value-free receipt bytes to verify."""
+
+    return _MATERIAL_FINGERPRINT_RECEIPT_DOMAIN + json.dumps(
+        {
+            "fingerprints": fingerprints,
+            "references": references,
+            "schema_version": schema_version,
+            "signer_key_id": signer_key_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _material_fingerprint_receipt(
+    *, commitments: dict[str, Any], reference_digests: dict[str, str]
+) -> dict[str, str]:
+    """Require authored fingerprint labels to match their value-free receipt."""
+
+    receipt = commitments.get("material_fingerprint_receipt")
+    labels = commitments.get("material_fingerprint_labels")
+    if type(receipt) is not dict or type(labels) is not dict:
+        raise ValueError("material fingerprint receipt is required")
+    if set(receipt) != {
+        "schema_version",
+        "references",
+        "fingerprints",
+        "signer_key_id",
+        "signature_base64",
+    }:
+        raise ValueError("material fingerprint receipt is invalid")
+    if receipt.get("schema_version") != _MATERIAL_FINGERPRINT_RECEIPT_SCHEMA_VERSION:
+        raise ValueError("material fingerprint receipt is invalid")
+    receipt_references = receipt.get("references")
+    receipt_fingerprints = receipt.get("fingerprints")
+    signer_key_id = receipt.get("signer_key_id")
+    signature_base64 = receipt.get("signature_base64")
+    if (
+        type(receipt_references) is not dict
+        or type(receipt_fingerprints) is not dict
+        or signer_key_id != _MATERIAL_FINGERPRINT_RECEIPT_SIGNER_KEY_ID
+        or type(signature_base64) is not str
+    ):
+        raise ValueError("material fingerprint receipt is invalid")
+    expected_keys = set(_MATERIAL_PURPOSES)
+    if (
+        set(labels) != expected_keys
+        or set(receipt_references) != expected_keys
+        or set(receipt_fingerprints) != expected_keys
+    ):
+        raise ValueError("material fingerprint receipt is invalid")
+
+    try:
+        signature = base64.b64decode(signature_base64, validate=True)
+        if base64.b64encode(signature).decode("ascii") != signature_base64:
+            raise ValueError
+        signer = Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(_MATERIAL_FINGERPRINT_RECEIPT_SIGNER_PUBLIC_KEY_BASE64, validate=True)
+        )
+        signer.verify(
+            signature,
+            _material_fingerprint_receipt_message(
+                schema_version=receipt["schema_version"],
+                references=receipt_references,
+                fingerprints=receipt_fingerprints,
+                signer_key_id=signer_key_id,
+            ),
+        )
+    except (InvalidSignature, ValueError):
+        raise ValueError("material fingerprint receipt signature is invalid") from None
+
+    fingerprints: dict[str, str] = {}
+    for purpose in _MATERIAL_PURPOSES:
+        label = labels[purpose]
+        reference = receipt_references[purpose]
+        fingerprint = receipt_fingerprints[purpose]
+        if (
+            type(label) is not str
+            or type(reference) is not str
+            or type(fingerprint) is not str
+            or reference != reference_digests[purpose]
+            or fingerprint != _digest(label)
+        ):
+            raise ValueError("material fingerprint receipt does not match authored material")
+        fingerprints[purpose] = fingerprint
+    return fingerprints
 
 
 def _topology(authored: dict[str, Any], report: Report) -> core.AllocationTopologyV2:
@@ -173,15 +303,117 @@ def _topology(authored: dict[str, Any], report: Report) -> core.AllocationTopolo
     return topology
 
 
+def _postgres_observation_receipt_message(
+    receipt: core.PostgreSQLLoginTransitionReceiptV1,
+) -> bytes:
+    """Return the exact domain-separated value-free receipt bytes to verify."""
+
+    return _POSTGRES_OBSERVATION_RECEIPT_DOMAIN + json.dumps(
+        receipt.model_dump(mode="json", warnings="error"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _postgres_observation_receipt(
+    *,
+    authored: dict[str, Any],
+    identity: str,
+) -> core.PostgreSQLLoginTransitionReceiptV1:
+    """Bind one authored PostgreSQL identity to its value-free receipt."""
+
+    receipts = authored.get("observation_receipts")
+    signatures = authored.get("observation_receipt_signatures")
+    if (
+        type(receipts) is not dict
+        or type(receipts.get(identity)) is not dict
+        or type(signatures) is not dict
+        or type(signatures.get(identity)) is not dict
+    ):
+        raise ValueError("PostgreSQL observation receipt is required")
+    raw = receipts[identity]
+    signature = signatures[identity]
+    if set(raw) != set(core.PostgreSQLLoginTransitionReceiptV1.model_fields) or set(signature) != {
+        "signer_key_id",
+        "signature_base64",
+    }:
+        raise ValueError("PostgreSQL observation receipt is invalid")
+    try:
+        receipt = core.PostgreSQLLoginTransitionReceiptV1(
+            schema_version=raw["schema_version"],
+            database_identity=raw["database_identity"],
+            prepared_operation_id=raw["prepared_operation_id"],
+            system_identifier=raw["system_identifier"],
+            database_name=raw["database_name"],
+            database_oid=raw["database_oid"],
+            schema_oid=raw["schema_oid"],
+            owner_role=raw["owner_role"],
+            owner_role_oid=raw["owner_role_oid"],
+            application_role=raw["application_role"],
+            application_role_oid=raw["application_role_oid"],
+            application_password_reference_sha256=raw["application_password_reference_sha256"],
+            prepared_control_policy_sha256=raw["prepared_control_policy_sha256"],
+            prepared_operation_result_sha256=raw["prepared_operation_result_sha256"],
+            owner_can_login=raw["owner_can_login"],
+            owner_password_absent=raw["owner_password_absent"],
+            application_can_login=raw["application_can_login"],
+            application_password_verifier_installed=raw["application_password_verifier_installed"],
+        )
+        if (
+            signature["signer_key_id"] != _POSTGRES_OBSERVATION_RECEIPT_SIGNER_KEY_ID
+            or type(signature["signature_base64"]) is not str
+        ):
+            raise ValueError
+        signature_bytes = base64.b64decode(signature["signature_base64"], validate=True)
+        if base64.b64encode(signature_bytes).decode("ascii") != signature["signature_base64"]:
+            raise ValueError
+        signer = Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(_POSTGRES_OBSERVATION_RECEIPT_SIGNER_PUBLIC_KEY_BASE64, validate=True)
+        )
+        signer.verify(signature_bytes, _postgres_observation_receipt_message(receipt))
+    except (InvalidSignature, KeyError, TypeError, ValueError):
+        raise ValueError("PostgreSQL observation receipt is invalid") from None
+
+    return receipt
+
+
+def _postgres_observation_receipt_matches(
+    receipt: core.PostgreSQLLoginTransitionReceiptV1,
+    transition: core.PostgreSQLLoginTransitionIntentV1,
+) -> bool:
+    return (
+        receipt.database_identity == transition.database_identity
+        and receipt.prepared_operation_id == transition.prepared_operation_id
+        and receipt.system_identifier == transition.system_identifier
+        and receipt.database_name == transition.database_name
+        and receipt.database_oid == transition.database_oid
+        and receipt.schema_oid == transition.schema_oid
+        and receipt.owner_role == transition.owner_role
+        and receipt.owner_role_oid == transition.owner_role_oid
+        and receipt.application_role == transition.application_role
+        and receipt.application_role_oid == transition.application_role_oid
+        and receipt.application_password_reference_sha256
+        == transition.application_password_reference_sha256
+        and receipt.prepared_control_policy_sha256 == transition.prepared_control_policy_sha256
+        and receipt.owner_can_login == transition.owner_can_login
+        and receipt.owner_password_absent == transition.owner_password_absent
+        and receipt.application_can_login == transition.application_can_login
+        and receipt.application_password_verifier_installed
+        == transition.application_password_verifier_installed
+    )
+
+
 def _postgres(
     *,
     authored: dict[str, Any],
     authority: str,
+    lane_authority: str,
     references: dict[str, str],
     commitments: dict[str, Any],
     report: Report,
 ) -> core.PostgreSQLRuntimeDatabaseIdentitiesV1:
     identities: dict[str, core.PostgreSQLRuntimeDatabaseIdentityV1] = {}
+    receipts: dict[str, core.PostgreSQLLoginTransitionReceiptV1] = {}
     password_reference = references["postgres_application_password"]
     for identity, lane in (("primary_database", "primary"), ("restore_database", "restore")):
         spec = authored[lane]
@@ -251,14 +483,23 @@ def _postgres(
             logging_allowed=False,
             public_artifact_allowed=False,
         )
+        receipt = _postgres_observation_receipt(authored=authored, identity=identity)
+        receipts[identity] = receipt
         identities[identity] = core.PostgreSQLRuntimeDatabaseIdentityV1(
             database_identity=cast(Any, identity),
-            observation_binding_sha256=_digest(commitments["observation_binding_labels"][identity]),
+            observation_binding_sha256=core.canonical_sha256(receipt),
             schema_oid=int(observed["schema_oid"]),
             login_transition=transition,
             connection_uri=grammar,
         )
+    if any(database.connection_uri.authority != lane_authority for database in identities.values()):
+        raise ValueError("PostgreSQL authority must match the declared lane")
     result = core.PostgreSQLRuntimeDatabaseIdentitiesV1(**identities)
+    if any(
+        not _postgres_observation_receipt_matches(receipt, identities[identity].login_transition)
+        for identity, receipt in receipts.items()
+    ):
+        raise ValueError("PostgreSQL observation receipt does not match transition")
     report.ok(
         "PostgreSQL identities proved the owner role can never log in, the "
         "owner password is absent, the verifier install is bound to the same "
@@ -266,20 +507,22 @@ def _postgres(
         "primary and restore lanes share no name, OID, role, or operation id"
     )
     report.ok(
-        "PostgreSQLConnectionUriGrammarV1 accepted the authority only as a "
+        "PostgreSQLConnectionUriGrammarV1 required both authorities to equal "
+        "the declared PostgreSQL lane and accepted that authority only as a "
         f"canonical scheme+IP-literal+port triple and recomputed its rendered "
         f"byte count ({identities['primary_database'].connection_uri.rendered_uri_byte_count} "
         "bytes primary) without ever assembling the URI"
     )
-    report.unbound(
-        "the PostgreSQL authority is cross-checked against nothing: any "
-        "reachable-or-not IP and any port validate identically, so a wrong "
-        "port is indistinguishable from a right one at this layer"
+    report.ok(
+        "PostgreSQLLoginTransitionReceiptV1 bound each database name, system "
+        "identifier, database/schema/role OIDs, role identities, operation id, "
+        "and login-state flags to the exact transition before its canonical "
+        "receipt digest entered the runtime identity"
     )
     report.unbound(
-        "database_oid / schema_oid / role OIDs / system_identifier are "
-        "post-provisioning observations. They are authored here as intent and "
-        "the map binds them to no observation receipt"
+        "the PostgreSQL observation receipts are authored value-free evidence "
+        "only: they prove no live database reachability or post-provisioning "
+        "state; a later effect receipt must still be independently verified"
     )
     return result
 
@@ -356,10 +599,9 @@ def _delivery_map(
     report: Report,
 ) -> tuple[core.TargetDeliveryMapV1, map_signing.TargetDeliveryMapSignerTrustAnchorV1]:
     commitments = contract_set["unbound_commitments"]
-    fingerprints = {
-        purpose: _digest(label)
-        for purpose, label in commitments["material_fingerprint_labels"].items()
-    }
+    fingerprints = _material_fingerprint_receipt(
+        commitments=commitments, reference_digests=reference_digests
+    )
     material = cast(
         tuple[Any, Any, Any, Any, Any],
         tuple(
@@ -567,9 +809,10 @@ def _delivery_map(
         "both cache authorities equal their lane's allocated static address"
     )
     report.unbound(
-        "material fingerprints are free 64-hex values. The map requires only "
-        "that the five are distinct and match the fields that cite them, so "
-        "they commit to no real provider material"
+        "the material fingerprint receipt is authored value-free evidence only: "
+        "it binds each fingerprint to its provider reference and contract-set "
+        "label, but proves no provider store, existence, or possession; Phase B "
+        "must still verify the signed provider-material attestation"
     )
     report.unbound(
         "source_commit, allocation_intent, wrapper_manifest, attach_protocol, "
@@ -609,6 +852,7 @@ def main(argv: list[str] | None = None) -> int:
     databases = _postgres(
         authored=contract_set["postgres"],
         authority=contract_set["addresses"]["postgresql_authority"],
+        lane_authority=contract_set["postgres"]["lane_authority"],
         references=reference_digests,
         commitments=contract_set["unbound_commitments"],
         report=report,
