@@ -1,9 +1,8 @@
 """Positive and negative coverage for the authored lab-delegation contract set.
 
 The negative cases exist so a green validation is never mistaken for a proof of
-the topology: each one names a specific wrong contract and asserts whether the
-library rejects it. The three ``accepts`` cases are deliberate — they record
-values the contract vocabulary does not bind to anything real.
+the topology: each one names a specific wrong contract and asserts that the
+library rejects it.
 """
 
 from __future__ import annotations
@@ -32,6 +31,7 @@ def _build(mutate: Callable[[dict[str, Any]], None] | None = None) -> Any:
     databases = harness._postgres(
         authored=contract_set["postgres"],
         authority=contract_set["addresses"]["postgresql_authority"],
+        lane_authority=contract_set["postgres"]["lane_authority"],
         references=digests,
         commitments=contract_set["unbound_commitments"],
         report=report,
@@ -167,28 +167,88 @@ def _invented_material_fingerprint(contract_set: dict[str, Any]) -> None:
     )
 
 
+def _wrong_material_fingerprint_receipt(contract_set: dict[str, Any]) -> None:
+    contract_set["unbound_commitments"]["material_fingerprint_receipt"]["fingerprints"][
+        "encryption_key"
+    ] = "f" * 64
+
+
+def _coordinated_invented_material_fingerprint(contract_set: dict[str, Any]) -> None:
+    label = "an-invented-label-and-coordinated-receipt-replacement"
+    contract_set["unbound_commitments"]["material_fingerprint_labels"]["encryption_key"] = label
+    contract_set["unbound_commitments"]["material_fingerprint_receipt"]["fingerprints"][
+        "encryption_key"
+    ] = harness._digest(label)
+
+
 def _invented_observed_oid(contract_set: dict[str, Any]) -> None:
     contract_set["postgres"]["primary"]["observed"]["database_oid"] = 999_999
 
 
+def _invented_observed_schema_oid(contract_set: dict[str, Any]) -> None:
+    contract_set["postgres"]["primary"]["observed"]["schema_oid"] = 999_998
+
+
+def _invented_observed_owner_role_oid(contract_set: dict[str, Any]) -> None:
+    contract_set["postgres"]["primary"]["observed"]["owner_role_oid"] = 999_997
+
+
+def _invented_observed_application_role_oid(contract_set: dict[str, Any]) -> None:
+    contract_set["postgres"]["primary"]["observed"]["application_role_oid"] = 999_996
+
+
+def _invented_observed_system_identifier(contract_set: dict[str, Any]) -> None:
+    contract_set["postgres"]["system_identifier"] = "90000000000000000000"
+
+
+def _wrong_observation_receipt_database_oid(contract_set: dict[str, Any]) -> None:
+    contract_set["postgres"]["observation_receipts"]["primary_database"]["database_oid"] = 999_995
+
+
+def _coordinated_observed_database_oid(contract_set: dict[str, Any]) -> None:
+    contract_set["postgres"]["primary"]["observed"]["database_oid"] = 999_994
+    contract_set["postgres"]["observation_receipts"]["primary_database"]["database_oid"] = 999_994
+
+
+def _unexpected_observation_receipt_key(contract_set: dict[str, Any]) -> None:
+    contract_set["postgres"]["observation_receipts"]["primary_database"]["unexpected"] = "ignored"
+
+
+def test_rejects_postgres_authority_outside_the_declared_lane() -> None:
+    with pytest.raises(ValueError, match="PostgreSQL authority must match the declared lane"):
+        _build(_wrong_postgres_port)
+
+
 @pytest.mark.parametrize(
-    ("mutate", "unbound_value"),
+    "mutate",
     [
-        (_wrong_postgres_port, "the PostgreSQL authority port"),
-        (_invented_material_fingerprint, "a provider material fingerprint"),
-        (_invented_observed_oid, "an observed database OID"),
+        _invented_material_fingerprint,
+        _wrong_material_fingerprint_receipt,
+        _coordinated_invented_material_fingerprint,
     ],
 )
-def test_accepts_values_the_contract_vocabulary_does_not_bind(
-    mutate: Callable[[dict[str, Any]], None], unbound_value: str
+def test_rejects_a_material_fingerprint_not_bound_by_its_receipt(
+    mutate: Callable[[dict[str, Any]], None],
 ) -> None:
-    """These pass on purpose. Each records a value nothing in the map constrains."""
+    with pytest.raises(ValueError, match="material fingerprint receipt"):
+        _build(mutate)
 
-    delivery_map, anchor = _build(mutate)
 
-    assert (
-        map_signing.verify_target_delivery_map_v1_signature(
-            delivery_map=delivery_map, signer_trust_anchor=anchor
-        ).schema_version
-        == "rsd.target-delivery-map.v1"
-    )
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _invented_observed_oid,
+        _invented_observed_schema_oid,
+        _invented_observed_owner_role_oid,
+        _invented_observed_application_role_oid,
+        _invented_observed_system_identifier,
+        _wrong_observation_receipt_database_oid,
+        _coordinated_observed_database_oid,
+        _unexpected_observation_receipt_key,
+    ],
+)
+def test_rejects_an_observed_identity_not_bound_by_its_receipt(
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    with pytest.raises(ValueError, match="PostgreSQL observation receipt"):
+        _build(mutate)
