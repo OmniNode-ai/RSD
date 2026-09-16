@@ -28,6 +28,30 @@ MULTI_RESULT_FIELDS: Final[frozenset[str]] = frozenset(
         "total_findings",
     }
 )
+# OMN-18479: the reviewer resolves cross-model agreement and ships the result
+# in ``quorum``.  It is OPTIONAL here only because this repository pins the
+# reviewer by sha: a pin predating that change emits no such key.  Every other
+# unexpected key is still refused -- an envelope that grew a field this parser
+# does not understand must not become a passing check by being ignored.
+OPTIONAL_MULTI_RESULT_FIELDS: Final[frozenset[str]] = frozenset({"quorum"})
+QUORUM_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "verdict",
+        "quorum_threshold",
+        "models_succeeded",
+        "quorum_met",
+        "blocking_count",
+        "warning_count",
+        "blocking_findings",
+        "warning_findings",
+    }
+)
+QUORUM_VERDICTS: Final[frozenset[str]] = frozenset(
+    {"passed", "blocked", "degraded_quorum", "no_models"}
+)
+# A quorum verdict that is not one of these two means no verdict was
+# established at all, and the absence of a verdict is never a passing one.
+QUORUM_DECIDED_VERDICTS: Final[frozenset[str]] = frozenset({"passed", "blocked"})
 PER_MODEL_RESULT_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "model",
@@ -87,8 +111,16 @@ class ReviewSummary:
     models_succeeded: tuple[str, ...]
 
 
-def _require_keys(value: object, expected: frozenset[str], label: str) -> dict[str, object]:
-    if not isinstance(value, dict) or set(value) != expected:
+def _require_keys(
+    value: object,
+    expected: frozenset[str],
+    label: str,
+    optional: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} schema is malformed")
+    keys = set(value)
+    if not expected <= keys or not keys <= (expected | optional):
         raise ValueError(f"{label} schema is malformed")
     return value
 
@@ -176,6 +208,52 @@ def _validate_finding(raw_finding: object) -> dict[str, object]:
     return finding
 
 
+def _validate_quorum(raw_quorum: object, succeeded: list[str]) -> tuple[int, str]:
+    """Validate the reviewer quorum block and return (blocking_count, verdict).
+
+    OMN-18479: blocking is the count of findings at least two DISTINCT
+    models raised, computed by the reviewer.  It is deliberately NOT a
+    severity sum across models here: that sum is what let a single model's
+    finding block a merge, and re-deriving it in this repository would
+    reinstate the defect one repository at a time.
+    """
+    quorum = _require_keys(raw_quorum, QUORUM_FIELDS, "review quorum")
+    verdict = _require_nonempty_string(quorum["verdict"], "quorum verdict")
+    if verdict not in QUORUM_VERDICTS:
+        raise ValueError("quorum verdict is not a recognized verdict")
+    threshold = _require_nonnegative_integer(quorum["quorum_threshold"], "quorum_threshold")
+    if threshold < 2:
+        raise ValueError("quorum threshold must require at least two models")
+    if not isinstance(quorum["quorum_met"], bool):
+        raise ValueError("quorum_met must be boolean")
+    blocking_count = _require_nonnegative_integer(quorum["blocking_count"], "quorum blocking_count")
+    _require_nonnegative_integer(quorum["warning_count"], "quorum warning_count")
+    quorum_models = _require_model_names(quorum["models_succeeded"], "quorum models_succeeded")
+    if quorum_models != succeeded:
+        raise ValueError("quorum models_succeeded disagrees with the review result")
+    for field in ("blocking_findings", "warning_findings"):
+        entries = quorum[field]
+        if not isinstance(entries, list):
+            raise ValueError(f"quorum {field} must be a list")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError(f"quorum {field} entries must be objects")
+            agreement = _require_nonnegative_integer(
+                entry.get("agreement_count"), "quorum agreement_count"
+            )
+            if field == "blocking_findings" and agreement < threshold:
+                raise ValueError("a blocking quorum finding must meet the agreement threshold")
+    if len(quorum["blocking_findings"]) != blocking_count:
+        raise ValueError("quorum blocking_count disagrees with blocking_findings")
+    if verdict not in QUORUM_DECIDED_VERDICTS:
+        raise ValueError(
+            f"the reviewer established no verdict (quorum {verdict}); this is not a pass"
+        )
+    if (verdict == "blocked") != (blocking_count > 0):
+        raise ValueError("quorum verdict disagrees with its own blocking count")
+    return blocking_count, verdict
+
+
 def parse_review_result(raw_json: str) -> ReviewSummary:
     """Parse one exact ``ModelMultiReviewResult`` JSON document."""
 
@@ -183,7 +261,12 @@ def parse_review_result(raw_json: str) -> ReviewSummary:
         raw_result = json.loads(raw_json)
     except json.JSONDecodeError as json_error:
         raise ValueError("review result is not valid JSON") from json_error
-    result = _require_keys(raw_result, MULTI_RESULT_FIELDS, "multi-model result")
+    result = _require_keys(
+        raw_result,
+        MULTI_RESULT_FIELDS,
+        "multi-model result",
+        optional=OPTIONAL_MULTI_RESULT_FIELDS,
+    )
 
     attempted = _require_model_names(result["models_attempted"], "models_attempted")
     succeeded = _require_model_names(result["models_succeeded"], "models_succeeded")
@@ -244,13 +327,20 @@ def parse_review_result(raw_json: str) -> ReviewSummary:
     expected_total = sum(count for _, success, count, _ in parsed_results if success)
     if total_findings != expected_total:
         raise ValueError("total_findings disagrees with successful per-model results")
-    blocking_count = sum(
-        1
-        for _, success, _, findings in parsed_results
-        if success
-        for finding in findings
-        if finding["severity"] in {"critical", "error"}
-    )
+    if "quorum" in result:
+        blocking_count, _ = _validate_quorum(result["quorum"], succeeded)
+    else:
+        # Reviewer pin predating OMN-18479: no agreement data exists, so the
+        # only available rule is the per-model sum.  It is kept solely so a
+        # pin bump and this parser can land separately; it goes away with the
+        # pin.
+        blocking_count = sum(
+            1
+            for _, success, _, findings in parsed_results
+            if success
+            for finding in findings
+            if finding["severity"] in {"critical", "error"}
+        )
     return ReviewSummary(
         verdict="blocked" if blocking_count else "passed",
         blocking_count=blocking_count,

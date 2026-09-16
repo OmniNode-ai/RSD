@@ -584,3 +584,100 @@ def test_authored_contract_set_validation_is_wired_as_a_gate() -> None:
     assert hook is not None, "the authored contract set validation is not a pre-commit hook"
     assert hook["entry"] == command
     assert hook["pass_filenames"] is False
+
+
+def _quorum(
+    *,
+    verdict: str = "passed",
+    blocking: int = 0,
+    warnings: int = 1,
+    threshold: int = 2,
+    agreement: int = 1,
+) -> dict[str, object]:
+    blocking_findings = [
+        {"agreement_count": max(agreement, threshold), "finding_ids": ["f-1"]}
+        for _ in range(blocking)
+    ]
+    warning_findings = [
+        {"agreement_count": agreement, "finding_ids": ["f-2"]} for _ in range(warnings)
+    ]
+    return {
+        "verdict": verdict,
+        "quorum_threshold": threshold,
+        "models_succeeded": ["qwen3-review", "qwen3-review-b"],
+        "quorum_met": True,
+        "blocking_count": blocking,
+        "warning_count": warnings,
+        "blocking_findings": blocking_findings,
+        "warning_findings": warning_findings,
+    }
+
+
+def test_review_parser_does_not_block_on_a_single_model_finding() -> None:
+    """OMN-18479: one model's error finding is a warning, not a block."""
+    envelope = _review_envelope([_finding("error")])
+    envelope["quorum"] = _quorum(verdict="passed", blocking=0, warnings=1)
+
+    summary = parse_review_result(json.dumps(envelope))
+
+    assert summary.verdict == "passed"
+    assert summary.blocking_count == 0
+
+
+def test_review_parser_blocks_when_two_models_agree() -> None:
+    """Positive control for the zero above, same envelope, agreement of two."""
+    envelope = _review_envelope([_finding("error")])
+    envelope["quorum"] = _quorum(verdict="blocked", blocking=1, warnings=0, agreement=2)
+
+    summary = parse_review_result(json.dumps(envelope))
+
+    assert summary.verdict == "blocked"
+    assert summary.blocking_count == 1
+
+
+def test_review_parser_refuses_a_verdictless_quorum() -> None:
+    envelope = _review_envelope()
+    envelope["quorum"] = _quorum(verdict="degraded_quorum", blocking=0, warnings=0)
+
+    with pytest.raises(ValueError):
+        parse_review_result(json.dumps(envelope))
+
+
+def test_review_parser_refuses_a_quorum_threshold_below_two() -> None:
+    envelope = _review_envelope()
+    envelope["quorum"] = _quorum(threshold=1, warnings=0)
+
+    with pytest.raises(ValueError):
+        parse_review_result(json.dumps(envelope))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda quorum: quorum.__setitem__("blocking_count", 1),
+        lambda quorum: quorum.__setitem__("verdict", "invented"),
+        lambda quorum: quorum.pop("warning_findings"),
+        lambda quorum: quorum.__setitem__("unexpected", 1),
+        lambda quorum: quorum.__setitem__("quorum_met", "yes"),
+        lambda quorum: quorum.__setitem__("models_succeeded", ["qwen3-review"]),
+    ],
+)
+def test_review_parser_rejects_a_malformed_quorum(
+    mutate: Callable[[dict[str, object]], object],
+) -> None:
+    envelope = _review_envelope()
+    quorum = _quorum(warnings=0)
+    mutate(quorum)
+    envelope["quorum"] = quorum
+
+    with pytest.raises(ValueError):
+        parse_review_result(json.dumps(envelope))
+
+
+def test_review_parser_still_rejects_unknown_top_level_keys() -> None:
+    """Accepting `quorum` must not have opened the envelope to anything."""
+    envelope = _review_envelope()
+    envelope["merged_findings"] = []
+
+    with pytest.raises(ValueError):
+        parse_review_result(json.dumps(envelope))
