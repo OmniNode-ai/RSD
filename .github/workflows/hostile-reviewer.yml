@@ -63,7 +63,7 @@ jobs:
             return 1
           }
 
-          clone_with_retry omniintelligence ../omniintelligence 12aaf67a782befad3e500b6b7d0fc3bc8826a0d9
+          clone_with_retry omniintelligence ../omniintelligence a8acc469e2284aba4290b01b79aaac182fe0a70b
           clone_with_retry omnibase_core ../omnibase_core 872beef0397e81064e1212ad5d9d73f173ea3f84
           clone_with_retry omnibase_compat ../omnibase_compat 039df62a695f0498821dfd76d44363872c8f6b22
 

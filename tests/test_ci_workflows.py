@@ -157,7 +157,7 @@ def test_pull_request_workflows_never_select_self_hosted_runners() -> None:
 def test_hostile_reviewer_pins_dependencies_and_verifies_checkout() -> None:
     text = _HOSTILE_REVIEWER.read_text(encoding="utf-8")
     expected_pins = {
-        "omniintelligence": "12aaf67a782befad3e500b6b7d0fc3bc8826a0d9",
+        "omniintelligence": "a8acc469e2284aba4290b01b79aaac182fe0a70b",
         "omnibase_core": "872beef0397e81064e1212ad5d9d73f173ea3f84",
         "omnibase_compat": "039df62a695f0498821dfd76d44363872c8f6b22",
     }

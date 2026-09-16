@@ -4,7 +4,7 @@
 The field sets mirror the pinned ``omniintelligence``
 ``ModelMultiReviewResult``, ``ModelExternalReviewResult``, and
 ``ModelReviewFindingObserved`` models at commit
-``dec976b1177cd1338d0d79335d30bebff687d997``.  This parser is deliberately
+``a8acc469e2284aba4290b01b79aaac182fe0a70b``, which is the pinned reviewer below.  This parser is deliberately
 strict: a model result must not be allowed to become a passing check merely
 because an unexpected, empty, or renamed field was ignored.
 """
