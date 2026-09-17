@@ -1,6 +1,12 @@
 repos:
   - repo: local
     hooks:
+      - id: strip-ai-coauthor-trailer
+        name: Strip AI-generated Co-Authored-By trailers from commit messages
+        entry: perl -i -ne 'print unless /^co-authored-by:.*claude.*noreply\@anthropic\.com/i'
+        language: system
+        pass_filenames: true
+        stages: [commit-msg]
       - id: ruff
         name: ruff
         entry: uv run ruff check --fix
@@ -21,3 +27,5 @@ repos:
         entry: uv run rsd-validate-lab-delegation-contracts
         language: system
         pass_filenames: false
+
+default_install_hook_types: [pre-commit, commit-msg]
