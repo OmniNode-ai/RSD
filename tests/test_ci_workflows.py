@@ -44,7 +44,7 @@ def test_all_workflow_actions_are_immutable_and_verified() -> None:
         "actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08",
         "astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86",
         "astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78",
-        "OmniNode-ai/omniclaude/.github/workflows/public-repo-hygiene-reusable.yml@211055c0d7261e1e4e7ccf05520e1cfe9d0d495e",
+        "OmniNode-ai/omniclaude/.github/workflows/public-repo-hygiene-reusable.yml@6ccd525e2b6390869d18f8e00d1b36294aa5550a",
     }
     seen: set[str] = set()
     for workflow in _WORKFLOW_DIR.glob("*.yml"):
