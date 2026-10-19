@@ -667,6 +667,134 @@ def _companion_stat_result(*, mode: int, uid: int, nlink: int) -> os.stat_result
     return os.stat_result((mode, 0, 0, nlink, uid, 0, 0, 0, 0, 0))
 
 
+def test_companion_validation_accepts_journal_removed_by_peer_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = _journal(tmp_path)
+    candidate = journal._path.with_name(f"{journal._path.name}-journal")
+    peer = sqlite3.connect(journal._path, isolation_level=None)
+    try:
+        peer.execute("PRAGMA journal_mode = DELETE")
+        peer.execute("BEGIN IMMEDIATE")
+        peer.execute("UPDATE authorization_journal_metadata SET singleton = singleton")
+        assert candidate.exists(), "SQLite must create a real peer rollback journal"
+        details = candidate.lstat()
+        assert stat.S_ISREG(details.st_mode) and stat.S_IMODE(details.st_mode) == 0o600, (
+            "SQLite must create the peer rollback journal as a regular 0o600 file"
+        )
+        real_lstat = os.lstat
+        hook_calls = 0
+
+        def peer_rollback_lstat(
+            path: str | os.PathLike[str], *, dir_fd: int | None = None
+        ) -> os.stat_result:
+            nonlocal hook_calls
+            if Path(path) == candidate and hook_calls == 0:
+                snapshot = real_lstat(path, dir_fd=dir_fd)
+                hook_calls += 1
+                peer.execute("ROLLBACK")
+                assert not candidate.exists(), "Peer rollback must unlink its journal"
+                return snapshot
+            return real_lstat(path, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "lstat", peer_rollback_lstat)
+        journal._validate_companions()
+        assert hook_calls == 1
+    finally:
+        peer.close()
+
+
+def test_claim_pair_is_claimed_and_nonce_replayed_when_peer_journal_commits_mid_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = _journal(tmp_path)
+    candidate = journal._path.with_name(f"{journal._path.name}-journal")
+    peer = sqlite3.connect(journal._path, isolation_level=None)
+    try:
+        peer.execute("PRAGMA journal_mode = DELETE")
+        peer.execute("BEGIN IMMEDIATE")
+        peer.execute("UPDATE authorization_journal_metadata SET singleton = singleton")
+        assert candidate.exists(), "SQLite must create a real peer rollback journal"
+        details = candidate.lstat()
+        assert stat.S_ISREG(details.st_mode) and stat.S_IMODE(details.st_mode) == 0o600, (
+            "SQLite must create the peer rollback journal as a regular 0o600 file"
+        )
+        real_lstat = os.lstat
+        hook_calls = 0
+
+        def peer_rollback_lstat(
+            path: str | os.PathLike[str], *, dir_fd: int | None = None
+        ) -> os.stat_result:
+            nonlocal hook_calls
+            if Path(path) == candidate and hook_calls == 0:
+                snapshot = real_lstat(path, dir_fd=dir_fd)
+                hook_calls += 1
+                peer.execute("ROLLBACK")
+                assert not candidate.exists(), "Peer rollback must unlink its journal"
+                return snapshot
+            return real_lstat(path, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "lstat", peer_rollback_lstat)
+        results = []
+        for i in range(2):
+            try:
+                journal._claim_verified(_verified("9" * 32, f"peer-{i}"))
+            except AuthorizationError as error:
+                results.append(error.phase)
+            else:
+                results.append("claimed")
+        assert results == ["claimed", "nonce_replayed"]
+        assert hook_calls == 1
+    finally:
+        peer.close()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "mode", "nlink", "directory"])
+def test_companion_validation_rejects_unsafe_companions(tmp_path: Path, kind: str) -> None:
+    journal = _journal(tmp_path)
+    candidate = journal._path.with_name(f"{journal._path.name}-journal")
+    if kind == "symlink":
+        target = tmp_path / "target"
+        target.touch(mode=0o600)
+        target.chmod(0o600)
+        candidate.symlink_to(target)
+    elif kind == "directory":
+        candidate.mkdir(mode=0o700)
+        candidate.chmod(0o700)
+    else:
+        candidate.touch(mode=0o600)
+        candidate.chmod(0o644 if kind == "mode" else 0o600)
+        if kind == "nlink":
+            os.link(candidate, tmp_path / "extra-link")
+
+    with pytest.raises(AuthorizationError, match="journal_path"):
+        journal._validate_companions()
+
+
+def test_companion_validation_takes_one_observation_per_companion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = _journal(tmp_path)
+    candidates = {
+        journal._path.with_name(f"{journal._path.name}{suffix}"): 0
+        for suffix in ("-journal", "-wal", "-shm")
+    }
+    candidate = journal._path.with_name(f"{journal._path.name}-wal")
+    candidate.touch(mode=0o600)
+    candidate.chmod(0o600)
+    real_lstat = os.lstat
+
+    def counting_lstat(path: str | os.PathLike[str]) -> os.stat_result:
+        candidate = Path(path)
+        if candidate in candidates:
+            candidates[candidate] += 1
+        return real_lstat(path)
+
+    monkeypatch.setattr(os, "lstat", counting_lstat)
+    journal._validate_companions()
+    assert all(calls == 1 for calls in candidates.values()), candidates
+
+
 @pytest.mark.parametrize(
     ("mode", "uid", "nlink", "expected"),
     [
@@ -699,7 +827,7 @@ def test_diagnostic_companion_snapshot_precedence_is_redacted(
         diagnostic._validate_companions()
     events, overflowed = observer.receipt()
     assert not overflowed
-    assert calls == 2
+    assert calls == 1
     assert any(
         event[6] == "companions_failed"
         and event[7] == expected
@@ -720,26 +848,40 @@ def test_diagnostic_companion_snapshot_acquisition_is_redacted(
     real_lstat = os.lstat
     calls = 0
 
-    def fail_second_lstat(path: str | os.PathLike[str]) -> os.stat_result:
+    def fail_lstat(path: str | os.PathLike[str]) -> os.stat_result:
         nonlocal calls
         if Path(path) == candidate:
             calls += 1
-            if calls == 2:
-                if failure == "missing":
-                    raise FileNotFoundError
-                raise OSError("redacted test fault")
+            if failure == "missing":
+                raise FileNotFoundError
+            raise OSError("redacted test fault")
         return real_lstat(path)
 
-    monkeypatch.setattr(os, "lstat", fail_second_lstat)
-    with pytest.raises(AuthorizationError, match="journal_path"):
+    monkeypatch.setattr(os, "lstat", fail_lstat)
+    if failure == "lstat_error":
+        with pytest.raises(AuthorizationError, match="journal_path"):
+            diagnostic._validate_companions()
+    else:
         diagnostic._validate_companions()
     events, overflowed = observer.receipt()
     assert not overflowed
-    assert calls == 2
-    assert any(
-        event[6] == "companions_failed" and event[7] == failure and event[8] == (("-wal", failure),)
-        for event in events
-    ), events
+    assert calls == 1
+    if failure == "lstat_error":
+        assert any(
+            event[6] == "companions_failed"
+            and event[7] == failure
+            and event[8] == (("-wal", failure),)
+            for event in events
+        ), events
+    else:
+        assert not any(event[6] == "companions_failed" for event in events), events
+        assert any(
+            event[6] == "companions_checked"
+            and event[8] == (("-journal", "missing"), ("-wal", "missing"), ("-shm", "missing"))
+            for event in events
+        ), events
+    assert str(journal._path) not in repr(events)
+    assert "redacted test fault" not in repr(events)
 
 
 def test_diagnostic_companion_regular_snapshot_is_redacted(
@@ -763,7 +905,7 @@ def test_diagnostic_companion_regular_snapshot_is_redacted(
     diagnostic._validate_companions()
     events, overflowed = observer.receipt()
     assert not overflowed
-    assert calls == 2
+    assert calls == 1
     assert any(
         event[8] == (("-journal", "missing"), ("-wal", "regular"), ("-shm", "missing"))
         for event in events

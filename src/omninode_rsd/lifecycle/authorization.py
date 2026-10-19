@@ -5337,11 +5337,10 @@ class SQLiteAuthorizationJournal:
         "nlink_mismatch",
         "regular",
     ]:
-        """Return the one-snapshot, redacted diagnostic category for a companion.
+        """Return the redacted validation category for a companion snapshot.
 
-        This is observer-only instrumentation.  The caller retains the existing
-        two-observation companion boundary and never performs another lstat while
-        selecting a category.
+        The caller takes exactly one lstat observation per companion and validates
+        that snapshot without performing another lstat while selecting a category.
         """
 
         if stat.S_ISLNK(details.st_mode):
@@ -5382,34 +5381,14 @@ class SQLiteAuthorizationJournal:
         companions: list[tuple[str, str]] | None = [] if observer is not None else None
         for suffix in ("-journal", "-wal", "-shm"):
             candidate = self._path.with_name(f"{self._path.name}{suffix}")
+            # DELETE mode unlinks "-journal" at each commit or rollback, so a second
+            # lstat can find a legitimate peer journal gone.
             try:
-                os.lstat(candidate)
+                details = os.lstat(candidate)
             except FileNotFoundError:
                 if companions is not None:
                     companions.append((suffix, "missing"))
                 continue
-            except OSError:
-                self._diagnostic_event(
-                    "companions_failed",
-                    result="lstat_error",
-                    companions=((suffix, "lstat_error"),),
-                )
-                raise AuthorizationError("journal_path") from None
-
-            if observer is None:
-                self._owner_file_details(candidate, "journal_path")
-                continue
-            assert companions is not None
-
-            try:
-                details = os.lstat(candidate)
-            except FileNotFoundError:
-                self._diagnostic_event(
-                    "companions_failed",
-                    result="missing",
-                    companions=((suffix, "missing"),),
-                )
-                raise AuthorizationError("journal_path") from None
             except OSError:
                 self._diagnostic_event(
                     "companions_failed",
@@ -5426,7 +5405,8 @@ class SQLiteAuthorizationJournal:
                     companions=((suffix, category),),
                 )
                 raise AuthorizationError("journal_path")
-            companions.append((suffix, category))
+            if companions is not None:
+                companions.append((suffix, category))
         if companions is not None:
             self._diagnostic_event("companions_checked", companions=tuple(companions))
 
