@@ -2,14 +2,15 @@
 """Fail-closed, nonprinting diagnostics for the hostile-review workflow.
 
 This module deliberately knows only configuration *slots*, not providers or
-configuration values.  Its public result types retain fixed categories and a
-bounded byte count; they never retain or render an endpoint, credential, or
-reviewer stderr text.
+configuration values. Its public results retain fixed categories, bounded
+byte counts and validated voter ids; they never render an endpoint, credential,
+reviewer error text or finding content.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Final
 
 MAX_DIAGNOSTIC_BYTES: Final[int] = 16 * 1024
+MAX_RESULT_BYTES: Final[int] = 1_200_000
+_VOTER_ID: Final[re.Pattern[str]] = re.compile(r"[a-z][a-z0-9-]{0,62}")
 
 
 class ConfigurationField(StrEnum):
@@ -178,17 +181,72 @@ def read_bounded_diagnostics(path: Path) -> bytes:
     return raw
 
 
+def failed_voter_diagnostics(path: Path) -> tuple[tuple[str, DiagnosticCategory], ...]:
+    """Read failure metadata, without trusting or printing free-form errors.
+
+    The CLI emits its result before returning degraded-quorum exit 2. Validate
+    the result identities and success lists together before emitting anything;
+    finding content and the verdict are deliberately not used to decide a gate.
+    """
+    if not path.is_absolute() or not path.is_file():
+        raise ValueError("review result is unavailable")
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_RESULT_BYTES + 1)
+    if len(raw) > MAX_RESULT_BYTES:
+        raise ValueError("review result exceeds the bound")
+    result = json.loads(raw)
+    if not isinstance(result, dict):
+        raise ValueError("review result is malformed")
+    rows = result.get("results")
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 64:
+        raise ValueError("review result rows are malformed")
+    attempted: list[str] = []
+    succeeded: list[str] = []
+    failed: list[str] = []
+    reports: list[tuple[str, DiagnosticCategory]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("review result row is malformed")
+        voter = row.get("model")
+        success = row.get("success")
+        error = row.get("error")
+        if not isinstance(voter, str) or _VOTER_ID.fullmatch(voter) is None:
+            raise ValueError("review voter id is malformed")
+        if voter in attempted or not isinstance(success, bool):
+            raise ValueError("review result status is malformed")
+        attempted.append(voter)
+        if success:
+            if error is not None:
+                raise ValueError("successful review has an error")
+            succeeded.append(voter)
+        else:
+            if not isinstance(error, str) or not error.strip():
+                raise ValueError("failed review has no error")
+            failed.append(voter)
+            reports.append((voter, classify_reviewer_diagnostics(error).category))
+    for field, expected in (
+        ("models_attempted", attempted),
+        ("models_succeeded", succeeded),
+        ("models_failed", failed),
+    ):
+        if result.get(field) != expected:
+            raise ValueError("review result status lists disagree")
+    return tuple(reports)
+
+
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="classify hostile-review diagnostics")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("preflight")
     classify = commands.add_parser("classify")
     classify.add_argument("--diagnostics", required=True, type=Path)
+    failures = commands.add_parser("failures")
+    failures.add_argument("--result", required=True, type=Path)
     return parser
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
-    """Emit only one allowlisted category, never an input or configuration value."""
+    """Emit fixed categories and voter ids, never error or configuration values."""
     parsed = _argument_parser().parse_args(arguments)
     if parsed.command == "preflight":
         preflight = preflight_reviewer_configuration(os.environ)
@@ -197,6 +255,16 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return 0
         print(DiagnosticCategory.CONFIGURATION.value)
         return 1
+
+    if parsed.command == "failures":
+        try:
+            reports = failed_voter_diagnostics(parsed.result)
+        except (OSError, ValueError, RecursionError):
+            print(DiagnosticCategory.ERROR.value)
+            return 1
+        for voter, category in reports:
+            print(f"review voter {voter} failed (category {category.value})")
+        return 0
 
     try:
         diagnostics = read_bounded_diagnostics(parsed.diagnostics)
