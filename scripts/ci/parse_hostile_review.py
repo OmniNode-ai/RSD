@@ -4,7 +4,7 @@
 The field sets mirror the pinned ``omniintelligence``
 ``ModelMultiReviewResult``, ``ModelExternalReviewResult``, and
 ``ModelReviewFindingObserved`` models at commit
-``a8acc469e2284aba4290b01b79aaac182fe0a70b``, which is the pinned reviewer below.  This parser is deliberately
+``475b99d47ef553ada207699178935dbe35b9ebf9``. This parser is deliberately
 strict: a model result must not be allowed to become a passing check merely
 because an unexpected, empty, or renamed field was ignored.
 """
@@ -28,12 +28,11 @@ MULTI_RESULT_FIELDS: Final[frozenset[str]] = frozenset(
         "total_findings",
     }
 )
-# OMN-18479: the reviewer resolves cross-model agreement and ships the result
-# in ``quorum``.  It is OPTIONAL here only because this repository pins the
-# reviewer by sha: a pin predating that change emits no such key.  Every other
-# unexpected key is still refused -- an envelope that grew a field this parser
-# does not understand must not become a passing check by being ignored.
-OPTIONAL_MULTI_RESULT_FIELDS: Final[frozenset[str]] = frozenset({"quorum"})
+# Defaulted additions at the pin. The CLI uses model_dump_json(indent=2)
+# without excluding defaults or nulls, so all of these appear on its output.
+OPTIONAL_MULTI_RESULT_FIELDS: Final[frozenset[str]] = frozenset(
+    {"quorum", "total_dropped", "skipped_reason", "standing_rules", "substitute_votes"}
+)
 QUORUM_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "verdict",
@@ -45,6 +44,22 @@ QUORUM_FIELDS: Final[frozenset[str]] = frozenset(
         "blocking_findings",
         "warning_findings",
     }
+)
+OPTIONAL_QUORUM_FIELDS: Final[frozenset[str]] = frozenset({"distinct_reviewers_succeeded"})
+QUORUM_FINDING_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "file_path",
+        "line_start",
+        "severity",
+        "rule",
+        "message",
+        "agreeing_models",
+        "agreement_count",
+        "blocking",
+    }
+)
+OPTIONAL_QUORUM_FINDING_FIELDS: Final[frozenset[str]] = frozenset(
+    {"finding_ids", "standing_rule_id"}
 )
 QUORUM_VERDICTS: Final[frozenset[str]] = frozenset(
     {"passed", "blocked", "degraded_quorum", "no_models"}
@@ -61,6 +76,30 @@ PER_MODEL_RESULT_FIELDS: Final[frozenset[str]] = frozenset(
         "findings",
         "result_count",
     }
+)
+OPTIONAL_PER_MODEL_RESULT_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "input_tokens",
+        "output_tokens",
+        "parse_failed",
+        "raw_reply_length",
+        "dropped_findings",
+        "reviewer_identity",
+    }
+)
+DROPPED_FINDING_FIELDS: Final[frozenset[str]] = frozenset(
+    {"title", "severity", "category", "reason"}
+)
+OPTIONAL_DROPPED_FINDING_FIELDS: Final[frozenset[str]] = frozenset({"location"})
+STANDING_RULES_FIELDS: Final[frozenset[str]] = frozenset(
+    {"version", "digest", "rule_ids", "mandatory_rule_ids", "source", "gated"}
+)
+OPTIONAL_STANDING_RULES_FIELDS: Final[frozenset[str]] = frozenset(
+    {"violations", "candidate_errors"}
+)
+STANDING_RULE_WEAKENING_FIELDS: Final[frozenset[str]] = frozenset({"rule_id", "reason"})
+SUBSTITUTE_VOTE_FIELDS: Final[frozenset[str]] = frozenset(
+    {"voter_id", "failure", "replaced_error", "reviewer_ids", "head_sha", "review_authors"}
 )
 FINDING_FIELDS: Final[frozenset[str]] = frozenset(
     {
@@ -85,6 +124,7 @@ FINDING_FIELDS: Final[frozenset[str]] = frozenset(
         "detection_method",
     }
 )
+OPTIONAL_FINDING_FIELDS: Final[frozenset[str]] = frozenset({"standing_rule_id"})
 SEVERITIES: Final[frozenset[str]] = frozenset({"critical", "error", "warning", "info", "hint"})
 CATEGORIES: Final[frozenset[str]] = frozenset(
     {
@@ -98,6 +138,8 @@ CATEGORIES: Final[frozenset[str]] = frozenset(
     }
 )
 CONFIDENCES: Final[frozenset[str]] = frozenset({"high", "medium", "low"})
+# Overlay results use voter_id (^[a-z][a-z0-9-]{0,62}$), not served model ids.
+# Those ids already fit this bounded, control-character-free allowlist.
 MODEL_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
@@ -153,8 +195,87 @@ def _require_nonnegative_integer(value: object, label: str) -> int:
     return value
 
 
+def _require_string(value: object, label: str) -> None:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+
+
+def _require_nullable_string(value: object, label: str) -> None:
+    if value is not None:
+        _require_string(value, label)
+
+
+def _require_strings(value: object, label: str) -> None:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list of strings")
+    for item in value:
+        _require_string(item, label)
+
+
+def _validate_optional_model_fields(result: dict[str, object]) -> None:
+    for field in ("input_tokens", "output_tokens"):
+        if field in result:
+            _require_nonnegative_integer(result[field], field)
+    if "parse_failed" in result and not isinstance(result["parse_failed"], bool):
+        raise ValueError("parse_failed must be boolean")
+    if result.get("raw_reply_length") is not None:
+        _require_nonnegative_integer(result["raw_reply_length"], "raw_reply_length")
+    _require_nullable_string(result.get("reviewer_identity"), "reviewer_identity")
+    dropped = result.get("dropped_findings", [])
+    if not isinstance(dropped, list):
+        raise ValueError("dropped_findings must be a list")
+    for raw_finding in dropped:
+        finding = _require_keys(
+            raw_finding, DROPPED_FINDING_FIELDS, "dropped finding", OPTIONAL_DROPPED_FINDING_FIELDS
+        )
+        for field in DROPPED_FINDING_FIELDS:
+            _require_string(finding[field], field)
+        _require_nullable_string(finding.get("location"), "location")
+
+
+def _validate_optional_multi_fields(result: dict[str, object]) -> None:
+    if "total_dropped" in result:
+        _require_nonnegative_integer(result["total_dropped"], "total_dropped")
+    _require_nullable_string(result.get("skipped_reason"), "skipped_reason")
+    if result.get("standing_rules") is not None:
+        rules = _require_keys(
+            result["standing_rules"],
+            STANDING_RULES_FIELDS,
+            "standing rules",
+            OPTIONAL_STANDING_RULES_FIELDS,
+        )
+        for field in ("version", "digest", "source"):
+            _require_string(rules[field], field)
+        for field in ("rule_ids", "mandatory_rule_ids", "candidate_errors"):
+            _require_strings(rules.get(field, []), field)
+        if not isinstance(rules["gated"], bool):
+            raise ValueError("standing rules gated must be boolean")
+        violations = rules.get("violations", [])
+        if not isinstance(violations, list):
+            raise ValueError("standing rules violations must be a list")
+        for raw_violation in violations:
+            violation = _require_keys(
+                raw_violation, STANDING_RULE_WEAKENING_FIELDS, "standing rule weakening"
+            )
+            _require_string(violation["rule_id"], "rule_id")
+            if violation["reason"] not in ("removed", "demoted", "reworded"):
+                raise ValueError("standing rule weakening reason is not recognized")
+    substitutes = result.get("substitute_votes", [])
+    if not isinstance(substitutes, list):
+        raise ValueError("substitute_votes must be a list")
+    for raw_substitute in substitutes:
+        substitute = _require_keys(raw_substitute, SUBSTITUTE_VOTE_FIELDS, "substitute vote")
+        for field in ("voter_id", "replaced_error", "head_sha"):
+            _require_string(substitute[field], field)
+        if substitute["failure"] not in ("timed out", "was unavailable"):
+            raise ValueError("substitute vote failure is not recognized")
+        for field in ("reviewer_ids", "review_authors"):
+            _require_strings(substitute[field], field)
+
+
 def _validate_finding(raw_finding: object) -> dict[str, object]:
-    finding = _require_keys(raw_finding, FINDING_FIELDS, "review finding")
+    finding = _require_keys(raw_finding, FINDING_FIELDS, "review finding", OPTIONAL_FINDING_FIELDS)
+    _require_nullable_string(finding.get("standing_rule_id"), "standing_rule_id")
     try:
         UUID(_require_nonempty_string(finding["finding_id"], "finding_id"))
     except ValueError as error:
@@ -217,7 +338,9 @@ def _validate_quorum(raw_quorum: object, succeeded: list[str]) -> tuple[int, str
     finding block a merge, and re-deriving it in this repository would
     reinstate the defect one repository at a time.
     """
-    quorum = _require_keys(raw_quorum, QUORUM_FIELDS, "review quorum")
+    quorum = _require_keys(raw_quorum, QUORUM_FIELDS, "review quorum", OPTIONAL_QUORUM_FIELDS)
+    if "distinct_reviewers_succeeded" in quorum:
+        _require_strings(quorum["distinct_reviewers_succeeded"], "distinct_reviewers_succeeded")
     verdict = _require_nonempty_string(quorum["verdict"], "quorum verdict")
     if verdict not in QUORUM_VERDICTS:
         raise ValueError("quorum verdict is not a recognized verdict")
@@ -236,8 +359,20 @@ def _validate_quorum(raw_quorum: object, succeeded: list[str]) -> tuple[int, str
         if not isinstance(entries, list):
             raise ValueError(f"quorum {field} must be a list")
         for entry in entries:
-            if not isinstance(entry, dict):
-                raise ValueError(f"quorum {field} entries must be objects")
+            entry = _require_keys(
+                entry, QUORUM_FINDING_FIELDS, "quorum finding", OPTIONAL_QUORUM_FINDING_FIELDS
+            )
+            for key in ("file_path", "rule", "message"):
+                _require_string(entry[key], key)
+            _require_nonnegative_integer(entry["line_start"], "quorum line_start")
+            severity = _require_nonempty_string(entry["severity"], "quorum severity")
+            if severity not in SEVERITIES:
+                raise ValueError("quorum severity is not recognized")
+            _require_model_names(entry["agreeing_models"], "agreeing_models")
+            if not isinstance(entry["blocking"], bool):
+                raise ValueError("quorum finding blocking must be boolean")
+            _require_strings(entry.get("finding_ids", []), "finding_ids")
+            _require_nullable_string(entry.get("standing_rule_id"), "standing_rule_id")
             agreement = _require_nonnegative_integer(
                 entry.get("agreement_count"), "quorum agreement_count"
             )
@@ -289,7 +424,9 @@ def parse_review_result(raw_json: str) -> ReviewSummary:
             raw_model_result,
             PER_MODEL_RESULT_FIELDS,
             "per-model result",
+            OPTIONAL_PER_MODEL_RESULT_FIELDS,
         )
+        _validate_optional_model_fields(model_result)
         model = _require_model_name(model_result["model"], "model")
         _require_nonempty_string(model_result["prompt_version"], "prompt_version")
         success = model_result["success"]
@@ -327,6 +464,7 @@ def parse_review_result(raw_json: str) -> ReviewSummary:
     expected_total = sum(count for _, success, count, _ in parsed_results if success)
     if total_findings != expected_total:
         raise ValueError("total_findings disagrees with successful per-model results")
+    _validate_optional_multi_fields(result)
     if "quorum" in result:
         blocking_count, _ = _validate_quorum(result["quorum"], succeeded)
     else:

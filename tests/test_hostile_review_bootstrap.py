@@ -43,10 +43,11 @@ def test_workflow_uses_trusted_base_and_immutable_actions() -> None:
     assert "if: always()" in gate
     assert "github.event.pull_request.head.repo.full_name" in reviewer
     assert "github.event.pull_request.head.sha" not in text
-    assert "LOCAL_LLM_SHARED_SECRET:" in text
-    assert "LLM_QWEN3_REVIEW_URL:" in text
-    assert "LLM_QWEN3_REVIEW_B_URL:" in text
-    assert text.count("github.event.pull_request.head.repo.full_name == github.repository") == 3
+    assert "LOCAL_LLM_SHARED_SECRET:" not in text
+    assert "LLM_QWEN3_" not in text
+    assert '--voters-overlay "$REVIEW_VOTERS_OVERLAY"' in text
+    assert "--model" not in text
+    assert text.count("github.event.pull_request.head.repo.full_name == github.repository") == 4
     assert "capture_bounded_stderr" in text
     assert "hostile_review_diagnostics.py" in text
     assert "classify_diagnostic" not in text
