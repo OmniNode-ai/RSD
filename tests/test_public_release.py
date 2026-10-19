@@ -411,6 +411,23 @@ def test_detects_other_restricted_markers(tmp_path: Path, name: str) -> None:
     assert any(item.rule == "sensitive_marker" for item in findings)
 
 
+def test_allows_only_expression_valued_app_key_input_in_workflows(tmp_path: Path) -> None:
+    key_input = _marker("restricted") + "-key:"
+    allowed = f"          {key_input} ${{{{ secrets.APP_KEY }}}}\n"
+    assert not [
+        item
+        for item in _write(tmp_path / "allowed", ".github/workflows/review.yml", allowed)
+        if item.rule == "sensitive_marker"
+    ]
+
+    literal = f"          {key_input} literal-key-material\n"
+    findings = _write(tmp_path / "literal", ".github/workflows/review.yml", literal)
+    assert any(item.rule == "sensitive_marker" for item in findings)
+
+    findings = _write(tmp_path / "readme", "README.md", allowed)
+    assert any(item.rule == "sensitive_marker" for item in findings)
+
+
 def test_allows_loopback_documentation_and_public_dependency_values(tmp_path: Path) -> None:
     content = "\n".join(
         [
