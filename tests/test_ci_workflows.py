@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -41,6 +42,7 @@ def test_all_workflow_actions_are_immutable_and_verified() -> None:
     expected = {
         "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
         "actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08",
         "astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86",
         "astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78",
@@ -97,9 +99,11 @@ def test_hostile_reviewer_is_fork_safe_and_minimal() -> None:
     assert "--with pyyaml" not in text.lower()
     assert "${{ secrets.GITHUB_TOKEN }}" not in text
     assert text.count("${{ github.token }}") == 1
-    assert "secrets['LOCAL_LLM_SHARED_SECRET']" in text
-    assert "secrets['LLM_QWEN3_REVIEW_URL']" in text
-    assert "secrets['LLM_QWEN3_REVIEW_B_URL']" in text
+    assert "LOCAL_LLM_SHARED_SECRET:" not in text
+    assert "LLM_QWEN3_" not in text
+    assert "LLM_ENDPOINT_CIDR_ALLOWLIST:" not in text
+    assert '--voters-overlay "$REVIEW_VOTERS_OVERLAY"' in text
+    assert "--model" not in text
     assert '--file "$REVIEW_INPUT"' in text
     assert "--no-fallback" in text
     assert "--python 3.12" in text
@@ -126,13 +130,91 @@ def test_hostile_reviewer_uses_canonical_runner_policy() -> None:
     assert "github.event.pull_request.head.repo.full_name" in reviewer
     assert "github.event.pull_request.head.sha" not in text
     assert "self-hosted" in reviewer
-    assert "LOCAL_LLM_SHARED_SECRET:" in text
-    assert "LLM_QWEN3_REVIEW_URL:" in text
-    assert "LLM_QWEN3_REVIEW_B_URL:" in text
-    assert text.count("github.event.pull_request.head.repo.full_name == github.repository") == 3
-    assert "secrets['LOCAL_LLM_SHARED_SECRET'] || ''" in text
-    assert "secrets['LLM_QWEN3_REVIEW_URL'] || ''" in text
-    assert "secrets['LLM_QWEN3_REVIEW_B_URL'] || ''" in text
+    assert "LOCAL_LLM_SHARED_SECRET:" not in text
+    assert "LLM_QWEN3_" not in text
+    assert text.count("github.event.pull_request.head.repo.full_name == github.repository") == 4
+    for value in (
+        "vars.OMNI_CI_OVERLAY_REPO",
+        "vars.OMNI_CI_OVERLAY_REF",
+        "secrets.ONEXBOT_APP_ID",
+        "secrets.ONEXBOT_APP_PRIVATE_KEY",
+    ):
+        assert (
+            "${{ github.event.pull_request.head.repo.full_name == github.repository && "
+            + value
+            + " || '' }}"
+        ) in text
+
+
+def test_hostile_reviewer_fetches_pinned_overlay_outside_workspace() -> None:
+    config = yaml.safe_load(_HOSTILE_REVIEWER.read_text(encoding="utf-8"))
+    job = config["jobs"]["hostile-review"]
+    assert job["env"] == {
+        "REVIEW_VOTERS_OVERLAY": "${{ github.workspace }}/../ci-overlay/config/onex/overlays/"
+        "node_review_voters_overlay_compute/overlay.yaml"
+    }
+    steps = {step["name"]: step for step in job["steps"]}
+    token = steps["Mint a read-only CI overlay token"]
+    assert (
+        token["uses"] == "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1"
+    )
+    assert token["with"]["permission-contents"] == "read"
+    assert token["with"]["repositories"] == "${{ steps.ci-overlay.outputs.name }}"
+    overlay = steps["Fetch the CI overlay"]["with"]
+    assert overlay["ref"] == "${{ steps.ci-overlay.outputs.ref }}"
+    assert overlay["token"] == "${{ steps.ci-overlay-token.outputs.token }}"
+    assert overlay["persist-credentials"] is False
+    assert (
+        overlay["sparse-checkout"].strip()
+        == "config/onex/overlays/node_review_voters_overlay_compute"
+    )
+    assert overlay["sparse-checkout-cone-mode"] is False
+    place = steps["Place the CI overlay outside the workspace"]
+    assert place["env"]["EXPECTED_OVERLAY_REF"] == "${{ steps.ci-overlay.outputs.ref }}"
+    assert "mv .ci-overlay-checkout ../ci-overlay" in place["run"]
+    assert 'FETCHED_REF="$(git -C ../ci-overlay rev-parse HEAD)"' in place["run"]
+    assert 'if [ "${FETCHED_REF}" != "${EXPECTED_OVERLAY_REF}" ]; then' in place["run"]
+    review = steps["Run adversarial review"]
+    assert set(review["env"]) == {"REVIEW_INPUT"}
+    assert list(steps).index("Resolve the CI overlay") < list(steps).index("Run adversarial review")
+
+
+@pytest.mark.parametrize(
+    ("repo", "ref", "expected"),
+    [
+        ("", "", "no review voters configured"),
+        ("bad\n::warning::injected", "a" * 40, "must be a bare repository name"),
+        ("owner/repo", "a" * 40, "must be a bare repository name"),
+        ("overlay", "", "OMNI_CI_OVERLAY_REF is unset"),
+        ("overlay", "dev", "full 40-hex lowercase commit sha"),
+        ("overlay", "A" * 40, "full 40-hex lowercase commit sha"),
+        ("overlay", "a" * 40 + "\n::warning::injected", "full 40-hex lowercase commit sha"),
+    ],
+)
+def test_overlay_resolver_fails_closed_without_echoing_rejected_values(
+    tmp_path: Path,
+    repo: str,
+    ref: str,
+    expected: str,
+) -> None:
+    config = yaml.safe_load(_HOSTILE_REVIEWER.read_text(encoding="utf-8"))
+    resolve = next(
+        step
+        for step in config["jobs"]["hostile-review"]["steps"]
+        if step["name"] == "Resolve the CI overlay"
+    )
+    output = tmp_path / "output"
+    result = subprocess.run(
+        ["bash", "-c", resolve["run"]],
+        env={"CI_OVERLAY_REPO": repo, "CI_OVERLAY_REF": ref, "GITHUB_OUTPUT": str(output)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert expected in result.stdout
+    assert "::warning::injected" not in result.stdout + result.stderr
+    assert not output.exists()
 
 
 def test_pull_request_workflows_never_select_self_hosted_runners() -> None:
@@ -157,11 +239,11 @@ def test_pull_request_workflows_never_select_self_hosted_runners() -> None:
 def test_hostile_reviewer_pins_dependencies_and_verifies_checkout() -> None:
     text = _HOSTILE_REVIEWER.read_text(encoding="utf-8")
     expected_pins = {
-        "omniintelligence": "a8acc469e2284aba4290b01b79aaac182fe0a70b",
-        "omnibase_core": "872beef0397e81064e1212ad5d9d73f173ea3f84",
-        "omnibase_compat": "039df62a695f0498821dfd76d44363872c8f6b22",
+        "omniintelligence": "475b99d47ef553ada207699178935dbe35b9ebf9",
     }
 
+    assert "omnibase_core" not in text
+    assert "omnibase_compat" not in text
     assert "git ls-remote" not in text
     assert 'git -C "${target_dir}" rev-parse HEAD' in text
     assert 'git -C "${target_dir}" fetch --no-tags --depth=1 origin "${expected_sha}"' in text
@@ -190,8 +272,8 @@ def test_hostile_reviewer_has_explicit_degraded_fork_and_default_deny_gate() -> 
     assert '--file "$REVIEW_INPUT"' in text
     assert "--no-fallback" in text
     assert "--python 3.12" in text
-    assert "--model qwen3-review" in text
-    assert "--model qwen3-review-b" in text
+    assert '--voters-overlay "$REVIEW_VOTERS_OVERLAY"' in text
+    assert "--model" not in text
 
 
 def test_hostile_reviewer_bounds_and_normalizes_diagnostics() -> None:
@@ -586,6 +668,21 @@ def test_authored_contract_set_validation_is_wired_as_a_gate() -> None:
     assert hook["pass_filenames"] is False
 
 
+def _quorum_finding(agreement: int, *, blocking: bool) -> dict[str, object]:
+    return {
+        "file_path": "src/example.py",
+        "line_start": 1,
+        "severity": "error" if blocking else "warning",
+        "rule": "review:example",
+        "message": "example finding",
+        "agreeing_models": ["qwen3-review", "qwen3-review-b"][:agreement],
+        "agreement_count": agreement,
+        "blocking": blocking,
+        "finding_ids": ["00000000-0000-0000-0000-000000000001"],
+        "standing_rule_id": None,
+    }
+
+
 def _quorum(
     *,
     verdict: str = "passed",
@@ -595,12 +692,9 @@ def _quorum(
     agreement: int = 1,
 ) -> dict[str, object]:
     blocking_findings = [
-        {"agreement_count": max(agreement, threshold), "finding_ids": ["f-1"]}
-        for _ in range(blocking)
+        _quorum_finding(max(agreement, threshold), blocking=True) for _ in range(blocking)
     ]
-    warning_findings = [
-        {"agreement_count": agreement, "finding_ids": ["f-2"]} for _ in range(warnings)
-    ]
+    warning_findings = [_quorum_finding(agreement, blocking=False) for _ in range(warnings)]
     return {
         "verdict": verdict,
         "quorum_threshold": threshold,
@@ -678,6 +772,114 @@ def test_review_parser_still_rejects_unknown_top_level_keys() -> None:
     """Accepting `quorum` must not have opened the envelope to anything."""
     envelope = _review_envelope()
     envelope["merged_findings"] = []
+
+    with pytest.raises(ValueError):
+        parse_review_result(json.dumps(envelope))
+
+
+def _pinned_review_envelope() -> dict[str, object]:
+    """Include every defaulted addition emitted by the pinned CLI."""
+    finding = _finding()
+    finding["standing_rule_id"] = None
+    envelope = _review_envelope([finding])
+    envelope.update(
+        {
+            "total_dropped": 1,
+            "skipped_reason": None,
+            "standing_rules": None,
+            "substitute_votes": [],
+            "quorum": _quorum(),
+        }
+    )
+    envelope["quorum"]["distinct_reviewers_succeeded"] = ["identity-a", "identity-b"]
+    for model in envelope["results"]:
+        model.update(
+            {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "parse_failed": False,
+                "raw_reply_length": None,
+                "dropped_findings": [],
+                "reviewer_identity": None,
+            }
+        )
+    envelope["results"][0]["dropped_findings"] = [
+        {
+            "title": "No defect",
+            "severity": "info",
+            "category": "informational",
+            "location": None,
+            "reason": "The model said the code was correct.",
+        }
+    ]
+    return envelope
+
+
+def test_review_parser_accepts_pinned_cli_defaults_and_overlay_voter_names() -> None:
+    envelope = _pinned_review_envelope()
+    names = ["voter-a", "v" + "a" * 62]
+    envelope["models_attempted"] = names
+    envelope["models_succeeded"] = names
+    envelope["quorum"]["models_succeeded"] = names
+    envelope["quorum"]["warning_findings"][0]["agreeing_models"] = names[:1]
+    for model, name in zip(envelope["results"], names, strict=True):
+        model["model"] = name
+
+    summary = parse_review_result(json.dumps(envelope))
+
+    assert summary.verdict == "passed"
+    assert summary.total_findings == 1
+    assert summary.models_succeeded == tuple(names)
+
+
+def test_review_parser_accepts_nested_standing_rules_and_substitute_votes() -> None:
+    envelope = _pinned_review_envelope()
+    envelope["standing_rules"] = {
+        "version": "v1",
+        "digest": "a" * 64,
+        "rule_ids": ["rule-a"],
+        "mandatory_rule_ids": ["rule-a"],
+        "source": "rules.yaml",
+        "gated": False,
+        "violations": [{"rule_id": "rule-a", "reason": "removed"}],
+        "candidate_errors": [],
+    }
+    envelope["substitute_votes"] = [
+        {
+            "voter_id": "voter-a",
+            "failure": "timed out",
+            "replaced_error": "request timed out",
+            "reviewer_ids": ["reviewer-a", "reviewer-b"],
+            "head_sha": "a" * 40,
+            "review_authors": ["author-a", "author-b"],
+        }
+    ]
+
+    assert parse_review_result(json.dumps(envelope)).verdict == "passed"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda result: result.__setitem__("truly_unknown", None),
+        lambda result: result["results"][0].__setitem__("truly_unknown", None),
+        lambda result: result["results"][0]["findings"][0].__setitem__("truly_unknown", None),
+        lambda result: result["results"][0]["dropped_findings"][0].__setitem__(
+            "truly_unknown", None
+        ),
+        lambda result: result["quorum"].__setitem__("truly_unknown", None),
+        lambda result: result["quorum"]["warning_findings"][0].__setitem__("truly_unknown", None),
+        lambda result: result.__setitem__("total_dropped", "1"),
+        lambda result: result["results"][0].__setitem__("input_tokens", -1),
+        lambda result: result["results"][0].__setitem__("parse_failed", "false"),
+        lambda result: result["results"][0]["findings"][0].__setitem__("standing_rule_id", []),
+    ],
+)
+def test_review_parser_rejects_unknown_keys_and_malformed_new_fields(
+    mutate: Callable[[dict[str, object]], object],
+) -> None:
+    envelope = _pinned_review_envelope()
+    mutate(envelope)
 
     with pytest.raises(ValueError):
         parse_review_result(json.dumps(envelope))

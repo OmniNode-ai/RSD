@@ -18,11 +18,12 @@ sys.modules[_DIAGNOSTICS_SPEC.name] = _DIAGNOSTICS
 _DIAGNOSTICS_SPEC.loader.exec_module(_DIAGNOSTICS)
 
 
-def _configured_environment() -> dict[str, str]:
+def _configured_environment(tmp_path: Path) -> dict[str, str]:
+    overlay = tmp_path / "voters-overlay.yaml"
+    overlay.write_text("roster data", encoding="utf-8")
     return {
-        "LOCAL_LLM_SHARED_SECRET": "configured",
-        "LLM_QWEN3_REVIEW_URL": "https://review.example.test/primary",
-        "LLM_QWEN3_REVIEW_B_URL": "http://review.example.test/secondary",
+        "LOCAL_LLM_SHARED_SECRET": "fixture-signing-key",
+        "REVIEW_VOTERS_OVERLAY": str(overlay),
     }
 
 
@@ -32,36 +33,76 @@ def test_preflight_reports_missing_slots_without_retaining_values() -> None:
     assert not preflight.ready
     assert preflight.missing_fields == (
         _DIAGNOSTICS.ConfigurationField.AUTHENTICATION,
-        _DIAGNOSTICS.ConfigurationField.PRIMARY_ENDPOINT,
-        _DIAGNOSTICS.ConfigurationField.SECONDARY_ENDPOINT,
+        _DIAGNOSTICS.ConfigurationField.VOTERS_OVERLAY,
     )
     assert preflight.malformed_fields == ()
-    assert _DIAGNOSTICS.preflight_reviewer_configuration(_configured_environment()).ready
 
 
-@pytest.mark.parametrize(
-    "endpoint",
-    (
-        "ftp://review.example.test",
-        "https://",
-        "https://user@review.example.test",
-        "https://review.example.test/#fragment",
-        "https://review.example.test/\x1fcontrol",
-    ),
-)
-def test_preflight_rejects_malformed_endpoint_shape_without_retaining_it(
-    endpoint: str,
+@pytest.mark.parametrize("invalid", ("relative", "missing", "empty", "directory", "nul"))
+def test_preflight_rejects_invalid_overlay_without_retaining_path(
+    tmp_path: Path,
+    invalid: str,
 ) -> None:
-    environment = _configured_environment()
-    environment["LLM_QWEN3_REVIEW_URL"] = endpoint
+    environment = _configured_environment(tmp_path)
+    overlay = Path(environment["REVIEW_VOTERS_OVERLAY"])
+    if invalid == "relative":
+        environment["REVIEW_VOTERS_OVERLAY"] = "relative-overlay.yaml"
+    elif invalid == "missing":
+        overlay.unlink()
+    elif invalid == "empty":
+        overlay.write_text("", encoding="utf-8")
+    elif invalid == "nul":
+        environment["REVIEW_VOTERS_OVERLAY"] += "\x00"
+    else:
+        overlay.unlink()
+        overlay.mkdir()
 
     preflight = _DIAGNOSTICS.preflight_reviewer_configuration(environment)
 
     assert not preflight.ready
     assert preflight.missing_fields == ()
-    assert preflight.malformed_fields == (_DIAGNOSTICS.ConfigurationField.PRIMARY_ENDPOINT,)
-    assert endpoint not in repr(preflight)
+    assert preflight.malformed_fields == (_DIAGNOSTICS.ConfigurationField.VOTERS_OVERLAY,)
+    for value in environment.values():
+        assert value not in repr(preflight)
     assert not hasattr(preflight, "values")
+
+
+@pytest.mark.parametrize("key", ("signing\nkey", "signing\rkey"))
+def test_preflight_rejects_multiline_authentication(tmp_path: Path, key: str) -> None:
+    environment = _configured_environment(tmp_path)
+    environment["LOCAL_LLM_SHARED_SECRET"] = key
+
+    preflight = _DIAGNOSTICS.preflight_reviewer_configuration(environment)
+
+    assert not preflight.ready
+    assert preflight.malformed_fields == (_DIAGNOSTICS.ConfigurationField.AUTHENTICATION,)
+    assert key not in repr(preflight)
+
+
+@pytest.mark.parametrize("state", ("missing-overlay", "missing-key", "ready"))
+def test_preflight_cli_emits_only_category(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    state: str,
+) -> None:
+    environment = _configured_environment(tmp_path)
+    if state == "missing-overlay":
+        Path(environment["REVIEW_VOTERS_OVERLAY"]).unlink()
+    elif state == "missing-key":
+        environment.pop("LOCAL_LLM_SHARED_SECRET")
+    for slot in ("REVIEW_VOTERS_OVERLAY", "LOCAL_LLM_SHARED_SECRET"):
+        monkeypatch.delenv(slot, raising=False)
+    for slot, value in environment.items():
+        monkeypatch.setenv(slot, value)
+
+    assert _DIAGNOSTICS.preflight_reviewer_configuration(environment).ready == (state == "ready")
+    assert _DIAGNOSTICS.main(["preflight"]) == (0 if state == "ready" else 1)
+    captured = capsys.readouterr()
+    assert captured.out == ("reviewer-ready\n" if state == "ready" else "reviewer-configuration\n")
+    assert captured.err == ""
+    for value in environment.values():
+        assert value not in captured.out + captured.err
 
 
 @pytest.mark.parametrize(

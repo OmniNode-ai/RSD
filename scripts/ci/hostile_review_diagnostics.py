@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Final
-from urllib.parse import urlsplit
 
 MAX_DIAGNOSTIC_BYTES: Final[int] = 16 * 1024
 
@@ -26,8 +25,7 @@ class ConfigurationField(StrEnum):
     """Provider-neutral configuration slots required for paired review."""
 
     AUTHENTICATION = "authentication"
-    PRIMARY_ENDPOINT = "primary_endpoint"
-    SECONDARY_ENDPOINT = "secondary_endpoint"
+    VOTERS_OVERLAY = "voters_overlay"
 
 
 class DiagnosticCategory(StrEnum):
@@ -66,8 +64,7 @@ class DiagnosticReport:
 
 _CONFIGURATION_ENVIRONMENT_KEYS: Final[tuple[tuple[ConfigurationField, str], ...]] = (
     (ConfigurationField.AUTHENTICATION, "LOCAL_LLM_SHARED_SECRET"),
-    (ConfigurationField.PRIMARY_ENDPOINT, "LLM_QWEN3_REVIEW_URL"),
-    (ConfigurationField.SECONDARY_ENDPOINT, "LLM_QWEN3_REVIEW_B_URL"),
+    (ConfigurationField.VOTERS_OVERLAY, "REVIEW_VOTERS_OVERLAY"),
 )
 _PROGRESS_TIMEOUT_MARKER: Final[re.Pattern[str]] = re.compile(
     r"\btimeout\s*=\s*[^\s]+", re.IGNORECASE
@@ -111,44 +108,26 @@ _PARSER: Final[re.Pattern[str]] = re.compile(
 )
 
 
-def is_valid_review_endpoint_shape(value: object) -> bool:
-    """Accept only a syntactically strict HTTP(S) endpoint without resolving it."""
-    if not isinstance(value, str) or not value or value != value.strip():
-        return False
-    if any(
-        character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value
-    ):
-        return False
-    if "#" in value:
-        return False
-    try:
-        parsed = urlsplit(value)
-        port = parsed.port
-    except ValueError:
-        return False
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-        return False
-    if "@" in parsed.netloc or parsed.username is not None or parsed.password is not None:
-        return False
-    if parsed.hostname is None:
-        return False
-    return parsed.hostname.isascii() and (port is None or port >= 1)
-
-
 def preflight_reviewer_configuration(
     environment: Mapping[str, object],
 ) -> ConfigurationPreflight:
-    """Inspect only required-slot presence without retaining their values."""
+    """Check runner authentication and overlay shape without retaining values."""
     missing: list[ConfigurationField] = []
     malformed: list[ConfigurationField] = []
     for field, environment_key in _CONFIGURATION_ENVIRONMENT_KEYS:
         value = environment.get(environment_key)
-        if not isinstance(value, str) or not value.strip() or "\r" in value or "\n" in value:
+        if not isinstance(value, str) or not value.strip():
             missing.append(field)
-        elif field is not ConfigurationField.AUTHENTICATION and not is_valid_review_endpoint_shape(
-            value
-        ):
+        elif "\r" in value or "\n" in value:
             malformed.append(field)
+        elif field is ConfigurationField.VOTERS_OVERLAY:
+            try:
+                path = Path(value)
+                valid = path.is_absolute() and path.is_file() and path.stat().st_size > 0
+            except (OSError, ValueError):
+                valid = False
+            if not valid:
+                malformed.append(field)
     return ConfigurationPreflight(tuple(missing), tuple(malformed))
 
 

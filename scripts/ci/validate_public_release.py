@@ -124,6 +124,11 @@ INTERNAL_HOST_RE = re.compile(
     r"(?i)(?<![a-z0-9-])(?:[a-z0-9-]+[.])+(?:local|lan|internal|corp|home|intranet)(?![a-z0-9-])"
 )
 GITHUB_SECRET_REFERENCE_RE = re.compile(r"\$\{\{\s*secrets\.[a-z0-9_]+\s*\}\}", re.IGNORECASE)
+# ``private-key`` is the fixed input name of actions/create-github-app-token,
+# not a publication label.  Only that input, in a workflow file, whose whole
+# value is one ``${{ ... }}`` expression (so no literal key material) is
+# exempt from the marker scan.
+GITHUB_APP_KEY_INPUT_RE = re.compile(r"^(\s*)private-key:(\s*\$\{\{[^{}]*\}\}\s*)$")
 SHORTHAND_HOST_RE = re.compile(
     r"(?i)(?<![a-z0-9-])(?:[a-z0-9_-]+[.])+(?:200|201)(?::\d{1,5})?(?![a-z0-9-])"
 )
@@ -349,7 +354,19 @@ def _scan_line(
                 _finding(path, line_number, match.start() + 1, rule, detail or match.group(0))
             )
 
-    add_matches(MARKER_RE, "sensitive_marker", "restricted publication marker")
+    marker_line = line
+    if path.parts[:2] == (".github", "workflows"):
+        marker_line = GITHUB_APP_KEY_INPUT_RE.sub(r"\1app-key-input:\2", line)
+    for match in MARKER_RE.finditer(marker_line):
+        findings.append(
+            _finding(
+                path,
+                line_number,
+                match.start() + 1,
+                "sensitive_marker",
+                "restricted publication marker",
+            )
+        )
     add_matches(ENV_REFERENCE_RE, "environment_reference", "environment file reference")
     add_matches(OLD_IDENTIFIER_RE, "legacy_identifier", "legacy private-project identifier")
     add_matches(ABSOLUTE_WORKSPACE_RE, "absolute_workspace_path", "absolute local workspace path")

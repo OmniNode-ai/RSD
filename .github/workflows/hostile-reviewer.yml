@@ -27,6 +27,8 @@ jobs:
           'ubuntu-latest' ||
           fromJSON(vars.OMNI_REVIEW_RUNS_ON_JSON || '["self-hosted","omnibase-ci"]') }}
     timeout-minutes: 60
+    env:
+      REVIEW_VOTERS_OVERLAY: ${{ github.workspace }}/../ci-overlay/config/onex/overlays/node_review_voters_overlay_compute/overlay.yaml
 
     steps:
       - name: Checkout trusted base tooling
@@ -36,6 +38,86 @@ jobs:
           path: base
           fetch-depth: 1
           persist-credentials: false
+
+      # OMN-17427: dead per-model URL secrets are replaced by the fleet overlay
+      # standard. The signing key and endpoint allowlist come from runner env.
+      - name: Resolve the CI overlay
+        id: ci-overlay
+        working-directory: ${{ github.workspace }}
+        env:
+          CI_OVERLAY_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository && vars.OMNI_CI_OVERLAY_REPO || '' }}
+          CI_OVERLAY_REF: ${{ github.event.pull_request.head.repo.full_name == github.repository && vars.OMNI_CI_OVERLAY_REF || '' }}
+        run: |
+          set -euo pipefail
+          # Both variables arrive through env: and are only ever expanded as quoted
+          # shell variables. Messages and outputs are written with printf, the
+          # value as an argument and never as the format. A value that fails
+          # validation is not echoed back: a newline in it would start a log line
+          # of its own, and a line beginning with two colons is a workflow command.
+          if [ -z "${CI_OVERLAY_REPO}" ]; then
+            printf '%s\n' "::error::no review voters configured: OMNI_CI_OVERLAY_REPO is unset, so no CI overlay supplies config/onex/overlays/node_review_voters_overlay_compute/overlay.yaml (review_voters_overlay.v1). The gate fails closed. To run it, put your voters in a repository of your own and set OMNI_CI_OVERLAY_REPO to its name."
+            exit 1
+          fi
+          if [[ ! "${CI_OVERLAY_REPO}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            printf '%s\n' "::error::OMNI_CI_OVERLAY_REPO must be a bare repository name (letters, digits, dot, underscore and hyphen only); the rejected value is not echoed"
+            exit 1
+          fi
+          if [ -z "${CI_OVERLAY_REF}" ]; then
+            printf '::error::OMNI_CI_OVERLAY_REF is unset: the CI overlay %s is read only at a pinned commit, so set the org Actions variable OMNI_CI_OVERLAY_REF to the full 40-hex commit sha of %s that carries config/onex/overlays/node_review_voters_overlay_compute/overlay.yaml. The gate fails closed.\n' "${CI_OVERLAY_REPO}" "${CI_OVERLAY_REPO}"
+            exit 1
+          fi
+          if [[ ! "${CI_OVERLAY_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '%s\n' "::error::OMNI_CI_OVERLAY_REF must be a full 40-hex lowercase commit sha; a branch, tag or short sha is refused because the voters could change without the pin changing. The rejected value is not echoed"
+            exit 1
+          fi
+          {
+            printf '%s\n' "name=${CI_OVERLAY_REPO}"
+            printf '%s\n' "ref=${CI_OVERLAY_REF}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Mint a read-only CI overlay token
+        id: ci-overlay-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ github.event.pull_request.head.repo.full_name == github.repository && secrets.ONEXBOT_APP_ID || '' }}
+          private-key: ${{ github.event.pull_request.head.repo.full_name == github.repository && secrets.ONEXBOT_APP_PRIVATE_KEY || '' }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ steps.ci-overlay.outputs.name }}
+          permission-contents: read
+
+      # Read only the exact commit OMNI_CI_OVERLAY_REF names (OMN-20910).
+      # The resolver validates the pinned overlay data (OMN-20923).
+      - name: Fetch the CI overlay
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.repository_owner }}/${{ steps.ci-overlay.outputs.name }}
+          ref: ${{ steps.ci-overlay.outputs.ref }}
+          token: ${{ steps.ci-overlay-token.outputs.token }}
+          path: .ci-overlay-checkout
+          persist-credentials: false
+          sparse-checkout: |
+            config/onex/overlays/node_review_voters_overlay_compute
+          sparse-checkout-cone-mode: false
+
+      - name: Place the CI overlay outside the workspace
+        working-directory: ${{ github.workspace }}
+        env:
+          OVERLAY_SOURCE: ${{ github.repository_owner }}/${{ steps.ci-overlay.outputs.name }}
+          EXPECTED_OVERLAY_REF: ${{ steps.ci-overlay.outputs.ref }}
+        run: |
+          set -euo pipefail
+          rm -rf ../ci-overlay
+          mv .ci-overlay-checkout ../ci-overlay
+          FETCHED_REF="$(git -C ../ci-overlay rev-parse HEAD)"
+          echo "CI overlay read from ${OVERLAY_SOURCE} at ${FETCHED_REF}"
+          if [ "${FETCHED_REF}" != "${EXPECTED_OVERLAY_REF}" ]; then
+            echo "::error::the CI overlay checkout is at ${FETCHED_REF}, not the pinned OMNI_CI_OVERLAY_REF ${EXPECTED_OVERLAY_REF}; refusing to read voters from it"
+            exit 1
+          fi
+          if [ ! -s "$REVIEW_VOTERS_OVERLAY" ]; then
+            echo "::error::the CI overlay carries no config/onex/overlays/node_review_voters_overlay_compute/overlay.yaml; no voter can be resolved"
+            exit 1
+          fi
 
       - name: Clone reviewer dependencies
         run: |
@@ -63,9 +145,7 @@ jobs:
             return 1
           }
 
-          clone_with_retry omniintelligence ../omniintelligence a8acc469e2284aba4290b01b79aaac182fe0a70b
-          clone_with_retry omnibase_core ../omnibase_core 872beef0397e81064e1212ad5d9d73f173ea3f84
-          clone_with_retry omnibase_compat ../omnibase_compat 039df62a695f0498821dfd76d44363872c8f6b22
+          clone_with_retry omniintelligence ../omniintelligence 475b99d47ef553ada207699178935dbe35b9ebf9
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
@@ -118,9 +198,6 @@ jobs:
         working-directory: ../omniintelligence
         env:
           REVIEW_INPUT: ${{ steps.fetch-diff.outputs.path }}
-          LOCAL_LLM_SHARED_SECRET: ${{ github.event.pull_request.head.repo.full_name == github.repository && secrets['LOCAL_LLM_SHARED_SECRET'] || '' }}
-          LLM_QWEN3_REVIEW_URL: ${{ github.event.pull_request.head.repo.full_name == github.repository && secrets['LLM_QWEN3_REVIEW_URL'] || '' }}
-          LLM_QWEN3_REVIEW_B_URL: ${{ github.event.pull_request.head.repo.full_name == github.repository && secrets['LLM_QWEN3_REVIEW_B_URL'] || '' }}
         run: |
           set -euo pipefail
 
@@ -153,8 +230,7 @@ jobs:
           STDERR_CAPTURE_PID=$!
           uv run --python 3.12 python -m omniintelligence.review_pairing.cli_review \
             --file "$REVIEW_INPUT" \
-            --model qwen3-review \
-            --model qwen3-review-b \
+            --voters-overlay "$REVIEW_VOTERS_OVERLAY" \
             --no-fallback \
             >"$REVIEW_STDOUT" 2>"$REVIEW_FIFO" &
           REVIEW_PID=$!
