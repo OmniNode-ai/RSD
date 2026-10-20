@@ -198,6 +198,7 @@ jobs:
         working-directory: ../omniintelligence
         env:
           REVIEW_INPUT: ${{ steps.fetch-diff.outputs.path }}
+          REVIEW_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
 
@@ -228,8 +229,10 @@ jobs:
 
           capture_bounded_stderr <"$REVIEW_FIFO" >"$REVIEW_STDERR" &
           STDERR_CAPTURE_PID=$!
+          # OMN-17427: the cloud voter requires the reviewed repository identity.
           uv run --python 3.12 python -m omniintelligence.review_pairing.cli_review \
             --file "$REVIEW_INPUT" \
+            --repo "$REVIEW_REPOSITORY" \
             --voters-overlay "$REVIEW_VOTERS_OVERLAY" \
             --no-fallback \
             >"$REVIEW_STDOUT" 2>"$REVIEW_FIFO" &
@@ -244,6 +247,16 @@ jobs:
             exit 1
           fi
           if [ "$REVIEW_STATUS" -ne 0 ]; then
+            # OMN-17427: degraded runs still carry per-voter result metadata.
+            # Emit only validated voter ids and fixed error categories; raw
+            # errors, findings, endpoints and credentials are not printed.
+            if VOTER_DIAGNOSTICS="$(uv run --no-project --python 3.12 python \
+              "$GITHUB_WORKSPACE/base/scripts/ci/hostile_review_diagnostics.py" \
+              failures --result "$REVIEW_STDOUT")"; then
+              printf '%s\n' "$VOTER_DIAGNOSTICS"
+            else
+              echo "::error::per-voter reviewer diagnostics unavailable"
+            fi
             if DIAGNOSTIC_CATEGORY="$(uv run --no-project --python 3.12 python \
               "$GITHUB_WORKSPACE/base/scripts/ci/hostile_review_diagnostics.py" \
               classify --diagnostics "$REVIEW_STDERR")"; then

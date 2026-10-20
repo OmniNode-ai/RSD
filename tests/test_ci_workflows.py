@@ -175,7 +175,10 @@ def test_hostile_reviewer_fetches_pinned_overlay_outside_workspace() -> None:
     assert 'FETCHED_REF="$(git -C ../ci-overlay rev-parse HEAD)"' in place["run"]
     assert 'if [ "${FETCHED_REF}" != "${EXPECTED_OVERLAY_REF}" ]; then' in place["run"]
     review = steps["Run adversarial review"]
-    assert set(review["env"]) == {"REVIEW_INPUT"}
+    assert review["env"] == {
+        "REVIEW_INPUT": "${{ steps.fetch-diff.outputs.path }}",
+        "REVIEW_REPOSITORY": "${{ github.repository }}",
+    }
     assert list(steps).index("Resolve the CI overlay") < list(steps).index("Run adversarial review")
 
 
