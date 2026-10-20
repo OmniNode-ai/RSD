@@ -198,6 +198,7 @@ jobs:
         working-directory: ../omniintelligence
         env:
           REVIEW_INPUT: ${{ steps.fetch-diff.outputs.path }}
+          REVIEW_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
 
@@ -228,8 +229,10 @@ jobs:
 
           capture_bounded_stderr <"$REVIEW_FIFO" >"$REVIEW_STDERR" &
           STDERR_CAPTURE_PID=$!
+          # OMN-17427: the cloud voter requires the reviewed repository identity.
           uv run --python 3.12 python -m omniintelligence.review_pairing.cli_review \
             --file "$REVIEW_INPUT" \
+            --repo "$REVIEW_REPOSITORY" \
             --voters-overlay "$REVIEW_VOTERS_OVERLAY" \
             --no-fallback \
             >"$REVIEW_STDOUT" 2>"$REVIEW_FIFO" &
