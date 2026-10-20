@@ -244,6 +244,7 @@ def test_workflow_failed_review_reports_voter_and_preserves_exit(
     fake_uv.write_text(
         "#!/bin/bash\n"
         "if [[ \" $* \" == *' -m omniintelligence.review_pairing.cli_review '* ]]; then\n"
+        '  printf \'%s\\0\' "$@" > "$FIXTURE_ARGV"\n'
         '  cat "$FIXTURE_RESULT"\n'
         "  echo 'request timed out; secret-value' >&2\n"
         "  exit 2\n"
@@ -270,6 +271,8 @@ def test_workflow_failed_review_reports_voter_and_preserves_exit(
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "FIXTURE_RESULT": str(result_path),
+        "FIXTURE_ARGV": str(tmp_path / "review-argv"),
+        "REVIEW_REPOSITORY": "OmniNode-ai/RSD",
         "FIXTURE_PYTHON": sys.executable,
         "GITHUB_WORKSPACE": str(workspace),
         "REVIEW_INPUT": str(review_input),
@@ -280,6 +283,11 @@ def test_workflow_failed_review_reports_voter_and_preserves_exit(
     completed = subprocess.run(
         ["bash", "-c", script], env=env, capture_output=True, text=True, check=False, timeout=15
     )
+    arguments = (tmp_path / "review-argv").read_text().split("\0")[:-1]
+    assert "--repo" in arguments, "review gateway refuses votes without repository metadata"
+    assert arguments[arguments.index("--repo") + 1] == "OmniNode-ai/RSD"
+    assert arguments[arguments.index("--file") + 1] == str(review_input)
+    assert "--no-fallback" in arguments
     assert completed.returncode == 2, completed.stdout + completed.stderr
     if result_state == "valid":
         assert "review voter sonnet failed (category reviewer-timeout)" in completed.stdout
